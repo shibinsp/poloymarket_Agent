@@ -1,0 +1,53 @@
+[agent]
+mode = "paper"                    # paper | live | backtest
+cycle_interval_seconds = 600      # 10 minutes
+death_balance_threshold = 0.0
+low_fuel_threshold = 10.0
+api_reserve = 2.0
+initial_paper_balance = 100.0
+
+[scanning]
+max_markets = 1000
+min_volume_24h = 5000.0
+max_resolution_days = 14
+max_spread_pct = 0.05
+categories = ["weather", "sports", "crypto", "politics"]
+
+[valuation]
+claude_model = "claude-sonnet-4-20250514"
+min_edge_threshold = 0.08
+high_confidence_edge = 0.06
+low_confidence_edge = 0.10
+cache_ttl_seconds = 300
+
+[risk]
+kelly_fraction = 0.5
+max_position_pct = 0.06
+max_total_exposure_pct = 0.30
+max_positions_per_category = 3
+min_position_usd = 1.0
+
+[execution]
+order_type = "limit"
+order_ttl_seconds = 300
+max_slippage_pct = 0.02
+max_retries = 3
+
+[monitoring]
+log_level = "info"
+discord_enabled = false
+daily_summary_hour = 9
+
+[polymarket]
+clob_base_url = "https://clob.polymarket.com"
+gamma_base_url = "https://gamma-api.polymarket.com"
+chain_id = 137
+
+[rate_limit]
+requests_per_second = 10
+burst_size = 20
+backoff_base_ms = 1000
+backoff_max_ms = 30000
+
+[database]
+path = "polymarket-agent.db"

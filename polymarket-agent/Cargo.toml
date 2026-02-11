@@ -1,0 +1,61 @@
+[package]
+name = "polymarket-agent"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88.0"
+
+[dependencies]
+# Polymarket official SDK
+polymarket-client-sdk = { version = "0.4", features = ["clob", "gamma", "data", "tracing"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP (for non-Polymarket APIs: Claude, NOAA, etc.)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Config
+toml = "0.8"
+dotenvy = "0.15"
+
+# Financial math — NEVER use f64 for money
+rust_decimal = { version = "1", features = ["serde-str"] }
+rust_decimal_macros = "1"
+
+# Crypto (for HMAC signing of non-SDK requests)
+hmac = "0.12"
+sha2 = "0.10"
+
+# Async trait for dyn-dispatchable async traits
+async-trait = "0.1"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# UUID
+uuid = { version = "1", features = ["v4"] }
+
+# URL encoding
+urlencoding = "2"
+
+# Rate limiting
+governor = "0.8"
+
+[dev-dependencies]
+tokio-test = "0.4"
+wiremock = "0.6"

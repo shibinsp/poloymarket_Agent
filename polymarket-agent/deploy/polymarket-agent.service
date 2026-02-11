@@ -1,0 +1,22 @@
+[Unit]
+Description=Polymarket Trading Agent
+After=network.target
+
+[Service]
+Type=simple
+User=agent
+WorkingDirectory=/opt/polymarket-agent
+ExecStart=/opt/polymarket-agent/target/release/polymarket-agent
+Restart=on-failure
+RestartSec=30
+Environment=RUST_LOG=info
+EnvironmentFile=/opt/polymarket-agent/.env
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/polymarket-agent
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
