@@ -45,9 +45,7 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub async fn new(config: AppConfig, secrets: Secrets) -> Result<Self> {
-        let store = Store::new(&config.database.path).await?;
-
+    pub async fn new(config: AppConfig, secrets: Secrets, store: Store) -> Result<Self> {
         let config_arc = Arc::new(config.clone());
         let polymarket = Arc::new(PolymarketClient::new(config_arc, &secrets).await?);
         let scanner = MarketScanner::new(polymarket.clone(), config.scanning.clone());

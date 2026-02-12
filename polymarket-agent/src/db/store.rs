@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use serde::Serialize;
 use sqlx::{FromRow, SqlitePool};
 use std::str::FromStr;
 
@@ -9,7 +10,7 @@ pub struct Store {
     pool: SqlitePool,
 }
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone, FromRow, Serialize)]
 pub struct TradeRecord {
     pub id: Option<i64>,
     pub cycle: i64,
@@ -29,7 +30,7 @@ pub struct TradeRecord {
     pub resolved_at: Option<String>,
 }
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone, FromRow, Serialize)]
 pub struct CycleRecord {
     pub id: Option<i64>,
     pub cycle_number: i64,
@@ -44,7 +45,7 @@ pub struct CycleRecord {
     pub created_at: Option<String>,
 }
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone, FromRow, Serialize)]
 pub struct ApiCostRecord {
     pub id: Option<i64>,
     pub provider: String,
@@ -57,6 +58,16 @@ pub struct ApiCostRecord {
 }
 
 impl Store {
+    /// Create a Store from an existing pool (for sharing between Agent and Dashboard).
+    pub fn from_pool(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
+
+    /// Get a reference to the underlying connection pool.
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
     pub async fn new(database_path: &str) -> Result<Self> {
         let options = SqliteConnectOptions::from_str(&format!("sqlite:{database_path}"))
             .context("Invalid database path")?
@@ -255,6 +266,37 @@ impl Store {
             Some(s) => Ok(Decimal::from_str(&s).unwrap_or(Decimal::ZERO)),
             None => Ok(Decimal::ZERO),
         }
+    }
+
+    /// Get all cycles ordered by cycle number.
+    pub async fn get_all_cycles(&self) -> Result<Vec<CycleRecord>> {
+        let cycles =
+            sqlx::query_as::<_, CycleRecord>("SELECT * FROM cycles ORDER BY cycle_number")
+                .fetch_all(&self.pool)
+                .await
+                .context("Failed to fetch all cycles")?;
+        Ok(cycles)
+    }
+
+    /// Get all API cost records.
+    pub async fn get_all_api_costs(&self) -> Result<Vec<ApiCostRecord>> {
+        let costs = sqlx::query_as::<_, ApiCostRecord>("SELECT * FROM api_costs ORDER BY id")
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to fetch all API costs")?;
+        Ok(costs)
+    }
+
+    /// Get recent trades with a limit.
+    pub async fn get_recent_trades(&self, limit: i64) -> Result<Vec<TradeRecord>> {
+        let trades = sqlx::query_as::<_, TradeRecord>(
+            "SELECT * FROM trades ORDER BY id DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to fetch recent trades")?;
+        Ok(trades)
     }
 
     pub async fn get_api_cost_for_cycle(&self, cycle: i64) -> Result<Decimal> {

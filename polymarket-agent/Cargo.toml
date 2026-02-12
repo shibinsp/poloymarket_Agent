@@ -53,6 +53,10 @@ uuid = { version = "1", features = ["v4"] }
 # URL encoding
 urlencoding = "2"
 
+# Web dashboard
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+
 # Rate limiting
 governor = "0.8"
 

@@ -75,6 +75,18 @@ pub struct MonitoringConfig {
     pub log_level: String,
     pub discord_enabled: bool,
     pub daily_summary_hour: u32,
+    #[serde(default = "default_dashboard_port")]
+    pub dashboard_port: u16,
+    #[serde(default = "default_dashboard_bind")]
+    pub dashboard_bind: String,
+}
+
+fn default_dashboard_port() -> u16 {
+    8080
+}
+
+fn default_dashboard_bind() -> String {
+    "127.0.0.1".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]

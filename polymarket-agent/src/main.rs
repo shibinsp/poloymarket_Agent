@@ -13,6 +13,8 @@ use anyhow::Result;
 
 use crate::agent::lifecycle::Agent;
 use crate::config::{AgentMode, AppConfig};
+use crate::db::store::Store;
+use crate::monitoring::dashboard::{DashboardState, spawn_dashboard};
 use crate::monitoring::logger;
 
 #[tokio::main]
@@ -35,11 +37,24 @@ async fn main() -> Result<()> {
 
 /// Run the agent in paper or live trading mode.
 async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
-    // Phase 10: Start health check server
-    let health_state = monitoring::health::HealthState::new();
-    let health_handle = monitoring::health::spawn_health_server(health_state.clone());
+    // Create shared database store
+    let store = Store::new(&config.database.path).await?;
 
-    let mut agent = Agent::new(config.clone(), secrets).await?;
+    // Create health state and dashboard
+    let health_state = monitoring::health::HealthState::new();
+    let dashboard_store = Store::from_pool(store.pool().clone());
+    let dashboard_state = DashboardState::new(
+        dashboard_store,
+        health_state.clone(),
+        config.agent.initial_paper_balance,
+    );
+    let dashboard_handle = spawn_dashboard(
+        dashboard_state,
+        &config.monitoring.dashboard_bind,
+        config.monitoring.dashboard_port,
+    );
+
+    let mut agent = Agent::new(config.clone(), secrets, store).await?;
     let interval = std::time::Duration::from_secs(config.agent.cycle_interval_seconds);
 
     loop {
@@ -56,8 +71,8 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
         tokio::time::sleep(interval).await;
     }
 
-    // Clean up health server
-    health_handle.abort();
+    // Clean up dashboard server
+    dashboard_handle.abort();
 
     Ok(())
 }

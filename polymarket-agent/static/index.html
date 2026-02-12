@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Polymarket Agent Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
+  background: #0f0f1a;
+  color: #e0e0e0;
+  min-height: 100vh;
+}
+a { color: #64b5f6; }
+
+/* Header */
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 24px;
+  background: #1a1a2e;
+  border-bottom: 1px solid #2a2a40;
+}
+.header h1 { font-size: 20px; font-weight: 600; }
+.header .status-badge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  padding: 6px 14px;
+  border-radius: 20px;
+  background: #1e3a2f;
+  color: #4caf50;
+}
+.header .status-badge.dead { background: #3a1e1e; color: #ef5350; }
+.header .status-badge.lowfuel { background: #3a351e; color: #ffc107; }
+.header .status-badge.critical { background: #3a2a1e; color: #ff9800; }
+.header .status-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: #4caf50;
+  animation: pulse 2s infinite;
+}
+.header .status-badge.dead .status-dot { background: #ef5350; animation: none; }
+.header .status-badge.lowfuel .status-dot { background: #ffc107; }
+.header .status-badge.critical .status-dot { background: #ff9800; }
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+/* KPI Cards */
+.kpi-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px;
+  padding: 16px 24px;
+}
+.kpi-card {
+  background: #1a1a2e;
+  border: 1px solid #2a2a40;
+  border-radius: 8px;
+  padding: 16px;
+}
+.kpi-card .label {
+  font-size: 11px;
+  text-transform: uppercase;
+  color: #888;
+  letter-spacing: 0.5px;
+  margin-bottom: 6px;
+}
+.kpi-card .value {
+  font-size: 24px;
+  font-weight: 700;
+  color: #fff;
+}
+.kpi-card .value.positive { color: #4caf50; }
+.kpi-card .value.negative { color: #ef5350; }
+
+/* Content */
+.content {
+  padding: 0 24px 24px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+.content.full { grid-template-columns: 1fr; }
+
+.panel {
+  background: #1a1a2e;
+  border: 1px solid #2a2a40;
+  border-radius: 8px;
+  padding: 16px;
+}
+.panel h2 {
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 12px;
+  color: #aaa;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.panel.chart-panel { grid-column: 1 / -1; }
+
+/* Tables */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+th {
+  text-align: left;
+  padding: 8px 10px;
+  border-bottom: 1px solid #2a2a40;
+  color: #888;
+  font-weight: 500;
+  font-size: 11px;
+  text-transform: uppercase;
+}
+td {
+  padding: 8px 10px;
+  border-bottom: 1px solid #1e1e30;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 250px;
+}
+tr:hover td { background: #1e1e30; }
+
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+}
+.badge.open { background: #1e3a5a; color: #64b5f6; }
+.badge.win { background: #1e3a2f; color: #4caf50; }
+.badge.loss { background: #3a1e1e; color: #ef5350; }
+.badge.alive { background: #1e3a2f; color: #4caf50; }
+.badge.lowfuel { background: #3a351e; color: #ffc107; }
+.badge.dead { background: #3a1e1e; color: #ef5350; }
+
+/* Chart */
+.chart-container {
+  position: relative;
+  height: 280px;
+}
+
+/* Footer */
+.footer {
+  text-align: center;
+  padding: 12px;
+  font-size: 12px;
+  color: #555;
+}
+
+/* Refresh indicator */
+.refresh-info {
+  font-size: 12px;
+  color: #555;
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Polymarket Agent</h1>
+  <div style="display:flex;align-items:center;gap:16px;">
+    <span class="refresh-info" id="lastRefresh">--</span>
+    <div class="status-badge" id="statusBadge">
+      <span class="status-dot"></span>
+      <span id="agentState">LOADING</span>
+    </div>
+  </div>
+</div>
+
+<div class="kpi-row">
+  <div class="kpi-card">
+    <div class="label">Bankroll</div>
+    <div class="value" id="kpiBankroll">--</div>
+  </div>
+  <div class="kpi-card">
+    <div class="label">Net P&L</div>
+    <div class="value" id="kpiPnl">--</div>
+  </div>
+  <div class="kpi-card">
+    <div class="label">Win Rate</div>
+    <div class="value" id="kpiWinRate">--</div>
+  </div>
+  <div class="kpi-card">
+    <div class="label">Total Trades</div>
+    <div class="value" id="kpiTrades">--</div>
+  </div>
+  <div class="kpi-card">
+    <div class="label">Cycles</div>
+    <div class="value" id="kpiCycles">--</div>
+  </div>
+  <div class="kpi-card">
+    <div class="label">API Cost</div>
+    <div class="value" id="kpiApiCost">--</div>
+  </div>
+</div>
+
+<div class="content full">
+  <div class="panel chart-panel">
+    <h2>Bankroll Over Time</h2>
+    <div class="chart-container">
+      <canvas id="bankrollChart"></canvas>
+    </div>
+  </div>
+</div>
+
+<div class="content">
+  <div class="panel">
+    <h2>Recent Trades</h2>
+    <div style="overflow-x:auto;">
+      <table id="tradesTable">
+        <thead>
+          <tr>
+            <th>Market</th>
+            <th>Side</th>
+            <th>Price</th>
+            <th>Size</th>
+            <th>Edge</th>
+            <th>Status</th>
+            <th>P&L</th>
+          </tr>
+        </thead>
+        <tbody id="tradesBody">
+          <tr><td colspan="7" style="text-align:center;color:#555;">No trades yet</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Recent Cycles</h2>
+    <div style="overflow-x:auto;">
+      <table id="cyclesTable">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Markets</th>
+            <th>Opps</th>
+            <th>Trades</th>
+            <th>Bankroll</th>
+            <th>Duration</th>
+            <th>State</th>
+          </tr>
+        </thead>
+        <tbody id="cyclesBody">
+          <tr><td colspan="7" style="text-align:center;color:#555;">No cycles yet</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="footer">
+  Polymarket Autonomous Trading Agent &mdash; Paper Mode
+</div>
+
+<script>
+let bankrollChart = null;
+
+function initChart() {
+  const ctx = document.getElementById('bankrollChart').getContext('2d');
+  bankrollChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [{
+        label: 'Bankroll ($)',
+        data: [],
+        borderColor: '#64b5f6',
+        backgroundColor: 'rgba(100, 181, 246, 0.1)',
+        fill: true,
+        tension: 0.3,
+        pointRadius: 2,
+        borderWidth: 2,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+      },
+      scales: {
+        x: {
+          ticks: { color: '#666', maxTicksLimit: 20 },
+          grid: { color: '#1e1e30' },
+        },
+        y: {
+          ticks: { color: '#666', callback: v => '$' + v },
+          grid: { color: '#1e1e30' },
+        }
+      }
+    }
+  });
+}
+
+function statusClass(state) {
+  if (!state) return '';
+  const s = state.toUpperCase();
+  if (s === 'DEAD') return 'dead';
+  if (s === 'LOW_FUEL' || s === 'LOWFUEL') return 'lowfuel';
+  if (s.includes('CRITICAL')) return 'critical';
+  return '';
+}
+
+function badgeClass(status) {
+  if (!status) return '';
+  const s = status.toUpperCase();
+  if (s === 'OPEN') return 'open';
+  if (s.includes('WIN')) return 'win';
+  if (s.includes('LOSS')) return 'loss';
+  return '';
+}
+
+function stateBadgeClass(state) {
+  if (!state) return 'alive';
+  const s = state.toUpperCase();
+  if (s === 'DEAD') return 'dead';
+  if (s.includes('LOW') || s.includes('FUEL')) return 'lowfuel';
+  if (s.includes('CRITICAL')) return 'dead';
+  return 'alive';
+}
+
+function fmt(val, prefix) {
+  if (val === null || val === undefined || val === '') return '--';
+  const n = parseFloat(val);
+  if (isNaN(n)) return val;
+  return (prefix || '') + n.toFixed(2);
+}
+
+function pctFmt(val) {
+  if (val === null || val === undefined || val === '') return '--';
+  const n = parseFloat(val);
+  if (isNaN(n)) return val;
+  return (n * 100).toFixed(1) + '%';
+}
+
+function truncate(s, max) {
+  if (!s) return '--';
+  return s.length > max ? s.substring(0, max) + '...' : s;
+}
+
+async function fetchJson(url) {
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) return null;
+    return await resp.json();
+  } catch {
+    return null;
+  }
+}
+
+async function refresh() {
+  const [health, metrics, trades, cycles] = await Promise.all([
+    fetchJson('/api/health'),
+    fetchJson('/api/metrics'),
+    fetchJson('/api/trades'),
+    fetchJson('/api/cycles/all'),
+  ]);
+
+  // Health / Status
+  if (health) {
+    const state = health.agent_state || 'UNKNOWN';
+    document.getElementById('agentState').textContent = state;
+    const badge = document.getElementById('statusBadge');
+    badge.className = 'status-badge ' + statusClass(state);
+  }
+
+  // KPI cards
+  if (metrics) {
+    document.getElementById('kpiBankroll').textContent = '$' + fmt(metrics.total_pnl !== undefined ?
+      (parseFloat(metrics.realized_pnl || 0) + 100).toFixed(2) : '--');
+
+    const pnlEl = document.getElementById('kpiPnl');
+    const pnl = parseFloat(metrics.net_profit || 0);
+    pnlEl.textContent = fmt(metrics.net_profit, '$');
+    pnlEl.className = 'value ' + (pnl >= 0 ? 'positive' : 'negative');
+
+    document.getElementById('kpiWinRate').textContent = pctFmt(metrics.win_rate);
+    document.getElementById('kpiTrades').textContent = metrics.total_trades || 0;
+    document.getElementById('kpiCycles').textContent = metrics.cycles_completed || 0;
+    document.getElementById('kpiApiCost').textContent = fmt(metrics.total_api_cost, '$');
+  }
+
+  // Bankroll chart from cycles
+  if (cycles && cycles.length > 0) {
+    const labels = cycles.map(c => 'C' + c.cycle_number);
+    const data = cycles.map(c => parseFloat(c.bankroll || 0));
+    bankrollChart.data.labels = labels;
+    bankrollChart.data.datasets[0].data = data;
+    bankrollChart.update();
+
+    // Update bankroll KPI from latest cycle
+    const latest = cycles[cycles.length - 1];
+    if (latest.bankroll) {
+      document.getElementById('kpiBankroll').textContent = '$' + parseFloat(latest.bankroll).toFixed(2);
+    }
+  }
+
+  // Trades table
+  if (trades && trades.length > 0) {
+    const tbody = document.getElementById('tradesBody');
+    tbody.innerHTML = trades.map(t => `
+      <tr>
+        <td title="${t.market_question || ''}">${truncate(t.market_question || t.market_id, 30)}</td>
+        <td>${t.direction || '--'}</td>
+        <td>${fmt(t.entry_price, '$')}</td>
+        <td>${fmt(t.size, '$')}</td>
+        <td>${pctFmt(t.edge_at_entry)}</td>
+        <td><span class="badge ${badgeClass(t.status)}">${t.status || '--'}</span></td>
+        <td class="${parseFloat(t.pnl || 0) >= 0 ? 'positive' : 'negative'}" style="color:${parseFloat(t.pnl || 0) >= 0 ? '#4caf50' : '#ef5350'}">${t.pnl ? fmt(t.pnl, '$') : '--'}</td>
+      </tr>
+    `).join('');
+  }
+
+  // Cycles table (last 20)
+  if (cycles && cycles.length > 0) {
+    const recent = cycles.slice(-20).reverse();
+    const tbody = document.getElementById('cyclesBody');
+    tbody.innerHTML = recent.map(c => `
+      <tr>
+        <td>${c.cycle_number}</td>
+        <td>${c.markets_scanned || 0}</td>
+        <td>${c.opportunities_found || 0}</td>
+        <td>${c.trades_placed || 0}</td>
+        <td>${fmt(c.bankroll, '$')}</td>
+        <td>${c.duration_ms ? (c.duration_ms / 1000).toFixed(1) + 's' : '--'}</td>
+        <td><span class="badge ${stateBadgeClass(c.agent_state)}">${c.agent_state || '--'}</span></td>
+      </tr>
+    `).join('');
+  }
+
+  document.getElementById('lastRefresh').textContent =
+    'Updated ' + new Date().toLocaleTimeString();
+}
+
+// Init
+initChart();
+refresh();
+setInterval(refresh, 30000);
+</script>
+</body>
+</html>

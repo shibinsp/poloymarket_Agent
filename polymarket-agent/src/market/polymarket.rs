@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
@@ -22,6 +22,8 @@ use polymarket_client_sdk::auth::state::Unauthenticated;
 use polymarket_client_sdk::types::U256;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
+use serde::Deserialize;
+use std::str::FromStr;
 use tokio::sync::Mutex;
 use tracing::{info, instrument, warn};
 
@@ -71,8 +73,10 @@ pub struct PolymarketClient {
     config: Arc<AppConfig>,
     /// CLOB client (unauthenticated — for market data)
     clob: ClobClient<Unauthenticated>,
-    /// Gamma client for market discovery
-    gamma: polymarket_client_sdk::gamma::Client,
+    /// HTTP client for direct Gamma API calls (bypasses SDK deserialization issues)
+    http: reqwest::Client,
+    /// Gamma API base URL
+    gamma_base_url: String,
     /// Rate limiter
     limiter: Arc<Limiter>,
     /// Paper trading state (only in Paper mode)
@@ -87,13 +91,17 @@ impl PolymarketClient {
         )
         .context("Failed to create CLOB client")?;
 
-        let gamma = polymarket_client_sdk::gamma::Client::new(&config.polymarket.gamma_base_url)
-            .context("Failed to create Gamma client")?;
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .context("Failed to create HTTP client")?;
+
+        let gamma_base_url = config.polymarket.gamma_base_url.trim_end_matches('/').to_string();
 
         let limiter = create_rate_limiter(&config.rate_limit);
 
         let paper_state = match config.agent.mode {
-            AgentMode::Paper => Some(Mutex::new(PaperTradingState {
+            AgentMode::Paper | AgentMode::Backtest => Some(Mutex::new(PaperTradingState {
                 balance: config.agent.initial_paper_balance,
                 positions: Vec::new(),
                 order_history: Vec::new(),
@@ -104,20 +112,23 @@ impl PolymarketClient {
         Ok(Self {
             config,
             clob,
-            gamma,
+            http,
+            gamma_base_url,
             limiter,
             paper_state,
         })
     }
 
-    // === Market Discovery (via Gamma API) ===
+    // === Market Discovery (via Gamma API, direct reqwest) ===
 
     /// Fetch markets from Gamma API, filtered by our criteria.
+    /// Uses direct reqwest instead of SDK to avoid Decimal deserialization issues
+    /// with the Gamma API returning JSON floats instead of strings.
     #[instrument(skip(self, filters))]
     pub async fn get_markets(&self, filters: &MarketFilters) -> Result<Vec<Market>> {
         let mut all_markets = Vec::new();
-        let mut offset = 0i32;
-        let limit = 100i32;
+        let mut offset = 0u32;
+        let limit = 100u32;
 
         let now = Utc::now();
         let max_end_date = now + chrono::Duration::days(filters.max_resolution_days as i64);
@@ -125,25 +136,41 @@ impl PolymarketClient {
         loop {
             self.rate_limit().await;
 
-            let request = polymarket_client_sdk::gamma::types::request::MarketsRequest::builder()
-                .limit(limit)
-                .offset(offset)
-                .closed(false)
-                .end_date_min(now)
-                .end_date_max(max_end_date)
-                .volume_num_min(filters.min_volume_24h)
-                .order("volume_num".to_string())
-                .ascending(false)
-                .build();
+            let url = format!("{}/markets", self.gamma_base_url);
 
-            let gamma_markets: Vec<polymarket_client_sdk::gamma::types::response::Market> = self
+            let gamma_markets: Vec<GammaMarketResponse> = self
                 .with_retry(|| {
-                    let req = &request;
+                    let url = url.clone();
+                    let end_min = now.to_rfc3339();
+                    let end_max = max_end_date.to_rfc3339();
+                    let vol_min = filters.min_volume_24h.to_string();
                     async move {
-                        self.gamma
-                            .markets(req)
+                        let resp = self
+                            .http
+                            .get(&url)
+                            .query(&[
+                                ("limit", limit.to_string()),
+                                ("offset", offset.to_string()),
+                                ("closed", "false".to_string()),
+                                ("end_date_min", end_min),
+                                ("end_date_max", end_max),
+                                ("volume_num_min", vol_min),
+                                ("order", "volume".to_string()),
+                                ("ascending", "false".to_string()),
+                            ])
+                            .send()
                             .await
-                            .map_err(|e| anyhow::anyhow!("{e}"))
+                            .map_err(|e| anyhow::anyhow!("HTTP error: {e}"))?;
+
+                        if !resp.status().is_success() {
+                            let status = resp.status();
+                            let body = resp.text().await.unwrap_or_default();
+                            return Err(anyhow::anyhow!("Gamma API {status}: {body}"));
+                        }
+
+                        resp.json::<Vec<GammaMarketResponse>>()
+                            .await
+                            .map_err(|e| anyhow::anyhow!("Deserialization error: {e}"))
                     }
                 })
                 .await
@@ -155,8 +182,8 @@ impl PolymarketClient {
 
             let page_count = gamma_markets.len();
 
-            for gm in gamma_markets {
-                if let Some(market) = convert_gamma_market(&gm) {
+            for gm in &gamma_markets {
+                if let Some(market) = convert_gamma_response(gm) {
                     if market.active && market.volume_24h >= filters.min_volume_24h {
                         all_markets.push(market);
                     }
@@ -165,7 +192,7 @@ impl PolymarketClient {
 
             offset += limit;
 
-            if all_markets.len() >= filters.max_markets || (page_count as i32) < limit {
+            if all_markets.len() >= filters.max_markets || (page_count as u32) < limit {
                 break;
             }
         }
@@ -461,17 +488,48 @@ fn parse_token_id(token_id: &str) -> Result<U256> {
         .map_err(|e| anyhow::anyhow!("Invalid token_id '{}': {}", token_id, e))
 }
 
-/// Convert a Gamma API Market to our domain Market type.
-fn convert_gamma_market(
-    gm: &polymarket_client_sdk::gamma::types::response::Market,
-) -> Option<Market> {
-    let question = gm.question.clone()?;
-    let end_date = gm.end_date?;
+/// Lightweight Gamma API market response for direct deserialization.
+/// The Gamma API returns some fields as JSON-encoded strings (outcomes,
+/// outcomePrices, clobTokenIds) and numeric fields as floats.
+/// We use `#[serde(default)]` and `Option` liberally to handle missing fields.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GammaMarketResponse {
+    condition_id: Option<String>,
+    question: Option<String>,
+    /// JSON-encoded string: "[\"Yes\", \"No\"]"
+    outcomes: Option<String>,
+    /// JSON-encoded string: "[\"0.025\", \"0.975\"]"
+    outcome_prices: Option<String>,
+    /// JSON-encoded string: "[\"14310...\", \"49141...\"]"
+    clob_token_ids: Option<String>,
+    /// RFC3339 datetime string
+    end_date: Option<String>,
+    volume24hr: Option<f64>,
+    active: Option<bool>,
+    closed: Option<bool>,
+}
 
-    // Build token info from clob_token_ids and outcome_prices
-    let token_ids = gm.clob_token_ids.as_ref()?;
-    let outcomes = gm.outcomes.as_ref()?;
-    let outcome_prices = gm.outcome_prices.as_ref();
+/// Parse a JSON-encoded string array like "[\"a\", \"b\"]" into Vec<String>.
+fn parse_json_string_array(s: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(s).unwrap_or_default()
+}
+
+/// Convert our direct Gamma response to domain Market type.
+fn convert_gamma_response(gm: &GammaMarketResponse) -> Option<Market> {
+    let question = gm.question.clone()?;
+    let end_date_str = gm.end_date.as_ref()?;
+    let end_date: DateTime<Utc> = DateTime::parse_from_rfc3339(end_date_str)
+        .ok()?
+        .with_timezone(&Utc);
+
+    let token_ids = parse_json_string_array(gm.clob_token_ids.as_deref()?);
+    let outcomes = parse_json_string_array(gm.outcomes.as_deref()?);
+    let outcome_prices = parse_json_string_array(gm.outcome_prices.as_deref().unwrap_or("[]"));
+
+    if token_ids.is_empty() || outcomes.is_empty() {
+        return None;
+    }
 
     let tokens: Vec<TokenInfo> = token_ids
         .iter()
@@ -479,36 +537,29 @@ fn convert_gamma_market(
         .map(|(i, tid)| {
             let outcome = outcomes.get(i).cloned().unwrap_or_default();
             let price = outcome_prices
-                .and_then(|prices| prices.get(i))
-                .copied()
+                .get(i)
+                .and_then(|s| Decimal::from_str(s).ok())
                 .unwrap_or(Decimal::ZERO);
             TokenInfo {
-                token_id: tid.to_string(),
+                token_id: tid.clone(),
                 outcome,
                 price,
             }
         })
         .collect();
 
-    let category = match gm.category.as_deref() {
-        Some("weather") => MarketCategory::Weather,
-        Some("sports") => MarketCategory::Sports,
-        Some("crypto") => MarketCategory::Crypto,
-        Some("politics") => MarketCategory::Politics,
-        Some(other) => MarketCategory::Other(other.to_string()),
-        None => MarketCategory::Other("unknown".to_string()),
-    };
+    let category = MarketCategory::Other("unknown".to_string());
 
-    let volume_24h = gm.volume_24hr.unwrap_or(Decimal::ZERO);
-    let active = gm.active.unwrap_or(false);
+    let volume_24h = gm
+        .volume24hr
+        .and_then(|v| Decimal::try_from(v).ok())
+        .unwrap_or(Decimal::ZERO);
+    let active = gm.active.unwrap_or(false) && !gm.closed.unwrap_or(true);
 
     Some(Market {
-        condition_id: gm
-            .condition_id
-            .map(|c| format!("{c:?}"))
-            .unwrap_or_default(),
+        condition_id: gm.condition_id.clone().unwrap_or_default(),
         question,
-        outcomes: outcomes.clone(),
+        outcomes,
         tokens,
         end_date,
         category,

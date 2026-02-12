@@ -37,6 +37,8 @@ max_retries = 3
 log_level = "info"
 discord_enabled = false
 daily_summary_hour = 9
+dashboard_port = 8080
+dashboard_bind = "127.0.0.1"
 
 [polymarket]
 clob_base_url = "https://clob.polymarket.com"

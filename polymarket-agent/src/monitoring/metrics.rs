@@ -6,13 +6,14 @@
 use anyhow::Result;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
+use serde::Serialize;
 use std::str::FromStr;
 use tracing::info;
 
 use crate::db::store::Store;
 
 /// Aggregated performance metrics snapshot.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PerformanceMetrics {
     pub total_trades: u64,
     pub open_trades: u64,

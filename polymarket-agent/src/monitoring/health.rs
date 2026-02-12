@@ -45,6 +45,12 @@ impl HealthState {
         }
     }
 
+    /// Get health data as a serializable JSON value.
+    pub async fn to_json(&self) -> serde_json::Value {
+        let data = self.inner.read().await;
+        serde_json::to_value(&*data).unwrap_or(serde_json::json!({"status": "error"}))
+    }
+
     pub fn record_cycle(&self, cycle_number: u64, state: AgentState) {
         let inner = self.inner.clone();
         tokio::spawn(async move {
