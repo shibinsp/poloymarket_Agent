@@ -1,5 +1,6 @@
 pub mod crypto;
 pub mod news;
+pub mod quality;
 pub mod sports;
 pub mod weather;
 

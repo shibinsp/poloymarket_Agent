@@ -548,7 +548,7 @@ fn convert_gamma_response(gm: &GammaMarketResponse) -> Option<Market> {
         })
         .collect();
 
-    let category = MarketCategory::Other("unknown".to_string());
+    let category = crate::market::category::infer_category(&question);
 
     let volume_24h = gm
         .volume24hr

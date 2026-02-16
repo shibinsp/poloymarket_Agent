@@ -1,21 +1,11 @@
-mod agent;
-mod backtesting;
-mod config;
-mod data;
-mod db;
-mod execution;
-mod market;
-mod monitoring;
-mod risk;
-mod valuation;
-
 use anyhow::Result;
 
-use crate::agent::lifecycle::Agent;
-use crate::config::{AgentMode, AppConfig};
-use crate::db::store::Store;
-use crate::monitoring::dashboard::{DashboardState, spawn_dashboard};
-use crate::monitoring::logger;
+use polymarket_agent::agent::lifecycle::Agent;
+use polymarket_agent::config::{self, AgentMode, AppConfig};
+use polymarket_agent::db::store::Store;
+use polymarket_agent::monitoring;
+use polymarket_agent::monitoring::dashboard::{DashboardState, spawn_dashboard};
+use polymarket_agent::monitoring::logger;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -58,29 +48,38 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
     let interval = std::time::Duration::from_secs(config.agent.cycle_interval_seconds);
 
     loop {
-        agent.run_cycle().await?;
+        tokio::select! {
+            result = agent.run_cycle() => {
+                result?;
 
-        // Update health state
-        health_state.record_cycle(agent.cycle_number(), agent.current_state());
+                // Update health state
+                health_state.record_cycle(agent.cycle_number(), agent.current_state());
 
-        if agent.is_dead() {
-            tracing::error!("Agent has died. Shutting down.");
-            break;
+                if agent.is_dead() {
+                    tracing::error!("Agent has died. Shutting down.");
+                    break;
+                }
+
+                tokio::time::sleep(interval).await;
+            }
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("Received Ctrl+C — shutting down gracefully");
+                break;
+            }
         }
-
-        tokio::time::sleep(interval).await;
     }
 
     // Clean up dashboard server
     dashboard_handle.abort();
+    tracing::info!("Agent shutdown complete");
 
     Ok(())
 }
 
 /// Run a backtest using historical or synthetic data.
 fn run_backtest(config: &AppConfig) -> Result<()> {
-    use crate::backtesting::engine::{self, BacktestConfig};
-    use crate::backtesting::historical;
+    use polymarket_agent::backtesting::engine::{self, BacktestConfig};
+    use polymarket_agent::backtesting::historical;
     use std::path::Path;
 
     let bt_config = BacktestConfig::from_app_config(config);

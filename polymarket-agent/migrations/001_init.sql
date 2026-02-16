@@ -47,3 +47,31 @@ CREATE INDEX IF NOT EXISTS idx_trades_market_id ON trades(market_id);
 CREATE INDEX IF NOT EXISTS idx_cycles_cycle_number ON cycles(cycle_number);
 CREATE INDEX IF NOT EXISTS idx_api_costs_provider ON api_costs(provider);
 CREATE INDEX IF NOT EXISTS idx_api_costs_cycle ON api_costs(cycle);
+
+CREATE TABLE IF NOT EXISTS confidence_calibration (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    market_id TEXT NOT NULL,
+    claude_confidence TEXT NOT NULL,
+    fair_value TEXT NOT NULL,
+    market_price_at_entry TEXT NOT NULL,
+    actual_outcome TEXT,
+    forecast_correct BOOLEAN,
+    resolved BOOLEAN NOT NULL DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now')),
+    resolved_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_calibration_resolved ON confidence_calibration(resolved);
+CREATE INDEX IF NOT EXISTS idx_calibration_market ON confidence_calibration(market_id);
+
+CREATE TABLE IF NOT EXISTS valuation_cache (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    condition_id TEXT NOT NULL UNIQUE,
+    probability TEXT NOT NULL,
+    confidence TEXT NOT NULL,
+    reasoning_summary TEXT,
+    key_factors TEXT,
+    data_quality TEXT NOT NULL,
+    time_sensitivity TEXT NOT NULL,
+    cached_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_valuation_cache_condition ON valuation_cache(condition_id);

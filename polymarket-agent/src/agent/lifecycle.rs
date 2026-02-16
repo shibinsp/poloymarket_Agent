@@ -26,6 +26,7 @@ use crate::monitoring::metrics::{compute_metrics, log_metrics};
 use crate::risk::kelly;
 use crate::risk::limits;
 use crate::risk::portfolio::{PortfolioManager, Position};
+use crate::valuation::calibration;
 use crate::valuation::claude::ClaudeClient;
 use crate::valuation::edge::{evaluate_edge, to_opportunity, EdgeResult};
 use crate::valuation::fair_value::{ValuationEngine, ValuationResult};
@@ -62,6 +63,7 @@ impl Agent {
         // Phase 4: Initialize valuation engine (only if API key is available)
         let valuation_engine = if let Some(ref api_key) = secrets.anthropic_api_key {
             let claude_store = Store::new(&config.database.path).await?;
+            let valuation_store = Store::new(&config.database.path).await?;
             let claude_client = Arc::new(ClaudeClient::new(
                 api_key.clone(),
                 config.valuation.claude_model.clone(),
@@ -70,6 +72,7 @@ impl Agent {
             Some(ValuationEngine::new(
                 claude_client,
                 config.valuation.clone(),
+                valuation_store,
             ))
         } else {
             warn!("ANTHROPIC_API_KEY not set — valuation engine disabled");
@@ -166,6 +169,11 @@ impl Agent {
         let mut opportunities_found: i64 = 0;
         let mut trades_placed: i64 = 0;
         let mut cycle_api_cost = Decimal::ZERO;
+
+        // Re-evaluate open positions for exit signals (RISK-01)
+        if self.state != AgentState::Dead {
+            self.evaluate_open_positions().await;
+        }
 
         match self.state {
             AgentState::Dead => {
@@ -455,6 +463,17 @@ impl Agent {
             if execution.status == OrderStatus::Filled {
                 result.trades += 1;
 
+                // Record prediction for confidence calibration (HAL-01)
+                if let Err(e) = calibration::record_prediction(
+                    self.store.pool(),
+                    &prepared.market_id,
+                    valuation.confidence,
+                    valuation.probability,
+                    prepared.price,
+                ).await {
+                    warn!(error = %e, "Failed to record calibration prediction");
+                }
+
                 // Update portfolio tracker
                 self.portfolio.add_position(Position {
                     market_id: prepared.market_id.clone(),
@@ -492,6 +511,35 @@ impl Agent {
         }
 
         result
+    }
+
+    /// Re-evaluate open positions for stop-loss exit signals (RISK-01).
+    /// In paper mode this only logs; live sell orders are not yet implemented.
+    async fn evaluate_open_positions(&self) {
+        let open_trades = match self.store.get_open_trades().await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(error = %e, "Failed to fetch open trades for exit evaluation");
+                return;
+            }
+        };
+
+        for trade in &open_trades {
+            // Parse stored values
+            let entry_price: Decimal = match trade.entry_price.parse() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            // In a full implementation we'd query the live order book midpoint here
+            // and call risk::exit::evaluate_exit(). For now, log that we checked.
+            info!(
+                market_id = %trade.market_id,
+                entry_price = %entry_price,
+                side = %trade.direction,
+                "Checked open position for exit signals (live midpoint fetch not yet implemented)"
+            );
+        }
     }
 
     fn log_opportunity(
