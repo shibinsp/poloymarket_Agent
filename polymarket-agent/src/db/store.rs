@@ -268,6 +268,21 @@ impl Store {
         }
     }
 
+    /// Get total API spend for the current UTC day.
+    pub async fn get_today_api_cost(&self) -> Result<Decimal> {
+        let row: (Option<String>,) = sqlx::query_as(
+            "SELECT CAST(SUM(CAST(cost AS REAL)) AS TEXT) FROM api_costs WHERE created_at >= date('now')",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .context("Failed to get today's API cost")?;
+
+        match row.0 {
+            Some(s) => Ok(Decimal::from_str(&s).unwrap_or(Decimal::ZERO)),
+            None => Ok(Decimal::ZERO),
+        }
+    }
+
     /// Get all cycles ordered by cycle number.
     pub async fn get_all_cycles(&self) -> Result<Vec<CycleRecord>> {
         let cycles =

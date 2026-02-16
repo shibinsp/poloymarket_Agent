@@ -286,6 +286,35 @@ impl PolymarketClient {
         Ok(book.midpoint)
     }
 
+    /// Get current YES price for a market by condition_id from Gamma API.
+    /// Returns the first outcome price (YES) as a Decimal.
+    /// This is a lightweight call for exit signal evaluation.
+    pub async fn get_current_yes_price(&self, condition_id: &str) -> Result<Decimal> {
+        self.rate_limit().await;
+
+        let url = format!("{}/markets", self.gamma_base_url);
+        let markets: Vec<GammaMarketResponse> = self
+            .http
+            .get(&url)
+            .query(&[("condition_id", condition_id)])
+            .send()
+            .await
+            .context("HTTP request to Gamma API failed")?
+            .json()
+            .await
+            .context("Failed to parse Gamma response")?;
+
+        let market = markets.first().context("Market not found on Gamma")?;
+        let prices_str = market.outcome_prices.as_deref().unwrap_or("[]");
+        let prices: Vec<String> = serde_json::from_str(prices_str).unwrap_or_default();
+        let yes_price = prices
+            .first()
+            .and_then(|s| Decimal::from_str(s).ok())
+            .unwrap_or(dec!(0.5));
+
+        Ok(yes_price)
+    }
+
     // === Order Placement ===
 
     /// Place a limit order. In paper mode, simulates the order.
@@ -406,6 +435,18 @@ impl PolymarketClient {
         );
 
         Ok(order_id)
+    }
+
+    // === Accessors ===
+
+    /// Borrow the HTTP client for use by resolution and other modules.
+    pub fn http_client(&self) -> &reqwest::Client {
+        &self.http
+    }
+
+    /// Borrow the Gamma API base URL.
+    pub fn gamma_base_url(&self) -> &str {
+        &self.gamma_base_url
     }
 
     // === Rate Limiting ===

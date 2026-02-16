@@ -33,6 +33,14 @@ pub struct AgentConfig {
     pub low_fuel_threshold: Decimal,
     pub api_reserve: Decimal,
     pub initial_paper_balance: Decimal,
+    /// Maximum API spend per calendar day (UTC). Stops new evaluations once hit.
+    /// Default: $5.00 — sufficient for ~550 Claude calls at ~$0.009 each.
+    #[serde(default = "default_daily_api_budget")]
+    pub daily_api_budget: Decimal,
+}
+
+fn default_daily_api_budget() -> Decimal {
+    rust_decimal_macros::dec!(5.0)
 }
 
 #[derive(Debug, Clone, Deserialize)]

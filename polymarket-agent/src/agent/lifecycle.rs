@@ -17,6 +17,7 @@ use crate::data::{DataAggregator, DataPoint, MarketQuery};
 use crate::db::store::{CycleRecord, Store};
 use crate::execution::fills;
 use crate::execution::order::{self, OrderStatus};
+use crate::execution::resolution;
 use crate::execution::wallet;
 use crate::market::models::{AgentState, MarketCandidate};
 use crate::market::polymarket::PolymarketClient;
@@ -175,6 +176,48 @@ impl Agent {
             self.evaluate_open_positions().await;
         }
 
+        // Check for resolved markets and settle trades
+        if self.state != AgentState::Dead {
+            match resolution::check_and_settle(
+                &self.store,
+                self.polymarket.http_client(),
+                self.polymarket.gamma_base_url(),
+            )
+            .await
+            {
+                Ok(settled) if !settled.is_empty() => {
+                    let pnl: Decimal = settled.iter().map(|r| r.pnl).sum();
+                    info!(
+                        settled = settled.len(),
+                        pnl = %pnl,
+                        "Resolved trades this cycle"
+                    );
+                }
+                Err(e) => warn!(error = %e, "Resolution check failed"),
+                _ => {}
+            }
+        }
+
+        // Daily API budget check — skip valuations if we've exceeded the cap
+        let budget_available = match self.store.get_today_api_cost().await {
+            Ok(today_cost) => {
+                if today_cost >= self.config.agent.daily_api_budget {
+                    warn!(
+                        today_cost = %today_cost,
+                        budget = %self.config.agent.daily_api_budget,
+                        "Daily API budget exhausted — skipping valuations this cycle"
+                    );
+                    false
+                } else {
+                    true
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to check daily API cost — allowing valuations");
+                true
+            }
+        };
+
         match self.state {
             AgentState::Dead => {
                 self.shutdown().await?;
@@ -188,7 +231,7 @@ impl Agent {
                 match self.scanner.scan().await {
                     Ok(candidates) => {
                         markets_scanned = candidates.len() as i64;
-                        if self.has_valuation_engine() {
+                        if self.has_valuation_engine() && budget_available {
                             let bankroll = self.effective_bankroll().await;
                             let result = self
                                 .evaluate_and_trade(&candidates, bankroll, 1)
@@ -213,7 +256,7 @@ impl Agent {
                             "Scan complete — candidates found"
                         );
 
-                        if self.has_valuation_engine() {
+                        if self.has_valuation_engine() && budget_available {
                             let bankroll = self.effective_bankroll().await;
                             let result = self
                                 .evaluate_and_trade(&candidates, bankroll, 10)
@@ -514,8 +557,11 @@ impl Agent {
     }
 
     /// Re-evaluate open positions for stop-loss exit signals (RISK-01).
-    /// In paper mode this only logs; live sell orders are not yet implemented.
+    /// Fetches current YES price from Gamma and evaluates against max loss threshold.
+    /// In paper mode, marks positions as CANCELLED. In live mode, sell orders would go here.
     async fn evaluate_open_positions(&self) {
+        use crate::risk::exit::{evaluate_exit, DEFAULT_MAX_LOSS_PCT};
+
         let open_trades = match self.store.get_open_trades().await {
             Ok(t) => t,
             Err(e) => {
@@ -525,20 +571,71 @@ impl Agent {
         };
 
         for trade in &open_trades {
-            // Parse stored values
+            let trade_id = match trade.id {
+                Some(id) => id,
+                None => continue,
+            };
             let entry_price: Decimal = match trade.entry_price.parse() {
                 Ok(p) => p,
                 Err(_) => continue,
             };
+            let side = match trade.direction.as_str() {
+                "YES" => crate::market::models::Side::Yes,
+                "NO" => crate::market::models::Side::No,
+                _ => continue,
+            };
 
-            // In a full implementation we'd query the live order book midpoint here
-            // and call risk::exit::evaluate_exit(). For now, log that we checked.
-            info!(
-                market_id = %trade.market_id,
-                entry_price = %entry_price,
-                side = %trade.direction,
-                "Checked open position for exit signals (live midpoint fetch not yet implemented)"
+            // Fetch current YES price from Gamma API
+            let current_yes_price = match self.polymarket.get_current_yes_price(&trade.market_id).await {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(
+                        market_id = %trade.market_id,
+                        error = %e,
+                        "Failed to fetch current price for exit evaluation"
+                    );
+                    continue;
+                }
+            };
+
+            let signal = evaluate_exit(
+                &trade.market_id,
+                entry_price,
+                side,
+                current_yes_price,
+                DEFAULT_MAX_LOSS_PCT,
             );
+
+            if signal.should_exit {
+                warn!(
+                    market_id = %trade.market_id,
+                    entry_price = %entry_price,
+                    current_price = %current_yes_price,
+                    pnl_pct = %signal.pnl_pct,
+                    reason = %signal.reason,
+                    "EXIT SIGNAL triggered — marking position as cancelled"
+                );
+
+                // Mark trade as cancelled (stop-loss exit)
+                if let Err(e) = self
+                    .store
+                    .update_trade_status(
+                        trade_id,
+                        "CANCELLED",
+                        Some(signal.pnl_pct * entry_price * trade.size.parse::<Decimal>().unwrap_or(Decimal::ZERO)),
+                        Some(chrono::Utc::now()),
+                    )
+                    .await
+                {
+                    warn!(error = %e, "Failed to update trade status for exit");
+                }
+            } else {
+                info!(
+                    market_id = %trade.market_id,
+                    pnl_pct = %signal.pnl_pct,
+                    "Position healthy"
+                );
+            }
         }
     }
 

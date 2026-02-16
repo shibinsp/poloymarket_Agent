@@ -5,6 +5,7 @@ death_balance_threshold = 0.0
 low_fuel_threshold = 10.0
 api_reserve = 2.0
 initial_paper_balance = 100.0
+daily_api_budget = 5.0               # max API spend per UTC day ($)
 
 [scanning]
 max_markets = 1000
