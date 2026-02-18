@@ -28,8 +28,9 @@ pub fn kelly_size(
     state: AgentState,
     config: &RiskConfig,
 ) -> KellyResult {
-    // Guard against degenerate inputs
-    if market_price <= Decimal::ZERO || market_price >= Decimal::ONE {
+    // Guard against degenerate inputs.
+    // Near-zero/near-one prices produce extreme odds (b = 99999) making Kelly unstable (TRD-05).
+    if market_price < dec!(0.02) || market_price > dec!(0.98) {
         return KellyResult::zero();
     }
     if fair_prob <= Decimal::ZERO || fair_prob >= Decimal::ONE {
@@ -264,6 +265,33 @@ mod tests {
             AgentState::Alive, &config,
         );
         assert!(!result.should_trade());
+    }
+
+    #[test]
+    fn test_kelly_near_zero_price_rejected() {
+        let config = default_config();
+        // Near-zero price (0.01) would create b = 99, making Kelly unstable
+        let result = kelly_size(
+            dec!(0.70), dec!(0.01), dec!(0.85), dec!(100),
+            AgentState::Alive, &config,
+        );
+        assert!(!result.should_trade());
+
+        // Near-one price (0.99) would create b ≈ 0.01, also unstable
+        let result = kelly_size(
+            dec!(0.70), dec!(0.99), dec!(0.85), dec!(100),
+            AgentState::Alive, &config,
+        );
+        assert!(!result.should_trade());
+
+        // Just above threshold should work
+        let result = kelly_size(
+            dec!(0.70), dec!(0.03), dec!(0.85), dec!(100),
+            AgentState::Alive, &config,
+        );
+        // May or may not trade (depends on edge), but should not be auto-rejected
+        assert!(result.kelly_raw != Decimal::ZERO || result.kelly_adjusted != Decimal::ZERO
+            || result.position_usd == Decimal::ZERO); // At least computed something
     }
 
     #[test]

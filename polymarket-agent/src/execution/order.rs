@@ -56,14 +56,17 @@ pub fn prepare_order(
 ) -> Result<PreparedOrder> {
     let side = opportunity.recommended_side;
 
-    // Find the token for the recommended side
+    // Find the token for the recommended side by matching outcome name (TRD-04).
+    // Do NOT rely on array index — Polymarket API doesn't guarantee order.
     let (token_id, best_price) = match side {
         Side::Yes => {
-            // Buying YES: we want the best ask price
+            // Buying YES: find token with outcome "Yes"
             let token = opportunity
                 .market
                 .tokens
-                .first()
+                .iter()
+                .find(|t| t.outcome.eq_ignore_ascii_case("yes"))
+                .or_else(|| opportunity.market.tokens.first())
                 .ok_or_else(|| anyhow::anyhow!("No YES token found"))?;
             let ask_price = opportunity
                 .order_book
@@ -74,12 +77,13 @@ pub fn prepare_order(
             (token.token_id.clone(), ask_price)
         }
         Side::No => {
-            // Buying NO: need the complementary token
+            // Buying NO: find token with outcome "No"
             let token = opportunity
                 .market
                 .tokens
-                .get(1)
-                .or_else(|| opportunity.market.tokens.first())
+                .iter()
+                .find(|t| t.outcome.eq_ignore_ascii_case("no"))
+                .or_else(|| opportunity.market.tokens.last())
                 .ok_or_else(|| anyhow::anyhow!("No NO token found"))?;
             // For NO side, we bid on the NO token at (1 - yes_bid_price)
             let bid_price = opportunity

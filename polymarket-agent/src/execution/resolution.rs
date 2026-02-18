@@ -192,17 +192,38 @@ async fn fetch_market_resolution(
 
     // Parse outcome prices to determine winner.
     // Resolved market outcome_prices are typically ["1", "0"] or ["0", "1"].
-    let prices_str = market
-        .outcome_prices
-        .as_deref()
-        .unwrap_or("[]");
-    let prices: Vec<String> = serde_json::from_str(prices_str).unwrap_or_default();
+    let prices_str = match &market.outcome_prices {
+        Some(s) if !s.is_empty() => s.as_str(),
+        _ => {
+            warn!(condition_id = %condition_id, "Resolved market missing outcome_prices — skipping");
+            return Ok(None);
+        }
+    };
+
+    let prices: Vec<String> = match serde_json::from_str(prices_str) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(
+                condition_id = %condition_id,
+                prices_str = %prices_str,
+                error = %e,
+                "Failed to parse outcome_prices JSON — skipping resolution"
+            );
+            return Ok(None);
+        }
+    };
 
     // First outcome is YES, second is NO
-    let yes_price = prices
-        .first()
-        .and_then(|s| Decimal::from_str(s).ok())
-        .unwrap_or(Decimal::ZERO);
+    let yes_price = match prices.first().and_then(|s| Decimal::from_str(s).ok()) {
+        Some(p) => p,
+        None => {
+            warn!(
+                condition_id = %condition_id,
+                "No valid YES price in outcome_prices — skipping resolution"
+            );
+            return Ok(None);
+        }
+    };
 
     let yes_won = yes_price > dec!(0.5);
 

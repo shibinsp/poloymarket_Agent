@@ -75,11 +75,29 @@ pub async fn unrealized_exposure(store: &Store) -> Result<Decimal> {
     let trades = store.get_open_trades().await?;
     let mut total = Decimal::ZERO;
     for trade in &trades {
-        if let (Ok(price), Ok(size)) = (
+        match (
             trade.entry_price.parse::<Decimal>(),
             trade.size.parse::<Decimal>(),
         ) {
-            total += price * size;
+            (Ok(price), Ok(size)) => {
+                total += price * size;
+            }
+            (Err(e), _) => {
+                warn!(
+                    trade_id = ?trade.id,
+                    entry_price = %trade.entry_price,
+                    error = %e,
+                    "Corrupted entry_price in trade — exposure underreported"
+                );
+            }
+            (_, Err(e)) => {
+                warn!(
+                    trade_id = ?trade.id,
+                    size = %trade.size,
+                    error = %e,
+                    "Corrupted size in trade — exposure underreported"
+                );
+            }
         }
     }
     Ok(total)

@@ -9,7 +9,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use sqlx::SqlitePool;
 use std::str::FromStr;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Default confidence discount applied before enough calibration data is collected.
 const DEFAULT_DISCOUNT: Decimal = dec!(0.85);
@@ -61,14 +61,25 @@ pub async fn record_resolution(
     .context("Failed to look up calibration record")?;
 
     if let Some((id, fair_value_str, _entry_price_str)) = row {
-        let fair_value = Decimal::from_str(&fair_value_str).unwrap_or(dec!(0.5));
+        let fair_value = match Decimal::from_str(&fair_value_str) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    market_id = %market_id,
+                    fair_value_str = %fair_value_str,
+                    error = %e,
+                    "Corrupted fair_value in calibration record — skipping resolution"
+                );
+                return Ok(());
+            }
+        };
 
         // Did Claude's directional call match the outcome?
         // If fair_value > 0.5 and outcome = 1.0 → correct
         // If fair_value < 0.5 and outcome = 0.0 → correct
+        // If fair_value == 0.5, there was no directional prediction → mark as incorrect
         let forecast_correct = (fair_value > dec!(0.5) && actual_outcome == Decimal::ONE)
-            || (fair_value < dec!(0.5) && actual_outcome == Decimal::ZERO)
-            || (fair_value == dec!(0.5)); // Neutral counts as correct (no strong opinion)
+            || (fair_value < dec!(0.5) && actual_outcome == Decimal::ZERO);
 
         sqlx::query(
             "UPDATE confidence_calibration

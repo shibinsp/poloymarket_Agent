@@ -54,14 +54,11 @@ pub fn evaluate_exit(
     let pnl_pct = match side {
         Side::Yes => (current_midpoint - entry_price) / entry_price,
         Side::No => {
-            // For NO side, we bought at (1 - midpoint), so track against that
-            let effective_entry = Decimal::ONE - entry_price;
-            let effective_current = Decimal::ONE - current_midpoint;
-            if effective_entry > Decimal::ZERO {
-                (effective_current - effective_entry) / effective_entry
-            } else {
-                Decimal::ZERO
-            }
+            // For NO side: entry_price IS what we paid for the NO token.
+            // Current NO price = 1 - current_midpoint (midpoint is the YES price).
+            // P&L% = (current_no_price - entry_price) / entry_price
+            let current_no_price = Decimal::ONE - current_midpoint;
+            (current_no_price - entry_price) / entry_price
         }
     };
 
@@ -121,10 +118,20 @@ mod tests {
 
     #[test]
     fn test_no_side_exit() {
-        // Bought NO at 0.40 (effective entry for complement = 0.60)
-        // Current midpoint 0.80 → complement = 0.20 → loss vs 0.60 entry
+        // Bought NO at 0.40. Current YES midpoint = 0.80 → NO price = 0.20.
+        // P&L% = (0.20 - 0.40) / 0.40 = -50% → exceeds 20% stop-loss.
         let signal = evaluate_exit("mkt1", dec!(0.40), Side::No, dec!(0.80), dec!(0.20));
         assert!(signal.should_exit);
+        assert!(signal.pnl_pct < -dec!(0.20));
+    }
+
+    #[test]
+    fn test_no_side_profit() {
+        // Bought NO at 0.40. Current YES midpoint = 0.30 → NO price = 0.70.
+        // P&L% = (0.70 - 0.40) / 0.40 = +75% → profit, no exit.
+        let signal = evaluate_exit("mkt1", dec!(0.40), Side::No, dec!(0.30), dec!(0.20));
+        assert!(!signal.should_exit);
+        assert!(signal.pnl_pct > Decimal::ZERO);
     }
 
     #[test]

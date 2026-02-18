@@ -42,16 +42,26 @@ struct RawValuationResult {
     time_sensitivity: TimeSensitivity,
 }
 
-impl From<RawValuationResult> for ValuationResult {
-    fn from(raw: RawValuationResult) -> Self {
-        Self {
-            probability: Decimal::try_from(raw.probability).unwrap_or(Decimal::ZERO),
-            confidence: Decimal::try_from(raw.confidence).unwrap_or(Decimal::ZERO),
-            reasoning_summary: raw.reasoning_summary,
-            key_factors: raw.key_factors,
-            data_quality: raw.data_quality,
-            time_sensitivity: raw.time_sensitivity,
+impl RawValuationResult {
+    /// Convert to ValuationResult, rejecting NaN/Infinity values instead of
+    /// silently defaulting to zero (which would pass bounds checks).
+    fn try_into_valuation(self) -> Result<ValuationResult> {
+        if !self.probability.is_finite() {
+            bail!("Claude returned non-finite probability: {}", self.probability);
         }
+        if !self.confidence.is_finite() {
+            bail!("Claude returned non-finite confidence: {}", self.confidence);
+        }
+        Ok(ValuationResult {
+            probability: Decimal::try_from(self.probability)
+                .context("Failed to convert probability to Decimal")?,
+            confidence: Decimal::try_from(self.confidence)
+                .context("Failed to convert confidence to Decimal")?,
+            reasoning_summary: self.reasoning_summary,
+            key_factors: self.key_factors,
+            data_quality: self.data_quality,
+            time_sensitivity: self.time_sensitivity,
+        })
     }
 }
 
@@ -102,8 +112,14 @@ impl ValuationEngine {
             return Ok(None);
         }
 
-        // Check persistent cache
+        // Skip markets with empty condition_id to prevent cache collisions (DAT-01)
         let cache_key = candidate.market.condition_id.clone();
+        if cache_key.is_empty() {
+            warn!("Market has empty condition_id — skipping to prevent cache collision");
+            return Ok(None);
+        }
+
+        // Check persistent cache
         if let Ok(Some(cached)) = self.get_cached_valuation(&cache_key).await {
             info!("Using cached valuation from DB");
             return Ok(Some(cached));
@@ -345,7 +361,7 @@ fn parse_valuation_response(text: &str) -> Result<ValuationResult> {
     let raw: RawValuationResult = serde_json::from_str(&json_str)
         .with_context(|| format!("Failed to parse valuation JSON: {json_str}"))?;
 
-    Ok(raw.into())
+    raw.try_into_valuation()
 }
 
 /// Extract and validate JSON from text that might contain markdown code blocks.
@@ -429,10 +445,18 @@ fn try_raw_json_object(text: &str) -> Option<String> {
 }
 
 /// Truncate a JSON value to a maximum string length.
+/// Uses char_indices to find a safe UTF-8 boundary, preventing panics on multi-byte chars.
 fn truncate_json(value: &serde_json::Value, max_len: usize) -> String {
     let s = value.to_string();
     if s.len() > max_len {
-        format!("{}...", &s[..max_len])
+        // Find the last valid char boundary at or before max_len
+        let boundary = s
+            .char_indices()
+            .take_while(|(i, _)| *i < max_len)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
+        format!("{}...", &s[..boundary])
     } else {
         s
     }

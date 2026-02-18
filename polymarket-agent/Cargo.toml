@@ -1,8 +1,8 @@
 [package]
 name = "polymarket-agent"
 version = "0.1.0"
-edition = "2024"
-rust-version = "1.88.0"
+edition = "2021"
+rust-version = "1.75.0"
 
 [dependencies]
 # Polymarket official SDK

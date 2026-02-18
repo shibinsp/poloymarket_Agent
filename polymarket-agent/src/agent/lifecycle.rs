@@ -145,24 +145,27 @@ impl Agent {
         );
 
         // Alert on state changes (Phase 8)
-        if self.state != old_state
-            && let Err(e) = self
+        if self.state != old_state {
+            if let Err(e) = self
                 .alert_client
                 .state_change(old_state, self.state, balance)
                 .await
-        {
-            warn!(error = %e, "Failed to send state change alert");
+            {
+                warn!(error = %e, "Failed to send state change alert");
+            }
         }
 
         // Check bankroll milestones (Phase 8)
-        if self.last_balance > Decimal::ZERO
-            && let Some(milestone) = check_milestone(self.last_balance, balance)
-            && let Err(e) = self
-                .alert_client
-                .bankroll_milestone(balance, milestone)
-                .await
-        {
-            warn!(error = %e, "Failed to send milestone alert");
+        if self.last_balance > Decimal::ZERO {
+            if let Some(milestone) = check_milestone(self.last_balance, balance) {
+                if let Err(e) = self
+                    .alert_client
+                    .bankroll_milestone(balance, milestone)
+                    .await
+                {
+                    warn!(error = %e, "Failed to send milestone alert");
+                }
+            }
         }
         self.last_balance = balance;
 
@@ -171,13 +174,13 @@ impl Agent {
         let mut trades_placed: i64 = 0;
         let mut cycle_api_cost = Decimal::ZERO;
 
-        // Re-evaluate open positions for exit signals (RISK-01)
-        if self.state != AgentState::Dead {
-            self.evaluate_open_positions().await;
-        }
+        // Re-evaluate open positions for exit signals (RISK-01).
+        // Always run, even in Dead state — positions need cleanup (TRD-06).
+        self.evaluate_open_positions().await;
 
-        // Check for resolved markets and settle trades
-        if self.state != AgentState::Dead {
+        // Check for resolved markets and settle trades.
+        // Always run, even in Dead state — must settle P&L for final accounting (TRD-06).
+        {
             match resolution::check_and_settle(
                 &self.store,
                 self.polymarket.http_client(),
@@ -296,7 +299,7 @@ impl Agent {
         .await?;
 
         // Phase 8: Periodic metrics summary (every 10 cycles)
-        if self.cycle_number > 0 && self.cycle_number.is_multiple_of(10) {
+        if self.cycle_number > 0 && self.cycle_number % 10 == 0 {
             match compute_metrics(&self.store, self.config.agent.initial_paper_balance).await {
                 Ok(m) => {
                     log_metrics(&m);
