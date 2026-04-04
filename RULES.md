@@ -122,9 +122,26 @@ gh pr create \
 # Or create via GitHub web UI
 ```
 
+### CodeRabbit Review (Mandatory Before Merge)
+1. **Install CodeRabbit** — Ensure the [CodeRabbit](https://www.coderabbit.ai/) GitHub App is installed on the repository
+2. **Automatic review triggers** — CodeRabbit automatically reviews every PR when it's opened or when new commits are pushed
+3. **Review the feedback** — Check the PR comments from `@coderabbitai` for:
+   - Bug risks and logic errors
+   - Performance issues
+   - Security concerns
+   - Style and convention violations
+   - Suggestions for improvement
+4. **Fix all issues** — Address every finding from CodeRabbit before merging:
+   - Apply suggested fixes directly or adapt them to your context
+   - Commit fixes to the same branch (the PR updates automatically)
+   - Re-request review if needed by commenting `@coderabbitai review`
+5. **No merge until clean** — Do not merge the PR until CodeRabbit has no outstanding critical issues
+6. **Override only with justification** — If you intentionally disagree with a CodeRabbit suggestion, add a comment in the PR explaining why
+
 ### PR Review Checklist
 Before merging, verify:
 - [ ] All CI checks pass (tests, clippy, build)
+- [ ] CodeRabbit review complete with no critical issues
 - [ ] Code follows project conventions
 - [ ] Tests cover new functionality
 - [ ] Documentation updated (README, RULES, etc.)
