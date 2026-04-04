@@ -3,8 +3,8 @@
 use polymarket_agent::data::quality::compute_data_quality;
 use polymarket_agent::market::category::infer_category;
 use polymarket_agent::market::models::MarketCategory;
-use polymarket_agent::risk::exit::{evaluate_exit, DEFAULT_MAX_LOSS_PCT};
 use polymarket_agent::market::models::Side;
+use polymarket_agent::risk::exit::{evaluate_exit, DEFAULT_MAX_LOSS_PCT};
 use polymarket_agent::valuation::fair_value::DataQuality;
 
 use chrono::Utc;
@@ -94,14 +94,26 @@ fn data_quality_multiple_fresh_sources_is_high() {
 
 #[test]
 fn exit_hold_when_within_tolerance() {
-    let signal = evaluate_exit("mkt1", dec!(0.50), Side::Yes, dec!(0.45), DEFAULT_MAX_LOSS_PCT);
+    let signal = evaluate_exit(
+        "mkt1",
+        dec!(0.50),
+        Side::Yes,
+        dec!(0.45),
+        DEFAULT_MAX_LOSS_PCT,
+    );
     assert!(!signal.should_exit);
 }
 
 #[test]
 fn exit_triggered_on_large_loss() {
     // Bought YES at 0.70, now at 0.40 → ~-43% loss
-    let signal = evaluate_exit("mkt2", dec!(0.70), Side::Yes, dec!(0.40), DEFAULT_MAX_LOSS_PCT);
+    let signal = evaluate_exit(
+        "mkt2",
+        dec!(0.70),
+        Side::Yes,
+        dec!(0.40),
+        DEFAULT_MAX_LOSS_PCT,
+    );
     assert!(signal.should_exit);
 }
 
@@ -109,7 +121,13 @@ fn exit_triggered_on_large_loss() {
 fn exit_no_side_loss() {
     // Bought NO at 0.30 (effective entry complement = 0.70)
     // Current midpoint 0.90 → complement = 0.10 → large loss vs 0.70 entry
-    let signal = evaluate_exit("mkt3", dec!(0.30), Side::No, dec!(0.90), DEFAULT_MAX_LOSS_PCT);
+    let signal = evaluate_exit(
+        "mkt3",
+        dec!(0.30),
+        Side::No,
+        dec!(0.90),
+        DEFAULT_MAX_LOSS_PCT,
+    );
     assert!(signal.should_exit);
 }
 

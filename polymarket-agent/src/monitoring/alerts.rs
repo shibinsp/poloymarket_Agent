@@ -6,7 +6,7 @@
 use anyhow::Result;
 use rust_decimal::Decimal;
 use serde::Serialize;
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::market::models::{AgentState, Side};
 use crate::monitoring::metrics::PerformanceMetrics;
@@ -139,10 +139,7 @@ impl AlertClient {
 
     /// Alert: Daily performance summary.
     pub async fn daily_summary(&self, metrics: &PerformanceMetrics) -> Result<()> {
-        let msg = format!(
-            "**Daily Summary**\n```\n{}\n```",
-            metrics.summary()
-        );
+        let msg = format!("**Daily Summary**\n```\n{}\n```", metrics.summary());
         self.send(&msg).await
     }
 

@@ -106,9 +106,7 @@ pub fn to_opportunity(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::market::models::{
-        Market, MarketCategory, OrderBookSnapshot, PriceLevel, TokenInfo,
-    };
+    use crate::market::models::{Market, MarketCategory, OrderBookSnapshot, PriceLevel, TokenInfo};
     use chrono::Utc;
 
     fn test_config() -> ValuationConfig {

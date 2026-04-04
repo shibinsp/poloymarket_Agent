@@ -102,7 +102,10 @@ impl ClaudeClient {
         );
 
         // Store cost in DB
-        if let Err(e) = self.track_cost(input_tokens, output_tokens, cost, cycle).await {
+        if let Err(e) = self
+            .track_cost(input_tokens, output_tokens, cost, cycle)
+            .await
+        {
             warn!(error = %e, "Failed to track API cost");
         }
 

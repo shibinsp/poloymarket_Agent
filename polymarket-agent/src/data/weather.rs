@@ -27,6 +27,12 @@ pub struct WeatherSource {
     client: reqwest::Client,
 }
 
+impl Default for WeatherSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WeatherSource {
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
@@ -99,7 +105,10 @@ impl DataSource for WeatherSource {
                         // Also match any query mentioning temperature/weather keywords
                         for q in queries {
                             let ql = q.question.to_lowercase();
-                            if (ql.contains("temperature") || ql.contains("weather") || ql.contains("hurricane") || ql.contains("rain"))
+                            if (ql.contains("temperature")
+                                || ql.contains("weather")
+                                || ql.contains("hurricane")
+                                || ql.contains("rain"))
                                 && !relevance.contains(&q.condition_id)
                             {
                                 relevance.push(q.condition_id.clone());

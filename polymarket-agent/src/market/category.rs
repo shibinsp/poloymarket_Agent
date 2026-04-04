@@ -13,44 +13,131 @@ pub fn infer_category(question: &str) -> MarketCategory {
     let q = question.to_lowercase();
 
     // Weather
-    if contains_any(&q, &[
-        "weather", "rain", "snow", "temperature", "storm", "hurricane",
-        "tornado", "flood", "drought", "celsius", "fahrenheit", "forecast",
-        "heatwave", "heat wave", "cold snap", "wildfire",
-    ]) {
+    if contains_any(
+        &q,
+        &[
+            "weather",
+            "rain",
+            "snow",
+            "temperature",
+            "storm",
+            "hurricane",
+            "tornado",
+            "flood",
+            "drought",
+            "celsius",
+            "fahrenheit",
+            "forecast",
+            "heatwave",
+            "heat wave",
+            "cold snap",
+            "wildfire",
+        ],
+    ) {
         return MarketCategory::Weather;
     }
 
     // Sports
-    if contains_any(&q, &[
-        "nfl", "nba", "nhl", "mlb", "mma", "ufc", "soccer", "football",
-        "basketball", "baseball", "hockey", "tennis", "golf", "boxing",
-        "championship", "super bowl", "world cup", "world series",
-        "playoffs", "finals", "mvp", "draft", "premier league",
-        "champions league", "match", "bout", "fight",
-    ]) {
+    if contains_any(
+        &q,
+        &[
+            "nfl",
+            "nba",
+            "nhl",
+            "mlb",
+            "mma",
+            "ufc",
+            "soccer",
+            "football",
+            "basketball",
+            "baseball",
+            "hockey",
+            "tennis",
+            "golf",
+            "boxing",
+            "championship",
+            "super bowl",
+            "world cup",
+            "world series",
+            "playoffs",
+            "finals",
+            "mvp",
+            "draft",
+            "premier league",
+            "champions league",
+            "match",
+            "bout",
+            "fight",
+        ],
+    ) {
         return MarketCategory::Sports;
     }
 
     // Crypto
-    if contains_any(&q, &[
-        "bitcoin", "ethereum", "btc", "eth", "solana", "sol", "dogecoin",
-        "doge", "crypto", "cryptocurrency", "blockchain", "token", "defi",
-        "nft", "altcoin", "stablecoin", "ripple", "xrp", "cardano",
-        "polkadot", "avalanche", "polygon", "matic", "binance", "coinbase",
-        "mining", "halving",
-    ]) {
+    if contains_any(
+        &q,
+        &[
+            "bitcoin",
+            "ethereum",
+            "btc",
+            "eth",
+            "solana",
+            "sol",
+            "dogecoin",
+            "doge",
+            "crypto",
+            "cryptocurrency",
+            "blockchain",
+            "token",
+            "defi",
+            "nft",
+            "altcoin",
+            "stablecoin",
+            "ripple",
+            "xrp",
+            "cardano",
+            "polkadot",
+            "avalanche",
+            "polygon",
+            "matic",
+            "binance",
+            "coinbase",
+            "mining",
+            "halving",
+        ],
+    ) {
         return MarketCategory::Crypto;
     }
 
     // Politics
-    if contains_any(&q, &[
-        "election", "vote", "ballot", "congress", "senate", "house",
-        "president", "governor", "mayor", "democrat", "republican",
-        "legislation", "bill", "law", "policy", "impeach", "cabinet",
-        "supreme court", "parliament", "prime minister", "referendum",
-        "midterm", "inaugurat",
-    ]) {
+    if contains_any(
+        &q,
+        &[
+            "election",
+            "vote",
+            "ballot",
+            "congress",
+            "senate",
+            "house",
+            "president",
+            "governor",
+            "mayor",
+            "democrat",
+            "republican",
+            "legislation",
+            "bill",
+            "law",
+            "policy",
+            "impeach",
+            "cabinet",
+            "supreme court",
+            "parliament",
+            "prime minister",
+            "referendum",
+            "midterm",
+            "inaugurat",
+        ],
+    ) {
         return MarketCategory::Politics;
     }
 

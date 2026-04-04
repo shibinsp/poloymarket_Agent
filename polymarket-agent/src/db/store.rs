@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use serde::Serialize;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{FromRow, SqlitePool};
 use std::str::FromStr;
 
@@ -154,12 +154,11 @@ impl Store {
     }
 
     pub async fn get_trades_by_market(&self, market_id: &str) -> Result<Vec<TradeRecord>> {
-        let trades =
-            sqlx::query_as::<_, TradeRecord>("SELECT * FROM trades WHERE market_id = ?")
-                .bind(market_id)
-                .fetch_all(&self.pool)
-                .await
-                .context("Failed to fetch trades by market")?;
+        let trades = sqlx::query_as::<_, TradeRecord>("SELECT * FROM trades WHERE market_id = ?")
+            .bind(market_id)
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to fetch trades by market")?;
         Ok(trades)
     }
 
@@ -285,11 +284,10 @@ impl Store {
 
     /// Get all cycles ordered by cycle number.
     pub async fn get_all_cycles(&self) -> Result<Vec<CycleRecord>> {
-        let cycles =
-            sqlx::query_as::<_, CycleRecord>("SELECT * FROM cycles ORDER BY cycle_number")
-                .fetch_all(&self.pool)
-                .await
-                .context("Failed to fetch all cycles")?;
+        let cycles = sqlx::query_as::<_, CycleRecord>("SELECT * FROM cycles ORDER BY cycle_number")
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to fetch all cycles")?;
         Ok(cycles)
     }
 
@@ -304,13 +302,12 @@ impl Store {
 
     /// Get recent trades with a limit.
     pub async fn get_recent_trades(&self, limit: i64) -> Result<Vec<TradeRecord>> {
-        let trades = sqlx::query_as::<_, TradeRecord>(
-            "SELECT * FROM trades ORDER BY id DESC LIMIT ?",
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await
-        .context("Failed to fetch recent trades")?;
+        let trades =
+            sqlx::query_as::<_, TradeRecord>("SELECT * FROM trades ORDER BY id DESC LIMIT ?")
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+                .context("Failed to fetch recent trades")?;
         Ok(trades)
     }
 
@@ -351,7 +348,10 @@ mod tests {
             duration_ms: Some(1500),
             created_at: None,
         };
-        let id = store.insert_cycle(&cycle).await.expect("should insert cycle");
+        let id = store
+            .insert_cycle(&cycle)
+            .await
+            .expect("should insert cycle");
         assert!(id > 0);
     }
 
@@ -376,10 +376,16 @@ mod tests {
             created_at: None,
             resolved_at: None,
         };
-        let id = store.insert_trade(&trade).await.expect("should insert trade");
+        let id = store
+            .insert_trade(&trade)
+            .await
+            .expect("should insert trade");
         assert!(id > 0);
 
-        let open = store.get_open_trades().await.expect("should get open trades");
+        let open = store
+            .get_open_trades()
+            .await
+            .expect("should get open trades");
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].market_id, "0xabc");
     }

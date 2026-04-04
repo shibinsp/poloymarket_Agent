@@ -143,11 +143,11 @@ mod tests {
 
     fn default_config() -> RiskConfig {
         RiskConfig {
-            kelly_fraction: dec!(0.5),     // Half-Kelly
-            max_position_pct: dec!(0.06),  // 6%
+            kelly_fraction: dec!(0.5),    // Half-Kelly
+            max_position_pct: dec!(0.06), // 6%
             max_total_exposure_pct: dec!(0.30),
             max_positions_per_category: 3,
-            min_position_usd: dec!(1),     // $1 min
+            min_position_usd: dec!(1), // $1 min
         }
     }
 
@@ -156,8 +156,12 @@ mod tests {
         let config = default_config();
         // Fair prob 70%, market price 50% → good edge
         let result = kelly_size(
-            dec!(0.70), dec!(0.50), dec!(0.85), dec!(100),
-            AgentState::Alive, &config,
+            dec!(0.70),
+            dec!(0.50),
+            dec!(0.85),
+            dec!(100),
+            AgentState::Alive,
+            &config,
         );
 
         assert!(result.kelly_raw > Decimal::ZERO);
@@ -171,8 +175,12 @@ mod tests {
         let config = default_config();
         // Fair prob 40%, market price 50% → negative edge
         let result = kelly_size(
-            dec!(0.40), dec!(0.50), dec!(0.85), dec!(100),
-            AgentState::Alive, &config,
+            dec!(0.40),
+            dec!(0.50),
+            dec!(0.85),
+            dec!(100),
+            AgentState::Alive,
+            &config,
         );
 
         assert!(result.kelly_raw < Decimal::ZERO);
@@ -188,8 +196,12 @@ mod tests {
         // adjusted = 0.2727 * 0.5 * 0.9 = ~0.1227
         // position = 0.1227 * 100 = ~12.27 → capped at 6
         let result = kelly_size(
-            dec!(0.60), dec!(0.45), dec!(0.90), dec!(100),
-            AgentState::Alive, &config,
+            dec!(0.60),
+            dec!(0.45),
+            dec!(0.90),
+            dec!(100),
+            AgentState::Alive,
+            &config,
         );
 
         assert!(result.kelly_raw > dec!(0.20));
@@ -201,12 +213,20 @@ mod tests {
     fn test_kelly_low_fuel_quarter() {
         let config = default_config();
         let alive = kelly_size(
-            dec!(0.70), dec!(0.50), dec!(0.85), dec!(100),
-            AgentState::Alive, &config,
+            dec!(0.70),
+            dec!(0.50),
+            dec!(0.85),
+            dec!(100),
+            AgentState::Alive,
+            &config,
         );
         let low_fuel = kelly_size(
-            dec!(0.70), dec!(0.50), dec!(0.85), dec!(100),
-            AgentState::LowFuel, &config,
+            dec!(0.70),
+            dec!(0.50),
+            dec!(0.85),
+            dec!(100),
+            AgentState::LowFuel,
+            &config,
         );
 
         // Low fuel should be approximately 1/4 of alive
@@ -218,8 +238,12 @@ mod tests {
     fn test_kelly_critical_survival_no_trade() {
         let config = default_config();
         let result = kelly_size(
-            dec!(0.70), dec!(0.50), dec!(0.85), dec!(100),
-            AgentState::CriticalSurvival, &config,
+            dec!(0.70),
+            dec!(0.50),
+            dec!(0.85),
+            dec!(100),
+            AgentState::CriticalSurvival,
+            &config,
         );
 
         assert!(!result.should_trade());
@@ -230,8 +254,12 @@ mod tests {
         let config = default_config();
         // Very small bankroll → position below $1 minimum
         let result = kelly_size(
-            dec!(0.55), dec!(0.50), dec!(0.50), dec!(5),
-            AgentState::Alive, &config,
+            dec!(0.55),
+            dec!(0.50),
+            dec!(0.50),
+            dec!(5),
+            AgentState::Alive,
+            &config,
         );
 
         // With small bankroll and low confidence, position may be below min
@@ -243,8 +271,12 @@ mod tests {
     fn test_kelly_zero_bankroll() {
         let config = default_config();
         let result = kelly_size(
-            dec!(0.70), dec!(0.50), dec!(0.85), Decimal::ZERO,
-            AgentState::Alive, &config,
+            dec!(0.70),
+            dec!(0.50),
+            dec!(0.85),
+            Decimal::ZERO,
+            AgentState::Alive,
+            &config,
         );
 
         assert!(!result.should_trade());
@@ -255,14 +287,22 @@ mod tests {
         let config = default_config();
         // Market price at boundary
         let result = kelly_size(
-            dec!(0.70), Decimal::ONE, dec!(0.85), dec!(100),
-            AgentState::Alive, &config,
+            dec!(0.70),
+            Decimal::ONE,
+            dec!(0.85),
+            dec!(100),
+            AgentState::Alive,
+            &config,
         );
         assert!(!result.should_trade());
 
         let result = kelly_size(
-            dec!(0.70), Decimal::ZERO, dec!(0.85), dec!(100),
-            AgentState::Alive, &config,
+            dec!(0.70),
+            Decimal::ZERO,
+            dec!(0.85),
+            dec!(100),
+            AgentState::Alive,
+            &config,
         );
         assert!(!result.should_trade());
     }
@@ -272,38 +312,61 @@ mod tests {
         let config = default_config();
         // Near-zero price (0.01) would create b = 99, making Kelly unstable
         let result = kelly_size(
-            dec!(0.70), dec!(0.01), dec!(0.85), dec!(100),
-            AgentState::Alive, &config,
+            dec!(0.70),
+            dec!(0.01),
+            dec!(0.85),
+            dec!(100),
+            AgentState::Alive,
+            &config,
         );
         assert!(!result.should_trade());
 
         // Near-one price (0.99) would create b ≈ 0.01, also unstable
         let result = kelly_size(
-            dec!(0.70), dec!(0.99), dec!(0.85), dec!(100),
-            AgentState::Alive, &config,
+            dec!(0.70),
+            dec!(0.99),
+            dec!(0.85),
+            dec!(100),
+            AgentState::Alive,
+            &config,
         );
         assert!(!result.should_trade());
 
         // Just above threshold should work
         let result = kelly_size(
-            dec!(0.70), dec!(0.03), dec!(0.85), dec!(100),
-            AgentState::Alive, &config,
+            dec!(0.70),
+            dec!(0.03),
+            dec!(0.85),
+            dec!(100),
+            AgentState::Alive,
+            &config,
         );
         // May or may not trade (depends on edge), but should not be auto-rejected
-        assert!(result.kelly_raw != Decimal::ZERO || result.kelly_adjusted != Decimal::ZERO
-            || result.position_usd == Decimal::ZERO); // At least computed something
+        assert!(
+            result.kelly_raw != Decimal::ZERO
+                || result.kelly_adjusted != Decimal::ZERO
+                || result.position_usd == Decimal::ZERO
+        ); // At least computed something
     }
 
     #[test]
     fn test_kelly_confidence_scaling() {
         let config = default_config();
         let high_conf = kelly_size(
-            dec!(0.70), dec!(0.50), dec!(0.95), dec!(100),
-            AgentState::Alive, &config,
+            dec!(0.70),
+            dec!(0.50),
+            dec!(0.95),
+            dec!(100),
+            AgentState::Alive,
+            &config,
         );
         let low_conf = kelly_size(
-            dec!(0.70), dec!(0.50), dec!(0.50), dec!(100),
-            AgentState::Alive, &config,
+            dec!(0.70),
+            dec!(0.50),
+            dec!(0.50),
+            dec!(100),
+            AgentState::Alive,
+            &config,
         );
 
         // Higher confidence → larger position (or both capped)

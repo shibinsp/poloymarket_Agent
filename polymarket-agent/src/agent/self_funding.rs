@@ -166,14 +166,8 @@ mod tests {
     #[test]
     fn test_enhanced_survival_dead_with_pnl() {
         // Wallet $0 but unrealized PnL $5 — still alive because effective > 0
-        let state = enhanced_survival_check(
-            dec!(0),
-            dec!(5),
-            dec!(0.05),
-            dec!(0),
-            dec!(2),
-            dec!(10),
-        );
+        let state =
+            enhanced_survival_check(dec!(0), dec!(5), dec!(0.05), dec!(0), dec!(2), dec!(10));
         // Wallet < next_cycle_cost + api_reserve → CriticalSurvival
         assert_eq!(state, AgentState::CriticalSurvival);
     }
@@ -194,21 +188,15 @@ mod tests {
     #[test]
     fn test_enhanced_survival_critical() {
         // Wallet $1.50, reserve $2, next cost $0.05 → can't afford
-        let state = enhanced_survival_check(
-            dec!(1.50),
-            dec!(0),
-            dec!(0.05),
-            dec!(0),
-            dec!(2),
-            dec!(10),
-        );
+        let state =
+            enhanced_survival_check(dec!(1.50), dec!(0), dec!(0.05), dec!(0), dec!(2), dec!(10));
         assert_eq!(state, AgentState::CriticalSurvival);
     }
 
     #[test]
     fn test_enhanced_survival_low_fuel() {
         let state = enhanced_survival_check(
-            dec!(8),    // below low_fuel threshold of $10
+            dec!(8), // below low_fuel threshold of $10
             dec!(0),
             dec!(0.05),
             dec!(0),

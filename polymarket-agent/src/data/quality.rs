@@ -5,7 +5,6 @@
 
 use chrono::Utc;
 use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
 
 use crate::data::DataPoint;
 use crate::valuation::fair_value::DataQuality;
@@ -42,10 +41,7 @@ pub fn compute_data_quality(data_points: &[DataPoint]) -> DataQuality {
     // Confidence: average of source-level confidence scores
     let total_confidence: Decimal = data_points.iter().map(|dp| dp.confidence).sum();
     let avg_confidence = total_confidence / Decimal::from(data_points.len() as u64);
-    let confidence_f64 = avg_confidence
-        .to_string()
-        .parse::<f64>()
-        .unwrap_or(0.5);
+    let confidence_f64 = avg_confidence.to_string().parse::<f64>().unwrap_or(0.5);
 
     // Weighted composite score
     let quality_score = (coverage_score * 0.4) + (freshness_score * 0.3) + (confidence_f64 * 0.3);
@@ -64,6 +60,7 @@ mod tests {
     use super::*;
     use crate::market::models::MarketCategory;
     use chrono::Duration;
+    use rust_decimal_macros::dec;
 
     fn make_data_point(source: &str, hours_ago: i64, confidence: Decimal) -> DataPoint {
         DataPoint {

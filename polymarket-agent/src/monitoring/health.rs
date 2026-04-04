@@ -68,6 +68,12 @@ impl HealthState {
     }
 }
 
+impl Default for HealthState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Spawn the health check HTTP server. Returns a handle that can be aborted.
 pub fn spawn_health_server(state: HealthState) -> JoinHandle<()> {
     tokio::spawn(async move {
