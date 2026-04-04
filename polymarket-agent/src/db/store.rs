@@ -68,6 +68,14 @@ impl Store {
         &self.pool
     }
 
+    /// Create a clone for use in parallel tasks.
+    /// Shares the same underlying connection pool.
+    pub fn clone_for_parallel(&self) -> Self {
+        Self {
+            pool: self.pool.clone(),
+        }
+    }
+
     pub async fn new(database_path: &str) -> Result<Self> {
         let options = SqliteConnectOptions::from_str(&format!("sqlite:{database_path}"))
             .context("Invalid database path")?

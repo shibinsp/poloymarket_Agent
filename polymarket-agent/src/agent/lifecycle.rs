@@ -3,6 +3,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use tracing::{error, info, warn};
 
 use crate::agent::self_funding::{
@@ -318,6 +319,7 @@ impl Agent {
     }
 
     /// Full pipeline: evaluate candidates → size with Kelly → check constraints → execute.
+    /// Uses parallel evaluation with JoinSet for higher throughput.
     async fn evaluate_and_trade(
         &mut self,
         candidates: &[MarketCandidate],
@@ -342,8 +344,13 @@ impl Agent {
         info!(data_points = all_data.len(), "External data collected");
 
         // Phase 4+5+6: Evaluate → Size → Execute
+        // Parallel evaluation with JoinSet for higher throughput
+        let mut join_set = tokio::task::JoinSet::new();
+        let engine_arc = self.valuation_engine.as_ref().unwrap().clone_for_parallel();
+        let config_valuation = self.config.valuation.clone();
+
+        // Spawn parallel valuation tasks
         for candidate in candidates.iter().take(max_evaluations) {
-            // Check if API cost exceeds remaining bankroll
             let estimated_cost = engine.estimated_call_cost();
             if estimated_cost > bankroll - result.api_cost {
                 warn!(
@@ -354,45 +361,87 @@ impl Agent {
                 break;
             }
 
-            // Find data points relevant to this market
+            let candidate = candidate.clone();
             let relevant_data: Vec<DataPoint> = all_data
                 .iter()
                 .filter(|dp| dp.relevance_to.contains(&candidate.market.condition_id))
                 .cloned()
                 .collect();
+            let engine = engine_arc.clone();
+            let config = config_valuation.clone();
+            let cycle_num = self.cycle_number as i64;
+            let remaining_budget = bankroll - result.api_cost;
 
-            // Phase 4: Get valuation from Claude
-            let (valuation, edge) = match engine
-                .evaluate(
-                    candidate,
-                    &relevant_data,
-                    bankroll - result.api_cost,
-                    self.cycle_number as i64,
-                )
-                .await
+            join_set.spawn(async move {
+                // Phase 4: Get valuation from Claude
+                let valuation = match engine
+                    .evaluate(&candidate, &relevant_data, remaining_budget, cycle_num)
+                    .await
+                {
+                    Ok(Some(v)) => v,
+                    Ok(None) => return None,
+                    Err(_) => return None,
+                };
+
+                let edge = match evaluate_edge(&candidate, &valuation, &config) {
+                    Some(e) => e,
+                    None => return None,
+                };
+
+                Some((candidate, valuation, edge))
+            });
+        }
+
+        // Collect results from parallel tasks
+        let mut eval_results = Vec::new();
+        while let Some(result_opt) = join_set.join_next().await {
+            if let Ok(Some((candidate, valuation, edge))) = result_opt {
+                eval_results.push((candidate, valuation, edge));
+            }
+        }
+
+        info!(
+            evaluations = eval_results.len(),
+            "Parallel evaluations complete"
+        );
+
+        // Process results sequentially for trade execution
+        for (candidate, valuation, edge) in eval_results {
+            let estimated_cost = engine.estimated_call_cost();
+            result.api_cost += estimated_cost;
+            result.opportunities += 1;
+            self.log_opportunity(&candidate, &valuation, &edge);
+
+            // Apply calibration discount to confidence (HAL-01)
+            let calibrated_confidence = match crate::valuation::calibration::compute_discount(
+                self.store.pool(),
+                200, // Look back 200 resolved trades
+            )
+            .await
             {
-                Ok(Some(valuation)) => {
-                    result.api_cost += estimated_cost;
-                    match evaluate_edge(candidate, &valuation, &self.config.valuation) {
-                        Some(edge) => (valuation, edge),
-                        None => continue,
+                Ok(discount) => {
+                    let calibrated = valuation.confidence * discount;
+                    if discount < dec!(1.0) {
+                        info!(
+                            original_confidence = %valuation.confidence,
+                            discount = %discount,
+                            calibrated_confidence = %calibrated,
+                            "Calibration discount applied"
+                        );
                     }
+                    calibrated
                 }
-                Ok(None) => break,
                 Err(e) => {
-                    warn!(market = %candidate.market.question, error = %e, "Valuation failed");
-                    continue;
+                    warn!(error = %e, "Failed to compute calibration discount — using raw confidence");
+                    valuation.confidence
                 }
             };
 
-            result.opportunities += 1;
-            self.log_opportunity(candidate, &valuation, &edge);
-
-            // Phase 5: Kelly sizing
+            // Phase 5: Kelly sizing with calibrated confidence
             let kelly_result = kelly::kelly_size(
                 valuation.probability,
                 edge.trade_price,
-                valuation.confidence,
+                calibrated_confidence,
                 bankroll - result.api_cost,
                 self.state,
                 &self.config.risk,
@@ -421,7 +470,7 @@ impl Agent {
 
             // Build opportunity with kelly size
             let opportunity =
-                to_opportunity(candidate, &valuation, &edge, kelly_result.position_usd);
+                to_opportunity(&candidate, &valuation, &edge, kelly_result.position_usd);
 
             // Portfolio constraint check
             let constraint_check = self.portfolio.check_constraints(&opportunity, bankroll);
