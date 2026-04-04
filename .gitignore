@@ -1,0 +1,10 @@
+# LibreOffice lock files
+.~lock.*#
+
+# Binary artifacts / release documents
+*.pdf
+*.docx
+*.html
+
+# Temporary files
+*.tmp
