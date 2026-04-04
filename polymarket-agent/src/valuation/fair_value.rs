@@ -90,12 +90,32 @@ pub struct ValuationEngine {
     store: Store,
 }
 
+impl Clone for ValuationEngine {
+    fn clone(&self) -> Self {
+        Self {
+            claude: self.claude.clone(),
+            config: self.config.clone(),
+            store: self.store.clone_for_parallel(),
+        }
+    }
+}
+
 impl ValuationEngine {
     pub fn new(claude: Arc<ClaudeClient>, config: ValuationConfig, store: Store) -> Self {
         Self {
             claude,
             config,
             store,
+        }
+    }
+
+    /// Create a clone for use in parallel evaluation tasks.
+    /// Shares the same underlying Claude client and store via Arc.
+    pub fn clone_for_parallel(&self) -> Self {
+        Self {
+            claude: self.claude.clone(),
+            config: self.config.clone(),
+            store: self.store.clone_for_parallel(),
         }
     }
 
