@@ -35,7 +35,11 @@ impl PortfolioManager {
     }
 
     /// Check if a new opportunity passes all portfolio constraints.
-    pub fn check_constraints(&self, opportunity: &Opportunity, bankroll: Decimal) -> ConstraintCheck {
+    pub fn check_constraints(
+        &self,
+        opportunity: &Opportunity,
+        bankroll: Decimal,
+    ) -> ConstraintCheck {
         let mut violations = Vec::new();
 
         // 1. Max total exposure
@@ -53,9 +57,7 @@ impl PortfolioManager {
         if category_count >= self.config.max_positions_per_category as usize {
             violations.push(format!(
                 "Already {} positions in {:?} (max {})",
-                category_count,
-                opportunity.market.category,
-                self.config.max_positions_per_category
+                category_count, opportunity.market.category, self.config.max_positions_per_category
             ));
         }
 
@@ -152,9 +154,7 @@ impl ConstraintCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::market::models::{
-        Market, MarketCategory, OrderBookSnapshot, PriceLevel, TokenInfo,
-    };
+    use crate::market::models::{Market, MarketCategory, OrderBookSnapshot, PriceLevel, TokenInfo};
     use chrono::Utc;
 
     fn test_config() -> RiskConfig {
@@ -167,7 +167,11 @@ mod tests {
         }
     }
 
-    fn test_opportunity(market_id: &str, category: MarketCategory, kelly_size: Decimal) -> Opportunity {
+    fn test_opportunity(
+        market_id: &str,
+        category: MarketCategory,
+        kelly_size: Decimal,
+    ) -> Opportunity {
         Opportunity {
             market: Market {
                 condition_id: market_id.to_string(),
@@ -185,8 +189,14 @@ mod tests {
             },
             order_book: OrderBookSnapshot {
                 token_id: "tok1".to_string(),
-                bids: vec![PriceLevel { price: dec!(0.48), size: dec!(100) }],
-                asks: vec![PriceLevel { price: dec!(0.52), size: dec!(100) }],
+                bids: vec![PriceLevel {
+                    price: dec!(0.48),
+                    size: dec!(100),
+                }],
+                asks: vec![PriceLevel {
+                    price: dec!(0.52),
+                    size: dec!(100),
+                }],
                 spread: dec!(0.04),
                 midpoint: dec!(0.50),
                 implied_probability: dec!(0.50),

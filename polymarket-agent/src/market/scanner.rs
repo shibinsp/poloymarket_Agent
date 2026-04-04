@@ -61,7 +61,10 @@ impl MarketScanner {
             }
         }
 
-        info!(candidates = candidates.len(), "Market candidates after filtering");
+        info!(
+            candidates = candidates.len(),
+            "Market candidates after filtering"
+        );
         Ok(candidates)
     }
 }

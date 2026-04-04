@@ -134,10 +134,7 @@ pub fn prepare_order(
     price = %order.price,
     size = %order.size,
 ))]
-pub async fn execute_order(
-    client: &PolymarketClient,
-    order: &PreparedOrder,
-) -> ExecutionResult {
+pub async fn execute_order(client: &PolymarketClient, order: &PreparedOrder) -> ExecutionResult {
     match client
         .place_limit_order(&order.token_id, order.side, order.price, order.size)
         .await
@@ -177,11 +174,9 @@ pub async fn execute_order(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rust_decimal_macros::dec;
-    use crate::market::models::{
-        Market, MarketCategory, OrderBookSnapshot, PriceLevel, TokenInfo,
-    };
+    use crate::market::models::{Market, MarketCategory, OrderBookSnapshot, PriceLevel, TokenInfo};
     use chrono::Utc;
+    use rust_decimal_macros::dec;
 
     fn test_config() -> ExecutionConfig {
         ExecutionConfig {

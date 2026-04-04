@@ -1,25 +1,29 @@
 //! Polymarket CLOB API client wrapper.
 //!
 //! Wraps `polymarket-client-sdk` with rate limiting, paper trading,
-//! retry logic, and domain type conversion.
+//! retry logic, authenticated live trading, and domain type conversion.
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
+use alloy::signers::k256::ecdsa::SigningKey;
+use alloy::signers::local::LocalSigner;
+use alloy::signers::Signer;
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
+use polymarket_client_sdk::auth::state::Authenticated;
+use polymarket_client_sdk::auth::Normal;
 use polymarket_client_sdk::clob::types::request::{
-    OrderBookSummaryRequest, PriceHistoryRequest,
+    BalanceAllowanceRequest, OrderBookSummaryRequest, PriceHistoryRequest,
 };
 use polymarket_client_sdk::clob::types::response::OrderBookSummaryResponse;
-use polymarket_client_sdk::clob::types::{Interval, TimeRange};
+use polymarket_client_sdk::clob::types::{Interval, OrderType, Side as ClobSide, TimeRange};
 use polymarket_client_sdk::clob::Client as ClobClient;
-use polymarket_client_sdk::auth::state::Unauthenticated;
-use polymarket_client_sdk::types::U256;
+use polymarket_client_sdk::types::{Decimal as SdkDecimal, U256};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::Deserialize;
@@ -29,7 +33,7 @@ use tracing::{info, instrument, warn};
 
 use crate::config::{AgentMode, AppConfig, RateLimitConfig, Secrets};
 use crate::market::models::{
-    Market, MarketCategory, OrderBookSnapshot, PriceHistoryPoint, PriceLevel, Side, TokenInfo,
+    Market, OrderBookSnapshot, PriceHistoryPoint, PriceLevel, Side, TokenInfo,
 };
 
 type Limiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
@@ -44,6 +48,7 @@ pub struct MarketFilters {
 
 /// Paper trading simulated position.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct PaperPosition {
     pub token_id: String,
     pub side: Side,
@@ -53,6 +58,7 @@ struct PaperPosition {
 
 /// Paper trading simulated order.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct PaperOrder {
     pub order_id: String,
     pub token_id: String,
@@ -69,22 +75,30 @@ struct PaperTradingState {
     order_history: Vec<PaperOrder>,
 }
 
+/// Authenticated CLOB client for live trading.
+struct AuthenticatedClient {
+    clob: ClobClient<Authenticated<Normal>>,
+    signer: LocalSigner<SigningKey>,
+}
+
 pub struct PolymarketClient {
     config: Arc<AppConfig>,
-    /// CLOB client (unauthenticated — for market data)
-    clob: ClobClient<Unauthenticated>,
+    /// Unauthenticated CLOB client (for market data in all modes)
+    clob: ClobClient,
+    /// Authenticated CLOB client (only for live trading)
+    auth_client: Option<AuthenticatedClient>,
     /// HTTP client for direct Gamma API calls (bypasses SDK deserialization issues)
     http: reqwest::Client,
     /// Gamma API base URL
     gamma_base_url: String,
     /// Rate limiter
     limiter: Arc<Limiter>,
-    /// Paper trading state (only in Paper mode)
+    /// Paper trading state (only in Paper/Backtest mode)
     paper_state: Option<Mutex<PaperTradingState>>,
 }
 
 impl PolymarketClient {
-    pub async fn new(config: Arc<AppConfig>, _secrets: &Secrets) -> Result<Self> {
+    pub async fn new(config: Arc<AppConfig>, secrets: &Secrets) -> Result<Self> {
         let clob = ClobClient::new(
             &config.polymarket.clob_base_url,
             polymarket_client_sdk::clob::Config::default(),
@@ -96,9 +110,40 @@ impl PolymarketClient {
             .build()
             .context("Failed to create HTTP client")?;
 
-        let gamma_base_url = config.polymarket.gamma_base_url.trim_end_matches('/').to_string();
+        let gamma_base_url = config
+            .polymarket
+            .gamma_base_url
+            .trim_end_matches('/')
+            .to_string();
 
         let limiter = create_rate_limiter(&config.rate_limit);
+
+        // Initialize authenticated client for live trading mode
+        let auth_client = match config.agent.mode {
+            AgentMode::Live => {
+                let private_key = secrets.polymarket_private_key.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("POLYMARKET_PRIVATE_KEY required for live trading")
+                })?;
+
+                let signer = LocalSigner::from_str(private_key)
+                    .context("Failed to parse private key")?
+                    .with_chain_id(Some(137)); // Polygon chain ID
+
+                let auth_clob = clob
+                    .clone()
+                    .authentication_builder(&signer)
+                    .authenticate()
+                    .await
+                    .context("Failed to authenticate with Polymarket CLOB")?;
+
+                info!("Authenticated CLOB client initialized for live trading");
+                Some(AuthenticatedClient {
+                    clob: auth_clob,
+                    signer,
+                })
+            }
+            _ => None,
+        };
 
         let paper_state = match config.agent.mode {
             AgentMode::Paper | AgentMode::Backtest => Some(Mutex::new(PaperTradingState {
@@ -112,6 +157,7 @@ impl PolymarketClient {
         Ok(Self {
             config,
             clob,
+            auth_client,
             http,
             gamma_base_url,
             limiter,
@@ -318,6 +364,7 @@ impl PolymarketClient {
     // === Order Placement ===
 
     /// Place a limit order. In paper mode, simulates the order.
+    /// In live mode, places a real order on Polymarket CLOB.
     #[instrument(skip(self), fields(token_id = %token_id, side = %side, price = %price, size = %size))]
     pub async fn place_limit_order(
         &self,
@@ -329,13 +376,74 @@ impl PolymarketClient {
         match self.config.agent.mode {
             AgentMode::Paper => self.paper_place_order(token_id, side, price, size).await,
             AgentMode::Live => {
-                bail!("Live order placement requires authenticated client (Phase 6)")
+                self.live_place_limit_order(token_id, side, price, size)
+                    .await
             }
             AgentMode::Backtest => {
                 // In backtest mode, simulate orders same as paper trading
                 self.paper_place_order(token_id, side, price, size).await
             }
         }
+    }
+
+    /// Place a live limit order on Polymarket CLOB.
+    async fn live_place_limit_order(
+        &self,
+        token_id: &str,
+        side: Side,
+        price: Decimal,
+        size: Decimal,
+    ) -> Result<String> {
+        let auth = self.auth_client.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("Authenticated client not available for live trading")
+        })?;
+
+        let token_u256 = parse_token_id(token_id)?;
+        let sdk_price = SdkDecimal::from_str(&price.to_string())
+            .context("Failed to convert price to SDK decimal")?;
+        let sdk_size = SdkDecimal::from_str(&size.to_string())
+            .context("Failed to convert size to SDK decimal")?;
+
+        let clob_side = match side {
+            Side::Yes => ClobSide::Buy,
+            Side::No => ClobSide::Sell,
+        };
+
+        // Build limit order (GTD = Good Till Date, 7 day expiry)
+        let order = auth
+            .clob
+            .limit_order()
+            .token_id(token_u256)
+            .order_type(OrderType::GTD)
+            .expiration(Utc::now() + TimeDelta::days(7))
+            .price(sdk_price)
+            .size(sdk_size)
+            .side(clob_side)
+            .build()
+            .await
+            .context("Failed to build limit order")?;
+
+        // Sign the order with EIP-712
+        let signed_order = auth
+            .clob
+            .sign(&auth.signer, order)
+            .await
+            .context("Failed to sign order")?;
+
+        // Submit the order
+        let response = auth
+            .clob
+            .post_order(signed_order)
+            .await
+            .map_err(|e| anyhow::anyhow!("Order submission failed: {e}"))?;
+
+        info!(
+            order_id = %response.order_id,
+            success = response.success,
+            "Live order placed successfully"
+        );
+
+        Ok(response.order_id)
     }
 
     /// Cancel an order by ID.
@@ -355,16 +463,36 @@ impl PolymarketClient {
                 }
                 Ok(())
             }
-            AgentMode::Live => {
-                bail!("Live cancel requires authenticated client (Phase 6)")
-            }
+            AgentMode::Live => self.live_cancel_order(order_id).await,
             AgentMode::Backtest => Ok(()),
         }
+    }
+
+    /// Cancel a live order on Polymarket CLOB.
+    async fn live_cancel_order(&self, order_id: &str) -> Result<()> {
+        let auth = self.auth_client.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("Authenticated client not available for live trading")
+        })?;
+
+        self.with_retry(|| {
+            let oid = order_id.to_string();
+            async move {
+                auth.clob
+                    .cancel_order(&oid)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Cancel order failed: {e}"))
+            }
+        })
+        .await?;
+
+        info!(order_id, "Live order cancelled successfully");
+        Ok(())
     }
 
     // === Balance ===
 
     /// Get available balance. In paper mode, returns simulated balance.
+    /// In live mode, queries the Polymarket CLOB balance allowance endpoint.
     pub async fn get_balance(&self) -> Result<Decimal> {
         match self.config.agent.mode {
             AgentMode::Paper => {
@@ -375,14 +503,134 @@ impl PolymarketClient {
                     Ok(Decimal::ZERO)
                 }
             }
-            AgentMode::Live => {
-                // balance_allowance requires authentication — will be implemented in Phase 6
-                // For now, return zero for live mode until authenticated client is available
-                warn!("Live balance query requires authenticated client (Phase 6)");
-                Ok(Decimal::ZERO)
-            }
+            AgentMode::Live => self.live_get_balance().await,
             AgentMode::Backtest => Ok(Decimal::ZERO),
         }
+    }
+
+    /// Get live balance from Polymarket CLOB.
+    async fn live_get_balance(&self) -> Result<Decimal> {
+        let auth = self.auth_client.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("Authenticated client not available for live trading")
+        })?;
+
+        let response = self
+            .with_retry(|| async move {
+                auth.clob
+                    .balance_allowance(BalanceAllowanceRequest::default())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Balance query failed: {e}"))
+            })
+            .await?;
+
+        // The balance is returned as a string in the response
+        let balance_str = response.balance.to_string();
+        let balance =
+            Decimal::from_str(&balance_str).context("Failed to parse balance from response")?;
+
+        info!(balance = %balance, "Live balance retrieved");
+        Ok(balance)
+    }
+
+    /// Get the wallet address for the authenticated account.
+    pub async fn get_wallet_address(&self) -> Result<String> {
+        let auth = self
+            .auth_client
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Authenticated client not available"))?;
+
+        Ok(format!("{:?}", auth.signer.address()))
+    }
+
+    /// Exit a position by placing a sell order.
+    /// In live mode, places a real sell order. In paper mode, marks as exited.
+    pub async fn exit_position(
+        &self,
+        token_id: &str,
+        side: Side,
+        price: Decimal,
+        size: Decimal,
+    ) -> Result<String> {
+        match self.config.agent.mode {
+            AgentMode::Paper => {
+                // In paper mode, just simulate the exit
+                info!(
+                    token_id,
+                    side = %side,
+                    price = %price,
+                    size = %size,
+                    "Paper position exited (simulated)"
+                );
+                Ok(format!("paper_exit_{token_id}"))
+            }
+            AgentMode::Live => {
+                // In live mode, place a sell order to exit
+                // The exit side is opposite to the original buy side
+                let exit_side = match side {
+                    Side::Yes => ClobSide::Sell, // Selling YES tokens
+                    Side::No => ClobSide::Buy,   // Buying back NO tokens (equivalent to selling)
+                };
+
+                self.live_place_limit_order_with_side(token_id, exit_side, price, size)
+                    .await
+            }
+            AgentMode::Backtest => Ok(format!("backtest_exit_{token_id}")),
+        }
+    }
+
+    /// Place a live limit order with an explicit CLOB side (for exits).
+    async fn live_place_limit_order_with_side(
+        &self,
+        token_id: &str,
+        clob_side: ClobSide,
+        price: Decimal,
+        size: Decimal,
+    ) -> Result<String> {
+        let auth = self.auth_client.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("Authenticated client not available for live trading")
+        })?;
+
+        let token_u256 = parse_token_id(token_id)?;
+        let sdk_price = SdkDecimal::from_str(&price.to_string())
+            .context("Failed to convert price to SDK decimal")?;
+        let sdk_size = SdkDecimal::from_str(&size.to_string())
+            .context("Failed to convert size to SDK decimal")?;
+
+        // Build limit order (GTD = Good Till Date, 7 day expiry)
+        let order = auth
+            .clob
+            .limit_order()
+            .token_id(token_u256)
+            .order_type(OrderType::GTD)
+            .expiration(Utc::now() + TimeDelta::days(7))
+            .price(sdk_price)
+            .size(sdk_size)
+            .side(clob_side)
+            .build()
+            .await
+            .context("Failed to build exit limit order")?;
+
+        // Sign the order with EIP-712
+        let signed_order = auth
+            .clob
+            .sign(&auth.signer, order)
+            .await
+            .context("Failed to sign exit order")?;
+
+        // Submit the order
+        let response = auth
+            .clob
+            .post_order(signed_order)
+            .await
+            .map_err(|e| anyhow::anyhow!("Exit order submission failed: {e}"))?;
+
+        info!(
+            order_id = %response.order_id,
+            success = response.success,
+            "Live exit order placed successfully"
+        );
+
+        Ok(response.order_id)
     }
 
     // === Paper Trading ===
@@ -494,10 +742,8 @@ impl PolymarketClient {
                         return Err(e.context(format!("Failed after {max_retries} retries")));
                     }
 
-                    let backoff_ms = std::cmp::min(
-                        base_ms.saturating_mul(2u64.pow(attempt - 1)),
-                        max_ms,
-                    );
+                    let backoff_ms =
+                        std::cmp::min(base_ms.saturating_mul(2u64.pow(attempt - 1)), max_ms);
 
                     warn!(
                         attempt,

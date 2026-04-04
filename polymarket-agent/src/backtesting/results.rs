@@ -143,8 +143,7 @@ impl BacktestTracker {
             self.trades[index].resolve(outcome_price);
             if self.trades[index].pnl.is_some() {
                 // Return shares * outcome_price (payout)
-                let payout =
-                    self.trades[index].shares * outcome_price;
+                let payout = self.trades[index].shares * outcome_price;
                 self.balance += payout;
 
                 // Track peak and drawdown
@@ -184,10 +183,7 @@ impl BacktestTracker {
             Decimal::ZERO
         };
 
-        let total_pnl: Decimal = resolved
-            .iter()
-            .filter_map(|t| t.pnl)
-            .sum();
+        let total_pnl: Decimal = resolved.iter().filter_map(|t| t.pnl).sum();
 
         let avg_pnl_per_trade = if total_trades > 0 {
             total_pnl / Decimal::from(total_trades)

@@ -22,6 +22,12 @@ pub struct CryptoSource {
     client: reqwest::Client,
 }
 
+impl Default for CryptoSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CryptoSource {
     pub fn new() -> Self {
         let client = reqwest::Client::builder()

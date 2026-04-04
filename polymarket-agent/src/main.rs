@@ -4,7 +4,7 @@ use polymarket_agent::agent::lifecycle::Agent;
 use polymarket_agent::config::{self, AgentMode, AppConfig};
 use polymarket_agent::db::store::Store;
 use polymarket_agent::monitoring;
-use polymarket_agent::monitoring::dashboard::{DashboardState, spawn_dashboard};
+use polymarket_agent::monitoring::dashboard::{spawn_dashboard, DashboardState};
 use polymarket_agent::monitoring::logger;
 
 #[tokio::main]

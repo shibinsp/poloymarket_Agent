@@ -5,17 +5,22 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
 use rust_decimal_macros::dec;
-use serde::Deserialize;
 
 use crate::data::{DataPoint, DataSource, MarketQuery};
 use crate::market::models::MarketCategory;
 
 pub struct NewsSource {
     client: reqwest::Client,
+}
+
+impl Default for NewsSource {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl NewsSource {
@@ -35,9 +40,8 @@ impl NewsSource {
 
         for term in search_terms {
             let encoded = urlencoding::encode(term);
-            let url = format!(
-                "https://news.google.com/rss/search?q={encoded}&hl=en-US&gl=US&ceid=US:en"
-            );
+            let url =
+                format!("https://news.google.com/rss/search?q={encoded}&hl=en-US&gl=US&ceid=US:en");
 
             match self.client.get(&url).send().await {
                 Ok(response) => {
@@ -135,7 +139,12 @@ fn extract_search_term(question: &str) -> String {
 
     // Take first 5 meaningful words
     q.split_whitespace()
-        .filter(|w| !["the", "a", "an", "be", "by", "in", "on", "at", "to", "of", "or", "and"].contains(w))
+        .filter(|w| {
+            ![
+                "the", "a", "an", "be", "by", "in", "on", "at", "to", "of", "or", "and",
+            ]
+            .contains(w)
+        })
         .take(5)
         .collect::<Vec<&str>>()
         .join(" ")

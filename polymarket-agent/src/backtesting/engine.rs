@@ -49,18 +49,14 @@ impl BacktestConfig {
 /// In skip_valuation mode, uses the historical fair value (resolved outcome)
 /// as a proxy for Claude's valuation. This tests the sizing/execution pipeline
 /// without incurring API costs.
-pub fn run_backtest(
-    snapshots: &[HistoricalSnapshot],
-    config: &BacktestConfig,
-) -> BacktestResults {
+pub fn run_backtest(snapshots: &[HistoricalSnapshot], config: &BacktestConfig) -> BacktestResults {
     let mut tracker = BacktestTracker::new(config.initial_balance);
     let mut portfolio = PortfolioManager::new(config.risk_config.clone());
     let mut trade_index = 0usize;
 
     // Group snapshots into cycles of max_evaluations_per_cycle
-    let cycles: Vec<&[HistoricalSnapshot]> = snapshots
-        .chunks(config.max_evaluations_per_cycle)
-        .collect();
+    let cycles: Vec<&[HistoricalSnapshot]> =
+        snapshots.chunks(config.max_evaluations_per_cycle).collect();
 
     info!(
         total_snapshots = snapshots.len(),
@@ -107,8 +103,7 @@ pub fn run_backtest(
                 // Blend market price with outcome to simulate imperfect prediction
                 // 60% weight on true outcome + 40% on market price = decent edge
                 let noise_factor = dec!(0.60);
-                snapshot.yes_price * (Decimal::ONE - noise_factor)
-                    + resolved_outcome * noise_factor
+                snapshot.yes_price * (Decimal::ONE - noise_factor) + resolved_outcome * noise_factor
             } else {
                 // Would call Claude here in non-skip mode
                 snapshot.yes_price
@@ -234,7 +229,11 @@ pub fn run_backtest(
             // Add position to portfolio (and immediately remove since resolved)
             portfolio.add_position(crate::risk::portfolio::Position {
                 market_id: snapshot.market_id.clone(),
-                token_id: format!("{}_{}", snapshot.market_id, if side == Side::Yes { "yes" } else { "no" }),
+                token_id: format!(
+                    "{}_{}",
+                    snapshot.market_id,
+                    if side == Side::Yes { "yes" } else { "no" }
+                ),
                 category: candidate.market.category,
                 side,
                 size_usd: liquidity_size,

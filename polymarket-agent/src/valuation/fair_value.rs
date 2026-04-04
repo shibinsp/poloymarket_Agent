@@ -13,8 +13,8 @@ use serde::Deserialize;
 use tracing::{info, instrument, warn};
 
 use crate::config::ValuationConfig;
-use crate::data::DataPoint;
 use crate::data::quality::compute_data_quality;
+use crate::data::DataPoint;
 use crate::db::store::Store;
 use crate::market::models::{MarketCandidate, OrderBookSnapshot};
 use crate::valuation::claude::ClaudeClient;
@@ -47,7 +47,10 @@ impl RawValuationResult {
     /// silently defaulting to zero (which would pass bounds checks).
     fn try_into_valuation(self) -> Result<ValuationResult> {
         if !self.probability.is_finite() {
-            bail!("Claude returned non-finite probability: {}", self.probability);
+            bail!(
+                "Claude returned non-finite probability: {}",
+                self.probability
+            );
         }
         if !self.confidence.is_finite() {
             bail!("Claude returned non-finite confidence: {}", self.confidence);
@@ -145,16 +148,10 @@ impl ValuationEngine {
 
         // Validate probability bounds
         if result.probability < Decimal::ZERO || result.probability > Decimal::ONE {
-            bail!(
-                "Invalid probability from Claude: {}",
-                result.probability
-            );
+            bail!("Invalid probability from Claude: {}", result.probability);
         }
         if result.confidence < Decimal::ZERO || result.confidence > Decimal::ONE {
-            bail!(
-                "Invalid confidence from Claude: {}",
-                result.confidence
-            );
+            bail!("Invalid confidence from Claude: {}", result.confidence);
         }
 
         info!(
@@ -355,8 +352,7 @@ Estimate the TRUE probability of YES outcome."#,
 /// Parse Claude's JSON response into a ValuationResult.
 fn parse_valuation_response(text: &str) -> Result<ValuationResult> {
     // Try to extract JSON from the response (Claude might wrap it in markdown code blocks)
-    let json_str = extract_json(text)
-        .context("No valid JSON found in Claude response")?;
+    let json_str = extract_json(text).context("No valid JSON found in Claude response")?;
 
     let raw: RawValuationResult = serde_json::from_str(&json_str)
         .with_context(|| format!("Failed to parse valuation JSON: {json_str}"))?;
@@ -389,7 +385,10 @@ fn try_markdown_block(text: &str, marker: &str) -> Option<String> {
     let json_start = start + marker.len();
     // Skip to next line if marker has language tag
     let json_start = if marker == "```json" || marker == "```" {
-        text[json_start..].find('\n').map(|n| json_start + n + 1).unwrap_or(json_start)
+        text[json_start..]
+            .find('\n')
+            .map(|n| json_start + n + 1)
+            .unwrap_or(json_start)
     } else {
         json_start
     };
@@ -565,12 +564,19 @@ mod tests {
         let book = OrderBookSnapshot {
             token_id: "test".to_string(),
             bids: vec![
-                PriceLevel { price: dec!(0.60), size: dec!(100) },
-                PriceLevel { price: dec!(0.59), size: dec!(200) },
+                PriceLevel {
+                    price: dec!(0.60),
+                    size: dec!(100),
+                },
+                PriceLevel {
+                    price: dec!(0.59),
+                    size: dec!(200),
+                },
             ],
-            asks: vec![
-                PriceLevel { price: dec!(0.65), size: dec!(150) },
-            ],
+            asks: vec![PriceLevel {
+                price: dec!(0.65),
+                size: dec!(150),
+            }],
             spread: dec!(0.05),
             midpoint: dec!(0.625),
             implied_probability: dec!(0.625),

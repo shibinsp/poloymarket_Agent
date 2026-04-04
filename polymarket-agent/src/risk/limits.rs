@@ -31,7 +31,10 @@ pub fn liquidity_adjusted_size(
 
 /// Calculate order book depth in USD at the best price level.
 pub fn depth_at_best(prices: &[(Decimal, Decimal)]) -> Decimal {
-    prices.first().map(|(_, size)| *size).unwrap_or(Decimal::ZERO)
+    prices
+        .first()
+        .map(|(_, size)| *size)
+        .unwrap_or(Decimal::ZERO)
 }
 
 /// Calculate total depth across all levels in USD.

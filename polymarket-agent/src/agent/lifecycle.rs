@@ -6,7 +6,7 @@ use rust_decimal::Decimal;
 use tracing::{error, info, warn};
 
 use crate::agent::self_funding::{
-    self, CycleCosts, enhanced_survival_check, edge_justifies_cost, log_cost_breakdown,
+    self, edge_justifies_cost, enhanced_survival_check, log_cost_breakdown, CycleCosts,
 };
 use crate::config::{AppConfig, Secrets};
 use crate::data::crypto::CryptoSource;
@@ -22,7 +22,7 @@ use crate::execution::wallet;
 use crate::market::models::{AgentState, MarketCandidate};
 use crate::market::polymarket::PolymarketClient;
 use crate::market::scanner::MarketScanner;
-use crate::monitoring::alerts::{AlertClient, check_milestone};
+use crate::monitoring::alerts::{check_milestone, AlertClient};
 use crate::monitoring::metrics::{compute_metrics, log_metrics};
 use crate::risk::kelly;
 use crate::risk::limits;
@@ -132,8 +132,7 @@ impl Agent {
         let unrealized = fills::unrealized_exposure(&self.store)
             .await
             .unwrap_or(Decimal::ZERO);
-        let next_cycle_cost =
-            self_funding::estimate_next_cycle_cost(&self.store, 20).await;
+        let next_cycle_cost = self_funding::estimate_next_cycle_cost(&self.store, 20).await;
 
         self.state = enhanced_survival_check(
             balance,
@@ -227,18 +226,22 @@ impl Agent {
                 return Ok(());
             }
             AgentState::CriticalSurvival => {
-                warn!(cycle = self.cycle_number, "Critical survival mode — monitoring only");
+                warn!(
+                    cycle = self.cycle_number,
+                    "Critical survival mode — monitoring only"
+                );
             }
             AgentState::LowFuel => {
-                warn!(cycle = self.cycle_number, "Low fuel mode — reduced operations");
+                warn!(
+                    cycle = self.cycle_number,
+                    "Low fuel mode — reduced operations"
+                );
                 match self.scanner.scan().await {
                     Ok(candidates) => {
                         markets_scanned = candidates.len() as i64;
                         if self.has_valuation_engine() && budget_available {
                             let bankroll = self.effective_bankroll().await;
-                            let result = self
-                                .evaluate_and_trade(&candidates, bankroll, 1)
-                                .await;
+                            let result = self.evaluate_and_trade(&candidates, bankroll, 1).await;
                             opportunities_found = result.opportunities as i64;
                             trades_placed = result.trades as i64;
                             cycle_api_cost = result.api_cost;
@@ -261,9 +264,7 @@ impl Agent {
 
                         if self.has_valuation_engine() && budget_available {
                             let bankroll = self.effective_bankroll().await;
-                            let result = self
-                                .evaluate_and_trade(&candidates, bankroll, 10)
-                                .await;
+                            let result = self.evaluate_and_trade(&candidates, bankroll, 10).await;
                             opportunities_found = result.opportunities as i64;
                             trades_placed = result.trades as i64;
                             cycle_api_cost = result.api_cost;
@@ -407,11 +408,7 @@ impl Agent {
             }
 
             // Phase 7: Check if projected profit justifies the API cost
-            if !edge_justifies_cost(
-                kelly_result.position_usd,
-                edge.raw_edge,
-                estimated_cost,
-            ) {
+            if !edge_justifies_cost(kelly_result.position_usd, edge.raw_edge, estimated_cost) {
                 info!(
                     market = %candidate.market.question,
                     position_usd = %kelly_result.position_usd,
@@ -516,7 +513,9 @@ impl Agent {
                     valuation.confidence,
                     valuation.probability,
                     prepared.price,
-                ).await {
+                )
+                .await
+                {
                     warn!(error = %e, "Failed to record calibration prediction");
                 }
 
@@ -561,7 +560,7 @@ impl Agent {
 
     /// Re-evaluate open positions for stop-loss exit signals (RISK-01).
     /// Fetches current YES price from Gamma and evaluates against max loss threshold.
-    /// In paper mode, marks positions as CANCELLED. In live mode, sell orders would go here.
+    /// In paper mode, marks positions as CANCELLED. In live mode, places sell orders.
     async fn evaluate_open_positions(&self) {
         use crate::risk::exit::{evaluate_exit, DEFAULT_MAX_LOSS_PCT};
 
@@ -587,9 +586,17 @@ impl Agent {
                 "NO" => crate::market::models::Side::No,
                 _ => continue,
             };
+            let size: Decimal = match trade.size.parse() {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
 
             // Fetch current YES price from Gamma API
-            let current_yes_price = match self.polymarket.get_current_yes_price(&trade.market_id).await {
+            let current_yes_price = match self
+                .polymarket
+                .get_current_yes_price(&trade.market_id)
+                .await
+            {
                 Ok(p) => p,
                 Err(e) => {
                     warn!(
@@ -616,18 +623,57 @@ impl Agent {
                     current_price = %current_yes_price,
                     pnl_pct = %signal.pnl_pct,
                     reason = %signal.reason,
-                    "EXIT SIGNAL triggered — marking position as cancelled"
+                    "EXIT SIGNAL triggered"
                 );
 
-                // Mark trade as cancelled (stop-loss exit)
+                // In live mode, place an actual sell order to exit
+                if self.config.agent.mode == crate::config::AgentMode::Live {
+                    // Find the token_id for this trade
+                    let token_id = match self.find_token_id_for_trade(&trade.market_id, side).await
+                    {
+                        Some(tid) => tid,
+                        None => {
+                            warn!(
+                                market_id = %trade.market_id,
+                                "Could not find token_id for exit order"
+                            );
+                            continue;
+                        }
+                    };
+
+                    // Exit at current market price
+                    let exit_price = match side {
+                        crate::market::models::Side::Yes => current_yes_price,
+                        crate::market::models::Side::No => Decimal::ONE - current_yes_price,
+                    };
+
+                    match self
+                        .polymarket
+                        .exit_position(&token_id, side, exit_price, size)
+                        .await
+                    {
+                        Ok(order_id) => {
+                            info!(
+                                order_id = %order_id,
+                                market_id = %trade.market_id,
+                                "Live exit order placed"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                market_id = %trade.market_id,
+                                "Failed to place live exit order"
+                            );
+                        }
+                    }
+                }
+
+                // Mark trade as cancelled/exited in database
+                let pnl = signal.pnl_pct * entry_price * size;
                 if let Err(e) = self
                     .store
-                    .update_trade_status(
-                        trade_id,
-                        "CANCELLED",
-                        Some(signal.pnl_pct * entry_price * trade.size.parse::<Decimal>().unwrap_or(Decimal::ZERO)),
-                        Some(chrono::Utc::now()),
-                    )
+                    .update_trade_status(trade_id, "CANCELLED", Some(pnl), Some(chrono::Utc::now()))
                     .await
                 {
                     warn!(error = %e, "Failed to update trade status for exit");
@@ -640,6 +686,57 @@ impl Agent {
                 );
             }
         }
+    }
+
+    /// Find the token_id for a given market and side.
+    /// Used for constructing exit orders in live mode.
+    async fn find_token_id_for_trade(
+        &self,
+        market_id: &str,
+        side: crate::market::models::Side,
+    ) -> Option<String> {
+        // Query the Gamma API to get market tokens
+        let url = format!("{}/markets", self.polymarket.gamma_base_url());
+        let markets: Vec<serde_json::Value> = match self
+            .polymarket
+            .http_client()
+            .get(&url)
+            .query(&[("condition_id", market_id)])
+            .send()
+            .await
+        {
+            Ok(resp) => match resp.json().await {
+                Ok(m) => m,
+                Err(_) => return None,
+            },
+            Err(_) => return None,
+        };
+
+        let market = markets.first()?;
+        let token_ids = market
+            .get("clobTokenIds")
+            .and_then(|v| v.as_str())
+            .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())?;
+
+        let outcomes = market
+            .get("outcomes")
+            .and_then(|v| v.as_str())
+            .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())?;
+
+        // Find the token index matching the side
+        let target_outcome = match side {
+            crate::market::models::Side::Yes => "Yes",
+            crate::market::models::Side::No => "No",
+        };
+
+        for (i, outcome) in outcomes.iter().enumerate() {
+            if outcome.eq_ignore_ascii_case(target_outcome) {
+                return token_ids.get(i).cloned();
+            }
+        }
+
+        // Fallback to first token
+        token_ids.first().cloned()
     }
 
     fn log_opportunity(

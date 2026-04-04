@@ -37,8 +37,8 @@ pub struct HistoricalSnapshot {
 /// Expected CSV columns: timestamp, market_id, question, category,
 /// yes_price, no_price, volume_24h, spread, end_date, resolved_outcome
 pub fn load_from_csv(path: &Path) -> Result<Vec<HistoricalSnapshot>> {
-    let content =
-        std::fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
 
     let mut snapshots = Vec::new();
     for (i, line) in content.lines().enumerate() {
@@ -198,10 +198,7 @@ pub fn snapshot_to_candidate(snapshot: &HistoricalSnapshot) -> MarketCandidate {
         timestamp: snapshot.timestamp,
     };
 
-    MarketCandidate {
-        market,
-        order_book,
-    }
+    MarketCandidate { market, order_book }
 }
 
 #[cfg(test)]
@@ -223,7 +220,10 @@ mod tests {
         }
 
         // Some should be resolved, some not
-        let resolved_count = snapshots.iter().filter(|s| s.resolved_outcome.is_some()).count();
+        let resolved_count = snapshots
+            .iter()
+            .filter(|s| s.resolved_outcome.is_some())
+            .count();
         assert!(resolved_count > 0);
         assert!(resolved_count < 100);
     }
@@ -261,7 +261,8 @@ mod tests {
 
     #[test]
     fn test_parse_csv_line_no_outcome() {
-        let line = "2025-01-01T00:00:00Z,m2,Test?,politics,0.50,0.50,10000,0.02,2025-01-08T00:00:00Z,";
+        let line =
+            "2025-01-01T00:00:00Z,m2,Test?,politics,0.50,0.50,10000,0.02,2025-01-08T00:00:00Z,";
         let snap = parse_csv_line(line).unwrap();
         assert_eq!(snap.market_id, "m2");
         assert!(snap.resolved_outcome.is_none());

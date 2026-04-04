@@ -139,7 +139,9 @@ pub async fn compute_discount(pool: &SqlitePool, lookback: usize) -> Result<Deci
 
     // Discount = empirical_accuracy / avg_confidence (capped at 1.0, floored at MIN_DISCOUNT)
     let discount = if avg_confidence > Decimal::ZERO {
-        (empirical_accuracy / avg_confidence).min(Decimal::ONE).max(MIN_DISCOUNT)
+        (empirical_accuracy / avg_confidence)
+            .min(Decimal::ONE)
+            .max(MIN_DISCOUNT)
     } else {
         DEFAULT_DISCOUNT
     };
@@ -171,15 +173,9 @@ mod tests {
     async fn test_record_and_resolve_prediction() {
         let store = Store::new(":memory:").await.unwrap();
 
-        record_prediction(
-            store.pool(),
-            "market_1",
-            dec!(0.85),
-            dec!(0.70),
-            dec!(0.50),
-        )
-        .await
-        .unwrap();
+        record_prediction(store.pool(), "market_1", dec!(0.85), dec!(0.70), dec!(0.50))
+            .await
+            .unwrap();
 
         record_resolution(store.pool(), "market_1", Decimal::ONE)
             .await

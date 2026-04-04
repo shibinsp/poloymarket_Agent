@@ -19,6 +19,7 @@ use crate::valuation::calibration;
 /// Lightweight response from Gamma API for resolution checking.
 /// Only fetches the fields we need to determine if a market has resolved.
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 #[serde(rename_all = "camelCase")]
 struct GammaResolutionResponse {
     condition_id: Option<String>,
@@ -58,10 +59,7 @@ pub async fn check_and_settle(
     }
 
     // Deduplicate market IDs
-    let mut market_ids: Vec<String> = open_trades
-        .iter()
-        .map(|t| t.market_id.clone())
-        .collect();
+    let mut market_ids: Vec<String> = open_trades.iter().map(|t| t.market_id.clone()).collect();
     market_ids.sort();
     market_ids.dedup();
 
@@ -104,12 +102,9 @@ pub async fn check_and_settle(
                     } else {
                         Decimal::ZERO
                     };
-                    if let Err(e) = calibration::record_resolution(
-                        store.pool(),
-                        market_id,
-                        actual_outcome,
-                    )
-                    .await
+                    if let Err(e) =
+                        calibration::record_resolution(store.pool(), market_id, actual_outcome)
+                            .await
                     {
                         warn!(error = %e, "Failed to record calibration resolution");
                     }
@@ -243,10 +238,9 @@ async fn settle_trade(
     resolution: &MarketResolution,
 ) -> Result<ResolutionResult> {
     let trade_id = trade.id.unwrap();
-    let entry_price = Decimal::from_str(&trade.entry_price)
-        .context("Invalid entry_price in trade record")?;
-    let size = Decimal::from_str(&trade.size)
-        .context("Invalid size in trade record")?;
+    let entry_price =
+        Decimal::from_str(&trade.entry_price).context("Invalid entry_price in trade record")?;
+    let size = Decimal::from_str(&trade.size).context("Invalid size in trade record")?;
 
     let side = match trade.direction.as_str() {
         "YES" => Side::Yes,
@@ -266,8 +260,8 @@ async fn settle_trade(
         match side {
             Side::Yes => (Decimal::ONE - entry_price) * size,
             Side::No => (Decimal::ONE - entry_price) * size, // Bought NO at entry, pays out (1 - entry)... wait
-            // NO tokens: entry_price is what we paid for the NO token.
-            // If NO wins, payout = $1 per NO share. Profit = (1 - entry_price) * size.
+                                                             // NO tokens: entry_price is what we paid for the NO token.
+                                                             // If NO wins, payout = $1 per NO share. Profit = (1 - entry_price) * size.
         }
     } else {
         // Loser gets nothing — loss is what we paid

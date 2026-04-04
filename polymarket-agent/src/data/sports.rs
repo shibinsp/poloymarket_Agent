@@ -28,6 +28,12 @@ pub struct SportsSource {
     client: reqwest::Client,
 }
 
+impl Default for SportsSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SportsSource {
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
@@ -123,9 +129,7 @@ impl DataSource for SportsSource {
                                 event.competitions.iter().any(|c| {
                                     c.competitors.iter().any(|comp| {
                                         ql.contains(&comp.team.display_name.to_lowercase())
-                                            || ql.contains(
-                                                &comp.team.abbreviation.to_lowercase(),
-                                            )
+                                            || ql.contains(&comp.team.abbreviation.to_lowercase())
                                     })
                                 }) || ql.contains(&sport_lower)
                             })
