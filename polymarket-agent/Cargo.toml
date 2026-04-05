@@ -66,6 +66,9 @@ governor = "0.8"
 # Secrecy for private key handling
 secrecy = "0.10"
 
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
 [dev-dependencies]
 tokio-test = "0.4"
 wiremock = "0.6"
