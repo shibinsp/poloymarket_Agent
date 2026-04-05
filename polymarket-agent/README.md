@@ -132,13 +132,17 @@ cargo build --release
 cp .env.example .env
 # Edit .env with your actual keys
 
+# Validate your setup (checks config, DB, API connectivity, balance)
+cargo run -- --dry-run
+
 # Run a backtest first (no API keys needed)
-# Edit config/default.toml → mode = "backtest"
-cargo run --release
+cargo run --release -- --mode backtest
 
 # Run in paper trading mode (requires ANTHROPIC_API_KEY)
-# Edit config/default.toml → mode = "paper"
-cargo run --release
+cargo run --release -- --mode paper
+
+# Run in live trading mode (requires ANTHROPIC_API_KEY + POLYMARKET_PRIVATE_KEY)
+cargo run --release -- --mode live
 ```
 
 ## Configuration
