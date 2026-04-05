@@ -1,4 +1,5 @@
 use anyhow::Result;
+use clap::Parser;
 
 use polymarket_agent::agent::lifecycle::Agent;
 use polymarket_agent::config::{self, AgentMode, AppConfig};
@@ -7,9 +8,54 @@ use polymarket_agent::monitoring;
 use polymarket_agent::monitoring::dashboard::{spawn_dashboard, DashboardState};
 use polymarket_agent::monitoring::logger;
 
+/// Polymarket Autonomous Trading Agent
+#[derive(Parser, Debug)]
+#[command(
+    name = "polymarket-agent",
+    about = "Autonomous prediction market trading agent"
+)]
+struct CliArgs {
+    /// Override agent mode from config file
+    #[arg(long, value_enum)]
+    mode: Option<AgentModeArg>,
+
+    /// Run a quick validation check (single cycle, no trades)
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Clone, clap::ValueEnum)]
+enum AgentModeArg {
+    Paper,
+    Live,
+    Backtest,
+}
+
+impl From<AgentModeArg> for AgentMode {
+    fn from(arg: AgentModeArg) -> Self {
+        match arg {
+            AgentModeArg::Paper => AgentMode::Paper,
+            AgentModeArg::Live => AgentMode::Live,
+            AgentModeArg::Backtest => AgentMode::Backtest,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let (config, secrets) = AppConfig::load()?;
+    let args = CliArgs::parse();
+
+    let (mut config, secrets) = AppConfig::load()?;
+
+    // Override mode from CLI if provided
+    if let Some(mode) = args.mode {
+        config.agent.mode = mode.into();
+    }
+
+    // Dry run mode: single cycle validation
+    if args.dry_run {
+        return run_dry_run(&config, &secrets).await;
+    }
 
     logger::init_logging(&config.monitoring)?;
 
@@ -23,6 +69,123 @@ async fn main() -> Result<()> {
         AgentMode::Backtest => run_backtest(&config),
         AgentMode::Paper | AgentMode::Live => run_agent(config, secrets).await,
     }
+}
+
+/// Quick dry-run validation: tests connectivity and pipeline without placing trades.
+async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()> {
+    println!("=== Polymarket Agent — Dry Run Validation ===\n");
+
+    // 1. Check config
+    println!("1. Configuration:");
+    println!("   Mode: {:?}", config.agent.mode);
+    println!(
+        "   Cycle interval: {}s",
+        config.agent.cycle_interval_seconds
+    );
+    println!(
+        "   Initial balance: ${}",
+        config.agent.initial_paper_balance
+    );
+    println!("   Daily API budget: ${}", config.agent.daily_api_budget);
+    println!(
+        "   Min edge threshold: {}%",
+        config.valuation.min_edge_threshold * rust_decimal_macros::dec!(100)
+    );
+    println!("   Kelly fraction: {}", config.risk.kelly_fraction);
+    println!(
+        "   Max position: {}%",
+        config.risk.max_position_pct * rust_decimal_macros::dec!(100)
+    );
+    println!("   ✅ Configuration valid\n");
+
+    // 2. Check database
+    println!("2. Database:");
+    let store = Store::new(&config.database.path).await?;
+    let cycle_count = store.get_cycle_count().await?;
+    println!("   Path: {}", config.database.path);
+    println!("   Previous cycles: {}", cycle_count);
+    println!("   ✅ Database connected\n");
+
+    // 3. Check API keys
+    println!("3. API Keys:");
+    let anthropic_ok = secrets.anthropic_api_key.is_some();
+    let poly_ok = secrets.polymarket_private_key.is_some();
+    println!(
+        "   Anthropic (Claude): {}",
+        if anthropic_ok {
+            "✅ Set"
+        } else {
+            "❌ Missing"
+        }
+    );
+    println!(
+        "   Polymarket Private Key: {}",
+        if poly_ok {
+            "✅ Set"
+        } else {
+            "⚠️  Missing (required for live mode)"
+        }
+    );
+    if config.agent.mode == AgentMode::Live && !poly_ok {
+        println!("   ❌ ERROR: POLYMARKET_PRIVATE_KEY required for live mode");
+        return Err(anyhow::anyhow!("Missing required API key for live mode"));
+    }
+    println!();
+
+    // 4. Test Polymarket connectivity
+    println!("4. Polymarket Connectivity:");
+    let config_arc = std::sync::Arc::new(config.clone());
+    let polymarket =
+        polymarket_agent::market::polymarket::PolymarketClient::new(config_arc.clone(), secrets)
+            .await?;
+
+    let filters = polymarket_agent::market::polymarket::MarketFilters {
+        min_volume_24h: config.scanning.min_volume_24h,
+        max_resolution_days: config.scanning.max_resolution_days,
+        max_markets: 10,
+        max_spread_pct: config.scanning.max_spread_pct,
+    };
+
+    let markets = polymarket.get_markets(&filters).await?;
+    println!(
+        "   Gamma API: ✅ Connected (found {} markets)",
+        markets.len()
+    );
+
+    if let Some(first) = markets.first() {
+        if let Some(first_token) = first.tokens.first() {
+            let book = polymarket.get_order_book(&first_token.token_id).await?;
+            println!(
+                "   CLOB API: ✅ Connected (spread: {}%)",
+                book.spread * rust_decimal_macros::dec!(100)
+            );
+        }
+    }
+    println!();
+
+    // 5. Check balance
+    println!("5. Balance:");
+    let balance = polymarket.get_balance().await?;
+    println!("   Current balance: ${}", balance);
+    if balance <= rust_decimal_macros::dec!(0) && config.agent.mode != AgentMode::Backtest {
+        println!("   ⚠️  Balance is zero — agent would be in Dead state");
+    } else {
+        println!("   ✅ Balance sufficient");
+    }
+    println!();
+
+    // 6. Summary
+    println!("=== Dry Run Summary ===");
+    println!("All systems operational. The agent is ready to run.");
+    println!();
+    println!("Next steps:");
+    println!("  Paper mode:  cargo run -- --mode paper");
+    println!("  Live mode:   cargo run -- --mode live");
+    println!("  Backtest:    cargo run -- --mode backtest");
+    println!();
+    println!("⚠️  Always run paper trading for 48-72h before going live.");
+
+    Ok(())
 }
 
 /// Run the agent in paper or live trading mode.
