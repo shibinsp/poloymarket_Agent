@@ -55,10 +55,13 @@ pub fn prepare_order(
     config: &ExecutionConfig,
 ) -> Result<PreparedOrder> {
     let side = opportunity.recommended_side;
+    let midpoint = opportunity.order_book.midpoint;
 
     // Find the token for the recommended side by matching outcome name (TRD-04).
     // Do NOT rely on array index — Polymarket API doesn't guarantee order.
-    let (token_id, best_price) = match side {
+    // Also compute `reference_price`: the fair mid-price for this side, used
+    // below as the slippage baseline (not `best_price` itself).
+    let (token_id, best_price, reference_price) = match side {
         Side::Yes => {
             // Buying YES: find token with outcome "Yes"
             let token = opportunity
@@ -73,8 +76,8 @@ pub fn prepare_order(
                 .asks
                 .first()
                 .map(|a| a.price)
-                .unwrap_or(opportunity.order_book.midpoint);
-            (token.token_id.clone(), ask_price)
+                .unwrap_or(midpoint);
+            (token.token_id.clone(), ask_price, midpoint)
         }
         Side::No => {
             // Buying NO: find token with outcome "No"
@@ -91,14 +94,17 @@ pub fn prepare_order(
                 .bids
                 .first()
                 .map(|b| b.price)
-                .unwrap_or(opportunity.order_book.midpoint);
+                .unwrap_or(midpoint);
             let no_price = Decimal::ONE - bid_price;
-            (token.token_id.clone(), no_price)
+            (token.token_id.clone(), no_price, Decimal::ONE - midpoint)
         }
     };
 
-    // Apply slippage limit: don't pay more than best_price * (1 + slippage)
-    let max_price = best_price * (Decimal::ONE + config.max_slippage_pct);
+    // Apply slippage limit: never pay more than max_slippage_pct above the
+    // order book's reference (mid) price. Previously this compared best_price
+    // against a bound derived from best_price itself, which is always >=
+    // best_price by construction — the cap could never actually bind.
+    let max_price = reference_price * (Decimal::ONE + config.max_slippage_pct);
     let order_price = best_price.min(max_price);
 
     // Size in number of shares (position_usd / price)
@@ -187,7 +193,13 @@ mod tests {
         }
     }
 
-    fn test_opportunity(side: Side, kelly_size: Decimal) -> Opportunity {
+    fn test_opportunity_with_book(
+        side: Side,
+        kelly_size: Decimal,
+        bid: Decimal,
+        ask: Decimal,
+    ) -> Opportunity {
+        let midpoint = (bid + ask) / dec!(2);
         Opportunity {
             market: Market {
                 condition_id: "m1".to_string(),
@@ -213,16 +225,16 @@ mod tests {
             order_book: OrderBookSnapshot {
                 token_id: "tok_yes".to_string(),
                 bids: vec![PriceLevel {
-                    price: dec!(0.58),
+                    price: bid,
                     size: dec!(500),
                 }],
                 asks: vec![PriceLevel {
-                    price: dec!(0.62),
+                    price: ask,
                     size: dec!(500),
                 }],
-                spread: dec!(0.04),
-                midpoint: dec!(0.60),
-                implied_probability: dec!(0.60),
+                spread: ask - bid,
+                midpoint,
+                implied_probability: midpoint,
                 timestamp: Utc::now(),
             },
             fair_value: dec!(0.75),
@@ -231,6 +243,12 @@ mod tests {
             recommended_side: side,
             kelly_size,
         }
+    }
+
+    /// Tight spread (±0.83% around midpoint 0.60) — well within the default
+    /// 2% slippage tolerance, so the cap should never bind here.
+    fn test_opportunity(side: Side, kelly_size: Decimal) -> Opportunity {
+        test_opportunity_with_book(side, kelly_size, dec!(0.595), dec!(0.605))
     }
 
     #[test]
@@ -242,9 +260,9 @@ mod tests {
 
         assert_eq!(order.side, Side::Yes);
         assert_eq!(order.token_id, "tok_yes");
-        // Price should be the best ask: 0.62
-        assert_eq!(order.price, dec!(0.62));
-        // Size = 6 / 0.62 = ~9.677
+        // Ask (0.605) is within 2% of midpoint (0.60), so price = best ask
+        assert_eq!(order.price, dec!(0.605));
+        // Size = 6 / 0.605 = ~9.917
         assert!(order.size > dec!(9));
         assert!(order.size < dec!(10));
         assert_eq!(order.edge, dec!(0.15));
@@ -259,10 +277,48 @@ mod tests {
 
         assert_eq!(order.side, Side::No);
         assert_eq!(order.token_id, "tok_no");
-        // NO price = 1 - best_bid(0.58) = 0.42
-        assert_eq!(order.price, dec!(0.42));
-        // Size = 5 / 0.42 = ~11.9
+        // NO price = 1 - best_bid(0.595) = 0.405, within 2% of NO midpoint (0.40)
+        assert_eq!(order.price, dec!(0.405));
+        // Size = 5 / 0.405 = ~12.3
         assert!(order.size > dec!(11));
+    }
+
+    #[test]
+    fn test_prepare_order_yes_side_slippage_capped() {
+        // Wide spread: ask (0.62) is 3.33% above midpoint (0.60), beyond the
+        // 2% slippage tolerance, so the order price must be capped rather
+        // than chasing the ask.
+        let config = test_config();
+        let opp = test_opportunity_with_book(Side::Yes, dec!(6), dec!(0.58), dec!(0.62));
+
+        let order = prepare_order(&opp, dec!(0.27), dec!(0.12), &config).unwrap();
+
+        assert_eq!(order.side, Side::Yes);
+        assert_eq!(order.token_id, "tok_yes");
+        // Capped at midpoint * 1.02 = 0.612, not the raw ask of 0.62
+        assert_eq!(order.price, dec!(0.612));
+        // Size = 6 / 0.612 = ~9.80
+        assert!(order.size > dec!(9));
+        assert!(order.size < dec!(10));
+        assert_eq!(order.edge, dec!(0.15));
+    }
+
+    #[test]
+    fn test_prepare_order_no_side_slippage_capped() {
+        // Wide spread: NO price (1 - 0.58 = 0.42) is 5% above the NO
+        // midpoint (0.40), beyond the 2% slippage tolerance.
+        let config = test_config();
+        let opp = test_opportunity_with_book(Side::No, dec!(5), dec!(0.58), dec!(0.62));
+
+        let order = prepare_order(&opp, dec!(0.20), dec!(0.10), &config).unwrap();
+
+        assert_eq!(order.side, Side::No);
+        assert_eq!(order.token_id, "tok_no");
+        // Capped at (1 - midpoint) * 1.02 = 0.40 * 1.02 = 0.408, not 0.42
+        assert_eq!(order.price, dec!(0.408));
+        // Size = 5 / 0.408 = ~12.25
+        assert!(order.size > dec!(12));
+        assert_eq!(order.edge, dec!(0.15));
     }
 
     #[test]

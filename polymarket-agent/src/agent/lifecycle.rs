@@ -490,11 +490,15 @@ impl Agent {
                 continue;
             }
 
-            // Liquidity check
+            // Liquidity check — use the order-book side that will actually be
+            // traded. Passing ask depth unconditionally here would pair
+            // YES-side liquidity with a NO-side reference price, understating
+            // risk for NO trades now that liquidity_adjusted_size actually
+            // uses best_price's magnitude to scale its caps.
             let depth = limits::depth_at_best(
                 &candidate
                     .order_book
-                    .asks
+                    .levels_for_side(edge.side)
                     .iter()
                     .map(|l| (l.price, l.size))
                     .collect::<Vec<_>>(),

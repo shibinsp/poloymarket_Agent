@@ -179,11 +179,12 @@ pub fn run_backtest(snapshots: &[HistoricalSnapshot], config: &BacktestConfig) -
                 continue;
             }
 
-            // Liquidity check (simulated: always adequate in backtest)
+            // Liquidity check — use the order-book side matching the traded
+            // side, consistent with the live-trading path in lifecycle.rs.
             let depth = limits::depth_at_best(
                 &candidate
                     .order_book
-                    .asks
+                    .levels_for_side(side)
                     .iter()
                     .map(|l| (l.price, l.size))
                     .collect::<Vec<_>>(),
