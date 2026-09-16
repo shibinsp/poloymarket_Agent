@@ -94,18 +94,16 @@ impl Store {
         Ok(store)
     }
 
+    /// Apply pending migrations from `./migrations`, tracked in `_sqlx_migrations`.
+    ///
+    /// Databases created by the previous ad-hoc runner have no tracking table;
+    /// `001_init.sql` is entirely `IF NOT EXISTS`, so re-applying it on such a
+    /// database is a no-op that simply records the version.
     async fn migrate(&self) -> Result<()> {
-        let migration_sql = include_str!("../../migrations/001_init.sql");
-        // Execute each statement separately (sqlx doesn't support multiple statements in one call)
-        for statement in migration_sql.split(';') {
-            let trimmed = statement.trim();
-            if !trimmed.is_empty() {
-                sqlx::query(trimmed)
-                    .execute(&self.pool)
-                    .await
-                    .with_context(|| format!("Failed to execute migration: {trimmed}"))?;
-            }
-        }
+        sqlx::migrate!("./migrations")
+            .run(&self.pool)
+            .await
+            .context("Failed to run database migrations")?;
         Ok(())
     }
 
