@@ -93,11 +93,15 @@ FROM api_costs GROUP BY date(created_at);
 Live mode requires:
 1. A Polymarket account with USDC on Polygon
 2. An Ethereum private key that controls the account
-3. The `polymarket-client-sdk` EIP-712 signing (currently stubbed with `bail!()`)
+3. Being legally allowed to trade on Polymarket — its international CLOB prohibits
+   US persons under its Terms of Service
 
-**Live mode is NOT yet implemented.** The `place_limit_order` function returns an
-error in live mode. This is intentional — implementing live order signing requires
-careful security work.
+**Live mode IS implemented (since commit `7c351e8`) but is NOT yet safe to run.**
+`--mode live` places real EIP-712-signed orders. As of 2026-09-17 the live path
+still records orders as filled without confirming the fill, hardcodes a 7-day order
+expiry, has no kill switch or loss breaker, and submits NO-side entries with an
+inverted order side. Treat `--mode live` as disabled until the go-live gate in the
+project roadmap is complete.
 
 ---
 

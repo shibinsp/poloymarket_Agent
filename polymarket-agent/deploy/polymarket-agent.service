@@ -1,6 +1,7 @@
 [Unit]
 Description=Polymarket Trading Agent
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -10,11 +11,17 @@ ExecStart=/opt/polymarket-agent/target/release/polymarket-agent
 Restart=on-failure
 RestartSec=30
 Environment=RUST_LOG=info
-EnvironmentFile=/opt/polymarket-agent/.env
+# Secrets live outside the read-only install dir (see deploy/setup.sh)
+EnvironmentFile=/etc/polymarket-agent/env
+
+# Graceful shutdown: the agent handles SIGTERM and finishes the in-flight cycle
+KillSignal=SIGTERM
+TimeoutStopSec=60
 
 # Security hardening
 NoNewPrivileges=true
 ProtectSystem=strict
+StateDirectory=polymarket-agent
 ReadWritePaths=/var/lib/polymarket-agent
 ProtectHome=true
 

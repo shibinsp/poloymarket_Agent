@@ -96,7 +96,7 @@ polymarket-agent/
 │   │   ├── logger.rs           # Structured JSON logging via tracing
 │   │   ├── metrics.rs          # Performance metrics (Sharpe, win rate, ROI, drawdown)
 │   │   ├── alerts.rs           # Discord webhook notifications
-│   │   └── health.rs           # HTTP health check endpoint on :9090
+│   │   └── health.rs           # Agent health state (served at /api/health by the dashboard)
 │   ├── backtesting/
 │   │   ├── engine.rs           # Backtest replay through full pipeline
 │   │   ├── historical.rs       # CSV loading and synthetic data generation
@@ -157,6 +157,7 @@ cargo run --release -- --mode live
 | `NOAA_API_TOKEN` | No | NOAA weather API for weather market data |
 | `ESPN_API_KEY` | No | ESPN API for sports market data |
 | `RUST_LOG` | No | Log level filter (default: `info`) |
+| `DASHBOARD_TOKEN` | No* | Bearer token for the dashboard's `/api/*` routes. *Required when `dashboard_bind` is not loopback — live mode refuses to start without it. |
 
 ### Config File (`config/default.toml`)
 
@@ -267,19 +268,23 @@ All trade history, cycle metrics, and API costs are persisted in SQLite:
 
 ## Monitoring
 
+### Dashboard
+
+While running in paper or live mode, the agent serves a web dashboard at `http://127.0.0.1:8080` (`dashboard_bind` / `dashboard_port` in `config/default.toml`). If `DASHBOARD_TOKEN` is set, every `/api/*` route except `/api/health` requires `Authorization: Bearer <token>`; the page prompts for it once and remembers it. Binding to a non-loopback address without a token is refused in live mode and falls back to `127.0.0.1` otherwise.
+
 ### Health Check
 
-While running in paper or live mode, the agent exposes a health endpoint on port 9090:
-
 ```bash
-curl http://localhost:9090/health
+curl http://localhost:8080/api/health
 ```
 
 ```json
 {
-  "status": "healthy",
-  "agent_state": "Alive",
+  "status": "ok",
+  "agent_state": "ALIVE",
   "cycle_number": 42,
+  "started_at": "2026-09-17T08:00:00Z",
+  "last_cycle_at": "2026-09-17T15:00:00Z",
   "uptime_seconds": 25200
 }
 ```
@@ -317,8 +322,8 @@ Every cycle logs: markets scanned, opportunities found, trades placed, API cost,
 # Upload or clone repo on VPS
 sudo bash deploy/setup.sh
 
-# Configure API keys
-sudo nano /opt/polymarket-agent/.env
+# Configure API keys (outside the read-only install dir)
+sudo nano /etc/polymarket-agent/env
 
 # Start the service
 sudo systemctl start polymarket-agent
@@ -326,7 +331,7 @@ sudo systemctl start polymarket-agent
 # Monitor
 sudo systemctl status polymarket-agent
 sudo journalctl -u polymarket-agent -f
-curl http://localhost:9090/health
+curl http://localhost:8080/api/health
 ```
 
 The systemd service includes security hardening:
@@ -339,7 +344,7 @@ The systemd service includes security hardening:
 ## Testing
 
 ```bash
-# Run all 100 unit tests
+# Run all unit and integration tests
 cargo test
 
 # Run with output visible
@@ -386,6 +391,8 @@ cargo clippy -- -D warnings
 4. **Liquidity risk.** Thin order books mean large positions can't exit cleanly.
 5. **Model risk.** Claude can be confidently wrong. The confidence score is self-assessed, not externally calibrated.
 6. **Black swan risk.** A single unexpected event can wipe correlated positions.
+7. **Jurisdiction.** Polymarket's international CLOB prohibits US persons from trading under its Terms of Service. If you are in the US, do not fund or run live mode against it.
+8. **Live mode is not yet production-safe.** As of 2026-09-17 the live path records orders as filled without confirmation, hardcodes a 7-day order expiry, has no kill switch or loss breaker, and submits NO-side entries with an inverted order side. Do not run `--mode live` until the go-live gate in the roadmap is complete.
 
 ## License
 

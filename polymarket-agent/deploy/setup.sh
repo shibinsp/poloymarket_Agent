@@ -62,9 +62,14 @@ else
 fi
 
 # 7. Setup config
+# Secrets live outside the (read-only under ProtectSystem=strict) install dir,
+# readable only by root and the agent user.
 echo "Step 7: Setting up configuration..."
-if [ ! -f "$INSTALL_DIR/.env" ]; then
-    cat > "$INSTALL_DIR/.env" << 'ENVEOF'
+ENV_DIR="/etc/polymarket-agent"
+ENV_FILE="$ENV_DIR/env"
+mkdir -p "$ENV_DIR"
+if [ ! -f "$ENV_FILE" ]; then
+    cat > "$ENV_FILE" << 'ENVEOF'
 # Polymarket Agent Environment Variables
 # Fill in your actual keys before starting the service
 
@@ -73,15 +78,17 @@ POLYMARKET_PRIVATE_KEY=
 DISCORD_WEBHOOK_URL=
 NOAA_API_TOKEN=
 ESPN_API_KEY=
+# Required if the dashboard is bound to anything other than 127.0.0.1
+DASHBOARD_TOKEN=
 ENVEOF
-    chown "$AGENT_USER:$AGENT_USER" "$INSTALL_DIR/.env"
-    chmod 600 "$INSTALL_DIR/.env"
-    echo "Created .env file at $INSTALL_DIR/.env — fill in your keys!"
+    chown "root:$AGENT_USER" "$ENV_FILE"
+    chmod 640 "$ENV_FILE"
+    echo "Created env file at $ENV_FILE — fill in your keys!"
 fi
 
-# Update config to use the data directory for the database
+# Point the database at the writable data directory
 if [ -f "$INSTALL_DIR/config/default.toml" ]; then
-    sed -i "s|path = \"polymarket.db\"|path = \"$DATA_DIR/trades.db\"|" "$INSTALL_DIR/config/default.toml" 2>/dev/null || true
+    sed -i "s|^path = \"polymarket-agent.db\"|path = \"$DATA_DIR/polymarket-agent.db\"|" "$INSTALL_DIR/config/default.toml"
 fi
 
 # 8. Install systemd service
@@ -94,15 +101,16 @@ echo ""
 echo "=== Setup Complete ==="
 echo ""
 echo "Next steps:"
-echo "  1. Edit $INSTALL_DIR/.env with your API keys"
+echo "  1. Edit $ENV_FILE with your API keys"
 echo "  2. Review $INSTALL_DIR/config/default.toml"
-echo "  3. Run a backtest first:"
-echo "     sudo -u $AGENT_USER $INSTALL_DIR/target/release/polymarket-agent"
-echo "     (set mode = \"backtest\" in config/default.toml)"
-echo "  4. Start in paper mode:"
+echo "  3. Validate the setup:"
+echo "     sudo -u $AGENT_USER $INSTALL_DIR/target/release/polymarket-agent --dry-run"
+echo "  4. Run a backtest first:"
+echo "     sudo -u $AGENT_USER $INSTALL_DIR/target/release/polymarket-agent --mode backtest"
+echo "  5. Start in paper mode:"
 echo "     sudo systemctl start polymarket-agent"
-echo "  5. Check logs:"
+echo "  6. Check logs:"
 echo "     sudo journalctl -u polymarket-agent -f"
-echo "  6. Check health:"
-echo "     curl http://localhost:9090/health"
+echo "  7. Check health:"
+echo "     curl http://localhost:8080/api/health"
 echo ""
