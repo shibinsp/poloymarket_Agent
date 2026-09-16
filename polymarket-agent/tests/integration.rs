@@ -8,7 +8,6 @@ use polymarket_agent::risk::exit::{evaluate_exit, DEFAULT_MAX_LOSS_PCT};
 use polymarket_agent::valuation::fair_value::DataQuality;
 
 use chrono::Utc;
-use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 // ──────────────────────────────────────────

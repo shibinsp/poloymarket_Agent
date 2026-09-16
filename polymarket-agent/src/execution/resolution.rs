@@ -227,11 +227,11 @@ async fn fetch_market_resolution(
 
 /// Settle a single trade based on market resolution.
 ///
-/// P&L calculation:
-/// - YES trade that wins: (1.0 - entry_price) × size
-/// - YES trade that loses: (0.0 - entry_price) × size (negative)
-/// - NO trade that wins: entry_price × size (we bought NO at entry_price, payout = 1 - entry)
-/// - NO trade that loses: -(1.0 - entry_price) × size
+/// P&L calculation. `entry_price` is what we paid per share of the token we
+/// bought — the YES price for YES trades, the NO price for NO trades — so the
+/// same formula applies to both sides:
+/// - winner: (1.0 - entry_price) × size — each winning share pays out $1
+/// - loser: -entry_price × size — losing shares expire worthless
 async fn settle_trade(
     store: &Store,
     trade: &TradeRecord,
@@ -254,17 +254,10 @@ async fn settle_trade(
         Side::No => !resolution.yes_won,
     };
 
-    // P&L calculation
+    // A winning share pays out $1; a losing share expires worthless.
     let pnl = if won {
-        // Winner receives $1 per share
-        match side {
-            Side::Yes => (Decimal::ONE - entry_price) * size,
-            Side::No => (Decimal::ONE - entry_price) * size, // Bought NO at entry, pays out (1 - entry)... wait
-                                                             // NO tokens: entry_price is what we paid for the NO token.
-                                                             // If NO wins, payout = $1 per NO share. Profit = (1 - entry_price) * size.
-        }
+        (Decimal::ONE - entry_price) * size
     } else {
-        // Loser gets nothing — loss is what we paid
         -entry_price * size
     };
 
@@ -324,8 +317,8 @@ mod tests {
     async fn test_settle_yes_trade_wins() {
         let store = Store::new(":memory:").await.unwrap();
         let trade = open_yes_trade(0, "0.60", "10");
-        let trade_id = store.insert_trade(&trade).await.unwrap();
-        let mut stored = store.get_open_trades().await.unwrap();
+        store.insert_trade(&trade).await.unwrap();
+        let stored = store.get_open_trades().await.unwrap();
         let t = &stored[0];
 
         let resolution = MarketResolution { yes_won: true };
