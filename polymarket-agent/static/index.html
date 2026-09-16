@@ -350,9 +350,32 @@ function truncate(s, max) {
   return s.length > max ? s.substring(0, max) + '...' : s;
 }
 
-async function fetchJson(url) {
+const TOKEN_KEY = 'dashboard_token';
+
+function getToken() {
+  try { return localStorage.getItem(TOKEN_KEY) || ''; } catch { return ''; }
+}
+
+function setToken(token) {
+  try { localStorage.setItem(TOKEN_KEY, token); } catch { /* storage unavailable */ }
+}
+
+async function fetchJson(url, retried = false) {
+  const sentToken = getToken();
   try {
-    const resp = await fetch(url);
+    const resp = await fetch(url, {
+      headers: sentToken ? { 'Authorization': 'Bearer ' + sentToken } : {},
+    });
+    if (resp.status === 401 && !retried) {
+      // Parallel requests all 401 at once; only prompt if nobody has supplied
+      // a new token since this request was sent.
+      if (getToken() === sentToken) {
+        const token = window.prompt('This dashboard requires an access token (DASHBOARD_TOKEN):');
+        if (!token) return null;
+        setToken(token.trim());
+      }
+      return fetchJson(url, true);
+    }
     if (!resp.ok) return null;
     return await resp.json();
   } catch {

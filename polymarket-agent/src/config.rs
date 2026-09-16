@@ -131,6 +131,9 @@ pub struct Secrets {
     pub discord_webhook_url: Option<String>,
     pub noaa_api_token: Option<String>,
     pub espn_api_key: Option<String>,
+    /// Bearer token protecting the dashboard's `/api/*` routes. Required when
+    /// the dashboard is bound to a non-loopback address.
+    pub dashboard_token: Option<String>,
 }
 
 impl Secrets {
@@ -141,6 +144,7 @@ impl Secrets {
             discord_webhook_url: std::env::var("DISCORD_WEBHOOK_URL").ok(),
             noaa_api_token: std::env::var("NOAA_API_TOKEN").ok(),
             espn_api_key: std::env::var("ESPN_API_KEY").ok(),
+            dashboard_token: std::env::var("DASHBOARD_TOKEN").ok(),
         }
     }
 }
