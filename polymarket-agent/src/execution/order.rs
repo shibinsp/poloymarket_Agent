@@ -293,8 +293,14 @@ mod tests {
 
         let order = prepare_order(&opp, dec!(0.27), dec!(0.12), &config).unwrap();
 
+        assert_eq!(order.side, Side::Yes);
+        assert_eq!(order.token_id, "tok_yes");
         // Capped at midpoint * 1.02 = 0.612, not the raw ask of 0.62
         assert_eq!(order.price, dec!(0.612));
+        // Size = 6 / 0.612 = ~9.80
+        assert!(order.size > dec!(9));
+        assert!(order.size < dec!(10));
+        assert_eq!(order.edge, dec!(0.15));
     }
 
     #[test]
@@ -306,8 +312,13 @@ mod tests {
 
         let order = prepare_order(&opp, dec!(0.20), dec!(0.10), &config).unwrap();
 
+        assert_eq!(order.side, Side::No);
+        assert_eq!(order.token_id, "tok_no");
         // Capped at (1 - midpoint) * 1.02 = 0.40 * 1.02 = 0.408, not 0.42
         assert_eq!(order.price, dec!(0.408));
+        // Size = 5 / 0.408 = ~12.25
+        assert!(order.size > dec!(12));
+        assert_eq!(order.edge, dec!(0.15));
     }
 
     #[test]

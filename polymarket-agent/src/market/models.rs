@@ -45,6 +45,23 @@ pub struct OrderBookSnapshot {
     pub timestamp: DateTime<Utc>,
 }
 
+impl OrderBookSnapshot {
+    /// The price levels that will actually be consumed when trading `side`.
+    ///
+    /// Buying YES lifts the ask side of the book; buying NO is priced off the
+    /// complement of the YES bid side (see `execution::order::prepare_order`,
+    /// which derives the NO execution price as `1 - best_bid`). Callers that
+    /// need depth/liquidity for a specific side must use this instead of
+    /// reaching for `asks` unconditionally, or they'll pair one side's
+    /// liquidity with the other side's reference price.
+    pub fn levels_for_side(&self, side: Side) -> &[PriceLevel] {
+        match side {
+            Side::Yes => &self.asks,
+            Side::No => &self.bids,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PriceLevel {
     pub price: Decimal,
@@ -107,5 +124,51 @@ impl std::fmt::Display for Side {
             Self::Yes => write!(f, "YES"),
             Self::No => write!(f, "NO"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    fn book_with(bid_size: Decimal, ask_size: Decimal) -> OrderBookSnapshot {
+        OrderBookSnapshot {
+            token_id: "tok".to_string(),
+            bids: vec![PriceLevel {
+                price: dec!(0.40),
+                size: bid_size,
+            }],
+            asks: vec![PriceLevel {
+                price: dec!(0.60),
+                size: ask_size,
+            }],
+            spread: dec!(0.20),
+            midpoint: dec!(0.50),
+            implied_probability: dec!(0.50),
+            timestamp: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn levels_for_side_yes_uses_asks() {
+        // Asymmetric depth: if Side::Yes ever picked bids instead, this
+        // would return 300 instead of 1000.
+        let book = book_with(dec!(300), dec!(1000));
+        let levels = book.levels_for_side(Side::Yes);
+        assert_eq!(levels.len(), 1);
+        assert_eq!(levels[0].price, dec!(0.60));
+        assert_eq!(levels[0].size, dec!(1000));
+    }
+
+    #[test]
+    fn levels_for_side_no_uses_bids() {
+        // Same asymmetric book: Side::No must resolve to the bid side, not
+        // the (much deeper, wrong-side) ask depth.
+        let book = book_with(dec!(300), dec!(1000));
+        let levels = book.levels_for_side(Side::No);
+        assert_eq!(levels.len(), 1);
+        assert_eq!(levels[0].price, dec!(0.40));
+        assert_eq!(levels[0].size, dec!(300));
     }
 }
