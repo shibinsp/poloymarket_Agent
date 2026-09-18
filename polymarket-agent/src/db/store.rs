@@ -345,6 +345,160 @@ impl Store {
             None => Ok(Decimal::ZERO),
         }
     }
+
+    // === Orders (multi-venue) ===
+
+    /// Record a submitted order. Written *before* the venue call returns, so
+    /// an order that times out still leaves a row to reconcile against — the
+    /// alternative is an order live at the venue that we have no record of.
+    pub async fn insert_order(&self, order: &OrderRecord) -> Result<i64> {
+        let result = sqlx::query(
+            "INSERT INTO orders (client_order_id, venue_order_id, venue_id, symbol, side, intent, trade_id, limit_price, qty, filled_qty, avg_fill_price, state, reject_reason, cycle, expires_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&order.client_order_id)
+        .bind(&order.venue_order_id)
+        .bind(&order.venue_id)
+        .bind(&order.symbol)
+        .bind(&order.side)
+        .bind(&order.intent)
+        .bind(order.trade_id)
+        .bind(&order.limit_price)
+        .bind(&order.qty)
+        .bind(&order.filled_qty)
+        .bind(&order.avg_fill_price)
+        .bind(&order.state)
+        .bind(&order.reject_reason)
+        .bind(order.cycle)
+        .bind(&order.expires_at)
+        .execute(&self.pool)
+        .await
+        .context("Failed to insert order")?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Update an order after querying the venue for its fate.
+    pub async fn update_order_state(
+        &self,
+        client_order_id: &str,
+        state: &str,
+        venue_order_id: Option<&str>,
+        filled_qty: &str,
+        avg_fill_price: Option<&str>,
+        reject_reason: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE orders SET state = ?, venue_order_id = COALESCE(?, venue_order_id), filled_qty = ?, avg_fill_price = ?, reject_reason = ?, updated_at = ? WHERE client_order_id = ?",
+        )
+        .bind(state)
+        .bind(venue_order_id)
+        .bind(filled_qty)
+        .bind(avg_fill_price)
+        .bind(reject_reason)
+        .bind(Utc::now().to_rfc3339())
+        .bind(client_order_id)
+        .execute(&self.pool)
+        .await
+        .context("Failed to update order state")?;
+        Ok(())
+    }
+
+    /// Orders the venue may still act on, plus any whose fate is unknown.
+    /// These must be resolved before placing anything new for the same symbol.
+    pub async fn get_unresolved_orders(&self) -> Result<Vec<OrderRecord>> {
+        sqlx::query_as::<_, OrderRecord>(
+            "SELECT * FROM orders WHERE state IN ('PENDING', 'ACCEPTED', 'PARTIALLY_FILLED', 'UNKNOWN') ORDER BY submitted_at",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to fetch unresolved orders")
+    }
+
+    /// Record a trade opened on a venue, once something has actually filled.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_venue_trade(&self, trade: &VenueTradeRecord) -> Result<i64> {
+        let result = sqlx::query(
+            "INSERT INTO trades (cycle, venue_id, symbol, asset_class, market_id, market_question, direction, side, entry_price, size, quantity, avg_fill_price, edge_at_entry, claude_fair_value, confidence, kelly_raw, kelly_adjusted, status, stop_price, target_price, horizon_hours, client_order_id, venue_order_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(trade.cycle)
+        .bind(&trade.venue_id)
+        .bind(&trade.symbol)
+        .bind(&trade.asset_class)
+        .bind(&trade.symbol)
+        .bind(&trade.display_name)
+        // `direction` is retained for legacy readers; `side` is authoritative.
+        .bind(&trade.side)
+        .bind(&trade.side)
+        .bind(&trade.entry_price)
+        .bind(&trade.quantity)
+        .bind(&trade.quantity)
+        .bind(&trade.avg_fill_price)
+        .bind(&trade.edge_at_entry)
+        .bind(&trade.fair_value)
+        .bind(&trade.confidence)
+        .bind(&trade.risk_pct)
+        .bind(&trade.stop_pct)
+        .bind(&trade.status)
+        .bind(&trade.stop_price)
+        .bind(&trade.target_price)
+        .bind(trade.horizon_hours)
+        .bind(&trade.client_order_id)
+        .bind(&trade.venue_order_id)
+        .execute(&self.pool)
+        .await
+        .context("Failed to insert venue trade")?;
+
+        Ok(result.last_insert_rowid())
+    }
+}
+
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct OrderRecord {
+    pub id: Option<i64>,
+    pub client_order_id: String,
+    pub venue_order_id: Option<String>,
+    pub venue_id: String,
+    pub symbol: String,
+    pub side: String,
+    pub intent: String,
+    pub trade_id: Option<i64>,
+    pub limit_price: Option<String>,
+    pub qty: String,
+    pub filled_qty: String,
+    pub avg_fill_price: Option<String>,
+    pub state: String,
+    pub reject_reason: Option<String>,
+    pub cycle: Option<i64>,
+    pub submitted_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub expires_at: Option<String>,
+}
+
+/// A filled position opened through a venue adapter.
+#[derive(Debug, Clone)]
+pub struct VenueTradeRecord {
+    pub cycle: i64,
+    pub venue_id: String,
+    pub symbol: String,
+    pub asset_class: String,
+    pub display_name: Option<String>,
+    pub side: String,
+    pub entry_price: String,
+    pub quantity: String,
+    pub avg_fill_price: Option<String>,
+    pub edge_at_entry: String,
+    pub fair_value: String,
+    pub confidence: String,
+    pub risk_pct: String,
+    pub stop_pct: String,
+    pub status: String,
+    pub stop_price: Option<String>,
+    pub target_price: Option<String>,
+    pub horizon_hours: Option<i64>,
+    pub client_order_id: Option<String>,
+    pub venue_order_id: Option<String>,
 }
 
 #[cfg(test)]
