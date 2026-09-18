@@ -1158,7 +1158,7 @@ mod tests {
     fn test_secrets() -> Secrets {
         Secrets {
             polymarket_private_key: None,
-            anthropic_api_key: None,
+            llm_api_key: None,
             discord_webhook_url: None,
             noaa_api_token: None,
             espn_api_key: None,

@@ -15,7 +15,21 @@ max_spread_pct = 0.05
 categories = ["weather", "sports", "crypto", "politics"]
 
 [valuation]
-claude_model = "claude-sonnet-4-20250514"
+# provider = "anthropic" (default) | "openai_compatible"
+#
+# For any OpenAI-compatible endpoint (NVIDIA NIM, vLLM, OpenRouter, Together)
+# set provider + base_url + model, and put the key in LLM_API_KEY. Example:
+#   provider = "openai_compatible"
+#   base_url = "https://integrate.api.nvidia.com/v1"
+#   model = "meta/llama-3.3-70b-instruct"
+# Pricing defaults to $0 for openai_compatible — set input/output prices below
+# if your endpoint bills you, otherwise the daily budget cap and the
+# edge-justifies-cost gate will both treat calls as free.
+provider = "openai_compatible"
+model = "deepseek-ai/deepseek-v4-flash-0731"
+base_url = "https://integrate.api.nvidia.com/v1"
+# input_price_per_million = 3.00
+# output_price_per_million = 15.00
 min_edge_threshold = 0.08
 high_confidence_edge = 0.06
 low_confidence_edge = 0.10

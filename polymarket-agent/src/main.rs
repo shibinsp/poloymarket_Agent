@@ -111,15 +111,13 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
 
     // 3. Check API keys
     println!("3. API Keys:");
-    let anthropic_ok = secrets.anthropic_api_key.is_some();
+    let llm_ok = secrets.llm_api_key.is_some();
     let poly_ok = secrets.polymarket_private_key.is_some();
     println!(
-        "   Anthropic (Claude): {}",
-        if anthropic_ok {
-            "✅ Set"
-        } else {
-            "❌ Missing"
-        }
+        "   LLM ({:?} / {}): {}",
+        config.valuation.provider,
+        config.valuation.model,
+        if llm_ok { "✅ Set" } else { "❌ Missing" }
     );
     println!(
         "   Polymarket Private Key: {}",
@@ -135,8 +133,56 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
     }
     println!();
 
-    // 4. Test Polymarket connectivity
-    println!("4. Polymarket Connectivity:");
+    // 4. Test the valuation model end to end — wrong provider/base_url/model
+    // combinations otherwise only surface mid-cycle, after a scan has run.
+    println!("4. Valuation Model:");
+    match &secrets.llm_api_key {
+        Some(key) => {
+            let llm_store = Store::from_pool(store.pool().clone());
+            match polymarket_agent::valuation::llm::LlmClient::new(
+                key.clone(),
+                &config.valuation,
+                llm_store,
+            ) {
+                Ok(client) => {
+                    println!("   Provider: {:?}", config.valuation.provider);
+                    println!("   Model: {}", config.valuation.model);
+                    match client
+                        .complete("Reply with exactly: OK", "Reply with exactly: OK", None)
+                        .await
+                    {
+                        Ok(resp) => {
+                            println!(
+                                "   Reply: {:?} ({} in / {} out tokens)",
+                                resp.text.trim(),
+                                resp.input_tokens,
+                                resp.output_tokens
+                            );
+                            println!("   Cost of this call: ${}", resp.cost);
+                            println!(
+                                "   Estimated per-valuation cost: ${}",
+                                client.estimated_call_cost()
+                            );
+                            println!("   ✅ Valuation model reachable");
+                        }
+                        Err(e) => {
+                            println!("   ❌ Call failed: {e}");
+                            return Err(e.context("Valuation model check failed"));
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("   ❌ Misconfigured: {e}");
+                    return Err(e.context("Valuation model misconfigured"));
+                }
+            }
+        }
+        None => println!("   ⚠️  No LLM_API_KEY/ANTHROPIC_API_KEY — valuations disabled"),
+    }
+    println!();
+
+    // 5. Test Polymarket connectivity
+    println!("5. Polymarket Connectivity:");
     let config_arc = std::sync::Arc::new(config.clone());
     let polymarket =
         polymarket_agent::market::polymarket::PolymarketClient::new(config_arc.clone(), secrets)
@@ -166,8 +212,8 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
     }
     println!();
 
-    // 5. Check balance
-    println!("5. Balance:");
+    // 6. Check balance
+    println!("6. Balance:");
     let balance = polymarket.get_balance().await?;
     println!("   Current balance: ${}", balance);
     if balance <= rust_decimal_macros::dec!(0) && config.agent.mode != AgentMode::Backtest {
@@ -177,7 +223,7 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
     }
     println!();
 
-    // 6. Summary
+    // 7. Summary
     println!("=== Dry Run Summary ===");
     println!("All systems operational. The agent is ready to run.");
     println!();

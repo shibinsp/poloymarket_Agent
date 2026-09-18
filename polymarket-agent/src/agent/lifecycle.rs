@@ -29,9 +29,9 @@ use crate::risk::kelly;
 use crate::risk::limits;
 use crate::risk::portfolio::{PortfolioManager, Position};
 use crate::valuation::calibration;
-use crate::valuation::claude::ClaudeClient;
 use crate::valuation::edge::{evaluate_edge, to_opportunity, EdgeResult};
 use crate::valuation::fair_value::{ValuationEngine, ValuationResult};
+use crate::valuation::llm::LlmClient;
 
 pub struct Agent {
     config: AppConfig,
@@ -63,23 +63,23 @@ impl Agent {
         let data_aggregator = DataAggregator::new(data_sources);
 
         // Phase 4: Initialize valuation engine (only if API key is available)
-        let valuation_engine = if let Some(ref api_key) = secrets.anthropic_api_key {
+        let valuation_engine = if let Some(ref api_key) = secrets.llm_api_key {
             // Share the caller's connection pool rather than opening (and
             // migrating) two more against the same database file.
-            let claude_store = store.clone_for_parallel();
+            let llm_store = store.clone_for_parallel();
             let valuation_store = store.clone_for_parallel();
-            let claude_client = Arc::new(ClaudeClient::new(
+            let llm_client = Arc::new(LlmClient::new(
                 api_key.clone(),
-                config.valuation.claude_model.clone(),
-                claude_store,
-            ));
+                &config.valuation,
+                llm_store,
+            )?);
             Some(ValuationEngine::new(
-                claude_client,
+                llm_client,
                 config.valuation.clone(),
                 valuation_store,
             ))
         } else {
-            warn!("ANTHROPIC_API_KEY not set — valuation engine disabled");
+            warn!("LLM_API_KEY/ANTHROPIC_API_KEY not set — valuation engine disabled");
             None
         };
 

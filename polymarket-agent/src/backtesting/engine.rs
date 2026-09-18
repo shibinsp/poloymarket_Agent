@@ -275,7 +275,11 @@ mod tests {
                 min_position_usd: dec!(1),
             },
             valuation_config: ValuationConfig {
-                claude_model: "claude-sonnet-4-5-20250929".to_string(),
+                provider: crate::config::LlmProvider::Anthropic,
+                model: "claude-sonnet-4-5-20250929".to_string(),
+                base_url: None,
+                input_price_per_million: None,
+                output_price_per_million: None,
                 min_edge_threshold: dec!(0.05),
                 high_confidence_edge: dec!(0.03),
                 low_confidence_edge: dec!(0.08),
