@@ -116,14 +116,23 @@ impl Store {
 
     pub async fn insert_trade(&self, trade: &TradeRecord) -> Result<i64> {
         let result = sqlx::query(
-            "INSERT INTO trades (cycle, market_id, market_question, direction, entry_price, size, edge_at_entry, claude_fair_value, confidence, kelly_raw, kelly_adjusted, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            // venue_id/symbol/side are derived here rather than defaulted in
+            // the schema: an empty symbol would collide across markets, which
+            // is the cache-collision bug class all over again. The legacy
+            // Polymarket path is always a BUY of the named outcome token, and
+            // the symbol format matches what the venue adapter produces.
+            "INSERT INTO trades (cycle, venue_id, symbol, side, market_id, market_question, direction, entry_price, size, quantity, edge_at_entry, claude_fair_value, confidence, kelly_raw, kelly_adjusted, status)
+             VALUES (?, 'polymarket', ?, 'BUY', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(trade.cycle)
+        .bind(format!("{}:{}", trade.market_id, trade.direction))
         .bind(&trade.market_id)
         .bind(&trade.market_question)
         .bind(&trade.direction)
         .bind(&trade.entry_price)
+        .bind(&trade.size)
+        // quantity mirrors size for the legacy path; they diverge once fills
+        // are confirmed rather than assumed.
         .bind(&trade.size)
         .bind(&trade.edge_at_entry)
         .bind(&trade.claude_fair_value)

@@ -10,6 +10,8 @@ pub struct AppConfig {
     pub scanning: ScanningConfig,
     pub valuation: ValuationConfig,
     pub risk: RiskConfig,
+    #[serde(default)]
+    pub sizing_continuous: ContinuousSizingConfig,
     pub execution: ExecutionConfig,
     pub monitoring: MonitoringConfig,
     pub polymarket: PolymarketConfig,
@@ -127,6 +129,54 @@ pub struct RiskConfig {
     pub max_total_exposure_pct: Decimal,
     pub max_positions_per_category: u32,
     pub min_position_usd: Decimal,
+}
+
+/// Volatility-targeted sizing for continuous assets (crypto, equities).
+/// Prediction markets keep using Kelly and ignore this.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContinuousSizingConfig {
+    /// Fraction of bankroll risked per trade if the stop is hit.
+    #[serde(default = "default_risk_per_trade")]
+    pub risk_per_trade_pct: Decimal,
+    #[serde(default = "default_atr_period")]
+    pub atr_period: usize,
+    /// Stop distance as a multiple of ATR.
+    #[serde(default = "default_atr_multiplier")]
+    pub atr_multiplier: Decimal,
+    /// Floor and ceiling on the stop, so a quiet market can't imply a huge
+    /// position and a wild one can't imply a meaningless stop.
+    #[serde(default = "default_min_stop_pct")]
+    pub min_stop_pct: Decimal,
+    #[serde(default = "default_max_stop_pct")]
+    pub max_stop_pct: Decimal,
+}
+
+impl Default for ContinuousSizingConfig {
+    fn default() -> Self {
+        Self {
+            risk_per_trade_pct: default_risk_per_trade(),
+            atr_period: default_atr_period(),
+            atr_multiplier: default_atr_multiplier(),
+            min_stop_pct: default_min_stop_pct(),
+            max_stop_pct: default_max_stop_pct(),
+        }
+    }
+}
+
+fn default_risk_per_trade() -> Decimal {
+    rust_decimal_macros::dec!(0.0075)
+}
+fn default_atr_period() -> usize {
+    14
+}
+fn default_atr_multiplier() -> Decimal {
+    rust_decimal_macros::dec!(2.0)
+}
+fn default_min_stop_pct() -> Decimal {
+    rust_decimal_macros::dec!(0.03)
+}
+fn default_max_stop_pct() -> Decimal {
+    rust_decimal_macros::dec!(0.12)
 }
 
 #[derive(Debug, Clone, Deserialize)]
