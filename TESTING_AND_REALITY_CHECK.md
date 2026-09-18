@@ -99,9 +99,9 @@ Live mode requires:
 **Live mode IS implemented (since commit `7c351e8`) but is NOT yet safe to run.**
 `--mode live` places real EIP-712-signed orders. As of 2026-09-17 the live path
 still records orders as filled without confirming the fill, hardcodes a 7-day order
-expiry, has no kill switch or loss breaker, and submits NO-side entries with an
-inverted order side. Treat `--mode live` as disabled until the go-live gate in the
-project roadmap is complete.
+expiry, has no kill switch, drawdown breaker, or daily-loss limit, and submits
+NO-side entries with an inverted order side. Treat `--mode live` as disabled
+until the go-live gate in the project roadmap is complete.
 
 ---
 

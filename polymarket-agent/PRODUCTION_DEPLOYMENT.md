@@ -181,7 +181,7 @@ sudo journalctl -u polymarket-agent -f
 
 ```bash
 # Check health endpoint
-curl http://localhost:8080/health
+curl http://localhost:8080/api/health
 
 # Expected response:
 # {"status":"ok","agent_state":"ALIVE","cycle_number":1,...}
@@ -222,8 +222,14 @@ sudo journalctl -u polymarket-agent -n 100 --no-pager
 
 Set up an external uptime monitor (UptimeRobot, Healthchecks.io) to ping:
 ```
-http://your-vps-ip:8080/health
+http://your-vps-ip:8080/api/health
 ```
+
+This requires binding the dashboard to a non-loopback address
+(`dashboard_bind` in `config/default.toml`), which in turn requires setting
+`DASHBOARD_TOKEN` in your env file — without it, live mode refuses to start
+and paper mode silently falls back to `127.0.0.1` (unreachable from outside
+the VPS). `/api/health` itself does not require the token.
 
 Alert if:
 - Response is not 200

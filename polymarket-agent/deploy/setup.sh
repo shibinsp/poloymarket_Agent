@@ -45,7 +45,10 @@ chown "$AGENT_USER:$AGENT_USER" "$DATA_DIR"
 echo "Step 5: Setting up codebase..."
 if [ -d "$INSTALL_DIR/.git" ]; then
     echo "Repository exists — pulling latest..."
-    su - "$AGENT_USER" -c "cd $INSTALL_DIR && git pull"
+    # Step 7 below rewrites config/default.toml in place on every run, which
+    # would otherwise conflict with a re-run's `git pull` on the second and
+    # later invocations of this script.
+    su - "$AGENT_USER" -c "cd $INSTALL_DIR && git checkout -- config/default.toml 2>/dev/null; git pull"
 else
     echo "Clone your repository to $INSTALL_DIR"
     echo "  git clone <your-repo-url> $INSTALL_DIR"
@@ -103,10 +106,10 @@ echo ""
 echo "Next steps:"
 echo "  1. Edit $ENV_FILE with your API keys"
 echo "  2. Review $INSTALL_DIR/config/default.toml"
-echo "  3. Validate the setup:"
-echo "     sudo -u $AGENT_USER $INSTALL_DIR/target/release/polymarket-agent --dry-run"
+echo "  3. Validate the setup (loads $ENV_FILE the same way systemd does):"
+echo "     sudo -u $AGENT_USER bash -c 'cd $INSTALL_DIR && set -a && source $ENV_FILE && set +a && ./target/release/polymarket-agent --dry-run'"
 echo "  4. Run a backtest first:"
-echo "     sudo -u $AGENT_USER $INSTALL_DIR/target/release/polymarket-agent --mode backtest"
+echo "     sudo -u $AGENT_USER bash -c 'cd $INSTALL_DIR && set -a && source $ENV_FILE && set +a && ./target/release/polymarket-agent --mode backtest'"
 echo "  5. Start in paper mode:"
 echo "     sudo systemctl start polymarket-agent"
 echo "  6. Check logs:"

@@ -392,7 +392,7 @@ cargo clippy -- -D warnings
 5. **Model risk.** Claude can be confidently wrong. The confidence score is self-assessed, not externally calibrated.
 6. **Black swan risk.** A single unexpected event can wipe correlated positions.
 7. **Jurisdiction.** Polymarket's international CLOB prohibits US persons from trading under its Terms of Service. If you are in the US, do not fund or run live mode against it.
-8. **Live mode is not yet production-safe.** As of 2026-09-17 the live path records orders as filled without confirmation, hardcodes a 7-day order expiry, has no kill switch or loss breaker, and submits NO-side entries with an inverted order side. Do not run `--mode live` until the go-live gate in the roadmap is complete.
+8. **Live mode is not yet production-safe.** As of 2026-09-17 the live path records orders as filled without confirmation, hardcodes a 7-day order expiry, has no kill switch, drawdown breaker, or daily-loss limit, and submits NO-side entries with an inverted order side. Do not run `--mode live` until the go-live gate in the roadmap is complete.
 
 ## License
 
