@@ -99,6 +99,11 @@ impl Store {
     /// Databases created by the previous ad-hoc runner have no tracking table;
     /// `001_init.sql` is entirely `IF NOT EXISTS`, so re-applying it on such a
     /// database is a no-op that simply records the version.
+    ///
+    /// Unlike the old runner, this checksums each applied migration: editing
+    /// an already-applied file (rather than adding a new one) makes every
+    /// existing database refuse to start. Schema changes always go in a new
+    /// `NNN_description.sql` file — see RULES.md's Database Rules.
     async fn migrate(&self) -> Result<()> {
         sqlx::migrate!("./migrations")
             .run(&self.pool)

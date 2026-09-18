@@ -219,45 +219,44 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
     let mut fatal: Option<anyhow::Error> = None;
 
     loop {
-        tokio::select! {
-            result = agent.run_cycle() => {
-                match result {
-                    Ok(()) => {
-                        consecutive_failures = 0;
-                        health_state.record_cycle(agent.cycle_number(), agent.current_state());
+        // Run the cycle to completion — it is never raced against the shutdown
+        // signal. A live order placement must not be abandoned partway
+        // through just because SIGTERM arrived; if a cycle genuinely hangs,
+        // systemd's TimeoutStopSec (see deploy/polymarket-agent.service) is
+        // the backstop that forces an exit.
+        match agent.run_cycle().await {
+            Ok(()) => {
+                consecutive_failures = 0;
+                health_state.record_cycle(agent.cycle_number(), agent.current_state());
 
-                        if agent.is_dead() {
-                            tracing::error!("Agent has died. Shutting down.");
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        consecutive_failures += 1;
-                        tracing::error!(
-                            error = %e,
-                            consecutive_failures,
-                            "Cycle failed — retrying after the normal interval"
-                        );
-                        if consecutive_failures >= MAX_CONSECUTIVE_CYCLE_FAILURES {
-                            fatal = Some(e.context(format!(
-                                "{consecutive_failures} consecutive cycle failures — exiting so the supervisor can restart"
-                            )));
-                            break;
-                        }
-                    }
+                if agent.is_dead() {
+                    tracing::error!("Agent has died. Shutting down.");
+                    break;
                 }
             }
-            signal = shutdown.recv() => {
-                tracing::info!(signal, "Shutdown signal received — stopping before the next cycle");
-                break;
+            Err(e) => {
+                consecutive_failures += 1;
+                health_state.record_failure();
+                tracing::error!(
+                    error = %e,
+                    consecutive_failures,
+                    "Cycle failed — retrying after the normal interval"
+                );
+                if consecutive_failures >= MAX_CONSECUTIVE_CYCLE_FAILURES {
+                    fatal = Some(e.context(format!(
+                        "{consecutive_failures} consecutive cycle failures — exiting so the supervisor can restart"
+                    )));
+                    break;
+                }
             }
         }
 
-        // Idle between cycles, but wake immediately on a shutdown signal.
+        // Idle between cycles, but wake immediately on a shutdown signal —
+        // this is the only point where a signal can interrupt the loop.
         tokio::select! {
             _ = tokio::time::sleep(interval) => {}
             signal = shutdown.recv() => {
-                tracing::info!(signal, "Shutdown signal received while idle — stopping");
+                tracing::info!(signal, "Shutdown signal received — stopping after the current cycle");
                 break;
             }
         }

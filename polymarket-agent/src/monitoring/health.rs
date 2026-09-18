@@ -59,6 +59,20 @@ impl HealthState {
             };
         });
     }
+
+    /// Mark a failed cycle so an external monitor sees it, without touching
+    /// `cycle_number`/`last_cycle_at` — those still reflect the last cycle
+    /// that actually completed.
+    pub fn record_failure(&self) {
+        let inner = self.inner.clone();
+        tokio::spawn(async move {
+            let mut data = inner.write().await;
+            data.uptime_seconds = (Utc::now() - data.started_at).num_seconds();
+            if data.status != "dead" {
+                data.status = "degraded".to_string();
+            }
+        });
+    }
 }
 
 impl Default for HealthState {
@@ -90,6 +104,21 @@ mod tests {
         assert_eq!(data.cycle_number, 5);
         assert_eq!(data.agent_state, "ALIVE");
         assert_eq!(data.status, "ok");
+    }
+
+    #[tokio::test]
+    async fn test_health_state_record_failure() {
+        let state = HealthState::new();
+        state.record_cycle(3, AgentState::Alive);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        state.record_failure();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let data = state.inner.read().await;
+        assert_eq!(data.status, "degraded");
+        // The last successful cycle's data is preserved, not overwritten.
+        assert_eq!(data.cycle_number, 3);
     }
 
     #[tokio::test]
