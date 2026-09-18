@@ -227,7 +227,9 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
         match agent.run_cycle().await {
             Ok(()) => {
                 consecutive_failures = 0;
-                health_state.record_cycle(agent.cycle_number(), agent.current_state());
+                health_state
+                    .record_cycle(agent.cycle_number(), agent.current_state())
+                    .await;
 
                 if agent.is_dead() {
                     tracing::error!("Agent has died. Shutting down.");
@@ -236,7 +238,7 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
             }
             Err(e) => {
                 consecutive_failures += 1;
-                health_state.record_failure();
+                health_state.record_failure().await;
                 tracing::error!(
                     error = %e,
                     consecutive_failures,
@@ -276,8 +278,8 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
 /// the loop is idle between cycles. `systemctl stop` sends SIGTERM, which the
 /// previous Ctrl+C-only handler ignored.
 struct ShutdownSignals {
-    #[cfg(unix)]
-    interrupt: tokio::signal::unix::Signal,
+    // SIGINT is covered by the cross-platform tokio::signal::ctrl_c(); only
+    // SIGTERM needs a unix-specific stream.
     #[cfg(unix)]
     terminate: tokio::signal::unix::Signal,
 }
@@ -288,7 +290,6 @@ impl ShutdownSignals {
         {
             use tokio::signal::unix::{signal, SignalKind};
             Ok(Self {
-                interrupt: signal(SignalKind::interrupt())?,
                 terminate: signal(SignalKind::terminate())?,
             })
         }
@@ -303,7 +304,7 @@ impl ShutdownSignals {
         #[cfg(unix)]
         {
             tokio::select! {
-                _ = self.interrupt.recv() => "SIGINT",
+                _ = tokio::signal::ctrl_c() => "SIGINT",
                 _ = self.terminate.recv() => "SIGTERM",
             }
         }

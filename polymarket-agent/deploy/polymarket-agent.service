@@ -14,9 +14,12 @@ Environment=RUST_LOG=info
 # Secrets live outside the read-only install dir (see deploy/setup.sh)
 EnvironmentFile=/etc/polymarket-agent/env
 
-# Graceful shutdown: the agent handles SIGTERM and finishes the in-flight cycle
+# Graceful shutdown: the agent handles SIGTERM but deliberately finishes the
+# in-flight cycle first rather than abandoning an order mid-placement, so allow
+# well beyond a normal cycle. A cycle retrying against a degraded network can
+# legitimately run for minutes; SIGKILL after this is the last resort.
 KillSignal=SIGTERM
-TimeoutStopSec=60
+TimeoutStopSec=300
 
 # Security hardening
 NoNewPrivileges=true

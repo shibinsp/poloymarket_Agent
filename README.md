@@ -154,6 +154,7 @@ cargo run --release
 | `ESPN_API_KEY` | No | ESPN API for sports market data |
 | `RUST_LOG` | No | Log level filter (default: `info`) |
 | `DASHBOARD_TOKEN` | No* | Bearer token for the dashboard's `/api/*` routes. *Required when `dashboard_bind` is not loopback — live mode refuses to start without it. |
+| `CONFIG_PATH` | No | Path to the TOML config (default: `config/default.toml`). Deployments point this outside the git checkout. |
 
 ### Config File (`config/default.toml`)
 

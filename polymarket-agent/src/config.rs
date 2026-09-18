@@ -149,17 +149,27 @@ impl Secrets {
     }
 }
 
+/// Where to read the TOML config from when `CONFIG_PATH` is unset.
+const DEFAULT_CONFIG_PATH: &str = "config/default.toml";
+
 impl AppConfig {
-    /// Load configuration from config/default.toml, overlaying environment variables for secrets.
+    /// Load configuration from `$CONFIG_PATH` (default `config/default.toml`),
+    /// overlaying environment variables for secrets.
+    ///
+    /// The override lets a deployment keep its tuned config outside the git
+    /// checkout (see deploy/setup.sh), so redeploying never has to edit — or
+    /// revert — a tracked file.
     pub fn load() -> Result<(Self, Secrets)> {
         dotenvy::dotenv().ok();
 
-        let config_path = Path::new("config/default.toml");
+        let config_path =
+            std::env::var("CONFIG_PATH").unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string());
+        let config_path = Path::new(&config_path);
         let contents = std::fs::read_to_string(config_path)
             .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
 
-        let config: AppConfig =
-            toml::from_str(&contents).context("Failed to parse config/default.toml")?;
+        let config: AppConfig = toml::from_str(&contents)
+            .with_context(|| format!("Failed to parse config file: {}", config_path.display()))?;
 
         let secrets = Secrets::from_env();
 

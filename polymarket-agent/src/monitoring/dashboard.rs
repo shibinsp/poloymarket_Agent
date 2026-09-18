@@ -47,8 +47,12 @@ impl DashboardState {
             store: Arc::new(store),
             health,
             initial_bankroll,
+            // Trim before storing: the page sends a trimmed token, so keeping
+            // stray whitespace here would 401 every request with an
+            // apparently-correct token.
             api_token: api_token
-                .filter(|t| !t.trim().is_empty())
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
                 .map(|t| Arc::from(t.as_str())),
         }
     }
@@ -253,6 +257,23 @@ mod tests {
     async fn blank_token_counts_as_no_token() {
         let app = app_with_token(Some("   ")).await;
         assert_eq!(status(app, "/api/trades", None).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn token_is_trimmed_before_comparison() {
+        // A token with stray whitespace (easy to introduce in an .env or
+        // systemd EnvironmentFile) must still match what the page sends.
+        let app = app_with_token(Some("  s3cret\t")).await;
+        assert_eq!(
+            status(app.clone(), "/api/trades", Some("Bearer s3cret")).await,
+            StatusCode::OK
+        );
+        // The comparison itself is still exact — only the configured value is
+        // trimmed, not whatever the client sends.
+        assert_eq!(
+            status(app, "/api/trades", Some("Bearer  s3cret")).await,
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     #[tokio::test]

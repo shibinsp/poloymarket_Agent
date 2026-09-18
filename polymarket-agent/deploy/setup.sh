@@ -45,10 +45,9 @@ chown "$AGENT_USER:$AGENT_USER" "$DATA_DIR"
 echo "Step 5: Setting up codebase..."
 if [ -d "$INSTALL_DIR/.git" ]; then
     echo "Repository exists — pulling latest..."
-    # Step 7 below rewrites config/default.toml in place on every run, which
-    # would otherwise conflict with a re-run's `git pull` on the second and
-    # later invocations of this script.
-    su - "$AGENT_USER" -c "cd $INSTALL_DIR && git checkout -- config/default.toml 2>/dev/null; git pull"
+    # The live config lives outside the checkout (see step 7), so the working
+    # tree stays clean and this pull never conflicts.
+    su - "$AGENT_USER" -c "cd '$INSTALL_DIR' && git pull"
 else
     echo "Clone your repository to $INSTALL_DIR"
     echo "  git clone <your-repo-url> $INSTALL_DIR"
@@ -70,9 +69,10 @@ fi
 echo "Step 7: Setting up configuration..."
 ENV_DIR="/etc/polymarket-agent"
 ENV_FILE="$ENV_DIR/env"
+CONFIG_FILE="$ENV_DIR/config.toml"
 mkdir -p "$ENV_DIR"
 if [ ! -f "$ENV_FILE" ]; then
-    cat > "$ENV_FILE" << 'ENVEOF'
+    cat > "$ENV_FILE" << ENVEOF
 # Polymarket Agent Environment Variables
 # Fill in your actual keys before starting the service
 
@@ -83,15 +83,31 @@ NOAA_API_TOKEN=
 ESPN_API_KEY=
 # Required if the dashboard is bound to anything other than 127.0.0.1
 DASHBOARD_TOKEN=
+
+# Read the tuned config from outside the git checkout so redeploys never
+# touch it. Edit $CONFIG_FILE, not the repo's config/default.toml.
+CONFIG_PATH=$CONFIG_FILE
 ENVEOF
     chown "root:$AGENT_USER" "$ENV_FILE"
     chmod 640 "$ENV_FILE"
     echo "Created env file at $ENV_FILE — fill in your keys!"
 fi
 
-# Point the database at the writable data directory
-if [ -f "$INSTALL_DIR/config/default.toml" ]; then
-    sed -i "s|^path = \"polymarket-agent.db\"|path = \"$DATA_DIR/polymarket-agent.db\"|" "$INSTALL_DIR/config/default.toml"
+# Seed the live config once from the repo default, pointing the database at
+# the writable data directory. On later runs it is left alone, so operator
+# tuning survives a redeploy and `git pull` never sees a dirty working tree.
+if [ ! -f "$CONFIG_FILE" ]; then
+    if [ -f "$INSTALL_DIR/config/default.toml" ]; then
+        sed "s|^path = \"polymarket-agent.db\"|path = \"$DATA_DIR/polymarket-agent.db\"|" \
+            "$INSTALL_DIR/config/default.toml" > "$CONFIG_FILE"
+        chown "root:$AGENT_USER" "$CONFIG_FILE"
+        chmod 640 "$CONFIG_FILE"
+        echo "Created config at $CONFIG_FILE — review before starting!"
+    else
+        echo "WARNING: $INSTALL_DIR/config/default.toml not found — cannot seed $CONFIG_FILE"
+    fi
+else
+    echo "Config already exists at $CONFIG_FILE — leaving your settings untouched"
 fi
 
 # 8. Install systemd service
@@ -105,7 +121,7 @@ echo "=== Setup Complete ==="
 echo ""
 echo "Next steps:"
 echo "  1. Edit $ENV_FILE with your API keys"
-echo "  2. Review $INSTALL_DIR/config/default.toml"
+echo "  2. Review $CONFIG_FILE (the live config — NOT the repo's config/default.toml)"
 echo "  3. Validate the setup (loads $ENV_FILE the same way systemd does):"
 echo "     sudo -u $AGENT_USER bash -c 'cd $INSTALL_DIR && set -a && source $ENV_FILE && set +a && ./target/release/polymarket-agent --dry-run'"
 echo "  4. Run a backtest first:"

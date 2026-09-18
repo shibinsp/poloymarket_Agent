@@ -44,34 +44,31 @@ impl HealthState {
         serde_json::to_value(&*data).unwrap_or(serde_json::json!({"status": "error"}))
     }
 
-    pub fn record_cycle(&self, cycle_number: u64, state: AgentState) {
-        let inner = self.inner.clone();
-        tokio::spawn(async move {
-            let mut data = inner.write().await;
-            data.cycle_number = cycle_number;
-            data.agent_state = state.to_string();
-            data.last_cycle_at = Some(Utc::now());
-            data.uptime_seconds = (Utc::now() - data.started_at).num_seconds();
-            data.status = if state == AgentState::Dead {
-                "dead".to_string()
-            } else {
-                "ok".to_string()
-            };
-        });
+    /// Awaited rather than spawned: the caller breaks out of the main loop
+    /// immediately after recording a death or a fatal failure run, and a
+    /// detached task could lose that final write to runtime teardown.
+    pub async fn record_cycle(&self, cycle_number: u64, state: AgentState) {
+        let mut data = self.inner.write().await;
+        data.cycle_number = cycle_number;
+        data.agent_state = state.to_string();
+        data.last_cycle_at = Some(Utc::now());
+        data.uptime_seconds = (Utc::now() - data.started_at).num_seconds();
+        data.status = if state == AgentState::Dead {
+            "dead".to_string()
+        } else {
+            "ok".to_string()
+        };
     }
 
     /// Mark a failed cycle so an external monitor sees it, without touching
     /// `cycle_number`/`last_cycle_at` — those still reflect the last cycle
     /// that actually completed.
-    pub fn record_failure(&self) {
-        let inner = self.inner.clone();
-        tokio::spawn(async move {
-            let mut data = inner.write().await;
-            data.uptime_seconds = (Utc::now() - data.started_at).num_seconds();
-            if data.status != "dead" {
-                data.status = "degraded".to_string();
-            }
-        });
+    pub async fn record_failure(&self) {
+        let mut data = self.inner.write().await;
+        data.uptime_seconds = (Utc::now() - data.started_at).num_seconds();
+        if data.status != "dead" {
+            data.status = "degraded".to_string();
+        }
     }
 }
 
@@ -95,10 +92,7 @@ mod tests {
     #[tokio::test]
     async fn test_health_state_update() {
         let state = HealthState::new();
-        state.record_cycle(5, AgentState::Alive);
-
-        // Give the spawned task time to complete
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        state.record_cycle(5, AgentState::Alive).await;
 
         let data = state.inner.read().await;
         assert_eq!(data.cycle_number, 5);
@@ -109,11 +103,8 @@ mod tests {
     #[tokio::test]
     async fn test_health_state_record_failure() {
         let state = HealthState::new();
-        state.record_cycle(3, AgentState::Alive);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        state.record_failure();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        state.record_cycle(3, AgentState::Alive).await;
+        state.record_failure().await;
 
         let data = state.inner.read().await;
         assert_eq!(data.status, "degraded");
@@ -124,9 +115,7 @@ mod tests {
     #[tokio::test]
     async fn test_health_state_dead() {
         let state = HealthState::new();
-        state.record_cycle(10, AgentState::Dead);
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        state.record_cycle(10, AgentState::Dead).await;
 
         let data = state.inner.read().await;
         assert_eq!(data.status, "dead");

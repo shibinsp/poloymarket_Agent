@@ -291,13 +291,14 @@ impl Agent {
         let costs = CycleCosts::new(cycle_api_cost);
         log_cost_breakdown(self.cycle_number, &costs, cumulative_api_cost);
 
-        // Log cycle results. Non-fatal: this insert runs after scanning,
-        // valuation (paid Claude calls) and trade execution are already
-        // done, so propagating its error would make main.rs retry the
-        // entire cycle — re-spending the API budget and re-evaluating
-        // trades — just to redo a bookkeeping write.
+        // Log cycle results. The error is reported to the caller (so the
+        // consecutive-failure counter and health status in main.rs still
+        // work) but `cycle_number` advances below regardless, so the next
+        // call starts a genuinely new cycle instead of replaying this one's
+        // scanning, paid valuations and trades just to redo a bookkeeping
+        // write.
         let duration = start.elapsed();
-        if let Err(e) = self
+        let log_result = self
             .log_cycle(
                 duration,
                 markets_scanned,
@@ -305,8 +306,8 @@ impl Agent {
                 trades_placed,
                 cycle_api_cost,
             )
-            .await
-        {
+            .await;
+        if let Err(ref e) = log_result {
             warn!(error = %e, "Failed to record cycle summary");
         }
 
@@ -325,7 +326,7 @@ impl Agent {
 
         self.cycle_number += 1;
 
-        Ok(())
+        log_result
     }
 
     /// Full pipeline: evaluate candidates → size with Kelly → check constraints → execute.

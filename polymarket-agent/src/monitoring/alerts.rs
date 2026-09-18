@@ -27,10 +27,19 @@ struct DiscordMessage {
 
 impl AlertClient {
     pub fn new(webhook_url: Option<String>, enabled: bool) -> Self {
+        // A cycle is never cancelled mid-flight (see main.rs), so every call
+        // made inside one must be time-boxed or a stalled endpoint wedges the
+        // whole agent. Alerts are the least critical call in a cycle, so they
+        // get the shortest timeout.
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("Failed to build HTTP client");
+
         Self {
             enabled: enabled && webhook_url.is_some(),
             webhook_url,
-            http: reqwest::Client::new(),
+            http,
         }
     }
 
