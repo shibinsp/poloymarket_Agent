@@ -52,6 +52,14 @@ pub struct ScanningConfig {
     pub categories: Vec<String>,
 }
 
+/// Claude Sonnet list pricing, used when an Anthropic config doesn't override it.
+pub const ANTHROPIC_DEFAULT_INPUT_PRICE: Decimal = rust_decimal_macros::dec!(3.00);
+pub const ANTHROPIC_DEFAULT_OUTPUT_PRICE: Decimal = rust_decimal_macros::dec!(15.00);
+
+fn default_max_tokens() -> u32 {
+    1024
+}
+
 /// Wire format the valuation LLM speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -85,6 +93,10 @@ pub struct ValuationConfig {
     pub input_price_per_million: Option<Decimal>,
     #[serde(default)]
     pub output_price_per_million: Option<Decimal>,
+    /// Response token budget. Reasoning models spend this on chain-of-thought
+    /// before emitting the JSON schema, so they need considerably more.
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: u32,
     pub min_edge_threshold: Decimal,
     pub high_confidence_edge: Decimal,
     pub low_confidence_edge: Decimal,
@@ -96,8 +108,8 @@ impl ValuationConfig {
     pub fn effective_pricing(&self) -> (Decimal, Decimal) {
         let (default_in, default_out) = match self.provider {
             LlmProvider::Anthropic => (
-                crate::valuation::llm::ANTHROPIC_DEFAULT_INPUT_PRICE,
-                crate::valuation::llm::ANTHROPIC_DEFAULT_OUTPUT_PRICE,
+                ANTHROPIC_DEFAULT_INPUT_PRICE,
+                ANTHROPIC_DEFAULT_OUTPUT_PRICE,
             ),
             LlmProvider::OpenAiCompatible => (Decimal::ZERO, Decimal::ZERO),
         };
@@ -185,17 +197,27 @@ pub struct Secrets {
     pub dashboard_token: Option<String>,
 }
 
+/// Read an env var, treating blank/whitespace-only as unset.
+fn non_empty_env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 impl Secrets {
     pub fn from_env() -> Self {
         Self {
-            polymarket_private_key: std::env::var("POLYMARKET_PRIVATE_KEY").ok(),
-            llm_api_key: std::env::var("LLM_API_KEY")
-                .ok()
-                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok()),
-            discord_webhook_url: std::env::var("DISCORD_WEBHOOK_URL").ok(),
-            noaa_api_token: std::env::var("NOAA_API_TOKEN").ok(),
-            espn_api_key: std::env::var("ESPN_API_KEY").ok(),
-            dashboard_token: std::env::var("DASHBOARD_TOKEN").ok(),
+            polymarket_private_key: non_empty_env("POLYMARKET_PRIVATE_KEY"),
+            // An unset var and one set to "" must behave the same, or the
+            // blank `LLM_API_KEY=` line in .env.example would shadow the
+            // ANTHROPIC_API_KEY fallback with Some("").
+            llm_api_key: non_empty_env("LLM_API_KEY")
+                .or_else(|| non_empty_env("ANTHROPIC_API_KEY")),
+            discord_webhook_url: non_empty_env("DISCORD_WEBHOOK_URL"),
+            noaa_api_token: non_empty_env("NOAA_API_TOKEN"),
+            espn_api_key: non_empty_env("ESPN_API_KEY"),
+            dashboard_token: non_empty_env("DASHBOARD_TOKEN"),
         }
     }
 }
@@ -262,8 +284,8 @@ mod tests {
         assert_eq!(
             cfg.effective_pricing(),
             (
-                crate::valuation::llm::ANTHROPIC_DEFAULT_INPUT_PRICE,
-                crate::valuation::llm::ANTHROPIC_DEFAULT_OUTPUT_PRICE
+                ANTHROPIC_DEFAULT_INPUT_PRICE,
+                ANTHROPIC_DEFAULT_OUTPUT_PRICE
             )
         );
     }
@@ -309,6 +331,36 @@ mod tests {
                 rust_decimal_macros::dec!(1.5)
             )
         );
+    }
+
+    #[test]
+    fn blank_env_var_is_treated_as_unset() {
+        // .env.example ships a blank `LLM_API_KEY=`; if that shadowed the
+        // ANTHROPIC_API_KEY fallback, the agent would start "enabled" and 401
+        // on every call.
+        std::env::set_var("BLANK_ENV_TEST", "");
+        assert_eq!(non_empty_env("BLANK_ENV_TEST"), None);
+        std::env::set_var("BLANK_ENV_TEST", "   ");
+        assert_eq!(non_empty_env("BLANK_ENV_TEST"), None);
+        std::env::set_var("BLANK_ENV_TEST", " value ");
+        assert_eq!(non_empty_env("BLANK_ENV_TEST"), Some("value".to_string()));
+        std::env::remove_var("BLANK_ENV_TEST");
+    }
+
+    #[test]
+    fn max_tokens_defaults_but_is_overridable() {
+        let base = r#"
+            model = "m"
+            min_edge_threshold = 0.08
+            high_confidence_edge = 0.06
+            low_confidence_edge = 0.10
+            cache_ttl_seconds = 300
+        "#;
+        let cfg: ValuationConfig = toml::from_str(base).unwrap();
+        assert_eq!(cfg.max_tokens, 1024);
+
+        let cfg: ValuationConfig = toml::from_str(&format!("max_tokens = 8192\n{base}")).unwrap();
+        assert_eq!(cfg.max_tokens, 8192);
     }
 
     #[test]

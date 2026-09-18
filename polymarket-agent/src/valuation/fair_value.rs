@@ -108,11 +108,7 @@ impl ValuationEngine {
     /// Create a clone for use in parallel evaluation tasks.
     /// Shares the same underlying LLM client and store via Arc.
     pub fn clone_for_parallel(&self) -> Self {
-        Self {
-            llm: self.llm.clone(),
-            config: self.config.clone(),
-            store: self.store.clone_for_parallel(),
-        }
+        self.clone()
     }
 
     /// Evaluate a market candidate using Claude.

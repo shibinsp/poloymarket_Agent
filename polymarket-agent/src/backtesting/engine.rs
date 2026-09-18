@@ -280,6 +280,7 @@ mod tests {
                 base_url: None,
                 input_price_per_million: None,
                 output_price_per_million: None,
+                max_tokens: 1024,
                 min_edge_threshold: dec!(0.05),
                 high_confidence_edge: dec!(0.03),
                 low_confidence_edge: dec!(0.08),

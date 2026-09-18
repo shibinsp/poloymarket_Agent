@@ -19,13 +19,9 @@ use tracing::{info, instrument, warn};
 use crate::config::{LlmProvider, ValuationConfig};
 use crate::db::store::{ApiCostRecord, Store};
 
-/// Default Claude Sonnet pricing, used when the config doesn't override it.
-pub const ANTHROPIC_DEFAULT_INPUT_PRICE: Decimal = dec!(3.00);
-pub const ANTHROPIC_DEFAULT_OUTPUT_PRICE: Decimal = dec!(15.00);
 const MILLION: Decimal = dec!(1_000_000);
 
 const ANTHROPIC_DEFAULT_BASE_URL: &str = "https://api.anthropic.com/v1";
-const MAX_TOKENS: u32 = 1024;
 
 /// Typical valuation call shape, used to estimate spend before making it.
 pub const TYPICAL_INPUT_TOKENS: i64 = 2000;
@@ -37,6 +33,7 @@ pub struct LlmClient {
     model: String,
     provider: LlmProvider,
     base_url: String,
+    max_tokens: u32,
     input_price_per_million: Decimal,
     output_price_per_million: Decimal,
     store: Store,
@@ -70,7 +67,25 @@ impl LlmClient {
             ),
         };
 
+        // Sending Anthropic's x-api-key to an unrelated host would leak the
+        // credential; this usually means someone flipped `provider` back
+        // without clearing a base_url left over from another provider.
+        if config.provider == LlmProvider::Anthropic && base_url != ANTHROPIC_DEFAULT_BASE_URL {
+            warn!(
+                base_url = %base_url,
+                "provider is \"anthropic\" but base_url is not {ANTHROPIC_DEFAULT_BASE_URL} — \
+                 the Anthropic API key will be sent to this host"
+            );
+        }
+
         let (input_price_per_million, output_price_per_million) = config.effective_pricing();
+        if input_price_per_million.is_zero() && output_price_per_million.is_zero() {
+            warn!(
+                "Valuation pricing is $0 — the daily API budget cap, the edge-justifies-cost \
+                 gate and the self-funding survival check will all treat calls as free. Set \
+                 valuation.input_price_per_million/output_price_per_million if this endpoint bills you."
+            );
+        }
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
@@ -81,6 +96,7 @@ impl LlmClient {
             provider = ?config.provider,
             model = %config.model,
             base_url = %base_url,
+            max_tokens = config.max_tokens,
             input_price_per_million = %input_price_per_million,
             output_price_per_million = %output_price_per_million,
             "Valuation LLM configured"
@@ -92,6 +108,7 @@ impl LlmClient {
             model: config.model.clone(),
             provider: config.provider,
             base_url,
+            max_tokens: config.max_tokens,
             input_price_per_million,
             output_price_per_million,
             store,
@@ -143,7 +160,7 @@ impl LlmClient {
     async fn complete_anthropic(&self, system: &str, user: &str) -> Result<(String, i64, i64)> {
         let request = AnthropicRequest {
             model: self.model.clone(),
-            max_tokens: MAX_TOKENS,
+            max_tokens: self.max_tokens,
             system: Some(system.to_string()),
             messages: vec![ChatMessage {
                 role: "user".to_string(),
@@ -185,7 +202,7 @@ impl LlmClient {
         // rather than a dedicated field.
         let request = OpenAiRequest {
             model: self.model.clone(),
-            max_tokens: MAX_TOKENS,
+            max_tokens: self.max_tokens,
             messages: vec![
                 ChatMessage {
                     role: "system".to_string(),
@@ -212,11 +229,21 @@ impl LlmClient {
         let parsed: OpenAiResponse =
             serde_json::from_str(&body).context("Failed to parse LLM API response")?;
 
-        let text = parsed
-            .choices
-            .first()
-            .map(|c| c.message.content.clone())
-            .unwrap_or_default();
+        let Some(choice) = parsed.choices.first() else {
+            bail!("LLM returned no choices (content filter or provider error)");
+        };
+
+        // A truncated completion is otherwise indistinguishable from a
+        // malformed one downstream, where the JSON parse simply fails.
+        if choice.finish_reason.as_deref() == Some("length") {
+            bail!(
+                "LLM response truncated at max_tokens ({}) — raise valuation.max_tokens; \
+                 reasoning models spend this budget before emitting the JSON schema",
+                self.max_tokens
+            );
+        }
+
+        let text = choice.message.content.clone().unwrap_or_default();
 
         // usage is optional in the OpenAI schema; absent means we can't bill it.
         let (input_tokens, output_tokens) = parsed
@@ -229,11 +256,16 @@ impl LlmClient {
 
     async fn read_success_body(response: reqwest::Response, label: &str) -> Result<String> {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
         if !status.is_success() {
+            // Best-effort on the error path: a body we can't read shouldn't
+            // mask the status code we already have.
+            let body = response.text().await.unwrap_or_default();
             bail!("{label} API error ({status}): {body}");
         }
-        Ok(body)
+        response
+            .text()
+            .await
+            .with_context(|| format!("Failed to read {label} API response body"))
     }
 
     fn cost(&self, input_tokens: i64, output_tokens: i64) -> Decimal {
@@ -273,11 +305,6 @@ impl LlmClient {
         };
         self.store.insert_api_cost(&record).await?;
         Ok(())
-    }
-
-    /// Get total API cost across all cycles.
-    pub async fn total_cost(&self) -> Result<Decimal> {
-        self.store.get_total_api_cost().await
     }
 }
 
@@ -347,12 +374,18 @@ struct OpenAiResponse {
 #[derive(Debug, Deserialize)]
 struct OpenAiChoice {
     message: OpenAiMessage,
+    /// "stop", "length", "content_filter", … Absent on some providers.
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct OpenAiMessage {
+    /// `Option` rather than `#[serde(default)] String`: reasoning models and
+    /// refusals return an explicit `"content": null`, which would otherwise
+    /// fail deserialization outright.
     #[serde(default)]
-    content: String,
+    content: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -373,7 +406,7 @@ pub struct LlmResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{body_json_schema, header, method, path};
+    use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn valuation_config(provider: LlmProvider, base_url: Option<String>) -> ValuationConfig {
@@ -383,6 +416,7 @@ mod tests {
             base_url,
             input_price_per_million: None,
             output_price_per_million: None,
+            max_tokens: 1024,
             min_edge_threshold: dec!(0.08),
             high_confidence_edge: dec!(0.06),
             low_confidence_edge: dec!(0.10),
@@ -396,8 +430,8 @@ mod tests {
         let cost = calculate_cost(
             1000,
             500,
-            ANTHROPIC_DEFAULT_INPUT_PRICE,
-            ANTHROPIC_DEFAULT_OUTPUT_PRICE,
+            crate::config::ANTHROPIC_DEFAULT_INPUT_PRICE,
+            crate::config::ANTHROPIC_DEFAULT_OUTPUT_PRICE,
         );
         // input: 1000 * 3.00 / 1_000_000 = 0.003
         // output: 500 * 15.00 / 1_000_000 = 0.0075
@@ -409,8 +443,8 @@ mod tests {
         let cost = calculate_cost(
             0,
             0,
-            ANTHROPIC_DEFAULT_INPUT_PRICE,
-            ANTHROPIC_DEFAULT_OUTPUT_PRICE,
+            crate::config::ANTHROPIC_DEFAULT_INPUT_PRICE,
+            crate::config::ANTHROPIC_DEFAULT_OUTPUT_PRICE,
         );
         assert_eq!(cost, Decimal::ZERO);
     }
@@ -420,8 +454,8 @@ mod tests {
         let cost = calculate_cost(
             100_000,
             4_000,
-            ANTHROPIC_DEFAULT_INPUT_PRICE,
-            ANTHROPIC_DEFAULT_OUTPUT_PRICE,
+            crate::config::ANTHROPIC_DEFAULT_INPUT_PRICE,
+            crate::config::ANTHROPIC_DEFAULT_OUTPUT_PRICE,
         );
         assert_eq!(cost, dec!(0.36));
     }
@@ -484,7 +518,15 @@ mod tests {
             .and(path("/messages"))
             .and(header("x-api-key", "secret-key"))
             .and(header("anthropic-version", "2023-06-01"))
-            .and(body_json_schema::<serde_json::Value>)
+            // Assert the actual Anthropic shape: system is its own top-level
+            // field and messages carries only the user turn. Without this the
+            // test passes even if the two request builders are swapped.
+            .and(body_partial_json(serde_json::json!({
+                "model": "test-model",
+                "max_tokens": 1024,
+                "system": "sys",
+                "messages": [{"role": "user", "content": "user"}]
+            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "content": [{"type": "text", "text": "hello from claude"}],
                 "usage": {"input_tokens": 1000, "output_tokens": 500}
@@ -513,6 +555,15 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(header("authorization", "Bearer nvapi-test"))
+            // OpenAI carries the system prompt as messages[0], not a field.
+            .and(body_partial_json(serde_json::json!({
+                "model": "test-model",
+                "max_tokens": 1024,
+                "messages": [
+                    {"role": "system", "content": "sys"},
+                    {"role": "user", "content": "user"}
+                ]
+            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "choices": [{"message": {"role": "assistant", "content": "hello from nim"}}],
                 "usage": {"prompt_tokens": 1000, "completion_tokens": 500}
@@ -557,6 +608,91 @@ mod tests {
         assert_eq!(resp.text, "no usage block");
         assert_eq!(resp.input_tokens, 0);
         assert_eq!(resp.cost, Decimal::ZERO);
+    }
+
+    #[tokio::test]
+    async fn openai_compatible_tolerates_null_content() {
+        // Reasoning models and refusals return an explicit content: null.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": null},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 0}
+            })))
+            .mount(&server)
+            .await;
+
+        let store = Store::new(":memory:").await.unwrap();
+        let client = LlmClient::new(
+            "k".to_string(),
+            &valuation_config(LlmProvider::OpenAiCompatible, Some(server.uri())),
+            store,
+        )
+        .unwrap();
+
+        let resp = client.complete("sys", "user", None).await.unwrap();
+        assert_eq!(resp.text, "");
+    }
+
+    #[tokio::test]
+    async fn truncated_completion_is_reported_clearly() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": "{\"probability\": 0."},
+                    "finish_reason": "length"
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 1024}
+            })))
+            .mount(&server)
+            .await;
+
+        let store = Store::new(":memory:").await.unwrap();
+        let client = LlmClient::new(
+            "k".to_string(),
+            &valuation_config(LlmProvider::OpenAiCompatible, Some(server.uri())),
+            store,
+        )
+        .unwrap();
+
+        let err = client.complete("sys", "user", None).await.unwrap_err();
+        assert!(
+            err.to_string().contains("truncated at max_tokens"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_choices_is_an_error_not_an_empty_string() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 0}
+            })))
+            .mount(&server)
+            .await;
+
+        let store = Store::new(":memory:").await.unwrap();
+        let client = LlmClient::new(
+            "k".to_string(),
+            &valuation_config(LlmProvider::OpenAiCompatible, Some(server.uri())),
+            store,
+        )
+        .unwrap();
+
+        let err = client.complete("sys", "user", None).await.unwrap_err();
+        assert!(
+            err.to_string().contains("no choices"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

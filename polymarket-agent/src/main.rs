@@ -135,14 +135,19 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
 
     // 4. Test the valuation model end to end — wrong provider/base_url/model
     // combinations otherwise only surface mid-cycle, after a scan has run.
+    // Failures are recorded and reported at the summary rather than returned
+    // here, so one bad setting doesn't hide the remaining checks.
     println!("4. Valuation Model:");
+    let mut failures: Vec<String> = Vec::new();
     match &secrets.llm_api_key {
         Some(key) => {
-            let llm_store = Store::from_pool(store.pool().clone());
+            // Probe against a throwaway in-memory store: the real one would
+            // record this call in api_costs and eat into the daily budget.
+            let probe_store = Store::new(":memory:").await?;
             match polymarket_agent::valuation::llm::LlmClient::new(
                 key.clone(),
                 &config.valuation,
-                llm_store,
+                probe_store,
             ) {
                 Ok(client) => {
                     println!("   Provider: {:?}", config.valuation.provider);
@@ -167,13 +172,13 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
                         }
                         Err(e) => {
                             println!("   ❌ Call failed: {e}");
-                            return Err(e.context("Valuation model check failed"));
+                            failures.push(format!("valuation model call failed: {e}"));
                         }
                     }
                 }
                 Err(e) => {
                     println!("   ❌ Misconfigured: {e}");
-                    return Err(e.context("Valuation model misconfigured"));
+                    failures.push(format!("valuation model misconfigured: {e}"));
                 }
             }
         }
@@ -225,6 +230,13 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
 
     // 7. Summary
     println!("=== Dry Run Summary ===");
+    if !failures.is_empty() {
+        println!("❌ {} check(s) failed:", failures.len());
+        for f in &failures {
+            println!("   - {f}");
+        }
+        return Err(anyhow::anyhow!("Dry run failed: {}", failures.join("; ")));
+    }
     println!("All systems operational. The agent is ready to run.");
     println!();
     println!("Next steps:");

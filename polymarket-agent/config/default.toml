@@ -25,9 +25,9 @@ categories = ["weather", "sports", "crypto", "politics"]
 # Pricing defaults to $0 for openai_compatible — set input/output prices below
 # if your endpoint bills you, otherwise the daily budget cap and the
 # edge-justifies-cost gate will both treat calls as free.
-provider = "openai_compatible"
-model = "deepseek-ai/deepseek-v4-flash-0731"
-base_url = "https://integrate.api.nvidia.com/v1"
+provider = "anthropic"
+model = "claude-sonnet-4-20250514"
+# base_url = "https://api.anthropic.com/v1"
 # input_price_per_million = 3.00
 # output_price_per_million = 15.00
 min_edge_threshold = 0.08
