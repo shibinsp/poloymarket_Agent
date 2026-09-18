@@ -58,8 +58,9 @@ cp .env.example .env
 Edit `.env` — you only need ONE key for paper mode:
 
 ```env
-# REQUIRED — this is the only thing that costs real money (~$0.009/call)
-ANTHROPIC_API_KEY=sk-ant-your-key-here
+# REQUIRED — the valuation model key. LLM_API_KEY wins; ANTHROPIC_API_KEY is
+# read as a fallback. With provider = "anthropic" this costs ~$0.009/call.
+LLM_API_KEY=sk-ant-your-key-here
 
 # OPTIONAL — leave as placeholders, not needed for paper mode
 POLYMARKET_PRIVATE_KEY=0x0000000000000000000000000000000000000000000000000000000000000000

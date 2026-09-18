@@ -7,3 +7,6 @@
 *.pem
 *.key
 .DS_Store
+
+# Local per-machine config (see CONFIG_PATH)
+config/local.toml

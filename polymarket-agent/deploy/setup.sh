@@ -76,6 +76,8 @@ if [ ! -f "$ENV_FILE" ]; then
 # Polymarket Agent Environment Variables
 # Fill in your actual keys before starting the service
 
+# Valuation model key (LLM_API_KEY wins; ANTHROPIC_API_KEY is a fallback)
+LLM_API_KEY=
 ANTHROPIC_API_KEY=
 POLYMARKET_PRIVATE_KEY=
 DISCORD_WEBHOOK_URL=

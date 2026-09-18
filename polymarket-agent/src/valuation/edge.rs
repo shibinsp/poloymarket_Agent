@@ -111,7 +111,12 @@ mod tests {
 
     fn test_config() -> ValuationConfig {
         ValuationConfig {
-            claude_model: "claude-sonnet-4-20250514".to_string(),
+            provider: crate::config::LlmProvider::Anthropic,
+            model: "claude-sonnet-4-20250514".to_string(),
+            base_url: None,
+            input_price_per_million: None,
+            output_price_per_million: None,
+            max_tokens: 1024,
             min_edge_threshold: dec!(0.08),
             high_confidence_edge: dec!(0.06),
             low_confidence_edge: dec!(0.10),

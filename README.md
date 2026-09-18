@@ -147,7 +147,8 @@ cargo run --release
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `ANTHROPIC_API_KEY` | Yes (paper/live) | Claude API key for market valuation |
+| `LLM_API_KEY` | Yes (paper/live) | API key for the configured valuation provider. Falls back to `ANTHROPIC_API_KEY`. |
+| `ANTHROPIC_API_KEY` | — | Legacy fallback for `LLM_API_KEY`. |
 | `POLYMARKET_PRIVATE_KEY` | Yes (live) | Ethereum private key for signing orders |
 | `DISCORD_WEBHOOK_URL` | No | Discord webhook for trade/status alerts |
 | `NOAA_API_TOKEN` | No | NOAA weather API for weather market data |
@@ -183,7 +184,10 @@ cargo run --release
 **Valuation:**
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `claude_model` | `"claude-sonnet-4-20250514"` | Claude model for valuations |
+| `provider` | `"anthropic"` | `anthropic` or `openai_compatible` (NVIDIA NIM, vLLM, OpenRouter, …) |
+| `model` | `"claude-sonnet-4-20250514"` | Model id as the provider names it (accepts the old `claude_model` key) |
+| `base_url` | provider default | API root. Required for `openai_compatible`, e.g. `https://integrate.api.nvidia.com/v1` |
+| `input_price_per_million` / `output_price_per_million` | provider default | Cost-tracking rates. Default to Claude pricing for `anthropic` and **$0** for `openai_compatible` — set them if your endpoint bills you, or the daily budget cap treats calls as free |
 | `min_edge_threshold` | `0.08` | Minimum edge to trade (8%) |
 | `high_confidence_edge` | `0.06` | Reduced threshold at high confidence |
 | `low_confidence_edge` | `0.10` | Raised threshold at low confidence |

@@ -17,7 +17,7 @@ use crate::data::quality::compute_data_quality;
 use crate::data::DataPoint;
 use crate::db::store::Store;
 use crate::market::models::{MarketCandidate, OrderBookSnapshot};
-use crate::valuation::claude::ClaudeClient;
+use crate::valuation::llm::LlmClient;
 use sqlx;
 
 /// Claude's structured valuation response.
@@ -85,7 +85,7 @@ pub enum TimeSensitivity {
 }
 
 pub struct ValuationEngine {
-    claude: Arc<ClaudeClient>,
+    llm: Arc<LlmClient>,
     config: ValuationConfig,
     store: Store,
 }
@@ -93,7 +93,7 @@ pub struct ValuationEngine {
 impl Clone for ValuationEngine {
     fn clone(&self) -> Self {
         Self {
-            claude: self.claude.clone(),
+            llm: self.llm.clone(),
             config: self.config.clone(),
             store: self.store.clone_for_parallel(),
         }
@@ -101,22 +101,14 @@ impl Clone for ValuationEngine {
 }
 
 impl ValuationEngine {
-    pub fn new(claude: Arc<ClaudeClient>, config: ValuationConfig, store: Store) -> Self {
-        Self {
-            claude,
-            config,
-            store,
-        }
+    pub fn new(llm: Arc<LlmClient>, config: ValuationConfig, store: Store) -> Self {
+        Self { llm, config, store }
     }
 
     /// Create a clone for use in parallel evaluation tasks.
-    /// Shares the same underlying Claude client and store via Arc.
+    /// Shares the same underlying LLM client and store via Arc.
     pub fn clone_for_parallel(&self) -> Self {
-        Self {
-            claude: self.claude.clone(),
-            config: self.config.clone(),
-            store: self.store.clone_for_parallel(),
-        }
+        self.clone()
     }
 
     /// Evaluate a market candidate using Claude.
@@ -152,18 +144,18 @@ impl ValuationEngine {
         let system_prompt = build_system_prompt();
         let user_prompt = build_user_prompt(candidate, data_points);
 
-        // Call Claude
+        // Call the valuation model
         let response = self
-            .claude
+            .llm
             .complete(&system_prompt, &user_prompt, Some(cycle))
             .await
-            .context("Claude valuation call failed")?;
+            .context("LLM valuation call failed")?;
 
         // Parse JSON response
         let mut result = parse_valuation_response(&response.text)
-            .context("Failed to parse Claude valuation response")?;
+            .context("Failed to parse LLM valuation response")?;
 
-        // Override Claude's self-reported data quality with programmatic assessment (HAL-04)
+        // Override the model's self-reported data quality with programmatic assessment (HAL-04)
         result.data_quality = compute_data_quality(data_points);
 
         // Validate probability bounds
@@ -259,8 +251,7 @@ impl ValuationEngine {
 
     /// Estimate the cost of the next valuation API call.
     pub fn estimated_call_cost(&self) -> Decimal {
-        // Average Claude valuation call: ~2000 input tokens, ~300 output tokens
-        crate::valuation::claude::calculate_cost(2000, 300)
+        self.llm.estimated_call_cost()
     }
 }
 

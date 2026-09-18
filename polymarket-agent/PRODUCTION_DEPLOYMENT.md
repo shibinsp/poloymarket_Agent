@@ -29,7 +29,7 @@ cargo run -- --dry-run
 - [ ] `cargo test` passes (145/145)
 - [ ] `cargo clippy -- -D warnings` is clean
 - [ ] `cargo run -- --dry-run` shows all green checkmarks
-- [ ] `ANTHROPIC_API_KEY` is set (required for paper/live)
+- [ ] `LLM_API_KEY` is set (or `ANTHROPIC_API_KEY` as fallback) — required for paper/live
 - [ ] `POLYMARKET_PRIVATE_KEY` is set (required for live mode only)
 
 ---

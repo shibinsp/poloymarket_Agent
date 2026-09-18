@@ -52,13 +52,72 @@ pub struct ScanningConfig {
     pub categories: Vec<String>,
 }
 
+/// Claude Sonnet list pricing, used when an Anthropic config doesn't override it.
+pub const ANTHROPIC_DEFAULT_INPUT_PRICE: Decimal = rust_decimal_macros::dec!(3.00);
+pub const ANTHROPIC_DEFAULT_OUTPUT_PRICE: Decimal = rust_decimal_macros::dec!(15.00);
+
+fn default_max_tokens() -> u32 {
+    1024
+}
+
+/// Wire format the valuation LLM speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmProvider {
+    /// Anthropic Messages API (`/v1/messages`, `x-api-key`).
+    #[default]
+    Anthropic,
+    /// Any OpenAI-compatible chat-completions endpoint — NVIDIA NIM, vLLM,
+    /// OpenRouter, Together. Requires `base_url`.
+    // Pinned explicitly: snake_case would derive "open_ai_compatible".
+    #[serde(rename = "openai_compatible", alias = "open_ai_compatible")]
+    OpenAiCompatible,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ValuationConfig {
-    pub claude_model: String,
+    #[serde(default)]
+    pub provider: LlmProvider,
+    /// Model identifier as the provider names it.
+    #[serde(alias = "claude_model")]
+    pub model: String,
+    /// API root (no trailing `/chat/completions` or `/messages`). Required for
+    /// `openai_compatible`; defaults to Anthropic's endpoint otherwise.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Cost tracking rates. Default to Claude Sonnet pricing for Anthropic and
+    /// to zero for `openai_compatible` (free tiers and self-hosted models) —
+    /// set these if your endpoint actually bills you, or the daily API budget
+    /// and the edge-justifies-cost gate will both think calls are free.
+    #[serde(default)]
+    pub input_price_per_million: Option<Decimal>,
+    #[serde(default)]
+    pub output_price_per_million: Option<Decimal>,
+    /// Response token budget. Reasoning models spend this on chain-of-thought
+    /// before emitting the JSON schema, so they need considerably more.
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: u32,
     pub min_edge_threshold: Decimal,
     pub high_confidence_edge: Decimal,
     pub low_confidence_edge: Decimal,
     pub cache_ttl_seconds: u64,
+}
+
+impl ValuationConfig {
+    /// Per-million input/output rates, falling back to provider defaults.
+    pub fn effective_pricing(&self) -> (Decimal, Decimal) {
+        let (default_in, default_out) = match self.provider {
+            LlmProvider::Anthropic => (
+                ANTHROPIC_DEFAULT_INPUT_PRICE,
+                ANTHROPIC_DEFAULT_OUTPUT_PRICE,
+            ),
+            LlmProvider::OpenAiCompatible => (Decimal::ZERO, Decimal::ZERO),
+        };
+        (
+            self.input_price_per_million.unwrap_or(default_in),
+            self.output_price_per_million.unwrap_or(default_out),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -127,7 +186,9 @@ impl DatabaseConfig {
 /// Not serializable, not stored in config files.
 pub struct Secrets {
     pub polymarket_private_key: Option<String>,
-    pub anthropic_api_key: Option<String>,
+    /// API key for the configured valuation provider. Read from `LLM_API_KEY`,
+    /// falling back to `ANTHROPIC_API_KEY`.
+    pub llm_api_key: Option<String>,
     pub discord_webhook_url: Option<String>,
     pub noaa_api_token: Option<String>,
     pub espn_api_key: Option<String>,
@@ -136,15 +197,27 @@ pub struct Secrets {
     pub dashboard_token: Option<String>,
 }
 
+/// Read an env var, treating blank/whitespace-only as unset.
+fn non_empty_env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 impl Secrets {
     pub fn from_env() -> Self {
         Self {
-            polymarket_private_key: std::env::var("POLYMARKET_PRIVATE_KEY").ok(),
-            anthropic_api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
-            discord_webhook_url: std::env::var("DISCORD_WEBHOOK_URL").ok(),
-            noaa_api_token: std::env::var("NOAA_API_TOKEN").ok(),
-            espn_api_key: std::env::var("ESPN_API_KEY").ok(),
-            dashboard_token: std::env::var("DASHBOARD_TOKEN").ok(),
+            polymarket_private_key: non_empty_env("POLYMARKET_PRIVATE_KEY"),
+            // An unset var and one set to "" must behave the same, or the
+            // blank `LLM_API_KEY=` line in .env.example would shadow the
+            // ANTHROPIC_API_KEY fallback with Some("").
+            llm_api_key: non_empty_env("LLM_API_KEY")
+                .or_else(|| non_empty_env("ANTHROPIC_API_KEY")),
+            discord_webhook_url: non_empty_env("DISCORD_WEBHOOK_URL"),
+            noaa_api_token: non_empty_env("NOAA_API_TOKEN"),
+            espn_api_key: non_empty_env("ESPN_API_KEY"),
+            dashboard_token: non_empty_env("DASHBOARD_TOKEN"),
         }
     }
 }
@@ -190,6 +263,104 @@ mod tests {
         assert_eq!(config.agent.cycle_interval_seconds, 600);
         assert_eq!(config.scanning.max_markets, 1000);
         assert_eq!(config.polymarket.chain_id, 137);
+    }
+
+    #[test]
+    fn legacy_claude_model_key_still_parses() {
+        // Configs written before the provider abstraction only had
+        // `claude_model` and no `provider`; they must keep working.
+        let legacy = r#"
+            claude_model = "claude-sonnet-4-20250514"
+            min_edge_threshold = 0.08
+            high_confidence_edge = 0.06
+            low_confidence_edge = 0.10
+            cache_ttl_seconds = 300
+        "#;
+        let cfg: ValuationConfig = toml::from_str(legacy).expect("legacy config should parse");
+        assert_eq!(cfg.provider, LlmProvider::Anthropic);
+        assert_eq!(cfg.model, "claude-sonnet-4-20250514");
+        assert_eq!(cfg.base_url, None);
+        // Falls back to Claude pricing so cost tracking is unchanged.
+        assert_eq!(
+            cfg.effective_pricing(),
+            (
+                ANTHROPIC_DEFAULT_INPUT_PRICE,
+                ANTHROPIC_DEFAULT_OUTPUT_PRICE
+            )
+        );
+    }
+
+    #[test]
+    fn openai_compatible_provider_parses_and_defaults_to_free() {
+        let cfg: ValuationConfig = toml::from_str(
+            r#"
+            provider = "openai_compatible"
+            model = "deepseek-ai/deepseek-v4-flash-0731"
+            base_url = "https://integrate.api.nvidia.com/v1"
+            min_edge_threshold = 0.08
+            high_confidence_edge = 0.06
+            low_confidence_edge = 0.10
+            cache_ttl_seconds = 300
+        "#,
+        )
+        .expect("should parse");
+        assert_eq!(cfg.provider, LlmProvider::OpenAiCompatible);
+        assert_eq!(cfg.effective_pricing(), (Decimal::ZERO, Decimal::ZERO));
+    }
+
+    #[test]
+    fn explicit_pricing_overrides_provider_defaults() {
+        let cfg: ValuationConfig = toml::from_str(
+            r#"
+            provider = "openai_compatible"
+            model = "m"
+            base_url = "https://example.invalid/v1"
+            input_price_per_million = 0.5
+            output_price_per_million = 1.5
+            min_edge_threshold = 0.08
+            high_confidence_edge = 0.06
+            low_confidence_edge = 0.10
+            cache_ttl_seconds = 300
+        "#,
+        )
+        .expect("should parse");
+        assert_eq!(
+            cfg.effective_pricing(),
+            (
+                rust_decimal_macros::dec!(0.5),
+                rust_decimal_macros::dec!(1.5)
+            )
+        );
+    }
+
+    #[test]
+    fn blank_env_var_is_treated_as_unset() {
+        // .env.example ships a blank `LLM_API_KEY=`; if that shadowed the
+        // ANTHROPIC_API_KEY fallback, the agent would start "enabled" and 401
+        // on every call.
+        std::env::set_var("BLANK_ENV_TEST", "");
+        assert_eq!(non_empty_env("BLANK_ENV_TEST"), None);
+        std::env::set_var("BLANK_ENV_TEST", "   ");
+        assert_eq!(non_empty_env("BLANK_ENV_TEST"), None);
+        std::env::set_var("BLANK_ENV_TEST", " value ");
+        assert_eq!(non_empty_env("BLANK_ENV_TEST"), Some("value".to_string()));
+        std::env::remove_var("BLANK_ENV_TEST");
+    }
+
+    #[test]
+    fn max_tokens_defaults_but_is_overridable() {
+        let base = r#"
+            model = "m"
+            min_edge_threshold = 0.08
+            high_confidence_edge = 0.06
+            low_confidence_edge = 0.10
+            cache_ttl_seconds = 300
+        "#;
+        let cfg: ValuationConfig = toml::from_str(base).unwrap();
+        assert_eq!(cfg.max_tokens, 1024);
+
+        let cfg: ValuationConfig = toml::from_str(&format!("max_tokens = 8192\n{base}")).unwrap();
+        assert_eq!(cfg.max_tokens, 8192);
     }
 
     #[test]
