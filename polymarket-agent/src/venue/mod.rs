@@ -6,6 +6,7 @@
 //! boxed implementations, and per-venue error isolation so one broken
 //! exchange can't stop the cycle.
 
+pub mod polymarket;
 pub mod session;
 pub mod types;
 

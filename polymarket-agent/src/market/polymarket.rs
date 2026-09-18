@@ -36,6 +36,7 @@ use crate::config::{AgentMode, AppConfig, RateLimitConfig, Secrets};
 use crate::market::models::{
     Market, OrderBookSnapshot, PriceHistoryPoint, PriceLevel, Side, TokenInfo,
 };
+use crate::venue::types::{OrderState as VenueOrderState, Side as VenueSide};
 
 type Limiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
@@ -52,7 +53,7 @@ pub struct MarketFilters {
 #[allow(dead_code)]
 struct PaperPosition {
     pub token_id: String,
-    pub side: Side,
+    pub side: VenueSide,
     pub size: Decimal,
     pub entry_price: Decimal,
 }
@@ -63,12 +64,21 @@ struct PaperPosition {
 struct PaperOrder {
     pub order_id: String,
     pub token_id: String,
-    pub side: Side,
+    pub side: VenueSide,
     pub price: Decimal,
     pub size: Decimal,
     pub filled: bool,
     /// Whether this order was filled with adverse selection (price moved against us).
     pub adverse_selection: bool,
+}
+
+/// What a venue-semantics order placement produced.
+#[derive(Debug, Clone)]
+pub struct TokenOrderOutcome {
+    pub order_id: String,
+    pub state: VenueOrderState,
+    pub filled_qty: Decimal,
+    pub avg_fill_price: Option<Decimal>,
 }
 
 /// Result of a paper trading fill simulation.
@@ -387,14 +397,18 @@ impl PolymarketClient {
         size: Decimal,
     ) -> Result<String> {
         match self.config.agent.mode {
-            AgentMode::Paper => self.paper_place_order(token_id, side, price, size).await,
+            AgentMode::Paper => {
+                self.paper_place_order(token_id, VenueSide::Buy, price, size)
+                    .await
+            }
             AgentMode::Live => {
                 self.live_place_limit_order(token_id, side, price, size)
                     .await
             }
             AgentMode::Backtest => {
                 // In backtest mode, simulate orders same as paper trading
-                self.paper_place_order(token_id, side, price, size).await
+                self.paper_place_order(token_id, VenueSide::Buy, price, size)
+                    .await
             }
         }
     }
@@ -417,9 +431,11 @@ impl PolymarketClient {
         let sdk_size = SdkDecimal::from_str(&size.to_string())
             .context("Failed to convert size to SDK decimal")?;
 
+        // An entry is a BUY of whichever outcome token was selected — the
+        // token id already says which outcome. Mapping Side::No to a SELL
+        // (as this did) tried to sell NO shares the wallet doesn't hold.
         let clob_side = match side {
-            Side::Yes => ClobSide::Buy,
-            Side::No => ClobSide::Sell,
+            Side::Yes | Side::No => ClobSide::Buy,
         };
 
         // Build limit order (GTD = Good Till Date, 7 day expiry)
@@ -566,25 +582,18 @@ impl PolymarketClient {
     ) -> Result<String> {
         match self.config.agent.mode {
             AgentMode::Paper => {
-                // In paper mode, just simulate the exit
-                info!(
-                    token_id,
-                    side = %side,
-                    price = %price,
-                    size = %size,
-                    "Paper position exited (simulated)"
-                );
-                Ok(format!("paper_exit_{token_id}"))
+                // Run the exit through the same fill simulator as an entry so
+                // the balance and fill price reflect it. Previously this was a
+                // log line that returned a fake id, so paper exits never
+                // realised any P&L.
+                self.paper_place_order(token_id, VenueSide::Sell, price, size)
+                    .await
             }
             AgentMode::Live => {
-                // In live mode, place a sell order to exit
-                // The exit side is opposite to the original buy side
-                let exit_side = match side {
-                    Side::Yes => ClobSide::Sell, // Selling YES tokens
-                    Side::No => ClobSide::Buy,   // Buying back NO tokens (equivalent to selling)
-                };
-
-                self.live_place_limit_order_with_side(token_id, exit_side, price, size)
+                // Exiting means selling the outcome token we hold, whichever
+                // outcome it is — the token id already identifies it.
+                let _ = side;
+                self.live_place_limit_order_with_side(token_id, ClobSide::Sell, price, size)
                     .await
             }
             AgentMode::Backtest => Ok(format!("backtest_exit_{token_id}")),
@@ -646,6 +655,66 @@ impl PolymarketClient {
         Ok(response.order_id)
     }
 
+    // === Venue-semantics order placement ===
+
+    /// Place an order on one outcome token with explicit buy/sell semantics.
+    ///
+    /// `place_limit_order` treats YES/NO as *sides*, which is what forced
+    /// buying NO to be sent as a SELL. Here the token id identifies the
+    /// outcome and the side means exactly what it says, so the venue adapter
+    /// can express "buy the NO token" without any inversion.
+    ///
+    /// Unlike the legacy path this also returns what actually filled, rather
+    /// than discarding the simulator's fill price and size.
+    pub(crate) async fn place_token_order(
+        &self,
+        token_id: &str,
+        side: VenueSide,
+        price: Decimal,
+        size: Decimal,
+    ) -> Result<TokenOrderOutcome> {
+        match self.config.agent.mode {
+            AgentMode::Paper | AgentMode::Backtest => {
+                let fill = self
+                    .simulate_paper_fill(token_id, side, price, size)
+                    .await?;
+                Ok(if fill.filled {
+                    TokenOrderOutcome {
+                        order_id: fill.order_id,
+                        state: VenueOrderState::Filled,
+                        filled_qty: fill.fill_size,
+                        avg_fill_price: Some(fill.fill_price),
+                    }
+                } else {
+                    // Resting unfilled is a normal outcome, not an error.
+                    TokenOrderOutcome {
+                        order_id: fill.order_id,
+                        state: VenueOrderState::Accepted,
+                        filled_qty: Decimal::ZERO,
+                        avg_fill_price: None,
+                    }
+                })
+            }
+            AgentMode::Live => {
+                let clob_side = match side {
+                    VenueSide::Buy => ClobSide::Buy,
+                    VenueSide::Sell => ClobSide::Sell,
+                };
+                let order_id = self
+                    .live_place_limit_order_with_side(token_id, clob_side, price, size)
+                    .await?;
+                // Accepted, not Filled: the CLOB returning an id says nothing
+                // about whether it filled. Confirmation is the caller's job.
+                Ok(TokenOrderOutcome {
+                    order_id,
+                    state: VenueOrderState::Accepted,
+                    filled_qty: Decimal::ZERO,
+                    avg_fill_price: None,
+                })
+            }
+        }
+    }
+
     // === Paper Trading ===
 
     /// Place a paper order with realistic fill simulation.
@@ -657,7 +726,7 @@ impl PolymarketClient {
     async fn paper_place_order(
         &self,
         token_id: &str,
-        side: Side,
+        side: VenueSide,
         price: Decimal,
         size: Decimal,
     ) -> Result<String> {
@@ -681,7 +750,7 @@ impl PolymarketClient {
     async fn simulate_paper_fill(
         &self,
         token_id: &str,
-        side: Side,
+        side: VenueSide,
         price: Decimal,
         size: Decimal,
     ) -> Result<PaperFillResult> {
@@ -740,24 +809,33 @@ impl PolymarketClient {
             // Price moved 1-3% against us at fill time
             let slippage_pct = dec!(0.01) + (dec!(0.02) * Decimal::from(seed % 100) / dec!(100));
             match side {
-                Side::Yes => price * (dec!(1) + slippage_pct), // Pay more for YES
-                Side::No => price * (dec!(1) - slippage_pct),  // Get less for NO
+                // A buy fills worse by paying more; a sell by receiving less.
+                VenueSide::Buy => price * (dec!(1) + slippage_pct),
+                VenueSide::Sell => price * (dec!(1) - slippage_pct),
             }
         } else {
             price
         };
 
-        let cost = adverse_slippage * actual_size;
+        let notional = adverse_slippage * actual_size;
 
-        if cost > state.balance {
-            bail!(
-                "Insufficient paper balance: {} < cost {}",
-                state.balance,
-                cost
-            );
+        match side {
+            VenueSide::Buy => {
+                if notional > state.balance {
+                    bail!(
+                        "Insufficient paper balance: {} < cost {}",
+                        state.balance,
+                        notional
+                    );
+                }
+                state.balance -= notional;
+            }
+            // Closing a position returns cash rather than spending it; the
+            // previous code debited every order, so paper exits destroyed
+            // balance instead of realising it.
+            VenueSide::Sell => state.balance += notional,
         }
 
-        state.balance -= cost;
         state.positions.push(PaperPosition {
             token_id: token_id.to_string(),
             side,
@@ -1005,7 +1083,7 @@ fn convert_order_book(token_id: &str, response: &OrderBookSummaryResponse) -> Or
 
 /// Compute fill probability based on order aggressiveness.
 /// Orders at or inside the spread fill more often; outside fill less.
-fn compute_fill_probability(_side: Side, _price: Decimal, seed: u64) -> Decimal {
+fn compute_fill_probability(_side: VenueSide, _price: Decimal, seed: u64) -> Decimal {
     // Base fill rate: 70% for aggressive orders
     let base = dec!(0.70);
 

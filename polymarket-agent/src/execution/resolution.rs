@@ -140,14 +140,14 @@ pub async fn check_and_settle(
 }
 
 /// Parsed resolution state for a market.
-struct MarketResolution {
+pub(crate) struct MarketResolution {
     /// Whether YES won (YES outcome price = 1.0).
-    yes_won: bool,
+    pub(crate) yes_won: bool,
 }
 
 /// Fetch market resolution status from Gamma API.
 /// Returns `Ok(None)` if the market hasn't resolved yet.
-async fn fetch_market_resolution(
+pub(crate) async fn fetch_market_resolution(
     http: &reqwest::Client,
     gamma_base_url: &str,
     condition_id: &str,
