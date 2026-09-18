@@ -17,6 +17,9 @@ pub struct AppConfig {
     pub polymarket: PolymarketConfig,
     pub rate_limit: RateLimitConfig,
     pub database: DatabaseConfig,
+    /// Trading venues. Empty keeps the legacy Polymarket-only behaviour.
+    #[serde(default)]
+    pub venues: Vec<VenueConfig>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -103,6 +106,61 @@ pub struct ValuationConfig {
     pub high_confidence_edge: Decimal,
     pub low_confidence_edge: Decimal,
     pub cache_ttl_seconds: u64,
+}
+
+impl AppConfig {
+    /// Symbol universe the venue loop trades. Continuous assets need an
+    /// explicit universe — unlike prediction markets, they aren't discovered.
+    pub fn venue_symbols(&self) -> Vec<String> {
+        self.venues
+            .iter()
+            .filter(|v| v.enabled)
+            .flat_map(|v| v.symbols.clone())
+            .collect()
+    }
+
+    /// Per-side taker fee assumed when netting edge against costs.
+    pub fn venue_fee_pct(&self) -> Decimal {
+        self.venues
+            .iter()
+            .filter(|v| v.enabled)
+            .map(|v| v.fee_pct)
+            .max()
+            .unwrap_or(rust_decimal_macros::dec!(0.0025))
+    }
+
+    /// Minimum probability-of-up before a directional view is tradeable.
+    pub fn min_p_up(&self) -> Decimal {
+        rust_decimal_macros::dec!(0.55)
+    }
+
+    /// Cap on orders opened in a single cycle.
+    pub fn max_orders_per_cycle(&self) -> usize {
+        2
+    }
+}
+
+/// One configured trading venue.
+#[derive(Debug, Clone, Deserialize)]
+pub struct VenueConfig {
+    pub id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub data_url: Option<String>,
+    /// Explicit universe for continuous assets.
+    #[serde(default)]
+    pub symbols: Vec<String>,
+    /// Per-side taker fee as a fraction.
+    #[serde(default = "default_fee_pct")]
+    pub fee_pct: Decimal,
+}
+
+fn default_fee_pct() -> Decimal {
+    rust_decimal_macros::dec!(0.0025)
 }
 
 impl ValuationConfig {

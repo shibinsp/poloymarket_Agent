@@ -68,3 +68,23 @@ backoff_max_ms = 30000
 
 [database]
 path = "polymarket-agent.db"
+
+# Trading venues. Leave empty to keep the legacy Polymarket-only loop.
+# Continuous assets (crypto, equities) need an explicit symbol universe —
+# unlike prediction markets they are not discovered.
+#
+# [[venues]]
+# id = "alpaca"
+# kind = "alpaca"
+# enabled = true
+# base_url = "https://paper-api.alpaca.markets"
+# data_url = "https://data.alpaca.markets"
+# symbols = ["BTC/USD", "ETH/USD", "SPY", "AAPL"]
+# fee_pct = 0.0025
+
+[sizing_continuous]
+risk_per_trade_pct = 0.0075     # fraction of bankroll risked if the stop hits
+atr_period = 14
+atr_multiplier = 2.0            # stop distance = ATR x this, then clamped
+min_stop_pct = 0.03
+max_stop_pct = 0.12
