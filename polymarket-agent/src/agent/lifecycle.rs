@@ -64,8 +64,10 @@ impl Agent {
 
         // Phase 4: Initialize valuation engine (only if API key is available)
         let valuation_engine = if let Some(ref api_key) = secrets.anthropic_api_key {
-            let claude_store = Store::new(&config.database.path).await?;
-            let valuation_store = Store::new(&config.database.path).await?;
+            // Share the caller's connection pool rather than opening (and
+            // migrating) two more against the same database file.
+            let claude_store = store.clone_for_parallel();
+            let valuation_store = store.clone_for_parallel();
             let claude_client = Arc::new(ClaudeClient::new(
                 api_key.clone(),
                 config.valuation.claude_model.clone(),
@@ -289,16 +291,25 @@ impl Agent {
         let costs = CycleCosts::new(cycle_api_cost);
         log_cost_breakdown(self.cycle_number, &costs, cumulative_api_cost);
 
-        // Log cycle results
+        // Log cycle results. The error is reported to the caller (so the
+        // consecutive-failure counter and health status in main.rs still
+        // work) but `cycle_number` advances below regardless, so the next
+        // call starts a genuinely new cycle instead of replaying this one's
+        // scanning, paid valuations and trades just to redo a bookkeeping
+        // write.
         let duration = start.elapsed();
-        self.log_cycle(
-            duration,
-            markets_scanned,
-            opportunities_found,
-            trades_placed,
-            cycle_api_cost,
-        )
-        .await?;
+        let log_result = self
+            .log_cycle(
+                duration,
+                markets_scanned,
+                opportunities_found,
+                trades_placed,
+                cycle_api_cost,
+            )
+            .await;
+        if let Err(ref e) = log_result {
+            warn!(error = %e, "Failed to record cycle summary");
+        }
 
         // Phase 8: Periodic metrics summary (every 10 cycles)
         if self.cycle_number > 0 && self.cycle_number % 10 == 0 {
@@ -315,7 +326,7 @@ impl Agent {
 
         self.cycle_number += 1;
 
-        Ok(())
+        log_result
     }
 
     /// Full pipeline: evaluate candidates → size with Kelly → check constraints → execute.

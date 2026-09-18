@@ -122,26 +122,27 @@ gh pr create \
 # Or create via GitHub web UI
 ```
 
-### CodeRabbit Review (Mandatory Before Merge)
-1. **Install CodeRabbit** — Ensure the [CodeRabbit](https://www.coderabbit.ai/) GitHub App is installed on the repository
-2. **Automatic review triggers** — CodeRabbit automatically reviews every PR when it's opened or when new commits are pushed
-3. **Review the feedback** — Check the PR comments from `@coderabbitai` for:
+### Code Review (Mandatory Before Merge)
+1. **CI must be green** — `.github/workflows/ci.yml` runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test --all-targets` on every PR. This is the hard gate; nothing merges on red CI.
+2. **Automated review** — If the [CodeRabbit](https://www.coderabbit.ai/) GitHub App is installed, it reviews every PR automatically; address its findings. **As of 2026-09-17 it is NOT installed on this repository** (no CodeRabbit activity on PRs #1–#9). Until it is, run `/code-review <PR number> high` in Claude Code and post the findings as a PR comment.
+3. **Review the feedback** for:
    - Bug risks and logic errors
    - Performance issues
    - Security concerns
    - Style and convention violations
    - Suggestions for improvement
-4. **Fix all issues** — Address every finding from CodeRabbit before merging:
+4. **Fix all issues** — Address every critical/high finding before merging:
    - Apply suggested fixes directly or adapt them to your context
    - Commit fixes to the same branch (the PR updates automatically)
-   - Re-request review if needed by commenting `@coderabbitai review`
-5. **No merge until clean** — Do not merge the PR until CodeRabbit has no outstanding critical issues
-6. **Override only with justification** — If you intentionally disagree with a CodeRabbit suggestion, add a comment in the PR explaining why
+   - Re-run the review after pushing fixes
+5. **One human review** — At least one person other than the author reads the diff before merge.
+6. **No merge until clean** — Do not merge the PR while critical findings are outstanding
+7. **Override only with justification** — If you intentionally disagree with a finding, add a comment in the PR explaining why
 
 ### PR Review Checklist
 Before merging, verify:
-- [ ] All CI checks pass (tests, clippy, build)
-- [ ] CodeRabbit review complete with no critical issues
+- [ ] All CI checks pass (fmt, clippy, tests)
+- [ ] Automated review (CodeRabbit if installed, otherwise `/code-review`) complete with no critical issues
 - [ ] Code follows project conventions
 - [ ] Tests cover new functionality
 - [ ] Documentation updated (README, RULES, etc.)
@@ -292,15 +293,15 @@ cargo build --release
 sudo systemctl restart polymarket-agent
 ```
 
-## CI/CD Rules (When Implemented)
+## CI/CD Rules
 
-1. **All PRs must pass CI** — no merging on red CI
+1. **All PRs must pass CI** — no merging on red CI. The workflow lives at `.github/workflows/ci.yml` and runs from the `polymarket-agent/` directory.
 2. **Required checks:**
-   - `cargo test` — all tests pass
-   - `cargo clippy -- -D warnings` — no lint warnings
-   - `cargo build` — compiles successfully
-   - `cargo fmt --check` — formatting correct
-3. **Auto-deploy on merge to main** — only after all checks pass
+   - `cargo fmt --all -- --check` — formatting correct
+   - `cargo clippy --all-targets -- -D warnings` — no lint warnings
+   - `cargo test --all-targets` — all tests pass
+3. **Branch protection** — `master` should require the CI check to pass before merge (configure in GitHub repository settings).
+4. **Auto-deploy on merge to main** (not yet implemented) — only after all checks pass
 
 ## Review Guidelines
 

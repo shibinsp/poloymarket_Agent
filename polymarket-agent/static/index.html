@@ -350,9 +350,63 @@ function truncate(s, max) {
   return s.length > max ? s.substring(0, max) + '...' : s;
 }
 
-async function fetchJson(url) {
+const TOKEN_KEY = 'dashboard_token';
+const DECLINE_COOLDOWN_MS = 5 * 60 * 1000;
+
+function getToken() {
+  try { return localStorage.getItem(TOKEN_KEY) || ''; } catch { return ''; }
+}
+
+function setToken(token) {
+  try { localStorage.setItem(TOKEN_KEY, token); } catch { /* storage unavailable */ }
+}
+
+// The four requests in one refresh() tick can all 401 at once; without this,
+// each would pop its own window.prompt. Coalesce them into a single prompt,
+// and don't re-nag every 30s tick after the user explicitly cancels it.
+let authPromptInFlight = null;
+let authDeclinedUntil = 0;
+
+async function ensureToken() {
+  if (getToken()) return getToken();
+  if (Date.now() < authDeclinedUntil) return '';
+  if (authPromptInFlight) return authPromptInFlight;
+
+  authPromptInFlight = (async () => {
+    const input = window.prompt('This dashboard requires an access token (DASHBOARD_TOKEN):');
+    if (input && input.trim()) {
+      setToken(input.trim());
+    } else {
+      authDeclinedUntil = Date.now() + DECLINE_COOLDOWN_MS;
+    }
+    return getToken();
+  })();
+
   try {
-    const resp = await fetch(url);
+    return await authPromptInFlight;
+  } finally {
+    authPromptInFlight = null;
+  }
+}
+
+async function fetchJson(url, retried = false) {
+  try {
+    const token = getToken();
+    const resp = await fetch(url, {
+      headers: token ? { 'Authorization': 'Bearer ' + token } : {},
+    });
+    if (resp.status === 401) {
+      if (!retried) {
+        const newToken = await ensureToken();
+        if (!newToken) return null;
+        return fetchJson(url, true);
+      }
+      // The token we just tried (freshly entered or previously stored) was
+      // rejected — clear it so the next tick prompts again instead of
+      // failing silently forever with a bad token.
+      setToken('');
+      return null;
+    }
     if (!resp.ok) return null;
     return await resp.json();
   } catch {

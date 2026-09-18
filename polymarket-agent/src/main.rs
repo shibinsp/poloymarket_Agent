@@ -8,6 +8,9 @@ use polymarket_agent::monitoring;
 use polymarket_agent::monitoring::dashboard::{spawn_dashboard, DashboardState};
 use polymarket_agent::monitoring::logger;
 
+/// Exit (so the supervisor restarts us) after this many back-to-back cycle failures.
+const MAX_CONSECUTIVE_CYCLE_FAILURES: u32 = 5;
+
 /// Polymarket Autonomous Trading Agent
 #[derive(Parser, Debug)]
 #[command(
@@ -183,7 +186,7 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
     println!("  Live mode:   cargo run -- --mode live");
     println!("  Backtest:    cargo run -- --mode backtest");
     println!();
-    println!("⚠️  Always run paper trading for 48-72h before going live.");
+    println!("⚠️  Run paper trading for at least two weeks before going live.");
 
     Ok(())
 }
@@ -200,33 +203,62 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
         dashboard_store,
         health_state.clone(),
         config.agent.initial_paper_balance,
+        secrets.dashboard_token.clone(),
     );
     let dashboard_handle = spawn_dashboard(
         dashboard_state,
         &config.monitoring.dashboard_bind,
         config.monitoring.dashboard_port,
-    );
+        config.agent.mode,
+    )?;
 
     let mut agent = Agent::new(config.clone(), secrets, store).await?;
     let interval = std::time::Duration::from_secs(config.agent.cycle_interval_seconds);
+    let mut shutdown = ShutdownSignals::new()?;
+    let mut consecutive_failures: u32 = 0;
+    let mut fatal: Option<anyhow::Error> = None;
 
     loop {
-        tokio::select! {
-            result = agent.run_cycle() => {
-                result?;
-
-                // Update health state
-                health_state.record_cycle(agent.cycle_number(), agent.current_state());
+        // Run the cycle to completion — it is never raced against the shutdown
+        // signal. A live order placement must not be abandoned partway
+        // through just because SIGTERM arrived; if a cycle genuinely hangs,
+        // systemd's TimeoutStopSec (see deploy/polymarket-agent.service) is
+        // the backstop that forces an exit.
+        match agent.run_cycle().await {
+            Ok(()) => {
+                consecutive_failures = 0;
+                health_state
+                    .record_cycle(agent.cycle_number(), agent.current_state())
+                    .await;
 
                 if agent.is_dead() {
                     tracing::error!("Agent has died. Shutting down.");
                     break;
                 }
-
-                tokio::time::sleep(interval).await;
             }
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("Received Ctrl+C — shutting down gracefully");
+            Err(e) => {
+                consecutive_failures += 1;
+                health_state.record_failure().await;
+                tracing::error!(
+                    error = %e,
+                    consecutive_failures,
+                    "Cycle failed — retrying after the normal interval"
+                );
+                if consecutive_failures >= MAX_CONSECUTIVE_CYCLE_FAILURES {
+                    fatal = Some(e.context(format!(
+                        "{consecutive_failures} consecutive cycle failures — exiting so the supervisor can restart"
+                    )));
+                    break;
+                }
+            }
+        }
+
+        // Idle between cycles, but wake immediately on a shutdown signal —
+        // this is the only point where a signal can interrupt the loop.
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            signal = shutdown.recv() => {
+                tracing::info!(signal, "Shutdown signal received — stopping after the current cycle");
                 break;
             }
         }
@@ -236,7 +268,52 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
     dashboard_handle.abort();
     tracing::info!("Agent shutdown complete");
 
-    Ok(())
+    match fatal {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Persistent OS signal streams so a SIGINT/SIGTERM is never missed, even while
+/// the loop is idle between cycles. `systemctl stop` sends SIGTERM, which the
+/// previous Ctrl+C-only handler ignored.
+struct ShutdownSignals {
+    // SIGINT is covered by the cross-platform tokio::signal::ctrl_c(); only
+    // SIGTERM needs a unix-specific stream.
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+}
+
+impl ShutdownSignals {
+    fn new() -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            Ok(Self {
+                terminate: signal(SignalKind::terminate())?,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {})
+        }
+    }
+
+    /// Resolves with the name of the signal that was received.
+    async fn recv(&mut self) -> &'static str {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => "SIGINT",
+                _ = self.terminate.recv() => "SIGTERM",
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            "Ctrl+C"
+        }
+    }
 }
 
 /// Run a backtest using historical or synthetic data.

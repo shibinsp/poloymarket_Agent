@@ -1162,6 +1162,7 @@ mod tests {
             discord_webhook_url: None,
             noaa_api_token: None,
             espn_api_key: None,
+            dashboard_token: None,
         }
     }
 }

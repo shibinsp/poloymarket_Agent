@@ -36,16 +36,9 @@ Your paper balance starts at **$100** (configurable). Orders fill instantly at t
 
 ## Step-by-Step Setup
 
-### 1. Fix the Compilation Blocker
+### 1. Know What Paper Mode Does NOT Protect You From
 
-Open `Cargo.toml` and change line 4:
-```toml
-# BEFORE (broken — edition "2024" doesn't exist)
-edition = "2024"
-
-# AFTER (correct)
-edition = "2021"
-```
+Paper mode never touches real funds, but read [Important Limitations](#important-limitations-of-paper-mode) below before you start — in particular, **live mode exists in this codebase and is not yet safe to run**, and **Polymarket prohibits US persons from trading**. Keep `mode = "paper"` (the default) unless you have read the go-live gate in the project roadmap.
 
 ### 2. Install Rust (if needed)
 
@@ -75,6 +68,10 @@ NOAA_API_TOKEN=
 ESPN_API_KEY=
 RUST_LOG=info
 DATABASE_URL=sqlite:polymarket-agent.db
+
+# OPTIONAL for localhost; REQUIRED if you bind the dashboard to a non-loopback
+# address. All /api/* routes then need `Authorization: Bearer <token>`.
+DASHBOARD_TOKEN=
 ```
 
 ### 4. Build and Run Tests
@@ -246,7 +243,7 @@ grep "budget exhausted" agent.log
 | Week 1 | Run paper mode. Watch logs. Check dashboard daily. Look for obvious errors. |
 | Week 2 | Check calibration table. Is Claude > 55% accurate? Review which categories work best. |
 | Week 3 | Tune config based on results. Narrow to best categories. Adjust edge threshold. |
-| Week 4 | If consistently profitable on paper: consider $50 live test (requires EIP-712 implementation). |
+| Week 4 | If consistently profitable on paper: review the go-live gate in the roadmap. Do **not** switch to `--mode live` until every "mandatory before any real dollar" item is done (see Limitation 5). |
 
 ---
 
@@ -260,4 +257,4 @@ grep "budget exhausted" agent.log
 
 4. **Claude costs are real** — Even in paper mode, each valuation call costs ~$0.009 in real Anthropic credits. The $5/day budget cap protects you.
 
-5. **No live mode yet** — The `place_limit_order` function returns `bail!()` in live mode. Polymarket SDK wallet signing (EIP-712) is not implemented.
+5. **Live mode exists but is NOT yet safe to use** — Since commit `7c351e8`, `--mode live` places real EIP-712-signed orders on Polymarket's CLOB. As of 2026-09-17 the live path still: records orders as filled the moment an order id is returned (no fill confirmation or reconciliation); hardcodes a 7-day order expiry regardless of `order_ttl_seconds`; has no kill switch, drawdown breaker or daily-loss limit; and submits NO-side entries with an inverted order side (`ClobSide::Sell` on the NO token). **Do not run live until the go-live gate in the roadmap is complete.** Separately, Polymarket's international CLOB prohibits US persons from trading — check the current Terms of Service for your jurisdiction.
