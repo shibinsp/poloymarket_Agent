@@ -66,6 +66,9 @@ const ASSET_CLASS_EQUITY: &str = "us_equity";
 const ASSET_CLASS_CRYPTO: &str = "crypto";
 
 /// Alpaca caps a single crypto order at $200,000 notional.
+/// Alpaca caps `/v2/orders` at 500 rows per request.
+const ORDER_PAGE_SIZE: usize = 500;
+
 const CRYPTO_MAX_NOTIONAL: Decimal = dec!(200000);
 /// US equities quote in whole cents at and above $1.00. Sub-dollar names are
 /// allowed four decimals, so this is the conservative increment: rounding a
@@ -1058,20 +1061,56 @@ impl Venue for AlpacaVenue {
 
     #[instrument(skip(self), fields(venue = %self.id))]
     async fn open_orders(&self) -> Result<Vec<OrderAck>> {
-        let orders: Vec<AlpacaOrder> = self
-            .rest
-            .get(
-                Api::Trading,
-                "/v2/orders",
-                &[
-                    ("status", "open".to_string()),
-                    ("limit", "500".to_string()),
-                    ("nested", "false".to_string()),
-                ],
-            )
-            .await
-            .context("Failed to list open Alpaca orders")?;
-        Ok(orders.iter().map(to_ack).collect())
+        // Paged, because /v2/orders caps `limit` at 500 and returning the
+        // first page as if it were the whole answer is the failure this
+        // adapter exists to avoid: reconciliation and the kill switch both
+        // conclude that an order they cannot see does not exist, and stop
+        // tracking it. Alpaca pages by submission time, not offset.
+        let mut acks = Vec::new();
+        let mut after: Option<DateTime<Utc>> = None;
+
+        loop {
+            let mut params = vec![
+                ("status", "open".to_string()),
+                ("limit", ORDER_PAGE_SIZE.to_string()),
+                ("nested", "false".to_string()),
+                ("direction", "asc".to_string()),
+            ];
+            if let Some(cursor) = after {
+                params.push(("after", cursor.to_rfc3339()));
+            }
+
+            let page: Vec<AlpacaOrder> = self
+                .rest
+                .get(Api::Trading, "/v2/orders", &params)
+                .await
+                .context("Failed to list open Alpaca orders")?;
+
+            let full_page = page.len() >= ORDER_PAGE_SIZE;
+            let newest = page.iter().filter_map(|o| o.submitted_at).max();
+            acks.extend(page.iter().map(to_ack));
+
+            if !full_page {
+                break;
+            }
+            // Without a cursor that advances, the next request returns the
+            // same page forever. A full page whose orders carry no usable
+            // timestamp is reported rather than looped on, because silently
+            // truncating here is the very thing being fixed.
+            match newest {
+                Some(ts) if Some(ts) != after => after = Some(ts),
+                _ => {
+                    warn!(
+                        venue = %self.id,
+                        orders = acks.len(),
+                        "Open-order pagination cannot advance — the list may be incomplete"
+                    );
+                    break;
+                }
+            }
+        }
+
+        Ok(acks)
     }
 
     #[instrument(skip(self), fields(venue = %self.id))]
@@ -1879,6 +1918,73 @@ mod tests {
 
         let venue = venue(&server, &["AAPL"]);
         venue.cancel_order("order-1").await.unwrap();
+    }
+
+    /// Finding 14: /v2/orders caps a page at 500, and returning the first
+    /// page as the whole answer means reconciliation decides the 501st order
+    /// does not exist and stops tracking it.
+    #[tokio::test]
+    async fn open_orders_pages_past_the_first_five_hundred() {
+        let server = MockServer::start().await;
+
+        // A full first page, oldest first, then a short second page.
+        let first: Vec<Value> = (0..ORDER_PAGE_SIZE)
+            .map(|i| {
+                let mut o = order_response("new");
+                o["id"] = json!(format!("first-{i}"));
+                o["submitted_at"] = json!(format!("2026-09-19T10:{:02}:00Z", i % 60));
+                o
+            })
+            .collect();
+
+        Mock::given(method("GET"))
+            .and(path("/v2/orders"))
+            .and(query_param("direction", "asc"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(first))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        let mut last = order_response("new");
+        last["id"] = json!("second-0");
+        last["submitted_at"] = json!("2026-09-19T11:00:00Z");
+        Mock::given(method("GET"))
+            .and(path("/v2/orders"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([last])))
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["AAPL"]);
+        let orders = venue.open_orders().await.expect("both pages");
+
+        assert_eq!(orders.len(), ORDER_PAGE_SIZE + 1);
+        assert_eq!(orders.last().unwrap().venue_order_id, "second-0");
+    }
+
+    /// A full page whose rows carry no timestamp cannot advance the cursor.
+    /// Looping forever is worse than stopping, but stopping silently is what
+    /// this fix is about, so it warns and returns what it has.
+    #[tokio::test]
+    async fn open_orders_stops_rather_than_looping_when_the_cursor_cannot_advance() {
+        let server = MockServer::start().await;
+        let page: Vec<Value> = (0..ORDER_PAGE_SIZE)
+            .map(|i| {
+                let mut o = order_response("new");
+                o["id"] = json!(format!("o-{i}"));
+                o["submitted_at"] = Value::Null;
+                o
+            })
+            .collect();
+
+        Mock::given(method("GET"))
+            .and(path("/v2/orders"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page))
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["AAPL"]);
+        let orders = venue.open_orders().await.expect("returns the page it has");
+        assert_eq!(orders.len(), ORDER_PAGE_SIZE);
     }
 
     #[tokio::test]

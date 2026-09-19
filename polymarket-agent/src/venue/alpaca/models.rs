@@ -138,6 +138,10 @@ pub struct AlpacaOrder {
     pub time_in_force: String,
     #[serde(default)]
     pub extended_hours: bool,
+    /// Pagination cursor for `/v2/orders`, which pages by submission time
+    /// rather than by offset.
+    #[serde(default)]
+    pub submitted_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
