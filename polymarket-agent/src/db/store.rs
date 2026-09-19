@@ -735,6 +735,72 @@ pub struct VenueTradeRecord {
 mod tests {
     use super::*;
 
+    /// A database at 001 with real rows has to survive the rebuild in 002 and
+    /// come out mapped — the migration drops and recreates `trades`, so a
+    /// mistake here is silent data loss rather than an error.
+    #[tokio::test]
+    async fn a_legacy_database_upgrades_and_maps_its_rows() {
+        let path = std::env::temp_dir().join(format!("migrate-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let url = format!("sqlite:{}?mode=rwc", path.display());
+        let pool = sqlx::SqlitePool::connect(&url).await.expect("opens");
+
+        // Stand up the pre-002 schema and put a trade in it.
+        sqlx::raw_sql(include_str!("../../migrations/001_init.sql"))
+            .execute(&pool)
+            .await
+            .expect("001 applies");
+        sqlx::query(
+            "INSERT INTO trades (cycle, market_id, market_question, direction, entry_price,
+             size, edge_at_entry, claude_fair_value, confidence, kelly_raw, kelly_adjusted,
+             status, pnl)
+             VALUES (7, '0xdead', 'Will it rain?', 'NO', '0.35', '12.5', '0.11', '0.52',
+                     '0.8', '0.2', '0.1', 'OPEN', '1.25')",
+        )
+        .execute(&pool)
+        .await
+        .expect("legacy row inserts");
+
+        sqlx::raw_sql(include_str!("../../migrations/002_multi_venue.sql"))
+            .execute(&pool)
+            .await
+            .expect("002 applies");
+
+        let row: (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT venue_id, symbol, asset_class, side, entry_price, size, quantity,
+                 avg_fill_price FROM trades",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("the row survived the rebuild");
+
+        assert_eq!(row.0, "polymarket");
+        // A buy of the NO outcome, which is what the old direction column meant.
+        assert_eq!(row.1, "0xdead:NO");
+        assert_eq!(row.2, "prediction_binary");
+        assert_eq!(row.3, "BUY");
+        // What was requested is preserved...
+        assert_eq!(row.4, "0.35");
+        assert_eq!(row.5, "12.5");
+        // ...and what filled stays unknown, because it never was known. Copying
+        // the request in here would assert a fill nobody confirmed, and make
+        // slippage over historical rows measure zero by construction.
+        assert_eq!(row.6, None, "quantity must not claim a filled size");
+        assert_eq!(row.7, None, "avg_fill_price must not claim a fill price");
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[tokio::test]
     async fn test_store_create_and_migrate() {
         let store = Store::new(":memory:").await.expect("should create store");
