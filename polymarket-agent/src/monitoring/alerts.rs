@@ -2,20 +2,105 @@
 //!
 //! Sends notifications via Discord webhooks for trade events,
 //! state changes, and daily summaries.
+//!
+//! Alongside those there are *anomalies*: the agent noticing that something
+//! about its own operation is wrong. Trade alerts are a nice-to-have; an
+//! anomaly is the only reason an operator finds out that orders are being
+//! rejected at 3am. They are deduped, because the failures worth alerting on
+//! are exactly the ones that repeat every cycle, and an operator who is paged
+//! three hundred times stops reading.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use anyhow::Result;
+use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
 use serde::Serialize;
-use tracing::warn;
+use tracing::{error, warn};
 
 use crate::market::models::{AgentState, Side};
 use crate::monitoring::metrics::PerformanceMetrics;
+
+/// How long the same anomaly stays quiet after firing.
+const DEDUPE_WINDOW: Duration = Duration::minutes(30);
+
+/// How loud an anomaly is. Distinct from the anomaly itself because the same
+/// kind changes urgency with context: one rejected order is a notice, a venue
+/// rejecting everything is critical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlertLevel {
+    Notice,
+    Warning,
+    Critical,
+}
+
+impl AlertLevel {
+    fn label(&self) -> &'static str {
+        match self {
+            AlertLevel::Notice => "NOTICE",
+            AlertLevel::Warning => "WARNING",
+            AlertLevel::Critical => "CRITICAL",
+        }
+    }
+}
+
+/// Something wrong with the agent's own operation, as opposed to a trading
+/// outcome. Each variant is a dedupe bucket, so they are split by *what an
+/// operator would do about it* rather than by where in the code they arise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AnomalyKind {
+    /// The loop has not completed a cycle when one was due.
+    StalledCycle,
+    /// A venue failed repeatedly — unreachable, refusing auth, or erroring.
+    VenueUnreachable,
+    /// A write to SQLite failed. The ledger is now behind reality.
+    DbWriteFailed,
+    /// The daily valuation budget is gone; no new views until it resets.
+    BudgetExhausted,
+    /// Local records and the venue disagree about positions or balance.
+    ReconciliationMismatch,
+    /// The venue refused an order.
+    OrderRejected,
+    /// An order's fate is unknown — a submit that timed out may still have
+    /// been accepted, so this is never treated as "did not happen".
+    OrderStateUnknown,
+    /// An order has sat unresolved past the point where it should have been
+    /// filled or cancelled.
+    StaleOrder,
+}
+
+impl AnomalyKind {
+    /// Stable identifier — used as a dedupe key and reported on /api/health,
+    /// so it must not drift with the Debug formatting.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AnomalyKind::StalledCycle => "stalled_cycle",
+            AnomalyKind::VenueUnreachable => "venue_unreachable",
+            AnomalyKind::DbWriteFailed => "db_write_failed",
+            AnomalyKind::BudgetExhausted => "budget_exhausted",
+            AnomalyKind::ReconciliationMismatch => "reconciliation_mismatch",
+            AnomalyKind::OrderRejected => "order_rejected",
+            AnomalyKind::OrderStateUnknown => "order_state_unknown",
+            AnomalyKind::StaleOrder => "stale_order",
+        }
+    }
+}
 
 /// Discord webhook client.
 pub struct AlertClient {
     webhook_url: Option<String>,
     http: reqwest::Client,
     enabled: bool,
+    /// When each `(kind, scope)` last fired. Keyed by scope as well as kind so
+    /// one dead venue cannot mask a second one going down behind the same
+    /// 30-minute window.
+    recent: Mutex<HashMap<(AnomalyKind, String), DateTime<Utc>>>,
+    /// Whether the last delivery attempt failed. Alert delivery is its own
+    /// failure domain: if the webhook is down, silence means nothing, so the
+    /// health endpoint has to be able to say so.
+    delivery_failing: AtomicBool,
 }
 
 /// Discord webhook message format.
@@ -40,6 +125,8 @@ impl AlertClient {
             enabled: enabled && webhook_url.is_some(),
             webhook_url,
             http,
+            recent: Mutex::new(HashMap::new()),
+            delivery_failing: AtomicBool::new(false),
         }
     }
 
@@ -58,21 +145,115 @@ impl AlertClient {
             username: "Polymarket Agent".to_string(),
         };
 
+        // A delivery failure is logged at error, not warn: the whole point of
+        // an alert is that someone finds out, and the operator's only clue
+        // that they are not finding out is this line and /api/health.
         match self.http.post(url).json(&payload).send().await {
+            Ok(response) if response.status().is_success() => {
+                self.delivery_failing.store(false, Ordering::Relaxed);
+            }
             Ok(response) => {
-                if !response.status().is_success() {
-                    warn!(
-                        status = %response.status(),
-                        "Discord webhook returned non-success status"
-                    );
-                }
+                self.delivery_failing.store(true, Ordering::Relaxed);
+                error!(
+                    status = %response.status(),
+                    "Discord webhook returned non-success status — alerts are not being delivered"
+                );
             }
             Err(e) => {
-                warn!(error = %e, "Failed to send Discord alert");
+                self.delivery_failing.store(true, Ordering::Relaxed);
+                error!(error = %e, "Failed to send Discord alert — alerts are not being delivered");
             }
         }
 
         Ok(())
+    }
+
+    /// Whether the last delivery attempt failed, so the health endpoint can
+    /// report that silence is not the same as calm.
+    pub fn delivery_failing(&self) -> bool {
+        self.delivery_failing.load(Ordering::Relaxed)
+    }
+
+    /// Report an operational anomaly, deduped for 30 minutes per
+    /// `(kind, scope)`.
+    ///
+    /// `scope` names the thing that is wrong — a venue id, a symbol, an order
+    /// id — and is part of the dedupe key. Deduping on the kind alone would
+    /// mean a second venue failing during the first one's quiet window never
+    /// alerts at all; deduping on the full detail string would defeat dedupe
+    /// entirely, because detail usually carries a varying error message.
+    ///
+    /// Returns whether the anomaly passed its quiet window. A client with no
+    /// webhook configured still returns true: the dedupe decision is about the
+    /// anomaly, not about whether anyone happens to be listening.
+    pub async fn anomaly(
+        &self,
+        level: AlertLevel,
+        kind: AnomalyKind,
+        scope: &str,
+        detail: &str,
+    ) -> Result<bool> {
+        self.anomaly_at(Utc::now(), level, kind, scope, detail)
+            .await
+    }
+
+    /// `anomaly` with the clock supplied — for callers that already hold the
+    /// cycle's `now`, and for tests that would otherwise have to sleep for
+    /// half an hour.
+    pub async fn anomaly_at(
+        &self,
+        now: DateTime<Utc>,
+        level: AlertLevel,
+        kind: AnomalyKind,
+        scope: &str,
+        detail: &str,
+    ) -> Result<bool> {
+        // Always log, even when the alert itself is suppressed: the logs are
+        // the record of how often something is failing, and dedupe is about
+        // not paging an operator, not about hiding the frequency.
+        match level {
+            AlertLevel::Critical | AlertLevel::Warning => {
+                error!(kind = kind.as_str(), scope, detail, "Anomaly")
+            }
+            AlertLevel::Notice => warn!(kind = kind.as_str(), scope, detail, "Anomaly"),
+        }
+
+        if !self.should_fire(now, kind, scope) {
+            return Ok(false);
+        }
+
+        let msg = format!(
+            "**[{}] {}**\n\
+             Scope: {}\n\
+             {}",
+            level.label(),
+            kind.as_str(),
+            if scope.is_empty() { "agent" } else { scope },
+            detail
+        );
+        self.send(&msg).await?;
+        Ok(true)
+    }
+
+    /// Whether this `(kind, scope)` is outside its quiet window, recording the
+    /// firing if so. The lock is released before any await.
+    fn should_fire(&self, now: DateTime<Utc>, kind: AnomalyKind, scope: &str) -> bool {
+        // A panic while holding this lock must not disable alerting for the
+        // rest of the process, so a poisoned mutex is recovered rather than
+        // unwrapped.
+        let mut recent = self
+            .recent
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let key = (kind, scope.to_string());
+        match recent.get(&key) {
+            Some(&last) if now - last < DEDUPE_WINDOW => false,
+            _ => {
+                recent.insert(key, now);
+                true
+            }
+        }
     }
 
     /// Alert: New trade placed.
@@ -185,6 +366,7 @@ pub fn check_milestone(old_balance: Decimal, new_balance: Decimal) -> Option<Dec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use rust_decimal_macros::dec;
 
     #[test]
@@ -234,6 +416,140 @@ mod tests {
         // Old $40, new $55 → crosses $50
         let milestone = check_milestone(dec!(40), dec!(55));
         assert_eq!(milestone, Some(dec!(50)));
+    }
+
+    /// Anomalies are deduped per `(kind, scope)`; these run against a client
+    /// with no webhook, so they exercise the decision without a network.
+    fn silent_client() -> AlertClient {
+        AlertClient::new(None, false)
+    }
+
+    fn t(minutes: i64) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 9, 19, 12, 0, 0).unwrap() + Duration::minutes(minutes)
+    }
+
+    #[tokio::test]
+    async fn the_same_anomaly_stays_quiet_inside_the_window() {
+        let client = silent_client();
+        let fire = |at, detail: &'static str| {
+            client.anomaly_at(
+                at,
+                AlertLevel::Warning,
+                AnomalyKind::VenueUnreachable,
+                "alpaca",
+                detail,
+            )
+        };
+
+        assert!(fire(t(0), "connection refused").await.unwrap());
+        assert!(!fire(t(1), "connection refused").await.unwrap());
+        // A different message is still the same problem — dedupe must not be
+        // defeated by an error string that varies per attempt.
+        assert!(!fire(t(29), "connection reset").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn the_same_anomaly_fires_again_after_the_window() {
+        let client = silent_client();
+        let fire = |at| {
+            client.anomaly_at(
+                at,
+                AlertLevel::Warning,
+                AnomalyKind::VenueUnreachable,
+                "alpaca",
+                "down",
+            )
+        };
+
+        assert!(fire(t(0)).await.unwrap());
+        assert!(!fire(t(29)).await.unwrap());
+        assert!(fire(t(30)).await.unwrap());
+        // The window restarts from the second firing, not the first.
+        assert!(!fire(t(31)).await.unwrap());
+    }
+
+    /// The reason scope is part of the key: a second venue failing during the
+    /// first one's quiet window has to get through.
+    #[tokio::test]
+    async fn a_second_scope_is_not_masked_by_the_first() {
+        let client = silent_client();
+        let fire = |scope: &'static str| {
+            client.anomaly_at(
+                t(0),
+                AlertLevel::Critical,
+                AnomalyKind::VenueUnreachable,
+                scope,
+                "down",
+            )
+        };
+
+        assert!(fire("alpaca").await.unwrap());
+        assert!(fire("polymarket").await.unwrap());
+        assert!(!fire("alpaca").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn different_kinds_dedupe_independently() {
+        let client = silent_client();
+        assert!(client
+            .anomaly_at(
+                t(0),
+                AlertLevel::Warning,
+                AnomalyKind::OrderRejected,
+                "BTC/USD",
+                "no"
+            )
+            .await
+            .unwrap());
+        assert!(client
+            .anomaly_at(
+                t(0),
+                AlertLevel::Warning,
+                AnomalyKind::StaleOrder,
+                "BTC/USD",
+                "old"
+            )
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_client_with_no_webhook_reports_delivery_as_healthy() {
+        let client = silent_client();
+        client
+            .anomaly_at(
+                t(0),
+                AlertLevel::Notice,
+                AnomalyKind::StalledCycle,
+                "",
+                "late",
+            )
+            .await
+            .unwrap();
+        // Nothing was attempted, so nothing failed. Reporting a delivery
+        // failure here would have every un-alerted deployment look broken.
+        assert!(!client.delivery_failing());
+    }
+
+    #[test]
+    fn anomaly_kind_names_are_stable_and_distinct() {
+        // These strings are a dedupe key and a health-endpoint field; a
+        // duplicate would silently merge two buckets.
+        let kinds = [
+            AnomalyKind::StalledCycle,
+            AnomalyKind::VenueUnreachable,
+            AnomalyKind::DbWriteFailed,
+            AnomalyKind::BudgetExhausted,
+            AnomalyKind::ReconciliationMismatch,
+            AnomalyKind::OrderRejected,
+            AnomalyKind::OrderStateUnknown,
+            AnomalyKind::StaleOrder,
+        ];
+        let mut names: Vec<&str> = kinds.iter().map(|k| k.as_str()).collect();
+        names.sort_unstable();
+        let count = names.len();
+        names.dedup();
+        assert_eq!(names.len(), count);
     }
 
     #[tokio::test]
