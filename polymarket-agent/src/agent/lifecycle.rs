@@ -2,13 +2,18 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
+use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tracing::{error, info, warn};
 
+use crate::agent::reconcile::Reconciler;
+use crate::agent::scheduler::{self, WakePlan};
 use crate::agent::self_funding::{
     self, edge_justifies_cost, enhanced_survival_check, log_cost_breakdown, CycleCosts,
 };
+use crate::agent::venue_cycle::{CycleOutcome, VenueCycle};
+use crate::agent::venue_exits::VenueExits;
 use crate::config::{AppConfig, Secrets};
 use crate::data::crypto::CryptoSource;
 use crate::data::news::NewsSource;
@@ -23,7 +28,7 @@ use crate::execution::wallet;
 use crate::market::models::{AgentState, MarketCandidate};
 use crate::market::polymarket::PolymarketClient;
 use crate::market::scanner::MarketScanner;
-use crate::monitoring::alerts::{check_milestone, AlertClient};
+use crate::monitoring::alerts::{check_milestone, AlertClient, AlertLevel, AnomalyKind};
 use crate::monitoring::metrics::{compute_metrics, log_metrics};
 use crate::risk::kelly;
 use crate::risk::limits;
@@ -32,6 +37,7 @@ use crate::valuation::calibration;
 use crate::valuation::edge::{evaluate_edge, to_opportunity, EdgeResult};
 use crate::valuation::fair_value::{ValuationEngine, ValuationResult};
 use crate::valuation::llm::LlmClient;
+use crate::venue::VenueRegistry;
 
 pub struct Agent {
     config: AppConfig,
@@ -43,8 +49,13 @@ pub struct Agent {
     data_aggregator: DataAggregator,
     valuation_engine: Option<ValuationEngine>,
     portfolio: PortfolioManager,
-    alert_client: AlertClient,
+    alert_client: Arc<AlertClient>,
     last_balance: Decimal,
+    /// Venues from `[[venues]]`. Empty keeps the legacy Polymarket-only path.
+    venues: VenueRegistry,
+    /// Shared with the valuation engine; the venue cycle calls it directly
+    /// because continuous assets use a different prompt.
+    llm: Option<Arc<LlmClient>>,
 }
 
 impl Agent {
@@ -63,18 +74,20 @@ impl Agent {
         let data_aggregator = DataAggregator::new(data_sources);
 
         // Phase 4: Initialize valuation engine (only if API key is available)
+        let mut llm_client: Option<Arc<LlmClient>> = None;
         let valuation_engine = if let Some(ref api_key) = secrets.llm_api_key {
             // Share the caller's connection pool rather than opening (and
             // migrating) two more against the same database file.
             let llm_store = store.clone_for_parallel();
             let valuation_store = store.clone_for_parallel();
-            let llm_client = Arc::new(LlmClient::new(
+            let client = Arc::new(LlmClient::new(
                 api_key.clone(),
                 &config.valuation,
                 llm_store,
             )?);
+            llm_client = Some(client.clone());
             Some(ValuationEngine::new(
-                llm_client,
+                client,
                 config.valuation.clone(),
                 valuation_store,
             ))
@@ -83,14 +96,19 @@ impl Agent {
             None
         };
 
+        // Venues declared in [[venues]]. Sharing the Polymarket client keeps
+        // one paper balance across both the legacy and venue paths.
+        let venues =
+            crate::venue::factory::build_registry(&config, &secrets, Some(polymarket.clone()))?;
+
         // Phase 5: Initialize portfolio manager
         let portfolio = PortfolioManager::new(config.risk.clone());
 
         // Phase 8: Initialize alert client
-        let alert_client = AlertClient::new(
+        let alert_client = Arc::new(AlertClient::new(
             secrets.discord_webhook_url.clone(),
             config.monitoring.discord_enabled,
-        );
+        ));
 
         // Resume cycle number from last recorded cycle
         let cycle_number = match store.get_latest_cycle().await? {
@@ -102,6 +120,7 @@ impl Agent {
             mode = ?config.agent.mode,
             cycle_number,
             valuation_enabled = valuation_engine.is_some(),
+            venues = venues.len(),
             alerts_enabled = alert_client.is_enabled(),
             "Agent initialized"
         );
@@ -118,11 +137,37 @@ impl Agent {
             portfolio,
             alert_client,
             last_balance: Decimal::ZERO,
+            venues,
+            llm: llm_client,
         })
     }
 
     fn has_valuation_engine(&self) -> bool {
         self.valuation_engine.is_some()
+    }
+
+    /// Whether the current state allows opening new positions. Exits and
+    /// settlement still run in every state.
+    fn opens_positions(&self) -> bool {
+        matches!(self.state, AgentState::Alive | AgentState::LowFuel)
+    }
+
+    /// One pass of the venue-based loop over continuous assets.
+    async fn run_venue_cycle(&self, bankroll: Decimal) -> Result<CycleOutcome> {
+        let cycle = VenueCycle {
+            registry: &self.venues,
+            llm: self.llm.as_deref(),
+            store: &self.store,
+            config: &self.config,
+        };
+        cycle
+            .run(
+                chrono::Utc::now(),
+                self.state,
+                bankroll,
+                self.cycle_number as i64,
+            )
+            .await
     }
 
     pub async fn run_cycle(&mut self) -> Result<()> {
@@ -180,6 +225,76 @@ impl Agent {
         // Always run, even in Dead state — positions need cleanup (TRD-06).
         self.evaluate_open_positions().await;
 
+        // Continuous-asset positions never settle themselves, so they need an
+        // explicit exit pass. Like the legacy one above this runs in every
+        // state: being unable to open new positions must never mean being
+        // unable to close existing ones.
+        if !self.venues.is_empty() {
+            // Resolve outstanding orders before anything else looks at
+            // positions. An exit that filled since the last cycle must be on
+            // the books before the exit pass runs, or it re-sells a position
+            // that is already gone; an entry that filled must be visible
+            // before the cycle decides what to buy. This also releases the
+            // per-symbol block that unresolved orders hold.
+            let reconciler = Reconciler {
+                registry: &self.venues,
+                store: &self.store,
+                order_ttl: chrono::Duration::seconds(
+                    self.config.execution.order_ttl_seconds as i64,
+                ),
+            };
+            match reconciler.run(chrono::Utc::now()).await {
+                // An order the venue will not talk about keeps blocking its
+                // symbol, which is the safe direction but not a free one: the
+                // agent stops trading that symbol entirely until someone
+                // looks. Silence here is indistinguishable from working.
+                Ok(report) if report.unqueryable > 0 => {
+                    let _ = self
+                        .alert_client
+                        .anomaly(
+                            AlertLevel::Warning,
+                            AnomalyKind::OrderStateUnknown,
+                            "reconcile",
+                            &format!(
+                                "{} of {} orders could not be resolved — those symbols stay blocked",
+                                report.unqueryable, report.checked
+                            ),
+                        )
+                        .await;
+                }
+                Ok(_) => {}
+                // The pass itself failing is worse than any single finding:
+                // nothing is checking whether the ledger still matches the
+                // venue, so every later decision runs on unverified state.
+                Err(e) => {
+                    let _ = self
+                        .alert_client
+                        .anomaly(
+                            AlertLevel::Critical,
+                            AnomalyKind::ReconciliationMismatch,
+                            "reconcile",
+                            &format!("Reconciliation pass failed — ledger is unverified: {e}"),
+                        )
+                        .await;
+                }
+            }
+
+            let exits = VenueExits {
+                registry: &self.venues,
+                store: &self.store,
+                max_hold_hours: self.config.exits_continuous.max_hold_hours,
+                order_ttl_seconds: self.config.execution.order_ttl_seconds as i64,
+            };
+            match exits
+                .run(chrono::Utc::now(), self.cycle_number as i64)
+                .await
+            {
+                Ok(0) => {}
+                Ok(closed) => info!(closed, "Closed continuous positions this cycle"),
+                Err(e) => warn!(error = %e, "Venue exit pass failed"),
+            }
+        }
+
         // Check for resolved markets and settle trades.
         // Always run, even in Dead state — must settle P&L for final accounting (TRD-06).
         {
@@ -207,11 +322,22 @@ impl Agent {
         let budget_available = match self.store.get_today_api_cost().await {
             Ok(today_cost) => {
                 if today_cost >= self.config.agent.daily_api_budget {
-                    warn!(
-                        today_cost = %today_cost,
-                        budget = %self.config.agent.daily_api_budget,
-                        "Daily API budget exhausted — skipping valuations this cycle"
-                    );
+                    // Worth alerting rather than only logging: from here the
+                    // agent still runs cycles and still looks healthy, but it
+                    // forms no new views, so it quietly stops doing the thing
+                    // it exists to do until the day rolls over.
+                    let _ = self
+                        .alert_client
+                        .anomaly(
+                            AlertLevel::Warning,
+                            AnomalyKind::BudgetExhausted,
+                            "",
+                            &format!(
+                                "Spent ${today_cost} of ${} — no new valuations until the UTC day rolls over",
+                                self.config.agent.daily_api_budget
+                            ),
+                        )
+                        .await;
                     false
                 } else {
                     true
@@ -251,7 +377,21 @@ impl Agent {
                         }
                     }
                     Err(e) => {
-                        warn!(error = %e, "Market scan failed");
+                        // A scan that cannot reach the venue means the agent
+                        // sees no markets at all — it goes on cycling, logging
+                        // "Cycle complete", looking entirely healthy, and
+                        // trading nothing. Observed in a real run against a
+                        // DNS-blocked host: every cycle scanned 0 markets and
+                        // nothing said why.
+                        let _ = self
+                            .alert_client
+                            .anomaly(
+                                AlertLevel::Critical,
+                                AnomalyKind::VenueUnreachable,
+                                "polymarket",
+                                &format!("Market scan failed — no markets are visible: {e}"),
+                            )
+                            .await;
                     }
                 }
             }
@@ -276,9 +416,39 @@ impl Agent {
                         }
                     }
                     Err(e) => {
-                        warn!(error = %e, "Market scan failed");
+                        // A scan that cannot reach the venue means the agent
+                        // sees no markets at all — it goes on cycling, logging
+                        // "Cycle complete", looking entirely healthy, and
+                        // trading nothing. Observed in a real run against a
+                        // DNS-blocked host: every cycle scanned 0 markets and
+                        // nothing said why.
+                        let _ = self
+                            .alert_client
+                            .anomaly(
+                                AlertLevel::Critical,
+                                AnomalyKind::VenueUnreachable,
+                                "polymarket",
+                                &format!("Market scan failed — no markets are visible: {e}"),
+                            )
+                            .await;
                     }
                 }
+            }
+        }
+
+        // Venue path: continuous assets (crypto, equities). Runs alongside the
+        // legacy Polymarket loop above, and only when the agent state permits
+        // new positions — the same gate the legacy path applies.
+        if !self.venues.is_empty() && budget_available && self.opens_positions() {
+            let bankroll = self.effective_bankroll().await;
+            match self.run_venue_cycle(bankroll).await {
+                Ok(outcome) => {
+                    markets_scanned += outcome.instruments_scanned as i64;
+                    opportunities_found += outcome.views_taken as i64;
+                    trades_placed += outcome.orders_placed as i64;
+                    cycle_api_cost += outcome.api_cost;
+                }
+                Err(e) => warn!(error = %e, "Venue cycle failed"),
             }
         }
 
@@ -308,7 +478,15 @@ impl Agent {
             )
             .await;
         if let Err(ref e) = log_result {
-            warn!(error = %e, "Failed to record cycle summary");
+            let _ = self
+                .alert_client
+                .anomaly(
+                    AlertLevel::Warning,
+                    AnomalyKind::DbWriteFailed,
+                    "cycles",
+                    &format!("Could not record the cycle summary: {e}"),
+                )
+                .await;
         }
 
         // Phase 8: Periodic metrics summary (every 10 cycles)
@@ -564,7 +742,21 @@ impl Agent {
             if let Err(e) =
                 fills::record_trade(&self.store, &prepared, &execution, self.cycle_number).await
             {
-                warn!(error = %e, "Failed to record trade");
+                // The order went to the venue and the ledger does not know.
+                // Every later decision — exposure, exits, reconciliation —
+                // now reasons from a position that is missing, so this is the
+                // most expensive write in the cycle to lose.
+                let _ = self
+                    .alert_client
+                    .anomaly(
+                        AlertLevel::Critical,
+                        AnomalyKind::DbWriteFailed,
+                        "trades",
+                        &format!(
+                            "Order was placed but not recorded — the ledger is behind the venue: {e}"
+                        ),
+                    )
+                    .await;
             }
 
             if execution.status == OrderStatus::Filled {
@@ -914,6 +1106,25 @@ impl Agent {
 
     pub fn current_state(&self) -> AgentState {
         self.state
+    }
+
+    /// Shared so a watchdog outside the loop can report on it. A cycle that
+    /// hangs never returns to the loop, so the loop cannot notice its own
+    /// stall — something else has to hold the same client.
+    pub fn alerts(&self) -> Arc<AlertClient> {
+        self.alert_client.clone()
+    }
+
+    /// When the loop should run the next cycle. Kept on `Agent` so the venue
+    /// registry stays private — `main` schedules without knowing what a
+    /// session is.
+    pub fn next_wake(&self, now: DateTime<Utc>) -> WakePlan {
+        scheduler::next_wake(
+            &self.venues,
+            now,
+            Duration::seconds(self.config.agent.cycle_interval_seconds as i64),
+            Duration::seconds(self.config.agent.max_sleep_seconds as i64),
+        )
     }
 }
 

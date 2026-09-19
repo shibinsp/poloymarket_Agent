@@ -4,6 +4,7 @@ pub mod config;
 pub mod data;
 pub mod db;
 pub mod execution;
+pub mod json_decimal;
 pub mod market;
 pub mod monitoring;
 pub mod risk;

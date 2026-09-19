@@ -66,6 +66,9 @@ const ASSET_CLASS_EQUITY: &str = "us_equity";
 const ASSET_CLASS_CRYPTO: &str = "crypto";
 
 /// Alpaca caps a single crypto order at $200,000 notional.
+/// Alpaca caps `/v2/orders` at 500 rows per request.
+const ORDER_PAGE_SIZE: usize = 500;
+
 const CRYPTO_MAX_NOTIONAL: Decimal = dec!(200000);
 /// US equities quote in whole cents at and above $1.00. Sub-dollar names are
 /// allowed four decimals, so this is the conservative increment: rounding a
@@ -450,10 +453,11 @@ impl AlpacaVenue {
                 tick_size: asset.price_increment,
                 lot_size: asset.min_trade_increment,
                 // Alpaca gates crypto on a minimum *quantity* (`min_order_size`,
-                // e.g. 0.000026 BTC), not a minimum notional, and `Instrument`
-                // has nowhere to put a minimum quantity. Left unset rather than
-                // synthesised from a price we do not have at discovery time.
+                // e.g. 0.000026 BTC) rather than on notional value, which is
+                // why the constraint lives in `min_qty`: stating it as a
+                // notional would need a price discovery does not have.
                 min_notional: None,
+                min_qty: asset.min_order_size,
                 fractional: true,
                 meta: InstrumentMeta::Spot {
                     base: base.to_string(),
@@ -473,6 +477,7 @@ impl AlpacaVenue {
                     Some(Decimal::ONE)
                 },
                 min_notional: Some(EQUITY_MIN_NOTIONAL),
+                min_qty: None,
                 fractional: asset.fractionable,
                 meta: InstrumentMeta::Equity {
                     exchange: asset.exchange.clone(),
@@ -565,12 +570,54 @@ fn build_new_order(request: &OrderRequest) -> Result<NewOrder> {
         )
     })?;
 
+    // Apply the instrument's own constraints before Alpaca does. This module's
+    // header promises violations are refused here rather than bounced after the
+    // fact, and `round_qty`/`round_price` existed to do it — nothing called
+    // them, so `lot_size`, `tick_size` and `fractional` were decorative and
+    // every rejection came back from the venue instead.
+    let qty = {
+        let lotted = request.instrument.round_qty(request.qty);
+        // A non-fractionable name takes whole shares only. Rounding down is
+        // the safe direction: up would spend more than was sized for.
+        let whole = if request.instrument.fractional {
+            lotted
+        } else {
+            lotted.floor()
+        };
+        if whole <= Decimal::ZERO {
+            bail!(
+                "Quantity {} for {symbol} rounds to zero against the venue's lot size and                  whole-share rule — the order would only be rejected",
+                request.qty
+            );
+        }
+        // Alpaca gates crypto on a minimum quantity, and rounding down to the
+        // lot size can cross it. Checked after rounding rather than before,
+        // because the size that gets submitted is the one that has to clear.
+        if !request.instrument.meets_min_qty(whole) {
+            bail!(
+                "Quantity {whole} for {symbol} is below the venue's minimum order size of {}",
+                request
+                    .instrument
+                    .min_qty
+                    .unwrap_or(Decimal::ZERO)
+                    .normalize()
+            );
+        }
+        whole
+    };
+
     let (order_type, limit_price) = match request.kind {
         OrderKind::Limit { price } => {
             if price <= Decimal::ZERO {
                 bail!("Alpaca limit price must be positive, got {price} for {symbol}");
             }
-            ("limit", Some(price.normalize().to_string()))
+            let ticked = request.instrument.round_price(price, request.side);
+            if ticked <= Decimal::ZERO {
+                bail!(
+                    "Limit price {price} for {symbol} rounds to zero against the venue's                      tick size"
+                );
+            }
+            ("limit", Some(ticked.normalize().to_string()))
         }
         OrderKind::Market => ("market", None),
     };
@@ -613,7 +660,7 @@ fn build_new_order(request: &OrderRequest) -> Result<NewOrder> {
 
     Ok(NewOrder {
         symbol,
-        qty: request.qty.normalize().to_string(),
+        qty: qty.normalize().to_string(),
         side: side_str(request.side),
         order_type,
         time_in_force: tif,
@@ -1029,20 +1076,56 @@ impl Venue for AlpacaVenue {
 
     #[instrument(skip(self), fields(venue = %self.id))]
     async fn open_orders(&self) -> Result<Vec<OrderAck>> {
-        let orders: Vec<AlpacaOrder> = self
-            .rest
-            .get(
-                Api::Trading,
-                "/v2/orders",
-                &[
-                    ("status", "open".to_string()),
-                    ("limit", "500".to_string()),
-                    ("nested", "false".to_string()),
-                ],
-            )
-            .await
-            .context("Failed to list open Alpaca orders")?;
-        Ok(orders.iter().map(to_ack).collect())
+        // Paged, because /v2/orders caps `limit` at 500 and returning the
+        // first page as if it were the whole answer is the failure this
+        // adapter exists to avoid: reconciliation and the kill switch both
+        // conclude that an order they cannot see does not exist, and stop
+        // tracking it. Alpaca pages by submission time, not offset.
+        let mut acks = Vec::new();
+        let mut after: Option<DateTime<Utc>> = None;
+
+        loop {
+            let mut params = vec![
+                ("status", "open".to_string()),
+                ("limit", ORDER_PAGE_SIZE.to_string()),
+                ("nested", "false".to_string()),
+                ("direction", "asc".to_string()),
+            ];
+            if let Some(cursor) = after {
+                params.push(("after", cursor.to_rfc3339()));
+            }
+
+            let page: Vec<AlpacaOrder> = self
+                .rest
+                .get(Api::Trading, "/v2/orders", &params)
+                .await
+                .context("Failed to list open Alpaca orders")?;
+
+            let full_page = page.len() >= ORDER_PAGE_SIZE;
+            let newest = page.iter().filter_map(|o| o.submitted_at).max();
+            acks.extend(page.iter().map(to_ack));
+
+            if !full_page {
+                break;
+            }
+            // Without a cursor that advances, the next request returns the
+            // same page forever. A full page whose orders carry no usable
+            // timestamp is reported rather than looped on, because silently
+            // truncating here is the very thing being fixed.
+            match newest {
+                Some(ts) if Some(ts) != after => after = Some(ts),
+                _ => {
+                    warn!(
+                        venue = %self.id,
+                        orders = acks.len(),
+                        "Open-order pagination cannot advance — the list may be incomplete"
+                    );
+                    break;
+                }
+            }
+        }
+
+        Ok(acks)
     }
 
     #[instrument(skip(self), fields(venue = %self.id))]
@@ -1082,7 +1165,8 @@ impl Venue for AlpacaVenue {
         Ok(Balance {
             ccy: account.currency,
             available,
-            total: account.equity,
+            // Alpaca reports account equity directly, positions included.
+            total: Some(account.equity),
         })
     }
 
@@ -1123,6 +1207,7 @@ mod tests {
             tick_size: Some(EQUITY_TICK_SIZE),
             lot_size: None,
             min_notional: Some(EQUITY_MIN_NOTIONAL),
+            min_qty: None,
             fractional: true,
             meta: InstrumentMeta::Equity {
                 exchange: "NASDAQ".to_string(),
@@ -1139,6 +1224,7 @@ mod tests {
             tick_size: Some(dec!(1)),
             lot_size: Some(dec!(0.000000001)),
             min_notional: None,
+            min_qty: None,
             fractional: true,
             meta: InstrumentMeta::Spot {
                 base: "BTC".to_string(),
@@ -1156,6 +1242,163 @@ mod tests {
             extended_hours: ext,
             client_order_id: "cid-abc-123".to_string(),
         }
+    }
+
+    /// Finding 6: `lot_size`, `tick_size` and `fractional` were carried on the
+    /// instrument and never applied, so `round_qty`/`round_price` were dead
+    /// code and Alpaca bounced orders this module claims to validate locally.
+    #[test]
+    fn a_non_fractionable_name_is_sized_in_whole_shares() {
+        let mut inst = equity_instrument();
+        inst.fractional = false;
+
+        let built = build_new_order(&order(
+            inst,
+            OrderKind::Limit {
+                price: dec!(191.50),
+            },
+            TimeInForce::Day,
+            false,
+        ))
+        .expect("2.5 shares floors to 2");
+
+        assert_eq!(built.qty, "2");
+    }
+
+    #[test]
+    fn a_fractionable_name_keeps_its_fraction() {
+        let built = build_new_order(&order(
+            equity_instrument(),
+            OrderKind::Limit {
+                price: dec!(191.50),
+            },
+            TimeInForce::Day,
+            false,
+        ))
+        .expect("fractional equities take 2.5");
+
+        assert_eq!(built.qty, "2.5");
+    }
+
+    #[test]
+    fn quantity_is_floored_to_the_lot_size() {
+        let mut inst = crypto_instrument();
+        inst.lot_size = Some(dec!(0.001));
+        let mut req = order(
+            inst,
+            OrderKind::Limit { price: dec!(64000) },
+            TimeInForce::Gtc,
+            false,
+        );
+        req.qty = dec!(1.23456);
+
+        let built = build_new_order(&req).expect("floors to the lot");
+        assert_eq!(built.qty, "1.234");
+    }
+
+    /// Rounding down can reach zero, and a zero-quantity order is a guaranteed
+    /// rejection. Refusing locally says why; the venue's error would not.
+    #[test]
+    fn a_quantity_that_rounds_away_is_refused_locally() {
+        let mut inst = equity_instrument();
+        inst.fractional = false;
+        let mut req = order(
+            inst,
+            OrderKind::Limit {
+                price: dec!(191.50),
+            },
+            TimeInForce::Day,
+            false,
+        );
+        req.qty = dec!(0.4);
+
+        let err = build_new_order(&req).expect_err("0.4 whole shares is no shares");
+        assert!(err.to_string().contains("rounds to zero"), "{err}");
+    }
+
+    /// Finding 12: Alpaca publishes `min_order_size` for crypto and it was
+    /// parsed and thrown away, so a sub-minimum size was only refused by the
+    /// venue at submission. At micro capital this is where it bites — a few
+    /// dollars of BTC sits near the floor.
+    #[test]
+    fn a_crypto_order_below_the_venue_minimum_is_refused_locally() {
+        let mut inst = crypto_instrument();
+        inst.min_qty = Some(dec!(0.000026));
+        inst.lot_size = Some(dec!(0.000000001));
+
+        let mut req = order(
+            inst,
+            OrderKind::Limit { price: dec!(64000) },
+            TimeInForce::Gtc,
+            false,
+        );
+        req.qty = dec!(0.00001);
+
+        let err = build_new_order(&req).expect_err("below Alpaca's minimum");
+        assert!(err.to_string().contains("minimum order size"), "{err}");
+    }
+
+    #[test]
+    fn a_crypto_order_at_the_venue_minimum_is_accepted() {
+        let mut inst = crypto_instrument();
+        inst.min_qty = Some(dec!(0.000026));
+        inst.lot_size = Some(dec!(0.000001));
+
+        let mut req = order(
+            inst,
+            OrderKind::Limit { price: dec!(64000) },
+            TimeInForce::Gtc,
+            false,
+        );
+        req.qty = dec!(0.000026);
+
+        let built = build_new_order(&req).expect("exactly at the minimum clears");
+        assert_eq!(built.qty, "0.000026");
+    }
+
+    /// The ordering matters: rounding down to the lot size can push a size
+    /// that cleared the minimum below it, so the check has to come after the
+    /// rounding — the submitted size is the one that has to clear.
+    #[test]
+    fn rounding_down_to_the_lot_can_cross_the_minimum_and_is_caught() {
+        let mut inst = crypto_instrument();
+        inst.lot_size = Some(dec!(0.01));
+        inst.min_qty = Some(dec!(0.015));
+
+        let mut req = order(
+            inst,
+            OrderKind::Limit { price: dec!(64000) },
+            TimeInForce::Gtc,
+            false,
+        );
+        // 0.019 clears the 0.015 minimum, but floors to 0.01, which does not.
+        req.qty = dec!(0.019);
+
+        let err = build_new_order(&req).expect_err("the rounded size is below the minimum");
+        assert!(err.to_string().contains("minimum order size"), "{err}");
+    }
+
+    #[test]
+    fn a_limit_price_is_rounded_to_the_tick_toward_the_safe_side() {
+        let mut buy = order(
+            equity_instrument(),
+            OrderKind::Limit {
+                price: dec!(191.5049),
+            },
+            TimeInForce::Day,
+            false,
+        );
+        buy.side = Side::Buy;
+        // Buying: never round up into paying more than was sized for.
+        assert_eq!(build_new_order(&buy).unwrap().limit_price.unwrap(), "191.5");
+
+        let mut sell = buy.clone();
+        sell.side = Side::Sell;
+        // Selling: never round down into receiving less.
+        assert_eq!(
+            build_new_order(&sell).unwrap().limit_price.unwrap(),
+            "191.51"
+        );
     }
 
     fn order_response(status: &str) -> Value {
@@ -1582,6 +1825,12 @@ mod tests {
         assert_eq!(btc.tick_size, Some(dec!(1)));
         assert_eq!(btc.lot_size, Some(dec!(0.000000001)));
         assert_eq!(btc.quote_ccy, "USD");
+        // Alpaca's crypto floor is a quantity, not a notional, so it has to
+        // survive discovery in min_qty or the constraint is lost before
+        // anything can enforce it.
+        assert_eq!(btc.min_qty, Some(dec!(0.000026)));
+        assert_eq!(btc.min_notional, None);
+        assert_eq!(aapl.min_qty, None, "equities have no size floor");
         assert_eq!(
             btc.meta,
             InstrumentMeta::Spot {
@@ -1702,7 +1951,7 @@ mod tests {
         let balance = venue.balance().await.unwrap();
         assert_eq!(balance.ccy, "USD");
         assert_eq!(balance.available, dec!(150.00));
-        assert_eq!(balance.total, dec!(275.50));
+        assert_eq!(balance.total, Some(dec!(275.50)));
     }
 
     #[tokio::test]
@@ -1755,6 +2004,73 @@ mod tests {
 
         let venue = venue(&server, &["AAPL"]);
         venue.cancel_order("order-1").await.unwrap();
+    }
+
+    /// Finding 14: /v2/orders caps a page at 500, and returning the first
+    /// page as the whole answer means reconciliation decides the 501st order
+    /// does not exist and stops tracking it.
+    #[tokio::test]
+    async fn open_orders_pages_past_the_first_five_hundred() {
+        let server = MockServer::start().await;
+
+        // A full first page, oldest first, then a short second page.
+        let first: Vec<Value> = (0..ORDER_PAGE_SIZE)
+            .map(|i| {
+                let mut o = order_response("new");
+                o["id"] = json!(format!("first-{i}"));
+                o["submitted_at"] = json!(format!("2026-09-19T10:{:02}:00Z", i % 60));
+                o
+            })
+            .collect();
+
+        Mock::given(method("GET"))
+            .and(path("/v2/orders"))
+            .and(query_param("direction", "asc"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(first))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        let mut last = order_response("new");
+        last["id"] = json!("second-0");
+        last["submitted_at"] = json!("2026-09-19T11:00:00Z");
+        Mock::given(method("GET"))
+            .and(path("/v2/orders"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([last])))
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["AAPL"]);
+        let orders = venue.open_orders().await.expect("both pages");
+
+        assert_eq!(orders.len(), ORDER_PAGE_SIZE + 1);
+        assert_eq!(orders.last().unwrap().venue_order_id, "second-0");
+    }
+
+    /// A full page whose rows carry no timestamp cannot advance the cursor.
+    /// Looping forever is worse than stopping, but stopping silently is what
+    /// this fix is about, so it warns and returns what it has.
+    #[tokio::test]
+    async fn open_orders_stops_rather_than_looping_when_the_cursor_cannot_advance() {
+        let server = MockServer::start().await;
+        let page: Vec<Value> = (0..ORDER_PAGE_SIZE)
+            .map(|i| {
+                let mut o = order_response("new");
+                o["id"] = json!(format!("o-{i}"));
+                o["submitted_at"] = Value::Null;
+                o
+            })
+            .collect();
+
+        Mock::given(method("GET"))
+            .and(path("/v2/orders"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page))
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["AAPL"]);
+        let orders = venue.open_orders().await.expect("returns the page it has");
+        assert_eq!(orders.len(), ORDER_PAGE_SIZE);
     }
 
     #[tokio::test]

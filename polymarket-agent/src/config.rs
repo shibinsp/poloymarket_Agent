@@ -12,11 +12,16 @@ pub struct AppConfig {
     pub risk: RiskConfig,
     #[serde(default)]
     pub sizing_continuous: ContinuousSizingConfig,
+    #[serde(default)]
+    pub exits_continuous: ExitsContinuousConfig,
     pub execution: ExecutionConfig,
     pub monitoring: MonitoringConfig,
     pub polymarket: PolymarketConfig,
     pub rate_limit: RateLimitConfig,
     pub database: DatabaseConfig,
+    /// Trading venues. Empty keeps the legacy Polymarket-only behaviour.
+    #[serde(default)]
+    pub venues: Vec<VenueConfig>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -39,10 +44,20 @@ pub struct AgentConfig {
     /// Default: $5.00 — sufficient for ~550 Claude calls at ~$0.009 each.
     #[serde(default = "default_daily_api_budget")]
     pub daily_api_budget: Decimal,
+    /// Longest the agent will sleep when every venue is closed. Bounds only
+    /// the closed-market sleep, never the trading cadence: a weekend is two
+    /// days, and positions still need marking and orders reconciling in the
+    /// middle of it. Default: 1 hour.
+    #[serde(default = "default_max_sleep_seconds")]
+    pub max_sleep_seconds: u64,
 }
 
 fn default_daily_api_budget() -> Decimal {
     rust_decimal_macros::dec!(5.0)
+}
+
+fn default_max_sleep_seconds() -> u64 {
+    3600
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -103,6 +118,61 @@ pub struct ValuationConfig {
     pub high_confidence_edge: Decimal,
     pub low_confidence_edge: Decimal,
     pub cache_ttl_seconds: u64,
+}
+
+impl AppConfig {
+    /// Symbol universe the venue loop trades. Continuous assets need an
+    /// explicit universe — unlike prediction markets, they aren't discovered.
+    pub fn venue_symbols(&self) -> Vec<String> {
+        self.venues
+            .iter()
+            .filter(|v| v.enabled)
+            .flat_map(|v| v.symbols.clone())
+            .collect()
+    }
+
+    /// Per-side taker fee assumed when netting edge against costs.
+    pub fn venue_fee_pct(&self) -> Decimal {
+        self.venues
+            .iter()
+            .filter(|v| v.enabled)
+            .map(|v| v.fee_pct)
+            .max()
+            .unwrap_or(rust_decimal_macros::dec!(0.0025))
+    }
+
+    /// Minimum probability-of-up before a directional view is tradeable.
+    pub fn min_p_up(&self) -> Decimal {
+        rust_decimal_macros::dec!(0.55)
+    }
+
+    /// Cap on orders opened in a single cycle.
+    pub fn max_orders_per_cycle(&self) -> usize {
+        2
+    }
+}
+
+/// One configured trading venue.
+#[derive(Debug, Clone, Deserialize)]
+pub struct VenueConfig {
+    pub id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub data_url: Option<String>,
+    /// Explicit universe for continuous assets.
+    #[serde(default)]
+    pub symbols: Vec<String>,
+    /// Per-side taker fee as a fraction.
+    #[serde(default = "default_fee_pct")]
+    pub fee_pct: Decimal,
+}
+
+fn default_fee_pct() -> Decimal {
+    rust_decimal_macros::dec!(0.0025)
 }
 
 impl ValuationConfig {
@@ -179,6 +249,34 @@ fn default_max_stop_pct() -> Decimal {
     rust_decimal_macros::dec!(0.12)
 }
 
+/// Exit rules for continuous assets, which never settle themselves.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExitsContinuousConfig {
+    /// Fraction above entry at which to take profit.
+    #[serde(default = "default_take_profit_pct")]
+    pub take_profit_pct: Decimal,
+    /// Close regardless after this long, so a position that goes nowhere does
+    /// not tie up capital indefinitely.
+    #[serde(default = "default_max_hold_hours")]
+    pub max_hold_hours: i64,
+}
+
+impl Default for ExitsContinuousConfig {
+    fn default() -> Self {
+        Self {
+            take_profit_pct: default_take_profit_pct(),
+            max_hold_hours: default_max_hold_hours(),
+        }
+    }
+}
+
+fn default_take_profit_pct() -> Decimal {
+    rust_decimal_macros::dec!(0.06)
+}
+fn default_max_hold_hours() -> i64 {
+    72
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExecutionConfig {
     pub order_type: String,
@@ -249,6 +347,9 @@ pub struct Secrets {
     /// Bearer token protecting the dashboard's `/api/*` routes. Required when
     /// the dashboard is bound to a non-loopback address.
     pub dashboard_token: Option<String>,
+    /// Alpaca trading credentials. Paper and live use different keys.
+    pub alpaca_key_id: Option<String>,
+    pub alpaca_secret_key: Option<String>,
 }
 
 /// Read an env var, treating blank/whitespace-only as unset.
@@ -272,6 +373,8 @@ impl Secrets {
             noaa_api_token: non_empty_env("NOAA_API_TOKEN"),
             espn_api_key: non_empty_env("ESPN_API_KEY"),
             dashboard_token: non_empty_env("DASHBOARD_TOKEN"),
+            alpaca_key_id: non_empty_env("ALPACA_API_KEY_ID"),
+            alpaca_secret_key: non_empty_env("ALPACA_API_SECRET_KEY"),
         }
     }
 }
@@ -317,6 +420,25 @@ mod tests {
         assert_eq!(config.agent.cycle_interval_seconds, 600);
         assert_eq!(config.scanning.max_markets, 1000);
         assert_eq!(config.polymarket.chain_id, 137);
+        assert_eq!(config.agent.max_sleep_seconds, 3600);
+    }
+
+    /// Configs written before the scheduler have no `max_sleep_seconds`, and
+    /// one of them is the untracked local.toml `CONFIG_PATH` points at on a
+    /// live box. A new key that fails to parse there takes the agent down on
+    /// restart, so the default has to hold.
+    #[test]
+    fn agent_config_without_max_sleep_still_parses() {
+        let legacy = r#"
+            mode = "paper"
+            cycle_interval_seconds = 600
+            death_balance_threshold = 0.0
+            low_fuel_threshold = 10.0
+            api_reserve = 2.0
+            initial_paper_balance = 100.0
+        "#;
+        let agent: AgentConfig = toml::from_str(legacy).expect("should parse");
+        assert_eq!(agent.max_sleep_seconds, 3600);
     }
 
     #[test]

@@ -9,10 +9,17 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::{info, instrument, warn};
 
 use crate::config::ValuationConfig;
+
+/// Venue id the binary valuation cache is keyed under. The legacy path only
+/// ever values Polymarket markets.
+const POLYMARKET_VENUE_ID: &str = "polymarket";
+/// Discriminates a binary valuation from the directional payload that shares
+/// the table.
+const CACHE_KIND_BINARY: &str = "binary";
 use crate::data::quality::compute_data_quality;
 use crate::data::DataPoint;
 use crate::db::store::Store;
@@ -21,7 +28,11 @@ use crate::valuation::llm::LlmClient;
 use sqlx;
 
 /// Claude's structured valuation response.
-#[derive(Debug, Clone)]
+///
+/// Serialized whole into `valuation_cache_v2.payload_json` rather than spread
+/// across typed columns, so adding a field to a cached valuation does not need
+/// a migration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValuationResult {
     pub probability: Decimal,
     pub confidence: Decimal,
@@ -68,7 +79,7 @@ impl RawValuationResult {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DataQuality {
     High,
@@ -76,7 +87,7 @@ pub enum DataQuality {
     Low,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum TimeSensitivity {
     Hours,
@@ -183,45 +194,39 @@ impl ValuationEngine {
     }
 
     /// Get a cached valuation from SQLite if it hasn't expired.
+    ///
+    /// Reads `valuation_cache_v2`, which is keyed by venue and symbol. The
+    /// original table keyed on `condition_id` alone, so two venues' "BTC"
+    /// would have shared one entry — migration 002 added v2 for exactly that
+    /// reason and nothing had been switched over to it.
     async fn get_cached_valuation(&self, condition_id: &str) -> Result<Option<ValuationResult>> {
         let ttl = self.config.cache_ttl_seconds as i64;
-        let row: Option<(String, String, String, String, String, String)> = sqlx::query_as(
-            "SELECT probability, confidence, reasoning_summary, key_factors, data_quality, time_sensitivity
-             FROM valuation_cache
-             WHERE condition_id = ?
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT payload_json
+             FROM valuation_cache_v2
+             WHERE venue_id = ? AND symbol = ? AND horizon_hours = 0 AND kind = ?
              AND CAST((julianday('now') - julianday(cached_at)) * 86400 AS INTEGER) < ?",
         )
+        .bind(POLYMARKET_VENUE_ID)
         .bind(condition_id)
+        .bind(CACHE_KIND_BINARY)
         .bind(ttl)
         .fetch_optional(self.store.pool())
         .await?;
 
-        match row {
-            Some((prob, conf, reasoning, factors_json, dq, ts)) => {
-                let probability = prob.parse::<Decimal>().unwrap_or(Decimal::ZERO);
-                let confidence = conf.parse::<Decimal>().unwrap_or(Decimal::ZERO);
-                let key_factors: Vec<String> =
-                    serde_json::from_str(&factors_json).unwrap_or_default();
-                let data_quality = match dq.as_str() {
-                    "High" => DataQuality::High,
-                    "Medium" => DataQuality::Medium,
-                    _ => DataQuality::Low,
-                };
-                let time_sensitivity = match ts.as_str() {
-                    "Hours" => TimeSensitivity::Hours,
-                    "Weeks" => TimeSensitivity::Weeks,
-                    _ => TimeSensitivity::Days,
-                };
-                Ok(Some(ValuationResult {
-                    probability,
-                    confidence,
-                    reasoning_summary: reasoning,
-                    key_factors,
-                    data_quality,
-                    time_sensitivity,
-                }))
+        let Some((payload,)) = row else {
+            return Ok(None);
+        };
+
+        // A payload written by an older build is a cache miss, not an error.
+        // Failing the valuation because a cache row cannot be read would turn
+        // a stale cache into an outage.
+        match serde_json::from_str(&payload) {
+            Ok(result) => Ok(Some(result)),
+            Err(e) => {
+                warn!(error = %e, condition_id, "Discarding an unreadable cached valuation");
+                Ok(None)
             }
-            None => Ok(None),
         }
     }
 
@@ -231,19 +236,16 @@ impl ValuationEngine {
         condition_id: &str,
         result: &ValuationResult,
     ) -> Result<()> {
-        let factors_json = serde_json::to_string(&result.key_factors)?;
+        let payload = serde_json::to_string(result)?;
         sqlx::query(
-            "INSERT OR REPLACE INTO valuation_cache
-             (condition_id, probability, confidence, reasoning_summary, key_factors, data_quality, time_sensitivity, cached_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+            "INSERT OR REPLACE INTO valuation_cache_v2
+             (venue_id, symbol, horizon_hours, kind, payload_json, cached_at)
+             VALUES (?, ?, 0, ?, ?, datetime('now'))",
         )
+        .bind(POLYMARKET_VENUE_ID)
         .bind(condition_id)
-        .bind(result.probability.to_string())
-        .bind(result.confidence.to_string())
-        .bind(&result.reasoning_summary)
-        .bind(&factors_json)
-        .bind(format!("{:?}", result.data_quality))
-        .bind(format!("{:?}", result.time_sensitivity))
+        .bind(CACHE_KIND_BINARY)
+        .bind(&payload)
         .execute(self.store.pool())
         .await?;
         Ok(())
@@ -482,6 +484,113 @@ fn format_order_book_depth(book: &OrderBookSnapshot) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::config::LlmProvider;
+
+    async fn engine_with_cache_ttl(ttl: u64) -> ValuationEngine {
+        let store = Store::new(":memory:").await.expect("in-memory store");
+        let config = ValuationConfig {
+            provider: LlmProvider::Anthropic,
+            model: "test-model".to_string(),
+            base_url: None,
+            input_price_per_million: None,
+            output_price_per_million: None,
+            max_tokens: 1024,
+            min_edge_threshold: dec!(0.08),
+            high_confidence_edge: dec!(0.06),
+            low_confidence_edge: dec!(0.10),
+            cache_ttl_seconds: ttl,
+        };
+        let llm = Arc::new(
+            LlmClient::new("test-key".to_string(), &config, store.clone_for_parallel())
+                .expect("client builds"),
+        );
+        ValuationEngine::new(llm, config, store)
+    }
+
+    fn a_valuation() -> ValuationResult {
+        ValuationResult {
+            probability: dec!(0.73),
+            confidence: dec!(0.81),
+            reasoning_summary: "rain is likely".to_string(),
+            key_factors: vec!["forecast".to_string(), "radar".to_string()],
+            data_quality: DataQuality::High,
+            time_sensitivity: TimeSensitivity::Hours,
+        }
+    }
+
+    /// The cache now lives in valuation_cache_v2, keyed by venue and symbol.
+    /// The old table keyed on condition_id alone, so two venues' "BTC" shared
+    /// one entry — migration 002 added v2 for that reason and nothing had been
+    /// pointed at it.
+    #[tokio::test]
+    async fn a_valuation_round_trips_through_the_v2_cache() {
+        let engine = engine_with_cache_ttl(300).await;
+        let original = a_valuation();
+
+        engine
+            .set_cached_valuation("0xabc", &original)
+            .await
+            .expect("writes");
+        let cached = engine
+            .get_cached_valuation("0xabc")
+            .await
+            .expect("reads")
+            .expect("a fresh entry is a hit");
+
+        assert_eq!(cached.probability, original.probability);
+        assert_eq!(cached.confidence, original.confidence);
+        assert_eq!(cached.key_factors, original.key_factors);
+        assert_eq!(cached.data_quality, original.data_quality);
+        assert_eq!(cached.time_sensitivity, original.time_sensitivity);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_symbol_is_a_cache_miss() {
+        let engine = engine_with_cache_ttl(300).await;
+        assert!(engine
+            .get_cached_valuation("0xnever-seen")
+            .await
+            .expect("reads")
+            .is_none());
+    }
+
+    /// A zero TTL expires everything, which is how the freshness predicate is
+    /// exercised without waiting.
+    #[tokio::test]
+    async fn an_expired_entry_is_a_cache_miss() {
+        let engine = engine_with_cache_ttl(0).await;
+        engine
+            .set_cached_valuation("0xabc", &a_valuation())
+            .await
+            .expect("writes");
+        assert!(engine
+            .get_cached_valuation("0xabc")
+            .await
+            .expect("reads")
+            .is_none());
+    }
+
+    /// A row written by an older build must degrade to a miss, not fail the
+    /// valuation — a stale cache should never become an outage.
+    #[tokio::test]
+    async fn an_unreadable_payload_is_a_miss_not_an_error() {
+        let engine = engine_with_cache_ttl(300).await;
+        sqlx::query(
+            "INSERT INTO valuation_cache_v2
+             (venue_id, symbol, horizon_hours, kind, payload_json, cached_at)
+             VALUES ('polymarket', '0xabc', 0, 'binary', '{oh dear', datetime('now'))",
+        )
+        .execute(engine.store.pool())
+        .await
+        .expect("writes the bad row");
+
+        assert!(engine
+            .get_cached_valuation("0xabc")
+            .await
+            .expect("does not error")
+            .is_none());
+    }
 
     #[test]
     fn test_parse_valuation_response_clean_json() {

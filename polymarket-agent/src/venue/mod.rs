@@ -7,8 +7,11 @@
 //! exchange can't stop the cycle.
 
 pub mod alpaca;
+pub mod factory;
 pub mod polymarket;
 pub mod session;
+#[cfg(test)]
+pub mod test_support;
 pub mod types;
 
 use anyhow::Result;
@@ -122,8 +125,15 @@ impl VenueRegistry {
         self.all().filter(|v| v.is_open_at(at)).collect()
     }
 
-    /// Earliest instant any closed venue reopens, for sleep-until-open.
-    /// `None` when every venue is already open.
+    /// Earliest instant any *session-closed* venue reopens.
+    ///
+    /// Not a sleep-until time on its own, despite the obvious reading. It mins
+    /// over the closed venues only, so a registry holding a 24/7 crypto venue
+    /// beside a shut equity venue still returns Monday's open — sleeping
+    /// straight to that would sit out two days of tradeable crypto. Ask
+    /// `trades_at` first, which is what the scheduler does.
+    ///
+    /// `None` when every venue's session is open.
     pub fn next_open_after(&self, at: DateTime<Utc>) -> Option<DateTime<Utc>> {
         self.all()
             .filter_map(|v| match v.session_state(at) {
@@ -133,18 +143,47 @@ impl VenueRegistry {
             .min()
     }
 
-    /// Collect instruments across every open venue, isolating failures the way
-    /// `DataAggregator::fetch_all` does — one unreachable exchange degrades the
-    /// cycle instead of ending it.
-    pub async fn list_all_instruments(
+    /// Whether any venue could produce a tradeable instrument right now.
+    ///
+    /// This is deliberately *not* `!open_at(at).is_empty()`: a venue whose
+    /// session is shut still trades its always-on classes, so asking about
+    /// sessions alone would report "nothing to do" every weekend while the
+    /// crypto book is live. The scheduler sleeps on this answer, which is the
+    /// most expensive place to get it wrong.
+    pub fn trades_at(&self, at: DateTime<Utc>) -> bool {
+        self.all().any(|v| venue_has_work_at(v, at))
+    }
+
+    /// Instruments that can be traded right now, across every venue.
+    ///
+    /// Filtering is per *instrument*, not per venue. A venue serving both
+    /// equities and crypto reports the restrictive equity session, so
+    /// filtering by venue would stop crypto trading every weekend — the exact
+    /// opposite of what a 24/7 asset needs. Only session-bound instruments are
+    /// gated by the venue's session.
+    ///
+    /// Failures are isolated the way `DataAggregator::fetch_all` does: one
+    /// unreachable exchange degrades the cycle instead of ending it.
+    pub async fn list_tradeable_instruments(
         &self,
         at: DateTime<Utc>,
         filter: &ScanFilter,
     ) -> Vec<Instrument> {
         let mut out = Vec::new();
-        for venue in self.open_at(at) {
+        for venue in self.all() {
+            let session_open = venue.is_open_at(at);
+            // Skip the call entirely only if nothing this venue lists could be
+            // tradeable — i.e. it is closed and serves session-bound assets only.
+            if !venue_has_work_at(venue, at) {
+                continue;
+            }
+
             match venue.list_instruments(filter).await {
-                Ok(instruments) => out.extend(instruments),
+                Ok(instruments) => out.extend(
+                    instruments
+                        .into_iter()
+                        .filter(|i| instrument_tradeable(i, session_open)),
+                ),
                 Err(e) => warn!(
                     venue = %venue.id(),
                     error = %e,
@@ -156,113 +195,25 @@ impl VenueRegistry {
     }
 }
 
+/// Whether a venue can serve a tradeable instrument at `at` — either its
+/// session is open, or it lists a class that ignores sessions entirely.
+fn venue_has_work_at(venue: &dyn Venue, at: DateTime<Utc>) -> bool {
+    venue.is_open_at(at) || venue.capabilities().has_always_on()
+}
+
+/// Whether an instrument can be traded given its venue's session state.
+/// Crypto and prediction markets never close; equities do.
+fn instrument_tradeable(instrument: &Instrument, venue_session_open: bool) -> bool {
+    instrument.asset_class.never_closes() || venue_session_open
+}
+
 #[cfg(test)]
 mod tests {
     use super::types::{AssetClass, InstrumentMeta};
     use super::*;
     use chrono::TimeZone;
-    use rust_decimal_macros::dec;
 
-    /// Minimal venue for exercising the registry.
-    struct StubVenue {
-        id: VenueId,
-        caps: VenueCapabilities,
-        session: TradingSession,
-        instruments: Vec<Instrument>,
-        fail: bool,
-    }
-
-    impl StubVenue {
-        fn new(id: &str, session: TradingSession, symbols: &[&str], fail: bool) -> Self {
-            let venue_id = VenueId::new(id);
-            let instruments = symbols
-                .iter()
-                .map(|s| Instrument {
-                    id: InstrumentId::new(venue_id.clone(), *s),
-                    asset_class: AssetClass::CryptoSpot,
-                    display_name: s.to_string(),
-                    quote_ccy: "USD".to_string(),
-                    tick_size: None,
-                    lot_size: None,
-                    min_notional: None,
-                    fractional: true,
-                    meta: InstrumentMeta::Spot {
-                        base: s.to_string(),
-                    },
-                })
-                .collect();
-            Self {
-                id: venue_id,
-                caps: VenueCapabilities {
-                    asset_classes: vec![AssetClass::CryptoSpot],
-                    limit_only_outside_regular: false,
-                    supports_client_order_id: true,
-                    supports_candles: false,
-                },
-                session,
-                instruments,
-                fail,
-            }
-        }
-    }
-
-    #[async_trait]
-    impl Venue for StubVenue {
-        fn id(&self) -> &VenueId {
-            &self.id
-        }
-        fn capabilities(&self) -> &VenueCapabilities {
-            &self.caps
-        }
-        fn session(&self) -> &TradingSession {
-            &self.session
-        }
-        async fn list_instruments(&self, _f: &ScanFilter) -> Result<Vec<Instrument>> {
-            if self.fail {
-                anyhow::bail!("venue unreachable");
-            }
-            Ok(self.instruments.clone())
-        }
-        async fn quote(&self, _id: &InstrumentId) -> Result<Quote> {
-            anyhow::bail!("not implemented")
-        }
-        async fn candles(
-            &self,
-            _id: &InstrumentId,
-            _i: CandleInterval,
-            _l: usize,
-        ) -> Result<Vec<Candle>> {
-            Ok(Vec::new())
-        }
-        async fn place_order(&self, _r: &OrderRequest) -> Result<OrderAck> {
-            anyhow::bail!("not implemented")
-        }
-        async fn get_order(&self, _o: &OrderRef) -> Result<OrderAck> {
-            anyhow::bail!("not implemented")
-        }
-        async fn cancel_order(&self, _id: &str) -> Result<()> {
-            Ok(())
-        }
-        async fn cancel_all(&self) -> Result<()> {
-            Ok(())
-        }
-        async fn open_orders(&self) -> Result<Vec<OrderAck>> {
-            Ok(Vec::new())
-        }
-        async fn positions(&self) -> Result<Vec<Position>> {
-            Ok(Vec::new())
-        }
-        async fn balance(&self) -> Result<Balance> {
-            Ok(Balance {
-                ccy: "USD".to_string(),
-                available: dec!(100),
-                total: dec!(100),
-            })
-        }
-        async fn settlement(&self, _id: &InstrumentId) -> Result<Option<Settlement>> {
-            Ok(None)
-        }
-    }
+    use super::test_support::StubVenue;
 
     fn et(y: i32, m: u32, d: u32, h: u32) -> DateTime<Utc> {
         chrono_tz::America::New_York
@@ -279,10 +230,10 @@ mod tests {
                 &["BTC/USD"],
                 false,
             )),
-            Box::new(StubVenue::new(
+            Box::new(StubVenue::with_classes(
                 "equity",
                 TradingSession::us_equity_regular(),
-                &["AAPL"],
+                &[("AAPL", AssetClass::Equity)],
                 false,
             )),
         ])
@@ -312,15 +263,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_all_instruments_only_covers_open_venues() {
+    async fn equities_are_gated_by_session_but_crypto_is_not() {
         let reg = registry();
         let filter = ScanFilter::default();
-        let saturday = reg.list_all_instruments(et(2026, 9, 19, 12), &filter).await;
+        let saturday = reg
+            .list_tradeable_instruments(et(2026, 9, 19, 12), &filter)
+            .await;
         assert_eq!(saturday.len(), 1, "equities are shut at the weekend");
         assert_eq!(saturday[0].symbol(), "BTC/USD");
 
-        let weekday = reg.list_all_instruments(et(2026, 9, 17, 12), &filter).await;
+        let weekday = reg
+            .list_tradeable_instruments(et(2026, 9, 17, 12), &filter)
+            .await;
         assert_eq!(weekday.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_mixed_venue_still_trades_crypto_while_its_equity_session_is_shut() {
+        // Alpaca's real shape: one venue, both asset classes, reporting the
+        // restrictive equity session. Filtering by venue would silently stop
+        // crypto trading every weekend — the opposite of a 24/7 asset's needs.
+        let reg = VenueRegistry::new(vec![Box::new(StubVenue::with_classes(
+            "alpaca",
+            TradingSession::us_equity_regular(),
+            &[
+                ("AAPL", AssetClass::Equity),
+                ("BTC/USD", AssetClass::CryptoSpot),
+            ],
+            false,
+        ))]);
+
+        // Saturday: the venue reports closed, but crypto must still come back.
+        let saturday = reg
+            .list_tradeable_instruments(et(2026, 9, 19, 12), &ScanFilter::default())
+            .await;
+        assert_eq!(saturday.len(), 1);
+        assert_eq!(saturday[0].symbol(), "BTC/USD");
+
+        // Thursday midday: both are tradeable.
+        let weekday = reg
+            .list_tradeable_instruments(et(2026, 9, 17, 12), &ScanFilter::default())
+            .await;
+        assert_eq!(weekday.len(), 2);
+    }
+
+    #[test]
+    fn instrument_tradeability_follows_asset_class() {
+        let equity = Instrument {
+            id: InstrumentId::new(VenueId::new("v"), "AAPL"),
+            asset_class: AssetClass::Equity,
+            display_name: "AAPL".to_string(),
+            quote_ccy: "USD".to_string(),
+            tick_size: None,
+            lot_size: None,
+            min_notional: None,
+            min_qty: None,
+            fractional: true,
+            meta: InstrumentMeta::Equity {
+                exchange: "NASDAQ".to_string(),
+            },
+        };
+        let crypto = Instrument {
+            asset_class: AssetClass::CryptoSpot,
+            ..equity.clone()
+        };
+
+        assert!(instrument_tradeable(&equity, true));
+        assert!(!instrument_tradeable(&equity, false));
+        // Crypto ignores the venue's session entirely.
+        assert!(instrument_tradeable(&crypto, true));
+        assert!(instrument_tradeable(&crypto, false));
     }
 
     #[tokio::test]
@@ -340,7 +352,7 @@ mod tests {
             )),
         ]);
         let found = reg
-            .list_all_instruments(Utc::now(), &ScanFilter::default())
+            .list_tradeable_instruments(Utc::now(), &ScanFilter::default())
             .await;
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].venue().as_str(), "working");

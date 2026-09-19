@@ -109,7 +109,7 @@ pub fn kelly_size(
 }
 
 /// Result of Kelly sizing calculation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct KellyResult {
     /// Raw Kelly fraction before adjustments.
     pub kelly_raw: Decimal,
