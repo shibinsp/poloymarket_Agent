@@ -28,7 +28,7 @@ use crate::execution::wallet;
 use crate::market::models::{AgentState, MarketCandidate};
 use crate::market::polymarket::PolymarketClient;
 use crate::market::scanner::MarketScanner;
-use crate::monitoring::alerts::{check_milestone, AlertClient};
+use crate::monitoring::alerts::{check_milestone, AlertClient, AlertLevel, AnomalyKind};
 use crate::monitoring::metrics::{compute_metrics, log_metrics};
 use crate::risk::kelly;
 use crate::risk::limits;
@@ -296,11 +296,22 @@ impl Agent {
         let budget_available = match self.store.get_today_api_cost().await {
             Ok(today_cost) => {
                 if today_cost >= self.config.agent.daily_api_budget {
-                    warn!(
-                        today_cost = %today_cost,
-                        budget = %self.config.agent.daily_api_budget,
-                        "Daily API budget exhausted — skipping valuations this cycle"
-                    );
+                    // Worth alerting rather than only logging: from here the
+                    // agent still runs cycles and still looks healthy, but it
+                    // forms no new views, so it quietly stops doing the thing
+                    // it exists to do until the day rolls over.
+                    let _ = self
+                        .alert_client
+                        .anomaly(
+                            AlertLevel::Warning,
+                            AnomalyKind::BudgetExhausted,
+                            "",
+                            &format!(
+                                "Spent ${today_cost} of ${} — no new valuations until the UTC day rolls over",
+                                self.config.agent.daily_api_budget
+                            ),
+                        )
+                        .await;
                     false
                 } else {
                     true
@@ -413,7 +424,15 @@ impl Agent {
             )
             .await;
         if let Err(ref e) = log_result {
-            warn!(error = %e, "Failed to record cycle summary");
+            let _ = self
+                .alert_client
+                .anomaly(
+                    AlertLevel::Warning,
+                    AnomalyKind::DbWriteFailed,
+                    "cycles",
+                    &format!("Could not record the cycle summary: {e}"),
+                )
+                .await;
         }
 
         // Phase 8: Periodic metrics summary (every 10 cycles)
@@ -669,7 +688,21 @@ impl Agent {
             if let Err(e) =
                 fills::record_trade(&self.store, &prepared, &execution, self.cycle_number).await
             {
-                warn!(error = %e, "Failed to record trade");
+                // The order went to the venue and the ledger does not know.
+                // Every later decision — exposure, exits, reconciliation —
+                // now reasons from a position that is missing, so this is the
+                // most expensive write in the cycle to lose.
+                let _ = self
+                    .alert_client
+                    .anomaly(
+                        AlertLevel::Critical,
+                        AnomalyKind::DbWriteFailed,
+                        "trades",
+                        &format!(
+                            "Order was placed but not recorded — the ledger is behind the venue: {e}"
+                        ),
+                    )
+                    .await;
             }
 
             if execution.status == OrderStatus::Filled {
