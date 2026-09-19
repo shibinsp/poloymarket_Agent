@@ -44,10 +44,20 @@ pub struct AgentConfig {
     /// Default: $5.00 — sufficient for ~550 Claude calls at ~$0.009 each.
     #[serde(default = "default_daily_api_budget")]
     pub daily_api_budget: Decimal,
+    /// Longest the agent will sleep when every venue is closed. Bounds only
+    /// the closed-market sleep, never the trading cadence: a weekend is two
+    /// days, and positions still need marking and orders reconciling in the
+    /// middle of it. Default: 1 hour.
+    #[serde(default = "default_max_sleep_seconds")]
+    pub max_sleep_seconds: u64,
 }
 
 fn default_daily_api_budget() -> Decimal {
     rust_decimal_macros::dec!(5.0)
+}
+
+fn default_max_sleep_seconds() -> u64 {
+    3600
 }
 
 #[derive(Debug, Clone, Deserialize)]

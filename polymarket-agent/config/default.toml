@@ -6,6 +6,7 @@ low_fuel_threshold = 10.0
 api_reserve = 2.0
 initial_paper_balance = 100.0
 daily_api_budget = 5.0               # max API spend per UTC day ($)
+max_sleep_seconds = 3600          # longest sleep while every venue is closed
 
 [scanning]
 max_markets = 1000

@@ -2,11 +2,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
+use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tracing::{error, info, warn};
 
 use crate::agent::reconcile::Reconciler;
+use crate::agent::scheduler::{self, WakePlan};
 use crate::agent::self_funding::{
     self, edge_justifies_cost, enhanced_survival_check, log_cost_breakdown, CycleCosts,
 };
@@ -1017,6 +1019,18 @@ impl Agent {
 
     pub fn current_state(&self) -> AgentState {
         self.state
+    }
+
+    /// When the loop should run the next cycle. Kept on `Agent` so the venue
+    /// registry stays private — `main` schedules without knowing what a
+    /// session is.
+    pub fn next_wake(&self, now: DateTime<Utc>) -> WakePlan {
+        scheduler::next_wake(
+            &self.venues,
+            now,
+            Duration::seconds(self.config.agent.cycle_interval_seconds as i64),
+            Duration::seconds(self.config.agent.max_sleep_seconds as i64),
+        )
     }
 }
 

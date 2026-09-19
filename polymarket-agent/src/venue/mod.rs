@@ -10,6 +10,8 @@ pub mod alpaca;
 pub mod factory;
 pub mod polymarket;
 pub mod session;
+#[cfg(test)]
+pub mod test_support;
 pub mod types;
 
 use anyhow::Result;
@@ -19,8 +21,8 @@ use tracing::warn;
 
 use self::session::{SessionState, TradingSession};
 use self::types::{
-    AssetClass, Balance, Candle, CandleInterval, Instrument, InstrumentId, OrderAck, OrderRef,
-    OrderRequest, Position, Quote, ScanFilter, Settlement, VenueCapabilities, VenueId,
+    Balance, Candle, CandleInterval, Instrument, InstrumentId, OrderAck, OrderRef, OrderRequest,
+    Position, Quote, ScanFilter, Settlement, VenueCapabilities, VenueId,
 };
 
 /// A trading venue.
@@ -134,6 +136,17 @@ impl VenueRegistry {
             .min()
     }
 
+    /// Whether any venue could produce a tradeable instrument right now.
+    ///
+    /// This is deliberately *not* `!open_at(at).is_empty()`: a venue whose
+    /// session is shut still trades its always-on classes, so asking about
+    /// sessions alone would report "nothing to do" every weekend while the
+    /// crypto book is live. The scheduler sleeps on this answer, which is the
+    /// most expensive place to get it wrong.
+    pub fn trades_at(&self, at: DateTime<Utc>) -> bool {
+        self.all().any(|v| venue_has_work_at(v, at))
+    }
+
     /// Instruments that can be traded right now, across every venue.
     ///
     /// Filtering is per *instrument*, not per venue. A venue serving both
@@ -154,9 +167,7 @@ impl VenueRegistry {
             let session_open = venue.is_open_at(at);
             // Skip the call entirely only if nothing this venue lists could be
             // tradeable — i.e. it is closed and serves session-bound assets only.
-            let has_always_on = venue.capabilities().supports(AssetClass::CryptoSpot)
-                || venue.capabilities().supports(AssetClass::PredictionBinary);
-            if !session_open && !has_always_on {
+            if !venue_has_work_at(venue, at) {
                 continue;
             }
 
@@ -177,146 +188,25 @@ impl VenueRegistry {
     }
 }
 
+/// Whether a venue can serve a tradeable instrument at `at` — either its
+/// session is open, or it lists a class that ignores sessions entirely.
+fn venue_has_work_at(venue: &dyn Venue, at: DateTime<Utc>) -> bool {
+    venue.is_open_at(at) || venue.capabilities().has_always_on()
+}
+
 /// Whether an instrument can be traded given its venue's session state.
 /// Crypto and prediction markets never close; equities do.
 fn instrument_tradeable(instrument: &Instrument, venue_session_open: bool) -> bool {
-    match instrument.asset_class {
-        AssetClass::CryptoSpot | AssetClass::PredictionBinary => true,
-        AssetClass::Equity => venue_session_open,
-    }
+    instrument.asset_class.never_closes() || venue_session_open
 }
 
 #[cfg(test)]
 mod tests {
-    use super::types::InstrumentMeta;
+    use super::types::{AssetClass, InstrumentMeta};
     use super::*;
     use chrono::TimeZone;
-    use rust_decimal_macros::dec;
 
-    /// Minimal venue for exercising the registry.
-    struct StubVenue {
-        id: VenueId,
-        caps: VenueCapabilities,
-        session: TradingSession,
-        instruments: Vec<Instrument>,
-        fail: bool,
-    }
-
-    impl StubVenue {
-        fn new(id: &str, session: TradingSession, symbols: &[&str], fail: bool) -> Self {
-            Self::with_classes(
-                id,
-                session,
-                &symbols
-                    .iter()
-                    .map(|s| (*s, AssetClass::CryptoSpot))
-                    .collect::<Vec<_>>(),
-                fail,
-            )
-        }
-
-        /// A venue whose instruments span asset classes — Alpaca's real shape.
-        fn with_classes(
-            id: &str,
-            session: TradingSession,
-            symbols: &[(&str, AssetClass)],
-            fail: bool,
-        ) -> Self {
-            let venue_id = VenueId::new(id);
-            let mut classes: Vec<AssetClass> = Vec::new();
-            for (_, class) in symbols {
-                if !classes.contains(class) {
-                    classes.push(*class);
-                }
-            }
-            let instruments = symbols
-                .iter()
-                .map(|(s, class)| Instrument {
-                    id: InstrumentId::new(venue_id.clone(), *s),
-                    asset_class: *class,
-                    display_name: s.to_string(),
-                    quote_ccy: "USD".to_string(),
-                    tick_size: None,
-                    lot_size: None,
-                    min_notional: None,
-                    fractional: true,
-                    meta: InstrumentMeta::Spot {
-                        base: s.to_string(),
-                    },
-                })
-                .collect();
-            Self {
-                id: venue_id,
-                caps: VenueCapabilities {
-                    asset_classes: classes,
-                    limit_only_outside_regular: false,
-                    supports_client_order_id: true,
-                    supports_candles: false,
-                },
-                session,
-                instruments,
-                fail,
-            }
-        }
-    }
-
-    #[async_trait]
-    impl Venue for StubVenue {
-        fn id(&self) -> &VenueId {
-            &self.id
-        }
-        fn capabilities(&self) -> &VenueCapabilities {
-            &self.caps
-        }
-        fn session(&self) -> &TradingSession {
-            &self.session
-        }
-        async fn list_instruments(&self, _f: &ScanFilter) -> Result<Vec<Instrument>> {
-            if self.fail {
-                anyhow::bail!("venue unreachable");
-            }
-            Ok(self.instruments.clone())
-        }
-        async fn quote(&self, _id: &InstrumentId) -> Result<Quote> {
-            anyhow::bail!("not implemented")
-        }
-        async fn candles(
-            &self,
-            _id: &InstrumentId,
-            _i: CandleInterval,
-            _l: usize,
-        ) -> Result<Vec<Candle>> {
-            Ok(Vec::new())
-        }
-        async fn place_order(&self, _r: &OrderRequest) -> Result<OrderAck> {
-            anyhow::bail!("not implemented")
-        }
-        async fn get_order(&self, _o: &OrderRef) -> Result<OrderAck> {
-            anyhow::bail!("not implemented")
-        }
-        async fn cancel_order(&self, _id: &str) -> Result<()> {
-            Ok(())
-        }
-        async fn cancel_all(&self) -> Result<()> {
-            Ok(())
-        }
-        async fn open_orders(&self) -> Result<Vec<OrderAck>> {
-            Ok(Vec::new())
-        }
-        async fn positions(&self) -> Result<Vec<Position>> {
-            Ok(Vec::new())
-        }
-        async fn balance(&self) -> Result<Balance> {
-            Ok(Balance {
-                ccy: "USD".to_string(),
-                available: dec!(100),
-                total: dec!(100),
-            })
-        }
-        async fn settlement(&self, _id: &InstrumentId) -> Result<Option<Settlement>> {
-            Ok(None)
-        }
-    }
+    use super::test_support::StubVenue;
 
     fn et(y: i32, m: u32, d: u32, h: u32) -> DateTime<Utc> {
         chrono_tz::America::New_York
