@@ -12,6 +12,8 @@ pub struct AppConfig {
     pub risk: RiskConfig,
     #[serde(default)]
     pub sizing_continuous: ContinuousSizingConfig,
+    #[serde(default)]
+    pub exits_continuous: ExitsContinuousConfig,
     pub execution: ExecutionConfig,
     pub monitoring: MonitoringConfig,
     pub polymarket: PolymarketConfig,
@@ -235,6 +237,34 @@ fn default_min_stop_pct() -> Decimal {
 }
 fn default_max_stop_pct() -> Decimal {
     rust_decimal_macros::dec!(0.12)
+}
+
+/// Exit rules for continuous assets, which never settle themselves.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExitsContinuousConfig {
+    /// Fraction above entry at which to take profit.
+    #[serde(default = "default_take_profit_pct")]
+    pub take_profit_pct: Decimal,
+    /// Close regardless after this long, so a position that goes nowhere does
+    /// not tie up capital indefinitely.
+    #[serde(default = "default_max_hold_hours")]
+    pub max_hold_hours: i64,
+}
+
+impl Default for ExitsContinuousConfig {
+    fn default() -> Self {
+        Self {
+            take_profit_pct: default_take_profit_pct(),
+            max_hold_hours: default_max_hold_hours(),
+        }
+    }
+}
+
+fn default_take_profit_pct() -> Decimal {
+    rust_decimal_macros::dec!(0.06)
+}
+fn default_max_hold_hours() -> i64 {
+    72
 }
 
 #[derive(Debug, Clone, Deserialize)]
