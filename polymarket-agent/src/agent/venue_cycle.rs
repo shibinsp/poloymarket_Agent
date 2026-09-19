@@ -92,7 +92,7 @@ impl VenueCycle<'_> {
             bankroll,
             cycle,
         };
-        let instruments = self.registry.list_all_instruments(now, &filter).await;
+        let instruments = self.registry.list_tradeable_instruments(now, &filter).await;
         outcome.instruments_scanned = instruments.len();
 
         for instrument in instruments {
