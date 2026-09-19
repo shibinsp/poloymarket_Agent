@@ -26,6 +26,7 @@ use crate::valuation::directional::{
     self, build_system_prompt, build_user_prompt, parse_directional_response,
 };
 use crate::valuation::llm::LlmClient;
+use crate::venue::session::SessionKind;
 use crate::venue::types::{
     AssetClass, CandleInterval, Instrument, OrderKind, OrderRequest, OrderState, ScanFilter, Side,
     TimeInForce,
@@ -236,6 +237,9 @@ impl VenueCycle<'_> {
             });
         }
 
+        let extended_hours =
+            needs_extended_hours_flag(instrument.asset_class, venue.session_state(ctx.now).kind());
+
         let client_order_id = Uuid::new_v4().to_string();
         let request = OrderRequest {
             instrument: instrument.clone(),
@@ -248,7 +252,7 @@ impl VenueCycle<'_> {
                 AssetClass::Equity => TimeInForce::Day,
                 _ => TimeInForce::Gtc,
             },
-            extended_hours: false,
+            extended_hours,
             client_order_id: client_order_id.clone(),
         };
 
@@ -376,6 +380,19 @@ struct CycleContext {
 struct EvaluationResult {
     cost: Decimal,
     placed: bool,
+}
+
+/// Whether an order must carry the extended-hours flag.
+///
+/// A venue configured with an extended session reports Open outside regular
+/// hours, and an equity order placed then is rejected unless it says so.
+/// Crypto has no sessions and rejects the flag outright.
+fn needs_extended_hours_flag(asset_class: AssetClass, session: Option<SessionKind>) -> bool {
+    asset_class == AssetClass::Equity
+        && matches!(
+            session,
+            Some(SessionKind::Extended) | Some(SessionKind::Overnight)
+        )
 }
 
 fn order_state_str(state: &OrderState) -> &'static str {
@@ -659,6 +676,31 @@ mod tests {
         let unresolved = store.get_unresolved_orders().await.unwrap();
         assert_eq!(unresolved.len(), 3);
         assert!(!unresolved.iter().any(|o| o.state == "FILLED"));
+    }
+
+    #[test]
+    fn extended_hours_flag_follows_the_session_not_an_assumption() {
+        use SessionKind::{Extended, Overnight, Regular};
+
+        // Equities outside regular hours must declare it, or Alpaca rejects
+        // the order — the venue still reports Open in those windows.
+        assert!(needs_extended_hours_flag(
+            AssetClass::Equity,
+            Some(Extended)
+        ));
+        assert!(needs_extended_hours_flag(
+            AssetClass::Equity,
+            Some(Overnight)
+        ));
+        assert!(!needs_extended_hours_flag(
+            AssetClass::Equity,
+            Some(Regular)
+        ));
+
+        // Crypto trades 24/7 and rejects the flag.
+        for session in [Some(Regular), Some(Extended), Some(Overnight), None] {
+            assert!(!needs_extended_hours_flag(AssetClass::CryptoSpot, session));
+        }
     }
 
     #[test]
