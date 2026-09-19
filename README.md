@@ -271,7 +271,23 @@ All trade history, cycle metrics, and API costs are persisted in SQLite:
 
 ### Dashboard
 
-While running in paper or live mode, the agent serves a web dashboard at `http://127.0.0.1:8080` (`dashboard_bind` / `dashboard_port` in `config/default.toml`). If `DASHBOARD_TOKEN` is set, every `/api/*` route except `/api/health` requires `Authorization: Bearer <token>`; the page prompts for it once and remembers it. Binding to a non-loopback address without a token is refused in live mode and falls back to `127.0.0.1` otherwise.
+While running in paper or live mode, the agent serves a web dashboard at `http://127.0.0.1:8080` (`dashboard_bind` / `dashboard_port` in `config/default.toml`). It has six pages — Overview, Trades, Cycles, Costs, Health and Settings — reached by hash routes such as `#/trades`.
+
+If `DASHBOARD_TOKEN` is set, every `/api/*` route except `/api/health` requires `Authorization: Bearer <token>`; the page asks for it once and remembers it in the browser, and it can be changed, cleared or tested from the Settings page. Binding to a non-loopback address without a token is refused in live mode and falls back to `127.0.0.1` otherwise.
+
+Because `/api/health` stays public, the header keeps reporting whether the agent is alive even when nothing else will load. Every figure is shown with how old it is, and if the agent stops the page says so instead of leaving stale numbers looking current.
+
+**`static/index.html` is a build artifact — do not edit it.** The dashboard source lives in [`polymarket-agent/ui/`](polymarket-agent/ui/README.md) (React + TypeScript, built by Vite into that one self-contained file). After changing it:
+
+```bash
+cd polymarket-agent/ui
+npm install
+npm run build:embed   # vite build, then cargo build
+```
+
+`cargo build` is not optional: the page is embedded with `include_str!` at
+compile time, so a rebuilt bundle does not reach the binary — or a running
+agent — until Rust recompiles and the agent restarts.
 
 ### Health Check
 
