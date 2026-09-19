@@ -12,11 +12,14 @@
 //! two lots of fees and slippage are paid, and without netting them the agent
 //! would trade constantly on noise.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::Deserialize;
+use serde_json::Value;
 use tracing::warn;
+
+use crate::json_decimal::value_to_decimal;
 
 use crate::data::DataPoint;
 use crate::valuation::fair_value::{extract_json, sanitize_market_question, DataQuality};
@@ -54,17 +57,24 @@ pub enum Direction {
 }
 
 /// Raw model output, before validation.
+///
+/// Every number arrives as a `Value` and is converted through
+/// `json_decimal::value_to_decimal`, never through `f64`. `invalidation_price`
+/// and `target_price` become a stop and a take-profit — money, which
+/// `RULES.md` says never touches binary floating point — and declaring them
+/// `f64` here would bake the rounding in before any later conversion could
+/// help. The same decoder handles venue responses, for the same reason.
 #[derive(Debug, Deserialize)]
 struct DirectionalResponse {
     direction: Direction,
-    p_up: f64,
-    expected_return_pct: f64,
+    p_up: Value,
+    expected_return_pct: Value,
     horizon_hours: i64,
-    confidence: f64,
+    confidence: Value,
     #[serde(default)]
-    invalidation_price: Option<f64>,
+    invalidation_price: Option<Value>,
     #[serde(default)]
-    target_price: Option<f64>,
+    target_price: Option<Value>,
     #[serde(default)]
     reasoning_summary: String,
     #[serde(default)]
@@ -73,13 +83,21 @@ struct DirectionalResponse {
     data_quality: Option<DataQuality>,
 }
 
-/// Convert a model-supplied float, rejecting NaN and infinity rather than
-/// letting them collapse to zero.
-fn finite(value: f64, field: &str) -> Result<Decimal> {
-    if !value.is_finite() {
-        bail!("Model returned a non-finite {field}: {value}");
+/// Convert a model-supplied number, naming the field when it will not parse.
+///
+/// Non-finite values are refused for free: JSON has no NaN or Infinity
+/// literal, and a model that writes them as strings fails to parse rather than
+/// collapsing to zero.
+fn number(value: &Value, field: &str) -> Result<Decimal> {
+    value_to_decimal(value).map_err(|e| anyhow!("Model returned an invalid {field}: {e}"))
+}
+
+/// The optional-price version, keeping "absent" distinct from "unparseable".
+fn optional_number(value: Option<&Value>, field: &str) -> Result<Option<Decimal>> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => number(v, field).map(Some),
     }
-    Decimal::try_from(value).with_context(|| format!("Model returned an unrepresentable {field}"))
 }
 
 /// Parse and validate a model response into a usable view.
@@ -88,17 +106,17 @@ pub fn parse_directional_response(text: &str) -> Result<DirectionalView> {
     let raw: DirectionalResponse =
         serde_json::from_str(&json).context("Model response did not match the expected schema")?;
 
-    let p_up = finite(raw.p_up, "p_up")?;
+    let p_up = number(&raw.p_up, "p_up")?;
     if !(Decimal::ZERO..=Decimal::ONE).contains(&p_up) {
         bail!("p_up out of range: {p_up}");
     }
 
-    let confidence = finite(raw.confidence, "confidence")?;
+    let confidence = number(&raw.confidence, "confidence")?;
     if !(Decimal::ZERO..=Decimal::ONE).contains(&confidence) {
         bail!("confidence out of range: {confidence}");
     }
 
-    let expected_return_pct = finite(raw.expected_return_pct, "expected_return_pct")?;
+    let expected_return_pct = number(&raw.expected_return_pct, "expected_return_pct")?;
     if expected_return_pct.abs() > MAX_ABS_EXPECTED_RETURN {
         bail!(
             "expected_return_pct implausible over this horizon: {expected_return_pct}; \
@@ -110,14 +128,9 @@ pub fn parse_directional_response(text: &str) -> Result<DirectionalView> {
         bail!("horizon_hours out of range: {}", raw.horizon_hours);
     }
 
-    let invalidation_price = raw
-        .invalidation_price
-        .map(|v| finite(v, "invalidation_price"))
-        .transpose()?;
-    let target_price = raw
-        .target_price
-        .map(|v| finite(v, "target_price"))
-        .transpose()?;
+    let invalidation_price =
+        optional_number(raw.invalidation_price.as_ref(), "invalidation_price")?;
+    let target_price = optional_number(raw.target_price.as_ref(), "target_price")?;
 
     Ok(DirectionalView {
         direction: raw.direction,
@@ -329,6 +342,73 @@ mod tests {
                 "should have rejected: {case}"
             );
         }
+    }
+
+    /// Models are inconsistent about quoting numbers. An `f64` field rejected
+    /// the string form outright, throwing away a whole valuation — and the
+    /// call that produced it — over formatting.
+    #[test]
+    fn prices_quoted_as_json_strings_parse_the_same_as_numbers() {
+        let as_numbers = r#"{"direction":"long","p_up":0.6,"expected_return_pct":0.04,
+                             "horizon_hours":24,"confidence":0.7,
+                             "invalidation_price":95.5,"target_price":110.25}"#;
+        let as_strings = r#"{"direction":"long","p_up":"0.6","expected_return_pct":"0.04",
+                             "horizon_hours":24,"confidence":"0.7",
+                             "invalidation_price":"95.5","target_price":"110.25"}"#;
+
+        let a = parse_directional_response(as_numbers).expect("numbers parse");
+        let b = parse_directional_response(as_strings).expect("strings parse too");
+
+        assert_eq!(a.invalidation_price, b.invalidation_price);
+        assert_eq!(a.target_price, b.target_price);
+        assert_eq!(a.p_up, b.p_up);
+        assert_eq!(a.expected_return_pct, b.expected_return_pct);
+    }
+
+    /// The point of not going through `f64`: a stop level keeps every digit it
+    /// was given. Through a binary float the tail is gone before any later
+    /// conversion to `Decimal` could recover it.
+    #[test]
+    fn a_price_keeps_more_precision_than_a_float_can_hold() {
+        let json = r#"{"direction":"long","p_up":0.6,"expected_return_pct":0.04,
+                       "horizon_hours":24,"confidence":0.7,
+                       "invalidation_price":"0.12345678901234567890"}"#;
+        let v = parse_directional_response(json).expect("parses");
+
+        let exact = Decimal::from_str_exact("0.12345678901234567890").unwrap();
+        assert_eq!(v.invalidation_price, Some(exact));
+        // Demonstrates the loss being avoided: the same text through f64.
+        // Parsed rather than written as a literal, because a literal with this
+        // many digits is itself a lint — which is the point.
+        let via_float =
+            Decimal::try_from("0.12345678901234567890".parse::<f64>().unwrap()).unwrap();
+        assert_ne!(
+            v.invalidation_price,
+            Some(via_float),
+            "if these match, the test is no longer proving anything"
+        );
+    }
+
+    /// A price that will not parse is an error, not a silent `None` — a stop
+    /// that quietly goes missing is a position with no stop.
+    #[test]
+    fn an_unparseable_price_is_refused_rather_than_dropped() {
+        let json = r#"{"direction":"long","p_up":0.6,"expected_return_pct":0.04,
+                       "horizon_hours":24,"confidence":0.7,
+                       "invalidation_price":"about ninety-five"}"#;
+        let err = parse_directional_response(json).unwrap_err();
+        assert!(err.to_string().contains("invalidation_price"), "{err}");
+    }
+
+    /// An absent or null price stays absent — distinct from unparseable.
+    #[test]
+    fn an_absent_price_is_none_not_an_error() {
+        let json = r#"{"direction":"long","p_up":0.6,"expected_return_pct":0.04,
+                       "horizon_hours":24,"confidence":0.7,
+                       "invalidation_price":null}"#;
+        let v = parse_directional_response(json).expect("parses");
+        assert_eq!(v.invalidation_price, None);
+        assert_eq!(v.target_price, None);
     }
 
     #[test]
