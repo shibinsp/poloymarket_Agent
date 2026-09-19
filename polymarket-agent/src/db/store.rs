@@ -415,6 +415,68 @@ impl Store {
         .context("Failed to fetch unresolved orders")
     }
 
+    /// Open continuous-asset positions, which unlike prediction markets never
+    /// settle themselves and must be explicitly closed.
+    pub async fn get_open_venue_trades(&self) -> Result<Vec<VenueOpenTrade>> {
+        let rows = sqlx::query_as::<_, VenueOpenTradeRow>(
+            "SELECT id, venue_id, symbol, asset_class, entry_price, avg_fill_price, quantity, stop_price, target_price, horizon_hours, created_at
+             FROM trades
+             WHERE status IN ('OPEN', 'PARTIAL') AND asset_class != 'prediction_binary'",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to fetch open venue trades")?;
+
+        rows.into_iter().map(VenueOpenTrade::try_from).collect()
+    }
+
+    /// Record the latest mark so the survival check and dashboard see market
+    /// value rather than entry cost.
+    pub async fn mark_trade(
+        &self,
+        id: i64,
+        mark_price: &str,
+        unrealized_pnl: &str,
+        at: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE trades SET mark_price = ?, unrealized_pnl = ?, marked_at = ? WHERE id = ?",
+        )
+        .bind(mark_price)
+        .bind(unrealized_pnl)
+        .bind(at.to_rfc3339())
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .context("Failed to mark trade")?;
+        Ok(())
+    }
+
+    /// Close a position once its exit has actually filled.
+    pub async fn close_trade(
+        &self,
+        id: i64,
+        exit_price: &str,
+        realized_pnl: &str,
+        reason: &str,
+        exit_order_id: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE trades SET status = 'CLOSED', mark_price = ?, realized_pnl = ?, pnl = ?, close_reason = ?, exit_order_id = ?, closed_at = ? WHERE id = ?",
+        )
+        .bind(exit_price)
+        .bind(realized_pnl)
+        .bind(realized_pnl)
+        .bind(reason)
+        .bind(exit_order_id)
+        .bind(Utc::now().to_rfc3339())
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .context("Failed to close trade")?;
+        Ok(())
+    }
+
     /// Record a trade opened on a venue, once something has actually filled.
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_venue_trade(&self, trade: &VenueTradeRecord) -> Result<i64> {
@@ -474,6 +536,79 @@ pub struct OrderRecord {
     pub submitted_at: Option<String>,
     pub updated_at: Option<String>,
     pub expires_at: Option<String>,
+}
+
+/// Raw row for an open venue position; decimals arrive as TEXT.
+#[derive(Debug, Clone, FromRow)]
+struct VenueOpenTradeRow {
+    id: i64,
+    venue_id: String,
+    symbol: String,
+    asset_class: String,
+    entry_price: String,
+    avg_fill_price: Option<String>,
+    quantity: Option<String>,
+    stop_price: Option<String>,
+    target_price: Option<String>,
+    horizon_hours: Option<i64>,
+    created_at: Option<String>,
+}
+
+/// An open continuous-asset position, with decimals parsed.
+#[derive(Debug, Clone)]
+pub struct VenueOpenTrade {
+    pub id: i64,
+    pub venue_id: String,
+    pub symbol: String,
+    pub asset_class: String,
+    pub entry_price: Decimal,
+    pub avg_fill_price: Option<Decimal>,
+    pub quantity: Decimal,
+    pub stop_price: Option<Decimal>,
+    pub target_price: Option<Decimal>,
+    pub horizon_hours: Option<i64>,
+    pub opened_at: Option<DateTime<Utc>>,
+}
+
+impl TryFrom<VenueOpenTradeRow> for VenueOpenTrade {
+    type Error = anyhow::Error;
+
+    /// Parsing failures are errors, not silent zeroes: a position whose size
+    /// or entry can't be read must not be marked or exited on a guess.
+    fn try_from(row: VenueOpenTradeRow) -> Result<Self> {
+        let parse = |value: &str, field: &str| -> Result<Decimal> {
+            Decimal::from_str(value)
+                .with_context(|| format!("trade {} has an unparseable {field}: {value}", row.id))
+        };
+        let parse_opt = |value: &Option<String>, field: &str| -> Result<Option<Decimal>> {
+            value.as_deref().map(|v| parse(v, field)).transpose()
+        };
+
+        Ok(Self {
+            id: row.id,
+            entry_price: parse(&row.entry_price, "entry_price")?,
+            avg_fill_price: parse_opt(&row.avg_fill_price, "avg_fill_price")?,
+            quantity: parse_opt(&row.quantity, "quantity")?
+                .context("trade is missing a quantity")?,
+            stop_price: parse_opt(&row.stop_price, "stop_price")?,
+            target_price: parse_opt(&row.target_price, "target_price")?,
+            horizon_hours: row.horizon_hours,
+            opened_at: row.created_at.as_deref().and_then(|s| {
+                DateTime::parse_from_rfc3339(s)
+                    .ok()
+                    .map(|d| d.with_timezone(&Utc))
+                    .or_else(|| {
+                        // SQLite's datetime('now') default has no offset.
+                        chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+                            .ok()
+                            .map(|n| n.and_utc())
+                    })
+            }),
+            venue_id: row.venue_id,
+            symbol: row.symbol,
+            asset_class: row.asset_class,
+        })
+    }
 }
 
 /// A filled position opened through a venue adapter.

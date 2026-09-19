@@ -10,6 +10,7 @@ use crate::agent::self_funding::{
     self, edge_justifies_cost, enhanced_survival_check, log_cost_breakdown, CycleCosts,
 };
 use crate::agent::venue_cycle::{CycleOutcome, VenueCycle};
+use crate::agent::venue_exits::VenueExits;
 use crate::config::{AppConfig, Secrets};
 use crate::data::crypto::CryptoSource;
 use crate::data::news::NewsSource;
@@ -220,6 +221,26 @@ impl Agent {
         // Re-evaluate open positions for exit signals (RISK-01).
         // Always run, even in Dead state — positions need cleanup (TRD-06).
         self.evaluate_open_positions().await;
+
+        // Continuous-asset positions never settle themselves, so they need an
+        // explicit exit pass. Like the legacy one above this runs in every
+        // state: being unable to open new positions must never mean being
+        // unable to close existing ones.
+        if !self.venues.is_empty() {
+            let exits = VenueExits {
+                registry: &self.venues,
+                store: &self.store,
+                max_hold_hours: self.config.exits_continuous.max_hold_hours,
+            };
+            match exits
+                .run(chrono::Utc::now(), self.cycle_number as i64)
+                .await
+            {
+                Ok(0) => {}
+                Ok(closed) => info!(closed, "Closed continuous positions this cycle"),
+                Err(e) => warn!(error = %e, "Venue exit pass failed"),
+            }
+        }
 
         // Check for resolved markets and settle trades.
         // Always run, even in Dead state — must settle P&L for final accounting (TRD-06).
