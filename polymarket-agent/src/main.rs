@@ -1,4 +1,5 @@
 use anyhow::Result;
+use chrono::Utc;
 use clap::Parser;
 
 use polymarket_agent::agent::lifecycle::Agent;
@@ -271,7 +272,6 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
     )?;
 
     let mut agent = Agent::new(config.clone(), secrets, store).await?;
-    let interval = std::time::Duration::from_secs(config.agent.cycle_interval_seconds);
     let mut shutdown = ShutdownSignals::new()?;
     let mut consecutive_failures: u32 = 0;
     let mut fatal: Option<anyhow::Error> = None;
@@ -311,10 +311,22 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
             }
         }
 
-        // Idle between cycles, but wake immediately on a shutdown signal —
-        // this is the only point where a signal can interrupt the loop.
+        // Idle until there is something to do, but wake immediately on a
+        // shutdown signal — this is the only point where a signal can
+        // interrupt the loop. The wake is computed *after* the cycle, not
+        // before it, so a cycle that ran long doesn't sleep on a stale plan.
+        let now = Utc::now();
+        let plan = agent.next_wake(now);
+        let sleep_for = plan.sleep_from(now);
+        tracing::debug!(
+            reason = plan.reason.as_str(),
+            wake_at = %plan.at,
+            sleep_s = sleep_for.as_secs(),
+            "Idling until the next wake"
+        );
+
         tokio::select! {
-            _ = tokio::time::sleep(interval) => {}
+            _ = tokio::time::sleep(sleep_for) => {}
             signal = shutdown.recv() => {
                 tracing::info!(signal, "Shutdown signal received — stopping after the current cycle");
                 break;

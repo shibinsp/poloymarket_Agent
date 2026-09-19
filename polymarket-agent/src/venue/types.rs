@@ -53,6 +53,16 @@ impl AssetClass {
     pub fn settles(&self) -> bool {
         matches!(self, AssetClass::PredictionBinary)
     }
+
+    /// Whether this class ignores its venue's trading session.
+    ///
+    /// Crypto and prediction contracts trade through nights, weekends and
+    /// holidays; equities do not. This is the one place that fact is stated —
+    /// both instrument filtering and the scheduler read it, and they must not
+    /// be allowed to disagree about whether there is anything to do.
+    pub fn never_closes(&self) -> bool {
+        matches!(self, AssetClass::CryptoSpot | AssetClass::PredictionBinary)
+    }
 }
 
 /// Direction of an order. Unlike the old `Side::{Yes, No}`, this says nothing
@@ -422,6 +432,12 @@ pub struct VenueCapabilities {
 impl VenueCapabilities {
     pub fn supports(&self, class: AssetClass) -> bool {
         self.asset_classes.contains(&class)
+    }
+
+    /// Whether the venue lists anything that trades while its session is shut.
+    /// Alpaca does — its equity session closes but its crypto book does not.
+    pub fn has_always_on(&self) -> bool {
+        self.asset_classes.iter().any(AssetClass::never_closes)
     }
 }
 
