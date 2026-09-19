@@ -3,6 +3,10 @@ dist/
 .vite/
 *.local
 
+# tsc -b incremental cache. Local build state, and it rewrites itself on
+# every build, so tracking it churns a diff on every commit.
+*.tsbuildinfo
+
 # The Vite entry point. The repo root's .gitignore has a blanket `*.html`
 # rule, which would silently drop this file from the commit and leave a fresh
 # clone unable to build the UI at all — the failure only shows up when
