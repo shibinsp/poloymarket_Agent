@@ -49,7 +49,7 @@ pub struct Agent {
     data_aggregator: DataAggregator,
     valuation_engine: Option<ValuationEngine>,
     portfolio: PortfolioManager,
-    alert_client: AlertClient,
+    alert_client: Arc<AlertClient>,
     last_balance: Decimal,
     /// Venues from `[[venues]]`. Empty keeps the legacy Polymarket-only path.
     venues: VenueRegistry,
@@ -105,10 +105,10 @@ impl Agent {
         let portfolio = PortfolioManager::new(config.risk.clone());
 
         // Phase 8: Initialize alert client
-        let alert_client = AlertClient::new(
+        let alert_client = Arc::new(AlertClient::new(
             secrets.discord_webhook_url.clone(),
             config.monitoring.discord_enabled,
-        );
+        ));
 
         // Resume cycle number from last recorded cycle
         let cycle_number = match store.get_latest_cycle().await? {
@@ -244,13 +244,39 @@ impl Agent {
                 ),
             };
             match reconciler.run(chrono::Utc::now()).await {
-                Ok(report) if report.unqueryable > 0 => warn!(
-                    unqueryable = report.unqueryable,
-                    checked = report.checked,
-                    "Some orders could not be resolved — those symbols stay blocked"
-                ),
+                // An order the venue will not talk about keeps blocking its
+                // symbol, which is the safe direction but not a free one: the
+                // agent stops trading that symbol entirely until someone
+                // looks. Silence here is indistinguishable from working.
+                Ok(report) if report.unqueryable > 0 => {
+                    let _ = self
+                        .alert_client
+                        .anomaly(
+                            AlertLevel::Warning,
+                            AnomalyKind::OrderStateUnknown,
+                            "reconcile",
+                            &format!(
+                                "{} of {} orders could not be resolved — those symbols stay blocked",
+                                report.unqueryable, report.checked
+                            ),
+                        )
+                        .await;
+                }
                 Ok(_) => {}
-                Err(e) => warn!(error = %e, "Reconciliation pass failed"),
+                // The pass itself failing is worse than any single finding:
+                // nothing is checking whether the ledger still matches the
+                // venue, so every later decision runs on unverified state.
+                Err(e) => {
+                    let _ = self
+                        .alert_client
+                        .anomaly(
+                            AlertLevel::Critical,
+                            AnomalyKind::ReconciliationMismatch,
+                            "reconcile",
+                            &format!("Reconciliation pass failed — ledger is unverified: {e}"),
+                        )
+                        .await;
+                }
             }
 
             let exits = VenueExits {
@@ -1052,6 +1078,13 @@ impl Agent {
 
     pub fn current_state(&self) -> AgentState {
         self.state
+    }
+
+    /// Shared so a watchdog outside the loop can report on it. A cycle that
+    /// hangs never returns to the loop, so the loop cannot notice its own
+    /// stall — something else has to hold the same client.
+    pub fn alerts(&self) -> Arc<AlertClient> {
+        self.alert_client.clone()
     }
 
     /// When the loop should run the next cycle. Kept on `Agent` so the venue
