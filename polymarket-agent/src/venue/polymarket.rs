@@ -21,7 +21,7 @@ use rust_decimal_macros::dec;
 use tracing::warn;
 
 use crate::execution::resolution::fetch_market_resolution;
-use crate::market::models::Market;
+use crate::market::models::{Market, OrderBookSnapshot};
 use crate::market::polymarket::{MarketFilters, PolymarketClient};
 use crate::venue::session::TradingSession;
 use crate::venue::types::{
@@ -71,6 +71,37 @@ impl PolymarketVenue {
 /// Free function so the mapping can be tested without constructing a live
 /// client.
 fn instruments_for_market(venue_id: &VenueId, market: &Market) -> Vec<Instrument> {
+    let instruments = build_instruments(venue_id, market);
+
+    // A symbol has to identify exactly one CLOB token, so anything that does
+    // not come out as one YES and one NO is not traded at all. Emitting a
+    // partial or duplicated set would put two different tokens behind the same
+    // symbol, and `resolve` would pick whichever happened to come first.
+    let yes = instruments.iter().filter(|i| has_suffix(i, YES)).count();
+    let no = instruments.iter().filter(|i| has_suffix(i, NO)).count();
+    if yes != 1 || no != 1 {
+        warn!(
+            question = %market.question,
+            yes,
+            no,
+            "Skipping market that does not resolve to exactly one YES and one NO instrument"
+        );
+        return Vec::new();
+    }
+
+    instruments
+}
+
+fn has_suffix(instrument: &Instrument, suffix: &str) -> bool {
+    instrument
+        .id
+        .symbol
+        .rsplit(':')
+        .next()
+        .is_some_and(|s| s == suffix)
+}
+
+fn build_instruments(venue_id: &VenueId, market: &Market) -> Vec<Instrument> {
     market
         .tokens
         .iter()
@@ -84,7 +115,14 @@ fn instruments_for_market(venue_id: &VenueId, market: &Market) -> Vec<Instrument
                 );
                 return None;
             }
-            let outcome = normalise_outcome(&token.outcome);
+            let Some(outcome) = normalise_outcome(&token.outcome) else {
+                warn!(
+                    question = %market.question,
+                    outcome = %token.outcome,
+                    "Skipping market whose outcomes are not binary Yes/No"
+                );
+                return None;
+            };
             Some(Instrument {
                 id: InstrumentId::new(
                     venue_id.clone(),
@@ -142,23 +180,21 @@ impl PolymarketVenue {
     async fn resolve(&self, id: &InstrumentId) -> Result<Instrument> {
         let condition_id = Self::condition_id_of(id)?;
         let outcome = Self::outcome_of(id)?;
-        let markets = self
-            .client
-            .get_markets(&MarketFilters {
-                min_volume_24h: Decimal::ZERO,
-                // Wide enough to cover anything currently held.
-                max_resolution_days: 365,
-                max_markets: 1000,
-                max_spread_pct: Decimal::ONE,
-            })
-            .await
-            .context("Failed to list markets while resolving instrument")?;
 
-        markets
-            .iter()
-            .find(|m| m.condition_id == condition_id)
-            .map(|m| self.instruments_for(m))
-            .unwrap_or_default()
+        // One market, fetched by id. The previous implementation paged the
+        // whole discovery universe on every quote — up to ten round trips per
+        // instrument per cycle — and then could not find the one market that
+        // mattered, because discovery filters out anything closed, past its
+        // end date, or below the top-N-by-volume cut. A held position hits all
+        // three of those exactly when it needs exiting.
+        let market = self
+            .client
+            .get_market_by_condition_id(condition_id)
+            .await
+            .with_context(|| format!("Failed to resolve instrument {id}"))?
+            .with_context(|| format!("Market {condition_id} not found on Polymarket"))?;
+
+        self.instruments_for(&market)
             .into_iter()
             .find(|i| {
                 Self::outcome_of(&i.id)
@@ -169,12 +205,43 @@ impl PolymarketVenue {
     }
 }
 
+/// Best bid and ask, refusing a book that is missing a side.
+///
+/// The previous code defaulted the missing side to 0 or 1, which made a
+/// one-sided book look like a well-formed quote: the taker price for a buy came
+/// out at $1.00 — the most a binary contract can possibly cost, i.e. a
+/// guaranteed total loss — and the spread read as a plausible-looking 200%.
+/// `OrderBookSnapshot::midpoint` is computed from the same two fallbacks, so it
+/// was wrong in exactly the same way; callers derive mid from these checked
+/// prices instead. The Alpaca adapter already refuses this state.
+fn two_sided_prices(book: &OrderBookSnapshot, id: &InstrumentId) -> Result<(Decimal, Decimal)> {
+    let bid = book
+        .bids
+        .first()
+        .map(|l| l.price)
+        .with_context(|| format!("One-sided book for {id}: no bids"))?;
+    let ask = book
+        .asks
+        .first()
+        .map(|l| l.price)
+        .with_context(|| format!("One-sided book for {id}: no asks"))?;
+    Ok((bid, ask))
+}
+
 /// Map a venue outcome label onto the canonical suffix used in symbols.
-fn normalise_outcome(outcome: &str) -> &'static str {
+///
+/// `None` for anything that is not a recognisable binary outcome. Folding
+/// every non-"yes" label to NO gave several tokens the same symbol with
+/// different CLOB token ids, so `resolve` returned whichever came first and
+/// the agent quoted, traded and settled against an outcome it never chose.
+fn normalise_outcome(outcome: &str) -> Option<&'static str> {
+    let outcome = outcome.trim();
     if outcome.eq_ignore_ascii_case("yes") {
-        YES
+        Some(YES)
+    } else if outcome.eq_ignore_ascii_case("no") {
+        Some(NO)
     } else {
-        NO
+        None
     }
 }
 
@@ -221,14 +288,13 @@ impl Venue for PolymarketVenue {
             .await
             .with_context(|| format!("Failed to fetch order book for {id}"))?;
 
-        let bid = book.bids.first().map(|l| l.price).unwrap_or(Decimal::ZERO);
-        let ask = book.asks.first().map(|l| l.price).unwrap_or(Decimal::ONE);
+        let (bid, ask) = two_sided_prices(&book, id)?;
 
         Ok(Quote {
             instrument: id.clone(),
             bid,
             ask,
-            mid: book.midpoint,
+            mid: (bid + ask) / dec!(2),
             last: None,
             ts: book.timestamp,
             book: Some(book),
@@ -409,13 +475,110 @@ mod tests {
         assert!(PolymarketVenue::outcome_of(&malformed).is_err());
     }
 
+    fn book(bids: &[(Decimal, Decimal)], asks: &[(Decimal, Decimal)]) -> OrderBookSnapshot {
+        let level = |(price, size): &(Decimal, Decimal)| crate::market::models::PriceLevel {
+            price: *price,
+            size: *size,
+        };
+        OrderBookSnapshot {
+            token_id: "tok".to_string(),
+            bids: bids.iter().map(level).collect(),
+            asks: asks.iter().map(level).collect(),
+            // Deliberately the values convert_order_book would fabricate for a
+            // one-sided book, to prove nothing downstream reads them.
+            spread: Decimal::ONE,
+            midpoint: dec!(0.5),
+            implied_probability: dec!(0.5),
+            timestamp: Utc::now(),
+        }
+    }
+
+    fn instrument_id() -> InstrumentId {
+        InstrumentId::new(venue_id(), "0xabc:YES")
+    }
+
+    #[test]
+    fn a_two_sided_book_quotes_its_own_prices() {
+        let b = book(&[(dec!(0.58), dec!(100))], &[(dec!(0.62), dec!(100))]);
+        let (bid, ask) = two_sided_prices(&b, &instrument_id()).unwrap();
+        assert_eq!(bid, dec!(0.58));
+        assert_eq!(ask, dec!(0.62));
+        // Mid comes from the checked prices, not the snapshot's own field.
+        assert_eq!((bid + ask) / dec!(2), dec!(0.60));
+    }
+
+    /// A missing ask used to default to $1.00 — the most a binary contract can
+    /// cost, so a buy at the taker price was a guaranteed total loss that the
+    /// quote presented as ordinary.
+    #[test]
+    fn a_book_with_no_asks_is_refused_rather_than_priced_at_one() {
+        let b = book(&[(dec!(0.58), dec!(100))], &[]);
+        let err = two_sided_prices(&b, &instrument_id()).expect_err("no asks");
+        assert!(err.to_string().contains("no asks"), "{err}");
+    }
+
+    #[test]
+    fn a_book_with_no_bids_is_refused_rather_than_priced_at_zero() {
+        let b = book(&[], &[(dec!(0.62), dec!(100))]);
+        let err = two_sided_prices(&b, &instrument_id()).expect_err("no bids");
+        assert!(err.to_string().contains("no bids"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_book_is_refused() {
+        let b = book(&[], &[]);
+        assert!(two_sided_prices(&b, &instrument_id()).is_err());
+    }
+
     #[test]
     fn outcome_labels_normalise_to_canonical_suffixes() {
-        assert_eq!(normalise_outcome("Yes"), "YES");
-        assert_eq!(normalise_outcome("YES"), "YES");
-        assert_eq!(normalise_outcome("No"), "NO");
-        // Anything that isn't a yes is treated as the complement.
-        assert_eq!(normalise_outcome("Nope"), "NO");
+        assert_eq!(normalise_outcome("Yes"), Some("YES"));
+        assert_eq!(normalise_outcome("YES"), Some("YES"));
+        assert_eq!(normalise_outcome("No"), Some("NO"));
+        assert_eq!(normalise_outcome(" no "), Some("NO"));
+    }
+
+    /// Anything that is not a binary Yes/No has no canonical suffix. Folding
+    /// it to NO gave two tokens the same symbol and different CLOB token ids,
+    /// so a lookup returned whichever came first.
+    #[test]
+    fn a_non_binary_outcome_has_no_canonical_suffix() {
+        for label in ["Nope", "Up", "Down", "Maybe", ""] {
+            assert_eq!(normalise_outcome(label), None, "label {label:?}");
+        }
+    }
+
+    /// The consequence that made it critical: symbols must uniquely identify a
+    /// token, so a market that cannot produce distinct Yes/No symbols is not
+    /// traded at all rather than traded against the wrong outcome.
+    #[test]
+    fn a_market_with_non_binary_outcomes_yields_no_instruments() {
+        let mut m = market();
+        m.tokens[0].outcome = "Up".to_string();
+        m.tokens[1].outcome = "Down".to_string();
+
+        assert!(instruments_for_market(&venue_id(), &m).is_empty());
+    }
+
+    /// A market that lists the same outcome twice would also collide.
+    #[test]
+    fn a_market_that_cannot_produce_both_sides_yields_no_instruments() {
+        let mut m = market();
+        m.tokens[1].outcome = "Yes".to_string();
+
+        assert!(instruments_for_market(&venue_id(), &m).is_empty());
+    }
+
+    #[test]
+    fn a_binary_market_yields_exactly_one_instrument_per_outcome() {
+        let instruments = instruments_for_market(&venue_id(), &market());
+        let mut symbols: Vec<&str> = instruments.iter().map(|i| i.id.symbol.as_str()).collect();
+        symbols.sort_unstable();
+        let distinct = symbols.len();
+        symbols.dedup();
+
+        assert_eq!(instruments.len(), 2);
+        assert_eq!(symbols.len(), distinct, "instrument symbols must be unique");
     }
 
     #[test]

@@ -234,6 +234,10 @@ impl DatabaseConfig {
 
 /// Secrets loaded exclusively from environment variables.
 /// Not serializable, not stored in config files.
+///
+/// `Default` is "no credentials at all", which is a legitimate configuration:
+/// paper mode needs none.
+#[derive(Default)]
 pub struct Secrets {
     pub polymarket_private_key: Option<String>,
     /// API key for the configured valuation provider. Read from `LLM_API_KEY`,
