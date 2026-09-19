@@ -377,7 +377,21 @@ impl Agent {
                         }
                     }
                     Err(e) => {
-                        warn!(error = %e, "Market scan failed");
+                        // A scan that cannot reach the venue means the agent
+                        // sees no markets at all — it goes on cycling, logging
+                        // "Cycle complete", looking entirely healthy, and
+                        // trading nothing. Observed in a real run against a
+                        // DNS-blocked host: every cycle scanned 0 markets and
+                        // nothing said why.
+                        let _ = self
+                            .alert_client
+                            .anomaly(
+                                AlertLevel::Critical,
+                                AnomalyKind::VenueUnreachable,
+                                "polymarket",
+                                &format!("Market scan failed — no markets are visible: {e}"),
+                            )
+                            .await;
                     }
                 }
             }
@@ -402,7 +416,21 @@ impl Agent {
                         }
                     }
                     Err(e) => {
-                        warn!(error = %e, "Market scan failed");
+                        // A scan that cannot reach the venue means the agent
+                        // sees no markets at all — it goes on cycling, logging
+                        // "Cycle complete", looking entirely healthy, and
+                        // trading nothing. Observed in a real run against a
+                        // DNS-blocked host: every cycle scanned 0 markets and
+                        // nothing said why.
+                        let _ = self
+                            .alert_client
+                            .anomaly(
+                                AlertLevel::Critical,
+                                AnomalyKind::VenueUnreachable,
+                                "polymarket",
+                                &format!("Market scan failed — no markets are visible: {e}"),
+                            )
+                            .await;
                     }
                 }
             }
