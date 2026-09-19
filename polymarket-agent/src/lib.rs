@@ -8,3 +8,4 @@ pub mod market;
 pub mod monitoring;
 pub mod risk;
 pub mod valuation;
+pub mod venue;

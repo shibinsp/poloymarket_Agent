@@ -36,6 +36,7 @@ use crate::config::{AgentMode, AppConfig, RateLimitConfig, Secrets};
 use crate::market::models::{
     Market, OrderBookSnapshot, PriceHistoryPoint, PriceLevel, Side, TokenInfo,
 };
+use crate::venue::types::{OrderState as VenueOrderState, Side as VenueSide};
 
 type Limiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
@@ -52,7 +53,7 @@ pub struct MarketFilters {
 #[allow(dead_code)]
 struct PaperPosition {
     pub token_id: String,
-    pub side: Side,
+    pub side: VenueSide,
     pub size: Decimal,
     pub entry_price: Decimal,
 }
@@ -63,12 +64,21 @@ struct PaperPosition {
 struct PaperOrder {
     pub order_id: String,
     pub token_id: String,
-    pub side: Side,
+    pub side: VenueSide,
     pub price: Decimal,
     pub size: Decimal,
     pub filled: bool,
     /// Whether this order was filled with adverse selection (price moved against us).
     pub adverse_selection: bool,
+}
+
+/// What a venue-semantics order placement produced.
+#[derive(Debug, Clone)]
+pub struct TokenOrderOutcome {
+    pub order_id: String,
+    pub state: VenueOrderState,
+    pub filled_qty: Decimal,
+    pub avg_fill_price: Option<Decimal>,
 }
 
 /// Result of a paper trading fill simulation.
@@ -262,6 +272,47 @@ impl PolymarketClient {
         Ok(all_markets)
     }
 
+    /// Fetch one market by condition id.
+    ///
+    /// Deliberately applies none of `get_markets`' filters. That call hard-codes
+    /// `closed=false`, an `end_date_min` of now, and a top-N-by-volume
+    /// truncation — all sensible for *discovering* something to trade, and all
+    /// wrong for looking up something already held. A position needs quoting
+    /// most urgently exactly when its market has closed, resolved, or dropped
+    /// out of the top page, which is precisely when those filters hide it.
+    pub async fn get_market_by_condition_id(&self, condition_id: &str) -> Result<Option<Market>> {
+        self.rate_limit().await;
+
+        let url = format!("{}/markets", self.gamma_base_url);
+        let gamma_markets: Vec<GammaMarketResponse> = self
+            .with_retry(|| {
+                let url = url.clone();
+                async move {
+                    let resp = self
+                        .http
+                        .get(&url)
+                        .query(&[("condition_id", condition_id)])
+                        .send()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("HTTP error: {e}"))?;
+
+                    if !resp.status().is_success() {
+                        let status = resp.status();
+                        let body = resp.text().await.unwrap_or_default();
+                        return Err(anyhow::anyhow!("Gamma API {status}: {body}"));
+                    }
+
+                    resp.json::<Vec<GammaMarketResponse>>()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Failed to decode Gamma market: {e}"))
+                }
+            })
+            .await
+            .with_context(|| format!("Failed to fetch market {condition_id}"))?;
+
+        Ok(gamma_markets.iter().find_map(convert_gamma_response))
+    }
+
     // === Order Book (via CLOB API) ===
 
     /// Get order book for a specific token.
@@ -387,14 +438,18 @@ impl PolymarketClient {
         size: Decimal,
     ) -> Result<String> {
         match self.config.agent.mode {
-            AgentMode::Paper => self.paper_place_order(token_id, side, price, size).await,
+            AgentMode::Paper => {
+                self.paper_place_order(token_id, VenueSide::Buy, price, size)
+                    .await
+            }
             AgentMode::Live => {
                 self.live_place_limit_order(token_id, side, price, size)
                     .await
             }
             AgentMode::Backtest => {
                 // In backtest mode, simulate orders same as paper trading
-                self.paper_place_order(token_id, side, price, size).await
+                self.paper_place_order(token_id, VenueSide::Buy, price, size)
+                    .await
             }
         }
     }
@@ -417,9 +472,11 @@ impl PolymarketClient {
         let sdk_size = SdkDecimal::from_str(&size.to_string())
             .context("Failed to convert size to SDK decimal")?;
 
+        // An entry is a BUY of whichever outcome token was selected — the
+        // token id already says which outcome. Mapping Side::No to a SELL
+        // (as this did) tried to sell NO shares the wallet doesn't hold.
         let clob_side = match side {
-            Side::Yes => ClobSide::Buy,
-            Side::No => ClobSide::Sell,
+            Side::Yes | Side::No => ClobSide::Buy,
         };
 
         // Build limit order (GTD = Good Till Date, 7 day expiry)
@@ -566,25 +623,18 @@ impl PolymarketClient {
     ) -> Result<String> {
         match self.config.agent.mode {
             AgentMode::Paper => {
-                // In paper mode, just simulate the exit
-                info!(
-                    token_id,
-                    side = %side,
-                    price = %price,
-                    size = %size,
-                    "Paper position exited (simulated)"
-                );
-                Ok(format!("paper_exit_{token_id}"))
+                // Run the exit through the same fill simulator as an entry so
+                // the balance and fill price reflect it. Previously this was a
+                // log line that returned a fake id, so paper exits never
+                // realised any P&L.
+                self.paper_place_order(token_id, VenueSide::Sell, price, size)
+                    .await
             }
             AgentMode::Live => {
-                // In live mode, place a sell order to exit
-                // The exit side is opposite to the original buy side
-                let exit_side = match side {
-                    Side::Yes => ClobSide::Sell, // Selling YES tokens
-                    Side::No => ClobSide::Buy,   // Buying back NO tokens (equivalent to selling)
-                };
-
-                self.live_place_limit_order_with_side(token_id, exit_side, price, size)
+                // Exiting means selling the outcome token we hold, whichever
+                // outcome it is — the token id already identifies it.
+                let _ = side;
+                self.live_place_limit_order_with_side(token_id, ClobSide::Sell, price, size)
                     .await
             }
             AgentMode::Backtest => Ok(format!("backtest_exit_{token_id}")),
@@ -646,6 +696,66 @@ impl PolymarketClient {
         Ok(response.order_id)
     }
 
+    // === Venue-semantics order placement ===
+
+    /// Place an order on one outcome token with explicit buy/sell semantics.
+    ///
+    /// `place_limit_order` treats YES/NO as *sides*, which is what forced
+    /// buying NO to be sent as a SELL. Here the token id identifies the
+    /// outcome and the side means exactly what it says, so the venue adapter
+    /// can express "buy the NO token" without any inversion.
+    ///
+    /// Unlike the legacy path this also returns what actually filled, rather
+    /// than discarding the simulator's fill price and size.
+    pub(crate) async fn place_token_order(
+        &self,
+        token_id: &str,
+        side: VenueSide,
+        price: Decimal,
+        size: Decimal,
+    ) -> Result<TokenOrderOutcome> {
+        match self.config.agent.mode {
+            AgentMode::Paper | AgentMode::Backtest => {
+                let fill = self
+                    .simulate_paper_fill(token_id, side, price, size)
+                    .await?;
+                Ok(if fill.filled {
+                    TokenOrderOutcome {
+                        order_id: fill.order_id,
+                        state: VenueOrderState::Filled,
+                        filled_qty: fill.fill_size,
+                        avg_fill_price: Some(fill.fill_price),
+                    }
+                } else {
+                    // Resting unfilled is a normal outcome, not an error.
+                    TokenOrderOutcome {
+                        order_id: fill.order_id,
+                        state: VenueOrderState::Accepted,
+                        filled_qty: Decimal::ZERO,
+                        avg_fill_price: None,
+                    }
+                })
+            }
+            AgentMode::Live => {
+                let clob_side = match side {
+                    VenueSide::Buy => ClobSide::Buy,
+                    VenueSide::Sell => ClobSide::Sell,
+                };
+                let order_id = self
+                    .live_place_limit_order_with_side(token_id, clob_side, price, size)
+                    .await?;
+                // Accepted, not Filled: the CLOB returning an id says nothing
+                // about whether it filled. Confirmation is the caller's job.
+                Ok(TokenOrderOutcome {
+                    order_id,
+                    state: VenueOrderState::Accepted,
+                    filled_qty: Decimal::ZERO,
+                    avg_fill_price: None,
+                })
+            }
+        }
+    }
+
     // === Paper Trading ===
 
     /// Place a paper order with realistic fill simulation.
@@ -657,7 +767,7 @@ impl PolymarketClient {
     async fn paper_place_order(
         &self,
         token_id: &str,
-        side: Side,
+        side: VenueSide,
         price: Decimal,
         size: Decimal,
     ) -> Result<String> {
@@ -681,7 +791,7 @@ impl PolymarketClient {
     async fn simulate_paper_fill(
         &self,
         token_id: &str,
-        side: Side,
+        side: VenueSide,
         price: Decimal,
         size: Decimal,
     ) -> Result<PaperFillResult> {
@@ -740,30 +850,16 @@ impl PolymarketClient {
             // Price moved 1-3% against us at fill time
             let slippage_pct = dec!(0.01) + (dec!(0.02) * Decimal::from(seed % 100) / dec!(100));
             match side {
-                Side::Yes => price * (dec!(1) + slippage_pct), // Pay more for YES
-                Side::No => price * (dec!(1) - slippage_pct),  // Get less for NO
+                // A buy fills worse by paying more; a sell by receiving less.
+                VenueSide::Buy => price * (dec!(1) + slippage_pct),
+                VenueSide::Sell => price * (dec!(1) - slippage_pct),
             }
         } else {
             price
         };
 
-        let cost = adverse_slippage * actual_size;
+        apply_paper_fill(&mut state, token_id, side, adverse_slippage, actual_size)?;
 
-        if cost > state.balance {
-            bail!(
-                "Insufficient paper balance: {} < cost {}",
-                state.balance,
-                cost
-            );
-        }
-
-        state.balance -= cost;
-        state.positions.push(PaperPosition {
-            token_id: token_id.to_string(),
-            side,
-            size: actual_size,
-            entry_price: adverse_slippage,
-        });
         state.order_history.push(PaperOrder {
             order_id: order_id.clone(),
             token_id: token_id.to_string(),
@@ -910,6 +1006,85 @@ fn parse_json_string_array(s: &str) -> Vec<String> {
 }
 
 /// Convert our direct Gamma response to domain Market type.
+/// Apply a fill to the paper book.
+///
+/// Free function so the accounting can be exercised without constructing a
+/// live CLOB client, which is what let the sell path stay wrong.
+fn apply_paper_fill(
+    state: &mut PaperTradingState,
+    token_id: &str,
+    side: VenueSide,
+    fill_price: Decimal,
+    fill_size: Decimal,
+) -> Result<()> {
+    let notional = fill_price * fill_size;
+
+    // A sell has to consume an existing holding, not conjure one. Crediting
+    // cash unconditionally and then pushing a second position left an exit
+    // holding *both* a long and a short of the same token: reported
+    // exposure doubled, and repeating the exit credited the proceeds again
+    // from nothing, so paper balance grew without bound. Paper P&L is the
+    // only evidence the strategy works, and that made it evidence of
+    // nothing.
+    match side {
+        VenueSide::Buy => {
+            if notional > state.balance {
+                bail!(
+                    "Insufficient paper balance: {} < cost {}",
+                    state.balance,
+                    notional
+                );
+            }
+            state.balance -= notional;
+            // Each buy is its own lot, so entry prices stay meaningful
+            // across several entries into the same token.
+            state.positions.push(PaperPosition {
+                token_id: token_id.to_string(),
+                side,
+                size: fill_size,
+                entry_price: fill_price,
+            });
+        }
+        VenueSide::Sell => {
+            let held: Decimal = state
+                .positions
+                .iter()
+                .filter(|p| p.token_id == token_id)
+                .map(|p| p.size)
+                .sum();
+
+            // Outcome tokens cannot be shorted — the complement is a
+            // separate instrument you buy — so selling more than is held
+            // means the ledger and the paper book have diverged. Failing
+            // loudly beats clamping, which would hide the divergence
+            // behind a trade of a size nobody asked for.
+            if fill_size > held {
+                bail!(
+                    "Insufficient paper position in {token_id}: holding {held}, tried to sell {fill_size}"
+                );
+            }
+
+            let mut remaining = fill_size;
+            for lot in state
+                .positions
+                .iter_mut()
+                .filter(|p| p.token_id == token_id)
+            {
+                if remaining.is_zero() {
+                    break;
+                }
+                let taken = remaining.min(lot.size);
+                lot.size -= taken;
+                remaining -= taken;
+            }
+            state.positions.retain(|p| p.size > Decimal::ZERO);
+            state.balance += notional;
+        }
+    }
+
+    Ok(())
+}
+
 fn convert_gamma_response(gm: &GammaMarketResponse) -> Option<Market> {
     let question = gm.question.clone()?;
     let end_date_str = gm.end_date.as_ref()?;
@@ -1005,7 +1180,7 @@ fn convert_order_book(token_id: &str, response: &OrderBookSummaryResponse) -> Or
 
 /// Compute fill probability based on order aggressiveness.
 /// Orders at or inside the spread fill more often; outside fill less.
-fn compute_fill_probability(_side: Side, _price: Decimal, seed: u64) -> Decimal {
+fn compute_fill_probability(_side: VenueSide, _price: Decimal, seed: u64) -> Decimal {
     // Base fill rate: 70% for aggressive orders
     let base = dec!(0.70);
 
@@ -1035,6 +1210,173 @@ mod tests {
 
     fn deserialize_order_book(json: &str) -> OrderBookSummaryResponse {
         serde_json::from_str(json).expect("valid order book JSON")
+    }
+
+    /// A paper-mode client whose Gamma base URL points at a mock server.
+    /// Paper mode needs no private key, and `ClobClient::new` only parses its
+    /// base URL, so the whole Gamma path is exercisable offline.
+    async fn client_against(gamma_base_url: &str) -> PolymarketClient {
+        let contents = std::fs::read_to_string("config/default.toml")
+            .expect("config/default.toml should exist");
+        let mut config: AppConfig = toml::from_str(&contents).expect("should parse");
+        config.agent.mode = AgentMode::Paper;
+        config.polymarket.gamma_base_url = gamma_base_url.to_string();
+
+        PolymarketClient::new(Arc::new(config), &Secrets::default())
+            .await
+            .expect("paper client needs no credentials")
+    }
+
+    fn gamma_market_json(condition_id: &str, closed: bool) -> serde_json::Value {
+        serde_json::json!([{
+            "conditionId": condition_id,
+            "question": "Will it rain?",
+            "endDate": "2020-01-01T00:00:00Z",
+            "closed": closed,
+            "clobTokenIds": "[\"tok_yes\", \"tok_no\"]",
+            "outcomes": "[\"Yes\", \"No\"]",
+            "outcomePrices": "[\"0.6\", \"0.4\"]",
+            "volume24hr": 0.0,
+            "liquidity": 0.0
+        }])
+    }
+
+    /// Finding 5: a held position needs quoting most urgently once its market
+    /// has closed or dropped out of the top-by-volume page — exactly what
+    /// `get_markets` filters out. The by-id lookup must not inherit any of
+    /// that, so this market is closed, zero-volume and long past its end date.
+    #[tokio::test]
+    async fn a_closed_market_is_still_findable_by_condition_id() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/markets"))
+            .and(wiremock::matchers::query_param("condition_id", "0xdead"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(gamma_market_json("0xdead", true)),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client_against(&server.uri()).await;
+        let market = client
+            .get_market_by_condition_id("0xdead")
+            .await
+            .expect("lookup succeeds")
+            .expect("closed market is still returned");
+
+        assert_eq!(market.condition_id, "0xdead");
+        assert_eq!(market.tokens.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_condition_id_is_none_not_an_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/markets"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+
+        let client = client_against(&server.uri()).await;
+        assert!(client
+            .get_market_by_condition_id("0xmissing")
+            .await
+            .expect("lookup succeeds")
+            .is_none());
+    }
+
+    fn paper_book(balance: Decimal) -> PaperTradingState {
+        PaperTradingState {
+            balance,
+            positions: Vec::new(),
+            order_history: Vec::new(),
+        }
+    }
+
+    fn held(state: &PaperTradingState, token_id: &str) -> Decimal {
+        state
+            .positions
+            .iter()
+            .filter(|p| p.token_id == token_id)
+            .map(|p| p.size)
+            .sum()
+    }
+
+    /// A round trip has to end flat with the cash back, not holding both sides
+    /// of itself. The old sell path credited cash and pushed a second position,
+    /// so an exit left [long 10, sell 10] and double the reported exposure.
+    #[test]
+    fn a_paper_round_trip_ends_flat() {
+        let mut state = paper_book(dec!(100));
+
+        apply_paper_fill(&mut state, "tok", VenueSide::Buy, dec!(0.60), dec!(10)).unwrap();
+        assert_eq!(state.balance, dec!(94));
+        assert_eq!(held(&state, "tok"), dec!(10));
+
+        apply_paper_fill(&mut state, "tok", VenueSide::Sell, dec!(0.60), dec!(10)).unwrap();
+        assert_eq!(state.balance, dec!(100));
+        assert_eq!(held(&state, "tok"), dec!(0));
+        assert!(
+            state.positions.is_empty(),
+            "a closed position must not linger: {:?}",
+            state.positions
+        );
+    }
+
+    /// The failure that made it critical: repeating an exit used to credit the
+    /// proceeds again out of nothing, so paper balance grew without bound.
+    #[test]
+    fn selling_more_than_is_held_is_refused_rather_than_minting_cash() {
+        let mut state = paper_book(dec!(100));
+        apply_paper_fill(&mut state, "tok", VenueSide::Buy, dec!(0.60), dec!(10)).unwrap();
+        apply_paper_fill(&mut state, "tok", VenueSide::Sell, dec!(0.60), dec!(10)).unwrap();
+
+        let err = apply_paper_fill(&mut state, "tok", VenueSide::Sell, dec!(0.60), dec!(10))
+            .expect_err("a second exit has nothing left to sell");
+        assert!(err.to_string().contains("Insufficient paper position"));
+        assert_eq!(state.balance, dec!(100), "balance must not move on refusal");
+    }
+
+    #[test]
+    fn a_partial_exit_leaves_the_remainder_open() {
+        let mut state = paper_book(dec!(100));
+        apply_paper_fill(&mut state, "tok", VenueSide::Buy, dec!(0.50), dec!(10)).unwrap();
+
+        apply_paper_fill(&mut state, "tok", VenueSide::Sell, dec!(0.50), dec!(4)).unwrap();
+        assert_eq!(held(&state, "tok"), dec!(6));
+        assert_eq!(state.balance, dec!(97));
+    }
+
+    /// Lots are consumed oldest-first and only from the token being sold.
+    #[test]
+    fn selling_one_token_leaves_another_untouched() {
+        let mut state = paper_book(dec!(100));
+        apply_paper_fill(&mut state, "a", VenueSide::Buy, dec!(0.50), dec!(4)).unwrap();
+        apply_paper_fill(&mut state, "b", VenueSide::Buy, dec!(0.50), dec!(6)).unwrap();
+        apply_paper_fill(&mut state, "a", VenueSide::Buy, dec!(0.70), dec!(2)).unwrap();
+
+        apply_paper_fill(&mut state, "a", VenueSide::Sell, dec!(0.60), dec!(5)).unwrap();
+
+        assert_eq!(held(&state, "a"), dec!(1));
+        assert_eq!(held(&state, "b"), dec!(6), "unrelated token must not move");
+        // The surviving "a" lot is the newer one, bought at 0.70.
+        let remaining = state
+            .positions
+            .iter()
+            .find(|p| p.token_id == "a")
+            .expect("one lot left");
+        assert_eq!(remaining.entry_price, dec!(0.70));
+    }
+
+    #[test]
+    fn a_buy_beyond_the_balance_is_refused() {
+        let mut state = paper_book(dec!(5));
+        let err = apply_paper_fill(&mut state, "tok", VenueSide::Buy, dec!(0.60), dec!(10))
+            .expect_err("6 > 5");
+        assert!(err.to_string().contains("Insufficient paper balance"));
+        assert_eq!(state.balance, dec!(5));
+        assert!(state.positions.is_empty());
     }
 
     #[test]
