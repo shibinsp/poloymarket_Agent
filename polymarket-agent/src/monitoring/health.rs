@@ -51,8 +51,25 @@ impl HealthState {
 
     /// Get health data as a serializable JSON value.
     pub async fn to_json(&self) -> serde_json::Value {
+        self.to_json_at(Utc::now()).await
+    }
+
+    async fn to_json_at(&self, now: DateTime<Utc>) -> serde_json::Value {
         let data = self.inner.read().await;
-        serde_json::to_value(&*data).unwrap_or(serde_json::json!({"status": "error"}))
+        let mut value =
+            serde_json::to_value(&*data).unwrap_or(serde_json::json!({"status": "error"}));
+
+        // Uptime follows the clock, not the last write. Recomputing it only
+        // when a cycle completes left it reading zero for as long as the first
+        // cycle took — and a cycle that never completes is exactly when
+        // somebody loads this endpoint to find out what is wrong.
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "uptime_seconds".to_string(),
+                serde_json::json!((now - data.started_at).num_seconds()),
+            );
+        }
+        value
     }
 
     /// Awaited rather than spawned: the caller breaks out of the main loop
@@ -112,6 +129,22 @@ mod tests {
     fn at(minute: i64) -> DateTime<Utc> {
         use chrono::TimeZone;
         Utc.with_ymd_and_hms(2026, 9, 19, 12, 0, 0).unwrap() + Duration::minutes(minute)
+    }
+
+    /// Uptime has to advance without a completed cycle. It previously only
+    /// moved when record_cycle or record_failure wrote it, so a process stuck
+    /// in its first cycle reported zero indefinitely.
+    #[tokio::test]
+    async fn uptime_advances_without_a_completed_cycle() {
+        let state = HealthState::new();
+        let started: DateTime<Utc> =
+            serde_json::from_value(state.to_json().await.get("started_at").unwrap().clone())
+                .unwrap();
+
+        let json = state.to_json_at(started + Duration::seconds(137)).await;
+        assert_eq!(json["uptime_seconds"], 137);
+        // And no cycle has been recorded, which is the situation under test.
+        assert!(json["last_cycle_at"].is_null());
     }
 
     #[tokio::test]

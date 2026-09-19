@@ -283,6 +283,16 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
     let mut consecutive_failures: u32 = 0;
     let mut fatal: Option<anyhow::Error> = None;
 
+    // Arm the watchdog before the first cycle, not after it. The loop sets a
+    // due time each time it goes to sleep, which leaves the very first cycle
+    // unwatched — and that is the one most likely to hang, because it is the
+    // one that first touches an unreachable venue or a misconfigured endpoint.
+    health_state
+        .expect_cycle_by(
+            Utc::now() + chrono::Duration::seconds(config.agent.cycle_interval_seconds as i64),
+        )
+        .await;
+
     loop {
         // Run the cycle to completion — it is never raced against the shutdown
         // signal. A live order placement must not be abandoned partway
