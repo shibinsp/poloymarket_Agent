@@ -420,6 +420,25 @@ mod tests {
         assert_eq!(config.agent.cycle_interval_seconds, 600);
         assert_eq!(config.scanning.max_markets, 1000);
         assert_eq!(config.polymarket.chain_id, 137);
+        assert_eq!(config.agent.max_sleep_seconds, 3600);
+    }
+
+    /// Configs written before the scheduler have no `max_sleep_seconds`, and
+    /// one of them is the untracked local.toml `CONFIG_PATH` points at on a
+    /// live box. A new key that fails to parse there takes the agent down on
+    /// restart, so the default has to hold.
+    #[test]
+    fn agent_config_without_max_sleep_still_parses() {
+        let legacy = r#"
+            mode = "paper"
+            cycle_interval_seconds = 600
+            death_balance_threshold = 0.0
+            low_fuel_threshold = 10.0
+            api_reserve = 2.0
+            initial_paper_balance = 100.0
+        "#;
+        let agent: AgentConfig = toml::from_str(legacy).expect("should parse");
+        assert_eq!(agent.max_sleep_seconds, 3600);
     }
 
     #[test]
