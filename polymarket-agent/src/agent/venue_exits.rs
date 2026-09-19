@@ -86,6 +86,8 @@ pub struct VenueExits<'a> {
     pub store: &'a Store,
     /// Hours after entry at which a position is closed regardless.
     pub max_hold_hours: i64,
+    /// How long an exit order may rest before reconciliation cancels it.
+    pub order_ttl_seconds: i64,
 }
 
 impl VenueExits<'_> {
@@ -204,7 +206,9 @@ impl VenueExits<'_> {
                 cycle: Some(cycle),
                 submitted_at: None,
                 updated_at: None,
-                expires_at: None,
+                expires_at: Some(
+                    (Utc::now() + Duration::seconds(self.order_ttl_seconds)).to_rfc3339(),
+                ),
             })
             .await?;
 
