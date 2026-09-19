@@ -13,7 +13,7 @@
 use std::collections::HashSet;
 
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -277,16 +277,19 @@ impl VenueCycle<'_> {
                 cycle: Some(ctx.cycle),
                 submitted_at: None,
                 updated_at: None,
-                expires_at: None,
+                expires_at: Some(
+                    (ctx.now + Duration::seconds(self.config.execution.order_ttl_seconds as i64))
+                        .to_rfc3339(),
+                ),
             })
             .await?;
 
-        let ack = match venue.place_order(&request).await {
-            Ok(ack) => ack,
+        // A failed submit is not a rejection: the venue may have accepted the
+        // order before the response was lost. Record UNKNOWN and let
+        // reconciliation ask, rather than assuming either way.
+        let outcome = match venue.place_order(&request).await {
+            Ok(ack) => Ok(ack),
             Err(e) => {
-                // The order's fate is genuinely unknown — the venue may have
-                // accepted it before the failure. Mark it so, so the next
-                // cycle queries rather than re-sending.
                 self.store
                     .update_order_state(
                         &client_order_id,
@@ -297,68 +300,86 @@ impl VenueCycle<'_> {
                         Some(&e.to_string()),
                     )
                     .await?;
-                return Err(e);
+                Err(e)
             }
         };
 
-        let state_str = order_state_str(&ack.state);
-        self.store
-            .update_order_state(
-                &client_order_id,
-                state_str,
-                Some(&ack.venue_order_id),
-                &ack.filled_qty.to_string(),
-                ack.avg_fill_price.map(|p| p.to_string()).as_deref(),
-                match &ack.state {
-                    OrderState::Rejected(reason) => Some(reason.as_str()),
-                    _ => None,
-                },
-            )
-            .await?;
+        let ack = outcome.as_ref().ok();
 
-        // A trade exists only once something filled. An accepted order is not
-        // a position.
-        if ack.filled_qty > Decimal::ZERO {
-            let fill_price = ack.avg_fill_price.unwrap_or(limit_price);
+        if let Some(ack) = ack {
             self.store
-                .insert_venue_trade(&VenueTradeRecord {
-                    cycle: ctx.cycle,
-                    venue_id: instrument.venue().to_string(),
-                    symbol: instrument.symbol().to_string(),
-                    asset_class: asset_class_str(instrument.asset_class).to_string(),
-                    display_name: Some(instrument.display_name.clone()),
-                    side: Side::Buy.to_string(),
-                    entry_price: fill_price.to_string(),
-                    quantity: ack.filled_qty.to_string(),
-                    avg_fill_price: Some(fill_price.to_string()),
-                    edge_at_entry: directional::net_edge(&view, cost_to_trade).to_string(),
-                    fair_value: view.p_up.to_string(),
-                    confidence: view.confidence.to_string(),
-                    risk_pct: sizing.risk_pct.unwrap_or_default().to_string(),
-                    stop_pct: sizing.stop_pct.unwrap_or_default().to_string(),
-                    status: if ack.state == OrderState::Filled {
-                        "OPEN".to_string()
-                    } else {
-                        "PARTIAL".to_string()
+                .update_order_state(
+                    &client_order_id,
+                    order_state_str(&ack.state),
+                    Some(&ack.venue_order_id),
+                    &ack.filled_qty.to_string(),
+                    ack.avg_fill_price.map(|p| p.to_string()).as_deref(),
+                    match &ack.state {
+                        OrderState::Rejected(reason) => Some(reason.as_str()),
+                        _ => None,
                     },
-                    stop_price: sizing
-                        .stop_pct
-                        .map(|s| (fill_price * (Decimal::ONE - s)).to_string()),
-                    target_price: view.target_price.map(|t| t.to_string()),
-                    horizon_hours: Some(view.horizon_hours),
-                    client_order_id: Some(client_order_id.clone()),
-                    venue_order_id: Some(ack.venue_order_id.clone()),
-                })
+                )
                 .await?;
         }
+
+        // Record the thesis now, whatever the order did.
+        //
+        // An order that fills on a later cycle still needs the stop, target and
+        // horizon that justified it, and none of that can be reconstructed
+        // after the fact. The row is PENDING until a fill is confirmed, and
+        // `get_open_venue_trades` ignores PENDING — so this is a record of
+        // intent, not a claim that a position exists.
+        let filled_qty = ack.map(|a| a.filled_qty).unwrap_or(Decimal::ZERO);
+        let fill_price = ack.and_then(|a| a.avg_fill_price).unwrap_or(limit_price);
+        let status = trade_status_for(ack.map(|a| &a.state), filled_qty, qty);
+        let trade_id = self
+            .store
+            .insert_venue_trade(&VenueTradeRecord {
+                cycle: ctx.cycle,
+                venue_id: instrument.venue().to_string(),
+                symbol: instrument.symbol().to_string(),
+                asset_class: asset_class_str(instrument.asset_class).to_string(),
+                display_name: Some(instrument.display_name.clone()),
+                side: Side::Buy.to_string(),
+                entry_price: fill_price.to_string(),
+                quantity: if filled_qty > Decimal::ZERO {
+                    filled_qty.to_string()
+                } else {
+                    qty.to_string()
+                },
+                avg_fill_price: (filled_qty > Decimal::ZERO).then(|| fill_price.to_string()),
+                edge_at_entry: directional::net_edge(&view, cost_to_trade).to_string(),
+                fair_value: view.p_up.to_string(),
+                confidence: view.confidence.to_string(),
+                risk_pct: sizing.risk_pct.unwrap_or_default().to_string(),
+                stop_pct: sizing.stop_pct.unwrap_or_default().to_string(),
+                status: status.to_string(),
+                stop_price: sizing
+                    .stop_pct
+                    .map(|s| (fill_price * (Decimal::ONE - s)).to_string()),
+                target_price: view.target_price.map(|t| t.to_string()),
+                horizon_hours: Some(view.horizon_hours),
+                client_order_id: Some(client_order_id.clone()),
+                venue_order_id: ack.map(|a| a.venue_order_id.clone()),
+            })
+            .await?;
+
+        self.store
+            .link_order_to_trade(&client_order_id, trade_id)
+            .await?;
+
+        // Surface the submit failure now that the thesis is safely recorded.
+        let ack = outcome?;
 
         info!(
             instrument = %instrument.id,
             venue_order_id = %ack.venue_order_id,
-            state = state_str,
+            state = order_state_str(&ack.state),
+            trade_id,
             qty = %qty,
             limit_price = %limit_price,
             filled = %ack.filled_qty,
+            status,
             p_up = %view.p_up,
             horizon_hours = view.horizon_hours,
             at = %ctx.now,
@@ -393,6 +414,29 @@ fn needs_extended_hours_flag(asset_class: AssetClass, session: Option<SessionKin
             session,
             Some(SessionKind::Extended) | Some(SessionKind::Overnight)
         )
+}
+
+/// The status a trade row starts life in, given what the order did.
+///
+/// `PENDING` means "an order is out there for this thesis" — it is deliberately
+/// not counted as an open position anywhere.
+fn trade_status_for(
+    state: Option<&OrderState>,
+    filled_qty: Decimal,
+    requested_qty: Decimal,
+) -> &'static str {
+    if filled_qty > Decimal::ZERO {
+        if filled_qty >= requested_qty {
+            "OPEN"
+        } else {
+            "PARTIAL"
+        }
+    } else if state.is_some_and(crate::agent::reconcile::is_terminal) {
+        // Ended without filling — it never became a position.
+        "CANCELLED"
+    } else {
+        "PENDING"
+    }
 }
 
 fn order_state_str(state: &OrderState) -> &'static str {

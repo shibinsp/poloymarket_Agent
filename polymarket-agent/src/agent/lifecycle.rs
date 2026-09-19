@@ -6,6 +6,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tracing::{error, info, warn};
 
+use crate::agent::reconcile::Reconciler;
 use crate::agent::self_funding::{
     self, edge_justifies_cost, enhanced_survival_check, log_cost_breakdown, CycleCosts,
 };
@@ -227,10 +228,34 @@ impl Agent {
         // state: being unable to open new positions must never mean being
         // unable to close existing ones.
         if !self.venues.is_empty() {
+            // Resolve outstanding orders before anything else looks at
+            // positions. An exit that filled since the last cycle must be on
+            // the books before the exit pass runs, or it re-sells a position
+            // that is already gone; an entry that filled must be visible
+            // before the cycle decides what to buy. This also releases the
+            // per-symbol block that unresolved orders hold.
+            let reconciler = Reconciler {
+                registry: &self.venues,
+                store: &self.store,
+                order_ttl: chrono::Duration::seconds(
+                    self.config.execution.order_ttl_seconds as i64,
+                ),
+            };
+            match reconciler.run(chrono::Utc::now()).await {
+                Ok(report) if report.unqueryable > 0 => warn!(
+                    unqueryable = report.unqueryable,
+                    checked = report.checked,
+                    "Some orders could not be resolved — those symbols stay blocked"
+                ),
+                Ok(_) => {}
+                Err(e) => warn!(error = %e, "Reconciliation pass failed"),
+            }
+
             let exits = VenueExits {
                 registry: &self.venues,
                 store: &self.store,
                 max_hold_hours: self.config.exits_continuous.max_hold_hours,
+                order_ttl_seconds: self.config.execution.order_ttl_seconds as i64,
             };
             match exits
                 .run(chrono::Utc::now(), self.cycle_number as i64)

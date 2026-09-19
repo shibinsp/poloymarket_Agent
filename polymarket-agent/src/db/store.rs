@@ -477,6 +477,101 @@ impl Store {
         Ok(())
     }
 
+    /// Trade linked to an order, with its current status, if one was recorded.
+    pub async fn trade_for_order(&self, client_order_id: &str) -> Result<Option<(i64, String)>> {
+        sqlx::query_as("SELECT id, status FROM trades WHERE client_order_id = ? LIMIT 1")
+            .bind(client_order_id)
+            .fetch_optional(&self.pool)
+            .await
+            .context("Failed to look up trade by client order id")
+    }
+
+    /// Current status of a trade, whatever its stage.
+    pub async fn trade_status(&self, id: i64) -> Result<Option<String>> {
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT status FROM trades WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .context("Failed to fetch trade status")?;
+        Ok(row.and_then(|r| r.0))
+    }
+
+    /// Point an order row at the trade whose thesis it carries.
+    pub async fn link_order_to_trade(&self, client_order_id: &str, trade_id: i64) -> Result<()> {
+        sqlx::query("UPDATE orders SET trade_id = ? WHERE client_order_id = ?")
+            .bind(trade_id)
+            .bind(client_order_id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to link order to trade")?;
+        Ok(())
+    }
+
+    /// Entry price and quantity of any trade, open or not — needed to price an
+    /// exit that filled after the cycle that placed it.
+    pub async fn get_trade_entry(&self, id: i64) -> Result<Option<(Decimal, Decimal)>> {
+        let row: Option<(Option<String>, Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT entry_price, avg_fill_price, quantity FROM trades WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .context("Failed to fetch trade entry")?;
+
+        let Some((entry, avg_fill, qty)) = row else {
+            return Ok(None);
+        };
+        // Prefer the actual fill; fall back to the intended entry.
+        let price = avg_fill.or(entry).unwrap_or_default();
+        // Fail loud: a silently-zeroed entry price turns a loss into a
+        // reported profit.
+        let parse = |v: &str, field: &str| -> Result<Decimal> {
+            Decimal::from_str(v).with_context(|| format!("Invalid decimal in {field}: {v:?}"))
+        };
+        Ok(Some((
+            parse(&price, "trades.entry_price")?,
+            parse(qty.as_deref().unwrap_or("0"), "trades.quantity")?,
+        )))
+    }
+
+    /// Promote a pending trade to an open position once its entry filled.
+    pub async fn activate_trade(
+        &self,
+        id: i64,
+        avg_fill_price: &str,
+        quantity: &str,
+        status: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE trades SET status = ?, avg_fill_price = ?, entry_price = ?, quantity = ?, size = ? WHERE id = ?",
+        )
+        .bind(status)
+        .bind(avg_fill_price)
+        .bind(avg_fill_price)
+        .bind(quantity)
+        .bind(quantity)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .context("Failed to activate trade")?;
+        Ok(())
+    }
+
+    /// Mark a trade that never opened — its entry was rejected, cancelled or
+    /// expired without filling.
+    pub async fn cancel_trade(&self, id: i64, reason: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE trades SET status = 'CANCELLED', close_reason = ?, closed_at = ? WHERE id = ?",
+        )
+        .bind(reason)
+        .bind(Utc::now().to_rfc3339())
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .context("Failed to cancel trade")?;
+        Ok(())
+    }
+
     /// Record a trade opened on a venue, once something has actually filled.
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_venue_trade(&self, trade: &VenueTradeRecord) -> Result<i64> {
