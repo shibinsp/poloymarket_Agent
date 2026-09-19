@@ -483,7 +483,7 @@ mod tests {
             Ok(Balance {
                 ccy: "USD".to_string(),
                 available: dec!(1000),
-                total: dec!(1000),
+                total: Some(dec!(1000)),
             })
         }
         async fn settlement(&self, _id: &InstrumentId) -> Result<Option<Settlement>> {

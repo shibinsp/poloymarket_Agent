@@ -376,8 +376,10 @@ impl Venue for PolymarketVenue {
         Ok(Balance {
             ccy: "USDC".to_string(),
             available,
-            // Without venue-side position data, total equals free cash.
-            total: available,
+            // `positions` is unimplemented for this venue, so there is no way
+            // to value what is held. Reporting free cash as account value
+            // would understate the account by the whole of its open exposure.
+            total: None,
         })
     }
 

@@ -1165,7 +1165,8 @@ impl Venue for AlpacaVenue {
         Ok(Balance {
             ccy: account.currency,
             available,
-            total: account.equity,
+            // Alpaca reports account equity directly, positions included.
+            total: Some(account.equity),
         })
     }
 
@@ -1950,7 +1951,7 @@ mod tests {
         let balance = venue.balance().await.unwrap();
         assert_eq!(balance.ccy, "USD");
         assert_eq!(balance.available, dec!(150.00));
-        assert_eq!(balance.total, dec!(275.50));
+        assert_eq!(balance.total, Some(dec!(275.50)));
     }
 
     #[tokio::test]

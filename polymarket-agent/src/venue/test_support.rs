@@ -136,7 +136,7 @@ impl Venue for StubVenue {
         Ok(Balance {
             ccy: "USD".to_string(),
             available: dec!(100),
-            total: dec!(100),
+            total: Some(dec!(100)),
         })
     }
     async fn settlement(&self, _id: &InstrumentId) -> Result<Option<Settlement>> {
