@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.vite/
+*.local
+
+# The Vite entry point. The repo root's .gitignore has a blanket `*.html`
+# rule, which would silently drop this file from the commit and leave a fresh
+# clone unable to build the UI at all — the failure only shows up when
+# somebody tries. The negation has to live here, below that rule.
+!index.html
