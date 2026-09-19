@@ -164,13 +164,17 @@ impl TradingSession {
         let time = local.time();
 
         for window in windows {
-            // A wrapping window belongs to the day it *started* on, so an
-            // instant at 01:00 is inside the previous day's overnight session.
+            // A wrapping window belongs to the trading day it *ends* on, not
+            // the one it starts on. Alpaca's overnight session runs Sunday
+            // 20:00 ET into Monday and Thursday 20:00 into Friday; there is no
+            // Friday-night session, because Saturday is not a trading day.
+            // Attaching it to the start date inverts exactly that: it opens
+            // Friday night into a shut venue and sits out Sunday night.
             let (session_date, inside) = if window.wraps_midnight() {
                 if time >= window.start {
-                    (today, true)
+                    (today + Duration::days(1), true)
                 } else if time < window.end {
-                    (today - Duration::days(1), true)
+                    (today, true)
                 } else {
                     (today, false)
                 }
@@ -214,7 +218,16 @@ impl TradingSession {
                 continue;
             }
             for window in windows {
-                let naive = date.and_time(window.start);
+                // `date` is the trading day. A wrapping window that belongs to
+                // it began the evening before, so the same shift applied in
+                // `state_at` has to be applied here or the two disagree about
+                // when the session starts.
+                let start_date = if window.wraps_midnight() {
+                    date - Duration::days(1)
+                } else {
+                    date
+                };
+                let naive = start_date.and_time(window.start);
                 // Ambiguous or skipped local times (DST transitions) are
                 // simply not offered as candidates.
                 if let Some(start) = tz.from_local_datetime(&naive).earliest() {
@@ -300,16 +313,94 @@ mod tests {
     #[test]
     fn overnight_window_wraps_past_midnight() {
         let s = TradingSession::us_equity_extended();
-        // 01:00 Friday belongs to Thursday's overnight session, which is a
-        // trading day, so it is open.
+        // Mid-week the overnight session spans both sides of midnight:
+        // Thursday 21:00 and the Friday 01:00 that continues it are one
+        // session, and Friday is a trading day.
+        assert_eq!(
+            s.state_at(et(2026, 9, 17, 21, 0)).kind(),
+            Some(SessionKind::Overnight)
+        );
         assert_eq!(
             s.state_at(et(2026, 9, 18, 1, 0)).kind(),
             Some(SessionKind::Overnight)
         );
-        // 01:00 Sunday belongs to Saturday's overnight — not a trading day.
-        assert!(!s.is_open_at(et(2026, 9, 20, 1, 0)));
-        // 01:00 Monday belongs to Sunday's overnight — also not a trading day.
-        assert!(!s.is_open_at(et(2026, 9, 21, 1, 0)));
+    }
+
+    /// An overnight session belongs to the trading day it *ends* on, which is
+    /// what decides both ends of the week. Alpaca runs Sunday 20:00 ET into
+    /// Monday and stops at Friday 20:00; attaching the window to the day it
+    /// starts on inverts exactly that — opening Friday night into a venue that
+    /// is shut and sitting out the Sunday night session that does run.
+    ///
+    /// Both ends are asserted here on purpose: the earlier test checked only
+    /// the Sunday/Monday side, so it passed while the Friday/Saturday side was
+    /// wrong.
+    #[test]
+    fn the_trading_week_opens_sunday_night_and_closes_friday_evening() {
+        let s = TradingSession::us_equity_extended();
+
+        // Friday 20:00 ET ends the week — there is no Friday-night session,
+        // because it would settle into a Saturday.
+        assert!(!s.is_open_at(et(2026, 9, 18, 21, 0)), "Friday 21:00");
+        assert!(!s.is_open_at(et(2026, 9, 19, 1, 0)), "Saturday 01:00");
+        assert!(!s.is_open_at(et(2026, 9, 19, 12, 0)), "Saturday midday");
+        assert!(!s.is_open_at(et(2026, 9, 20, 12, 0)), "Sunday midday");
+
+        // Sunday 20:00 ET opens the week, and it runs through into Monday.
+        assert_eq!(
+            s.state_at(et(2026, 9, 20, 20, 0)).kind(),
+            Some(SessionKind::Overnight),
+            "Sunday 20:00 is the weekly open"
+        );
+        assert_eq!(
+            s.state_at(et(2026, 9, 21, 1, 0)).kind(),
+            Some(SessionKind::Overnight),
+            "Monday 01:00 continues Sunday's session"
+        );
+    }
+
+    /// `state_at` and `next_open_after` have to agree about when a wrapping
+    /// session starts, or the scheduler sleeps to an instant that still
+    /// reports closed and spins.
+    #[test]
+    fn next_open_from_the_weekend_lands_on_the_sunday_night_open() {
+        let s = TradingSession::us_equity_extended();
+        for from in [
+            et(2026, 9, 18, 21, 0), // Friday night, just after the close
+            et(2026, 9, 19, 12, 0), // Saturday midday
+            et(2026, 9, 20, 12, 0), // Sunday midday
+        ] {
+            let SessionState::Closed { next_open } = s.state_at(from) else {
+                panic!("expected closed at {from}");
+            };
+            assert_eq!(next_open, et(2026, 9, 20, 20, 0), "from {from}");
+            assert!(
+                s.is_open_at(next_open),
+                "woke to a closed venue from {from}"
+            );
+        }
+    }
+
+    /// A holiday removes the session that settles into it, including the
+    /// overnight leg that starts the evening before.
+    #[test]
+    fn a_holiday_also_cancels_the_overnight_session_that_runs_into_it() {
+        let monday = NaiveDate::from_ymd_opt(2026, 9, 21).unwrap();
+        let s = TradingSession::us_equity_extended().with_holidays(vec![monday]);
+
+        assert!(!s.is_open_at(et(2026, 9, 20, 21, 0)), "Sunday night leg");
+        assert!(!s.is_open_at(et(2026, 9, 21, 1, 0)), "Monday small hours");
+        assert!(
+            !s.is_open_at(et(2026, 9, 21, 10, 0)),
+            "Monday regular hours"
+        );
+        // Tuesday's session is untouched, and its overnight leg starts Monday
+        // evening even though Monday itself is a holiday.
+        assert!(s.is_open_at(et(2026, 9, 21, 21, 0)), "Monday night leg");
+        assert!(
+            s.is_open_at(et(2026, 9, 22, 10, 0)),
+            "Tuesday regular hours"
+        );
     }
 
     #[test]
