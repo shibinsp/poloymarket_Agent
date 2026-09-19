@@ -25,10 +25,19 @@ pub struct SizeResult {
     pub position_usd: Decimal,
     /// Fractional stop distance below entry, when the method defines one.
     pub stop_pct: Option<Decimal>,
-    /// Fraction of bankroll risked if the stop is hit.
+    /// Fraction of bankroll actually risked if the stop is hit — computed from
+    /// the size being returned, not from the budget that was asked for. The
+    /// two differ whenever a cap binds, which at the shipped defaults is the
+    /// normal case rather than the exception.
     pub risk_pct: Option<Decimal>,
     /// Why the size is zero, for logging.
     pub rejection: Option<&'static str>,
+    /// Kelly diagnostics, present only for prediction markets.
+    ///
+    /// `trades.kelly_raw` and `trades.kelly_adjusted` are NOT NULL in the
+    /// schema and `Store::insert_trade` binds both, so the prediction path
+    /// cannot afford to drop them on the way through this type.
+    pub kelly: Option<KellyResult>,
 }
 
 impl SizeResult {
@@ -38,6 +47,7 @@ impl SizeResult {
             stop_pct: None,
             risk_pct: None,
             rejection: Some(reason),
+            kelly: None,
         }
     }
 
@@ -48,11 +58,24 @@ impl SizeResult {
 
 impl From<KellyResult> for SizeResult {
     fn from(k: KellyResult) -> Self {
+        // Kelly returns a zero position for a negative edge or a result below
+        // the minimum, and this type documents `rejection` as "why the size is
+        // zero". Leaving it None gave the prediction path a silent zero while
+        // the continuous path always explained itself.
+        let rejection = if k.position_usd > Decimal::ZERO {
+            None
+        } else if k.kelly_adjusted <= Decimal::ZERO {
+            Some("no positive Kelly edge")
+        } else {
+            Some("Kelly size below the minimum position")
+        };
+
         Self {
             position_usd: k.position_usd,
             stop_pct: None,
             risk_pct: None,
-            rejection: None,
+            rejection,
+            kelly: Some(k),
         }
     }
 }
@@ -150,11 +173,19 @@ fn size_continuous(
         return SizeResult::none("below venue minimum notional");
     }
 
+    // Report the risk actually being taken, not the budget that was requested.
+    // Once the cap binds, losing `stop_pct` of the capped notional costs a
+    // fraction of the budget — at the shipped defaults roughly a third of it —
+    // and a caller aggregating this field into a portfolio risk number would
+    // otherwise over-count every position.
+    let realised_risk_pct = position_usd * stop_pct / inputs.bankroll;
+
     SizeResult {
         position_usd,
         stop_pct: Some(stop_pct),
-        risk_pct: Some(risk_pct),
+        risk_pct: Some(realised_risk_pct),
         rejection: None,
+        kelly: None,
     }
 }
 
@@ -303,6 +334,102 @@ mod tests {
         );
         // Uncapped the target is $2000 (20% of bankroll); the 6% cap wins.
         assert_eq!(result.position_usd, dec!(600.00));
+    }
+
+    /// Finding 9: the reported risk has to describe the position being
+    /// returned. While the cap binds — the normal case at the shipped defaults
+    /// — the budget that was asked for is several times the risk actually
+    /// taken, and a caller summing this field into a portfolio number would
+    /// over-count every single position.
+    #[test]
+    fn risk_pct_describes_the_capped_position_not_the_budget() {
+        let inst = equity(None);
+        let bars = candles();
+        let bankroll = dec!(10_000);
+
+        let sized = size_position(
+            &inputs(&inst, &bars, bankroll, AgentState::Alive),
+            &risk_config(),
+            &continuous_config(),
+        );
+
+        let stop_pct = sized.stop_pct.expect("continuous sizing sets a stop");
+        let risk_pct = sized.risk_pct.expect("continuous sizing reports risk");
+
+        // The cap must actually be binding, or this proves nothing.
+        assert_eq!(sized.position_usd, bankroll * dec!(0.06));
+
+        // Losing the stop on the returned notional costs exactly risk_pct.
+        assert_eq!(risk_pct * bankroll, sized.position_usd * stop_pct);
+
+        // And that is well below the budget that was requested.
+        let requested = continuous_config().risk_per_trade_pct * dec!(0.80);
+        assert!(
+            risk_pct < requested,
+            "realised {risk_pct} should be below the requested budget {requested}"
+        );
+    }
+
+    #[test]
+    fn risk_pct_equals_the_budget_when_no_cap_binds() {
+        let inst = equity(None);
+        let bars = candles();
+        let bankroll = dec!(10_000);
+
+        let sized = size_position(
+            &inputs(&inst, &bars, bankroll, AgentState::Alive),
+            &uncapped_risk_config(),
+            &continuous_config(),
+        );
+
+        let requested = continuous_config().risk_per_trade_pct * dec!(0.80);
+        assert_eq!(sized.risk_pct, Some(requested));
+    }
+
+    /// Finding 10: `trades.kelly_raw` and `trades.kelly_adjusted` are NOT NULL
+    /// in the schema, so the conversion cannot drop them on the way through.
+    #[test]
+    fn converting_a_kelly_result_keeps_its_diagnostics() {
+        let k = KellyResult {
+            kelly_raw: dec!(0.25),
+            kelly_adjusted: dec!(0.10),
+            position_usd: dec!(60),
+            capped: true,
+        };
+
+        let sized: SizeResult = k.clone().into();
+
+        assert_eq!(sized.position_usd, dec!(60));
+        assert_eq!(sized.kelly, Some(k));
+        assert_eq!(sized.rejection, None);
+        assert!(sized.should_trade());
+    }
+
+    /// A zero size has to say why. The continuous path always explained
+    /// itself; the prediction path returned a silent zero.
+    #[test]
+    fn a_zero_kelly_size_explains_itself() {
+        let no_edge: SizeResult = KellyResult {
+            kelly_raw: dec!(-0.05),
+            kelly_adjusted: dec!(-0.02),
+            position_usd: Decimal::ZERO,
+            capped: false,
+        }
+        .into();
+        assert_eq!(no_edge.rejection, Some("no positive Kelly edge"));
+        assert!(!no_edge.should_trade());
+
+        let too_small: SizeResult = KellyResult {
+            kelly_raw: dec!(0.02),
+            kelly_adjusted: dec!(0.01),
+            position_usd: Decimal::ZERO,
+            capped: false,
+        }
+        .into();
+        assert_eq!(
+            too_small.rejection,
+            Some("Kelly size below the minimum position")
+        );
     }
 
     #[test]
