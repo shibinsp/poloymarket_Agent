@@ -317,6 +317,7 @@ mod tests {
             tick_size: None,
             lot_size: None,
             min_notional: None,
+            min_qty: None,
             fractional: true,
             meta: InstrumentMeta::Equity {
                 exchange: "NASDAQ".to_string(),

@@ -164,6 +164,19 @@ fn size_continuous(
     if position_usd < risk.min_position_usd {
         return SizeResult::none("below minimum position size");
     }
+    // A venue minimum expressed as a quantity has to be checked in quantity.
+    // At micro capital this is exactly where it bites: a $6 slice of BTC is a
+    // fraction small enough to sit near Alpaca's floor, and the rejection
+    // would otherwise only arrive at submission.
+    let qty = position_usd / inputs.price;
+    if !inputs.instrument.meets_min_qty(qty) {
+        warn!(
+            instrument = %inputs.instrument.id,
+            qty = %qty,
+            "Position is below the venue's minimum order size — skipping"
+        );
+        return SizeResult::none("below venue minimum order size");
+    }
     if !inputs.instrument.meets_min_notional(position_usd) {
         warn!(
             instrument = %inputs.instrument.id,
@@ -242,6 +255,7 @@ mod tests {
             tick_size: Some(dec!(0.01)),
             lot_size: None,
             min_notional,
+            min_qty: None,
             fractional: true,
             meta: InstrumentMeta::Equity {
                 exchange: "NASDAQ".to_string(),
@@ -258,6 +272,7 @@ mod tests {
             tick_size: Some(dec!(0.01)),
             lot_size: None,
             min_notional: None,
+            min_qty: None,
             fractional: false,
             meta: InstrumentMeta::Prediction {
                 condition_id: "0xabc".to_string(),
@@ -502,6 +517,40 @@ mod tests {
             );
             assert!(!r.should_trade(), "{state:?} must not open positions");
         }
+    }
+
+    /// Finding 12, at the sizing layer: a quantity minimum has to be checked
+    /// in quantity. A $6 slice of a $64k asset is 0.00009 — fine by notional,
+    /// and the venue still rejects it if its floor is a size.
+    #[test]
+    fn venue_minimum_order_size_blocks_a_position_that_clears_on_notional() {
+        let mut inst = equity(None);
+        inst.min_qty = Some(dec!(1));
+        let bars = candles();
+
+        let mut ins = inputs(&inst, &bars, dec!(10_000), AgentState::Alive);
+        // A $600 position at $100_000 a unit is 0.006 units — well over any
+        // notional floor, well under a one-unit minimum.
+        ins.price = dec!(100_000);
+
+        let sized = size_position(&ins, &risk_config(), &continuous_config());
+        assert!(!sized.should_trade());
+        assert_eq!(sized.rejection, Some("below venue minimum order size"));
+    }
+
+    #[test]
+    fn a_position_clearing_the_minimum_order_size_still_trades() {
+        let mut inst = equity(None);
+        inst.min_qty = Some(dec!(1));
+        let bars = candles();
+
+        // At $100 a share a $600 position is 6 shares, over the minimum.
+        let sized = size_position(
+            &inputs(&inst, &bars, dec!(10_000), AgentState::Alive),
+            &risk_config(),
+            &continuous_config(),
+        );
+        assert!(sized.should_trade());
     }
 
     #[test]

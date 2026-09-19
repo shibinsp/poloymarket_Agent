@@ -499,6 +499,7 @@ mod tests {
             tick_size: None,
             lot_size: None,
             min_notional: None,
+            min_qty: None,
             fractional: true,
             meta: crate::venue::types::InstrumentMeta::Equity {
                 exchange: "NASDAQ".to_string(),
@@ -530,6 +531,7 @@ mod tests {
             tick_size: None,
             lot_size: None,
             min_notional: None,
+            min_qty: None,
             fractional: true,
             meta: crate::venue::types::InstrumentMeta::Spot {
                 base: "BTC".to_string(),

@@ -453,10 +453,11 @@ impl AlpacaVenue {
                 tick_size: asset.price_increment,
                 lot_size: asset.min_trade_increment,
                 // Alpaca gates crypto on a minimum *quantity* (`min_order_size`,
-                // e.g. 0.000026 BTC), not a minimum notional, and `Instrument`
-                // has nowhere to put a minimum quantity. Left unset rather than
-                // synthesised from a price we do not have at discovery time.
+                // e.g. 0.000026 BTC) rather than on notional value, which is
+                // why the constraint lives in `min_qty`: stating it as a
+                // notional would need a price discovery does not have.
                 min_notional: None,
+                min_qty: asset.min_order_size,
                 fractional: true,
                 meta: InstrumentMeta::Spot {
                     base: base.to_string(),
@@ -476,6 +477,7 @@ impl AlpacaVenue {
                     Some(Decimal::ONE)
                 },
                 min_notional: Some(EQUITY_MIN_NOTIONAL),
+                min_qty: None,
                 fractional: asset.fractionable,
                 meta: InstrumentMeta::Equity {
                     exchange: asset.exchange.clone(),
@@ -586,6 +588,19 @@ fn build_new_order(request: &OrderRequest) -> Result<NewOrder> {
             bail!(
                 "Quantity {} for {symbol} rounds to zero against the venue's lot size and                  whole-share rule — the order would only be rejected",
                 request.qty
+            );
+        }
+        // Alpaca gates crypto on a minimum quantity, and rounding down to the
+        // lot size can cross it. Checked after rounding rather than before,
+        // because the size that gets submitted is the one that has to clear.
+        if !request.instrument.meets_min_qty(whole) {
+            bail!(
+                "Quantity {whole} for {symbol} is below the venue's minimum order size of {}",
+                request
+                    .instrument
+                    .min_qty
+                    .unwrap_or(Decimal::ZERO)
+                    .normalize()
             );
         }
         whole
@@ -1191,6 +1206,7 @@ mod tests {
             tick_size: Some(EQUITY_TICK_SIZE),
             lot_size: None,
             min_notional: Some(EQUITY_MIN_NOTIONAL),
+            min_qty: None,
             fractional: true,
             meta: InstrumentMeta::Equity {
                 exchange: "NASDAQ".to_string(),
@@ -1207,6 +1223,7 @@ mod tests {
             tick_size: Some(dec!(1)),
             lot_size: Some(dec!(0.000000001)),
             min_notional: None,
+            min_qty: None,
             fractional: true,
             meta: InstrumentMeta::Spot {
                 base: "BTC".to_string(),
@@ -1296,6 +1313,68 @@ mod tests {
 
         let err = build_new_order(&req).expect_err("0.4 whole shares is no shares");
         assert!(err.to_string().contains("rounds to zero"), "{err}");
+    }
+
+    /// Finding 12: Alpaca publishes `min_order_size` for crypto and it was
+    /// parsed and thrown away, so a sub-minimum size was only refused by the
+    /// venue at submission. At micro capital this is where it bites — a few
+    /// dollars of BTC sits near the floor.
+    #[test]
+    fn a_crypto_order_below_the_venue_minimum_is_refused_locally() {
+        let mut inst = crypto_instrument();
+        inst.min_qty = Some(dec!(0.000026));
+        inst.lot_size = Some(dec!(0.000000001));
+
+        let mut req = order(
+            inst,
+            OrderKind::Limit { price: dec!(64000) },
+            TimeInForce::Gtc,
+            false,
+        );
+        req.qty = dec!(0.00001);
+
+        let err = build_new_order(&req).expect_err("below Alpaca's minimum");
+        assert!(err.to_string().contains("minimum order size"), "{err}");
+    }
+
+    #[test]
+    fn a_crypto_order_at_the_venue_minimum_is_accepted() {
+        let mut inst = crypto_instrument();
+        inst.min_qty = Some(dec!(0.000026));
+        inst.lot_size = Some(dec!(0.000001));
+
+        let mut req = order(
+            inst,
+            OrderKind::Limit { price: dec!(64000) },
+            TimeInForce::Gtc,
+            false,
+        );
+        req.qty = dec!(0.000026);
+
+        let built = build_new_order(&req).expect("exactly at the minimum clears");
+        assert_eq!(built.qty, "0.000026");
+    }
+
+    /// The ordering matters: rounding down to the lot size can push a size
+    /// that cleared the minimum below it, so the check has to come after the
+    /// rounding — the submitted size is the one that has to clear.
+    #[test]
+    fn rounding_down_to_the_lot_can_cross_the_minimum_and_is_caught() {
+        let mut inst = crypto_instrument();
+        inst.lot_size = Some(dec!(0.01));
+        inst.min_qty = Some(dec!(0.015));
+
+        let mut req = order(
+            inst,
+            OrderKind::Limit { price: dec!(64000) },
+            TimeInForce::Gtc,
+            false,
+        );
+        // 0.019 clears the 0.015 minimum, but floors to 0.01, which does not.
+        req.qty = dec!(0.019);
+
+        let err = build_new_order(&req).expect_err("the rounded size is below the minimum");
+        assert!(err.to_string().contains("minimum order size"), "{err}");
     }
 
     #[test]
@@ -1745,6 +1824,12 @@ mod tests {
         assert_eq!(btc.tick_size, Some(dec!(1)));
         assert_eq!(btc.lot_size, Some(dec!(0.000000001)));
         assert_eq!(btc.quote_ccy, "USD");
+        // Alpaca's crypto floor is a quantity, not a notional, so it has to
+        // survive discovery in min_qty or the constraint is lost before
+        // anything can enforce it.
+        assert_eq!(btc.min_qty, Some(dec!(0.000026)));
+        assert_eq!(btc.min_notional, None);
+        assert_eq!(aapl.min_qty, None, "equities have no size floor");
         assert_eq!(
             btc.meta,
             InstrumentMeta::Spot {

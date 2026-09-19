@@ -135,6 +135,7 @@ fn build_instruments(venue_id: &VenueId, market: &Market) -> Vec<Instrument> {
                 tick_size: Some(dec!(0.01)),
                 lot_size: None,
                 min_notional: None,
+                min_qty: None,
                 fractional: false,
                 meta: InstrumentMeta::Prediction {
                     condition_id: market.condition_id.clone(),

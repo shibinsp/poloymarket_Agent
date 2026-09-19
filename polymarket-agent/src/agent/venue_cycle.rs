@@ -507,6 +507,7 @@ mod tests {
                 tick_size: Some(dec!(0.01)),
                 lot_size: None,
                 min_notional: None,
+                min_qty: None,
                 fractional: true,
                 meta: InstrumentMeta::Spot {
                     base: "BTC".to_string(),

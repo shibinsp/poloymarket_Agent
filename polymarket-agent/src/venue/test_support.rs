@@ -64,6 +64,7 @@ impl StubVenue {
                 tick_size: None,
                 lot_size: None,
                 min_notional: None,
+                min_qty: None,
                 fractional: true,
                 meta: InstrumentMeta::Spot {
                     base: s.to_string(),

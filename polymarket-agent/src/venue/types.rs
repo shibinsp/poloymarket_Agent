@@ -157,6 +157,10 @@ pub struct Instrument {
     /// Smallest order value the venue will accept. Binance.US rejects orders
     /// under roughly $10, which matters a great deal at a $100 bankroll.
     pub min_notional: Option<Decimal>,
+    /// Smallest tradeable quantity, where the venue gates on size rather than
+    /// on value. Alpaca's crypto `min_order_size` works this way (0.000026
+    /// BTC, say), and a notional minimum cannot express it without a price.
+    pub min_qty: Option<Decimal>,
     /// Whether fractional quantities are allowed (Alpaca equities, crypto).
     pub fractional: bool,
     pub meta: InstrumentMeta,
@@ -200,6 +204,14 @@ impl Instrument {
     pub fn meets_min_notional(&self, notional: Decimal) -> bool {
         match self.min_notional {
             Some(min) => notional >= min,
+            None => true,
+        }
+    }
+
+    /// Whether an order of this size clears the venue's minimum quantity.
+    pub fn meets_min_qty(&self, qty: Decimal) -> bool {
+        match self.min_qty {
+            Some(min) => qty >= min,
             None => true,
         }
     }
@@ -467,6 +479,7 @@ mod tests {
             tick_size: tick,
             lot_size: lot,
             min_notional: min,
+            min_qty: None,
             fractional: true,
             meta: InstrumentMeta::Equity {
                 exchange: "NASDAQ".to_string(),
