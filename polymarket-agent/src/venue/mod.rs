@@ -7,6 +7,7 @@
 //! exchange can't stop the cycle.
 
 pub mod alpaca;
+pub mod factory;
 pub mod polymarket;
 pub mod session;
 pub mod types;
