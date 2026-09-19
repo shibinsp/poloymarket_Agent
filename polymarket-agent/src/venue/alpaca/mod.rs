@@ -565,12 +565,41 @@ fn build_new_order(request: &OrderRequest) -> Result<NewOrder> {
         )
     })?;
 
+    // Apply the instrument's own constraints before Alpaca does. This module's
+    // header promises violations are refused here rather than bounced after the
+    // fact, and `round_qty`/`round_price` existed to do it — nothing called
+    // them, so `lot_size`, `tick_size` and `fractional` were decorative and
+    // every rejection came back from the venue instead.
+    let qty = {
+        let lotted = request.instrument.round_qty(request.qty);
+        // A non-fractionable name takes whole shares only. Rounding down is
+        // the safe direction: up would spend more than was sized for.
+        let whole = if request.instrument.fractional {
+            lotted
+        } else {
+            lotted.floor()
+        };
+        if whole <= Decimal::ZERO {
+            bail!(
+                "Quantity {} for {symbol} rounds to zero against the venue's lot size and                  whole-share rule — the order would only be rejected",
+                request.qty
+            );
+        }
+        whole
+    };
+
     let (order_type, limit_price) = match request.kind {
         OrderKind::Limit { price } => {
             if price <= Decimal::ZERO {
                 bail!("Alpaca limit price must be positive, got {price} for {symbol}");
             }
-            ("limit", Some(price.normalize().to_string()))
+            let ticked = request.instrument.round_price(price, request.side);
+            if ticked <= Decimal::ZERO {
+                bail!(
+                    "Limit price {price} for {symbol} rounds to zero against the venue's                      tick size"
+                );
+            }
+            ("limit", Some(ticked.normalize().to_string()))
         }
         OrderKind::Market => ("market", None),
     };
@@ -613,7 +642,7 @@ fn build_new_order(request: &OrderRequest) -> Result<NewOrder> {
 
     Ok(NewOrder {
         symbol,
-        qty: request.qty.normalize().to_string(),
+        qty: qty.normalize().to_string(),
         side: side_str(request.side),
         order_type,
         time_in_force: tif,
@@ -1156,6 +1185,101 @@ mod tests {
             extended_hours: ext,
             client_order_id: "cid-abc-123".to_string(),
         }
+    }
+
+    /// Finding 6: `lot_size`, `tick_size` and `fractional` were carried on the
+    /// instrument and never applied, so `round_qty`/`round_price` were dead
+    /// code and Alpaca bounced orders this module claims to validate locally.
+    #[test]
+    fn a_non_fractionable_name_is_sized_in_whole_shares() {
+        let mut inst = equity_instrument();
+        inst.fractional = false;
+
+        let built = build_new_order(&order(
+            inst,
+            OrderKind::Limit {
+                price: dec!(191.50),
+            },
+            TimeInForce::Day,
+            false,
+        ))
+        .expect("2.5 shares floors to 2");
+
+        assert_eq!(built.qty, "2");
+    }
+
+    #[test]
+    fn a_fractionable_name_keeps_its_fraction() {
+        let built = build_new_order(&order(
+            equity_instrument(),
+            OrderKind::Limit {
+                price: dec!(191.50),
+            },
+            TimeInForce::Day,
+            false,
+        ))
+        .expect("fractional equities take 2.5");
+
+        assert_eq!(built.qty, "2.5");
+    }
+
+    #[test]
+    fn quantity_is_floored_to_the_lot_size() {
+        let mut inst = crypto_instrument();
+        inst.lot_size = Some(dec!(0.001));
+        let mut req = order(
+            inst,
+            OrderKind::Limit { price: dec!(64000) },
+            TimeInForce::Gtc,
+            false,
+        );
+        req.qty = dec!(1.23456);
+
+        let built = build_new_order(&req).expect("floors to the lot");
+        assert_eq!(built.qty, "1.234");
+    }
+
+    /// Rounding down can reach zero, and a zero-quantity order is a guaranteed
+    /// rejection. Refusing locally says why; the venue's error would not.
+    #[test]
+    fn a_quantity_that_rounds_away_is_refused_locally() {
+        let mut inst = equity_instrument();
+        inst.fractional = false;
+        let mut req = order(
+            inst,
+            OrderKind::Limit {
+                price: dec!(191.50),
+            },
+            TimeInForce::Day,
+            false,
+        );
+        req.qty = dec!(0.4);
+
+        let err = build_new_order(&req).expect_err("0.4 whole shares is no shares");
+        assert!(err.to_string().contains("rounds to zero"), "{err}");
+    }
+
+    #[test]
+    fn a_limit_price_is_rounded_to_the_tick_toward_the_safe_side() {
+        let mut buy = order(
+            equity_instrument(),
+            OrderKind::Limit {
+                price: dec!(191.5049),
+            },
+            TimeInForce::Day,
+            false,
+        );
+        buy.side = Side::Buy;
+        // Buying: never round up into paying more than was sized for.
+        assert_eq!(build_new_order(&buy).unwrap().limit_price.unwrap(), "191.5");
+
+        let mut sell = buy.clone();
+        sell.side = Side::Sell;
+        // Selling: never round down into receiving less.
+        assert_eq!(
+            build_new_order(&sell).unwrap().limit_price.unwrap(),
+            "191.51"
+        );
     }
 
     fn order_response(status: &str) -> Value {

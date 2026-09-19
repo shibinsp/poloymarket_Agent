@@ -125,8 +125,15 @@ impl VenueRegistry {
         self.all().filter(|v| v.is_open_at(at)).collect()
     }
 
-    /// Earliest instant any closed venue reopens, for sleep-until-open.
-    /// `None` when every venue is already open.
+    /// Earliest instant any *session-closed* venue reopens.
+    ///
+    /// Not a sleep-until time on its own, despite the obvious reading. It mins
+    /// over the closed venues only, so a registry holding a 24/7 crypto venue
+    /// beside a shut equity venue still returns Monday's open — sleeping
+    /// straight to that would sit out two days of tradeable crypto. Ask
+    /// `trades_at` first, which is what the scheduler does.
+    ///
+    /// `None` when every venue's session is open.
     pub fn next_open_after(&self, at: DateTime<Utc>) -> Option<DateTime<Utc>> {
         self.all()
             .filter_map(|v| match v.session_state(at) {
