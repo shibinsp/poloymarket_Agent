@@ -9,6 +9,7 @@ use tracing::{error, info, warn};
 use crate::agent::self_funding::{
     self, edge_justifies_cost, enhanced_survival_check, log_cost_breakdown, CycleCosts,
 };
+use crate::agent::venue_cycle::{CycleOutcome, VenueCycle};
 use crate::config::{AppConfig, Secrets};
 use crate::data::crypto::CryptoSource;
 use crate::data::news::NewsSource;
@@ -32,6 +33,7 @@ use crate::valuation::calibration;
 use crate::valuation::edge::{evaluate_edge, to_opportunity, EdgeResult};
 use crate::valuation::fair_value::{ValuationEngine, ValuationResult};
 use crate::valuation::llm::LlmClient;
+use crate::venue::VenueRegistry;
 
 pub struct Agent {
     config: AppConfig,
@@ -45,6 +47,11 @@ pub struct Agent {
     portfolio: PortfolioManager,
     alert_client: AlertClient,
     last_balance: Decimal,
+    /// Venues from `[[venues]]`. Empty keeps the legacy Polymarket-only path.
+    venues: VenueRegistry,
+    /// Shared with the valuation engine; the venue cycle calls it directly
+    /// because continuous assets use a different prompt.
+    llm: Option<Arc<LlmClient>>,
 }
 
 impl Agent {
@@ -63,18 +70,20 @@ impl Agent {
         let data_aggregator = DataAggregator::new(data_sources);
 
         // Phase 4: Initialize valuation engine (only if API key is available)
+        let mut llm_client: Option<Arc<LlmClient>> = None;
         let valuation_engine = if let Some(ref api_key) = secrets.llm_api_key {
             // Share the caller's connection pool rather than opening (and
             // migrating) two more against the same database file.
             let llm_store = store.clone_for_parallel();
             let valuation_store = store.clone_for_parallel();
-            let llm_client = Arc::new(LlmClient::new(
+            let client = Arc::new(LlmClient::new(
                 api_key.clone(),
                 &config.valuation,
                 llm_store,
             )?);
+            llm_client = Some(client.clone());
             Some(ValuationEngine::new(
-                llm_client,
+                client,
                 config.valuation.clone(),
                 valuation_store,
             ))
@@ -82,6 +91,11 @@ impl Agent {
             warn!("LLM_API_KEY/ANTHROPIC_API_KEY not set — valuation engine disabled");
             None
         };
+
+        // Venues declared in [[venues]]. Sharing the Polymarket client keeps
+        // one paper balance across both the legacy and venue paths.
+        let venues =
+            crate::venue::factory::build_registry(&config, &secrets, Some(polymarket.clone()))?;
 
         // Phase 5: Initialize portfolio manager
         let portfolio = PortfolioManager::new(config.risk.clone());
@@ -102,6 +116,7 @@ impl Agent {
             mode = ?config.agent.mode,
             cycle_number,
             valuation_enabled = valuation_engine.is_some(),
+            venues = venues.len(),
             alerts_enabled = alert_client.is_enabled(),
             "Agent initialized"
         );
@@ -118,11 +133,37 @@ impl Agent {
             portfolio,
             alert_client,
             last_balance: Decimal::ZERO,
+            venues,
+            llm: llm_client,
         })
     }
 
     fn has_valuation_engine(&self) -> bool {
         self.valuation_engine.is_some()
+    }
+
+    /// Whether the current state allows opening new positions. Exits and
+    /// settlement still run in every state.
+    fn opens_positions(&self) -> bool {
+        matches!(self.state, AgentState::Alive | AgentState::LowFuel)
+    }
+
+    /// One pass of the venue-based loop over continuous assets.
+    async fn run_venue_cycle(&self, bankroll: Decimal) -> Result<CycleOutcome> {
+        let cycle = VenueCycle {
+            registry: &self.venues,
+            llm: self.llm.as_deref(),
+            store: &self.store,
+            config: &self.config,
+        };
+        cycle
+            .run(
+                chrono::Utc::now(),
+                self.state,
+                bankroll,
+                self.cycle_number as i64,
+            )
+            .await
     }
 
     pub async fn run_cycle(&mut self) -> Result<()> {
@@ -279,6 +320,22 @@ impl Agent {
                         warn!(error = %e, "Market scan failed");
                     }
                 }
+            }
+        }
+
+        // Venue path: continuous assets (crypto, equities). Runs alongside the
+        // legacy Polymarket loop above, and only when the agent state permits
+        // new positions — the same gate the legacy path applies.
+        if !self.venues.is_empty() && budget_available && self.opens_positions() {
+            let bankroll = self.effective_bankroll().await;
+            match self.run_venue_cycle(bankroll).await {
+                Ok(outcome) => {
+                    markets_scanned += outcome.instruments_scanned as i64;
+                    opportunities_found += outcome.views_taken as i64;
+                    trades_placed += outcome.orders_placed as i64;
+                    cycle_api_cost += outcome.api_cost;
+                }
+                Err(e) => warn!(error = %e, "Venue cycle failed"),
             }
         }
 

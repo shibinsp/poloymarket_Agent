@@ -307,6 +307,9 @@ pub struct Secrets {
     /// Bearer token protecting the dashboard's `/api/*` routes. Required when
     /// the dashboard is bound to a non-loopback address.
     pub dashboard_token: Option<String>,
+    /// Alpaca trading credentials. Paper and live use different keys.
+    pub alpaca_key_id: Option<String>,
+    pub alpaca_secret_key: Option<String>,
 }
 
 /// Read an env var, treating blank/whitespace-only as unset.
@@ -330,6 +333,8 @@ impl Secrets {
             noaa_api_token: non_empty_env("NOAA_API_TOKEN"),
             espn_api_key: non_empty_env("ESPN_API_KEY"),
             dashboard_token: non_empty_env("DASHBOARD_TOKEN"),
+            alpaca_key_id: non_empty_env("ALPACA_API_KEY_ID"),
+            alpaca_secret_key: non_empty_env("ALPACA_API_SECRET_KEY"),
         }
     }
 }
