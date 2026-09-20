@@ -326,6 +326,65 @@ pub struct RiskConfig {
     pub max_total_exposure_pct: Decimal,
     pub max_positions_per_category: u32,
     pub min_position_usd: Decimal,
+
+    // --- Circuit breakers (see `risk::circuit_breaker`) ---
+    //
+    // Every field below has a default, so an existing config file keeps
+    // working — and keeps the breakers *on*, which is the point. A safety
+    // limit that has to be opted into is a safety limit nobody has.
+    //
+    // Losses trip on a strict `>` and counts on a `>=`, so a limit of zero
+    // means "none tolerated" rather than silently meaning "disabled". To
+    // switch a check off, set it high.
+    /// Fraction of the day's starting equity that may be lost before entries
+    /// stop for the rest of the UTC day.
+    #[serde(default = "default_max_daily_loss_pct")]
+    pub max_daily_loss_pct: Decimal,
+    /// Cash equivalent of the above. At micro capital the percentage is a
+    /// rounding error and this is the number the operator actually agreed to.
+    #[serde(default = "default_max_daily_loss_usd")]
+    pub max_daily_loss_usd: Decimal,
+    /// Fraction below the all-time equity high that halts until a human
+    /// resumes. Does not clear at midnight: sleeping on a drawdown changes
+    /// nothing about it.
+    #[serde(default = "default_max_drawdown_pct")]
+    pub max_drawdown_pct: Decimal,
+    /// Positions opened per UTC day.
+    #[serde(default = "default_max_trades_per_day")]
+    pub max_trades_per_day: u32,
+    /// Consecutive losing closes before entries stop for the day.
+    #[serde(default = "default_max_consecutive_losses")]
+    pub max_consecutive_losses: u32,
+    /// Absolute ceiling on one live position, in dollars. Applies only in
+    /// live mode: a percentage of a paper balance is a number nobody agreed
+    /// to, and the first live run must not inherit it.
+    #[serde(default = "default_max_live_notional_per_position_usd")]
+    pub max_live_notional_per_position_usd: Decimal,
+    /// Absolute ceiling on all live positions together, in dollars.
+    #[serde(default = "default_max_live_total_notional_usd")]
+    pub max_live_total_notional_usd: Decimal,
+}
+
+fn default_max_daily_loss_pct() -> Decimal {
+    rust_decimal_macros::dec!(0.05)
+}
+fn default_max_daily_loss_usd() -> Decimal {
+    rust_decimal_macros::dec!(5.0)
+}
+fn default_max_drawdown_pct() -> Decimal {
+    rust_decimal_macros::dec!(0.15)
+}
+fn default_max_trades_per_day() -> u32 {
+    10
+}
+fn default_max_consecutive_losses() -> u32 {
+    4
+}
+fn default_max_live_notional_per_position_usd() -> Decimal {
+    rust_decimal_macros::dec!(10.0)
+}
+fn default_max_live_total_notional_usd() -> Decimal {
+    rust_decimal_macros::dec!(60.0)
 }
 
 /// Volatility-targeted sizing for continuous assets (crypto, equities).

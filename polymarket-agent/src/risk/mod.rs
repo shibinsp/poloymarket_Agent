@@ -1,3 +1,4 @@
+pub mod circuit_breaker;
 pub mod exit;
 pub mod kelly;
 pub mod limits;
