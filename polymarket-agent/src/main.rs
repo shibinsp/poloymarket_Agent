@@ -57,12 +57,20 @@ async fn main() -> Result<()> {
         config.agent.mode = mode.into();
     }
 
+    // Held for the lifetime of the process; `shutdown` flushes pending spans.
+    // Initialised before the dry-run branch on purpose: validating
+    // connectivity is exactly when a trace of what was attempted, and how long
+    // each call took, is worth having.
+    let telemetry = logger::init_logging(&config.monitoring, &config.telemetry)?;
+
     // Dry run mode: single cycle validation
     if args.dry_run {
-        return run_dry_run(&config, &secrets).await;
+        let result = run_dry_run(&config, &secrets).await;
+        // Flush on both paths — a failed dry run is the one whose spans you
+        // actually want.
+        telemetry.shutdown();
+        return result;
     }
-
-    logger::init_logging(&config.monitoring)?;
 
     tracing::info!(
         mode = ?config.agent.mode,
@@ -72,7 +80,7 @@ async fn main() -> Result<()> {
 
     match config.agent.mode {
         AgentMode::Backtest => run_backtest(&config),
-        AgentMode::Paper | AgentMode::Live => run_agent(config, secrets).await,
+        AgentMode::Paper | AgentMode::Live => run_agent(config, secrets, telemetry).await,
     }
 }
 
@@ -150,7 +158,9 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
                 key.clone(),
                 &config.valuation,
                 probe_store,
-            ) {
+            )
+            .map(|c| c.with_content_export(config.telemetry.export_content))
+            {
                 Ok(client) => {
                     println!("   Provider: {:?}", config.valuation.provider);
                     println!("   Model: {}", config.valuation.model);
@@ -252,7 +262,11 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
 }
 
 /// Run the agent in paper or live trading mode.
-async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
+async fn run_agent(
+    config: AppConfig,
+    secrets: config::Secrets,
+    telemetry: monitoring::telemetry::Telemetry,
+) -> Result<()> {
     // Create shared database store
     let store = Store::new(&config.database.path).await?;
 
@@ -370,6 +384,9 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
     // Clean up background tasks
     watchdog.abort();
     dashboard_handle.abort();
+    // Flush before the process goes away, or the last spans — the ones
+    // describing whatever ended the run — never leave the machine.
+    telemetry.shutdown();
     tracing::info!("Agent shutdown complete");
 
     match fatal {

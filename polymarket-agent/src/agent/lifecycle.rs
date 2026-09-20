@@ -5,7 +5,7 @@ use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use tracing::{error, info, warn};
+use tracing::{error, info, instrument, warn};
 
 use crate::agent::reconcile::Reconciler;
 use crate::agent::scheduler::{self, WakePlan};
@@ -80,11 +80,10 @@ impl Agent {
             // migrating) two more against the same database file.
             let llm_store = store.clone_for_parallel();
             let valuation_store = store.clone_for_parallel();
-            let client = Arc::new(LlmClient::new(
-                api_key.clone(),
-                &config.valuation,
-                llm_store,
-            )?);
+            let client = Arc::new(
+                LlmClient::new(api_key.clone(), &config.valuation, llm_store)?
+                    .with_content_export(config.telemetry.export_content),
+            );
             llm_client = Some(client.clone());
             Some(ValuationEngine::new(
                 client,
@@ -165,6 +164,16 @@ impl Agent {
             .await
     }
 
+    #[instrument(
+        skip(self),
+        fields(
+            otel.name = "agent.cycle",
+            cycle = self.cycle_number,
+            agent.state = %self.state,
+            markets_scanned = tracing::field::Empty,
+            trades_placed = tracing::field::Empty,
+        )
+    )]
     pub async fn run_cycle(&mut self) -> Result<()> {
         let start = Instant::now();
         info!(cycle = self.cycle_number, state = %self.state, "Starting cycle");

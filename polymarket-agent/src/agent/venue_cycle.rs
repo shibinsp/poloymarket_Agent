@@ -15,7 +15,8 @@ use std::collections::{HashMap, HashSet};
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
-use tracing::{info, warn};
+use tracing::Instrument as _;
+use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
 use crate::config::AppConfig;
@@ -97,6 +98,10 @@ impl VenueCycle<'_> {
     /// No bankroll parameter: each venue is sized against its own balance,
     /// fetched below. Passing one in is how every venue ended up sized from
     /// the Polymarket wallet.
+    #[instrument(
+        skip(self),
+        fields(otel.name = "venue.cycle", cycle = cycle, state = %state)
+    )]
     pub async fn run(
         &self,
         now: DateTime<Utc>,
@@ -381,7 +386,17 @@ impl VenueCycle<'_> {
         // A failed submit is not a rejection: the venue may have accepted the
         // order before the response was lost. Record UNKNOWN and let
         // reconciliation ask, rather than assuming either way.
-        let outcome = match venue.place_order(&request).await {
+        // The order submission gets its own span: it is the call most worth
+        // being able to find a timing or a failure for after the fact.
+        let place_span = tracing::info_span!(
+            "venue.place_order",
+            otel.name = "venue.place_order",
+            venue = %venue.id(),
+            symbol = %instrument.symbol(),
+            qty = %qty,
+            limit_price = %limit_price,
+        );
+        let outcome = match venue.place_order(&request).instrument(place_span).await {
             Ok(ack) => Ok(ack),
             Err(e) => {
                 self.store

@@ -292,6 +292,34 @@ npm run build:embed   # vite build, then cargo build
 compile time, so a rebuilt bundle does not reach the binary — or a running
 agent — until Rust recompiles and the agent restarts.
 
+### Tracing (OpenTelemetry / Langfuse)
+
+The agent exports spans over OTLP when an endpoint is configured, and stays
+silent otherwise. Set one env var and it turns itself on:
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318        # any OTLP collector
+# or, for a self-hosted Langfuse:
+LANGFUSE_HOST=http://localhost:3000
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+```
+
+Spans cover the trading cycle, the venue cycle and exit pass, reconciliation,
+order placement, and every model call. The valuation spans carry GenAI
+semantic-convention attributes (`gen_ai.request.model`,
+`gen_ai.usage.input_tokens`, `gen_ai.usage.cost`), so Langfuse renders them as
+generations with cost and token counts rather than as anonymous spans.
+
+`telemetry.export_content` controls whether prompts and completions travel with
+the span. It defaults to on, which assumes the destination is infrastructure you
+control. Turn it off and the spans keep model, token counts, cost and latency
+but carry no text.
+
+This is what makes a slow cycle legible: a 200-second cycle caused by a venue
+retrying behind a blocked DNS entry is three unrelated warnings in the logs, and
+one span with three children in a trace.
+
 ### Health Check
 
 ```bash

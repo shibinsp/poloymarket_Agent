@@ -19,6 +19,9 @@ pub struct AppConfig {
     pub polymarket: PolymarketConfig,
     pub rate_limit: RateLimitConfig,
     pub database: DatabaseConfig,
+    /// Tracing export. Absent means off.
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
     /// Trading venues. Empty keeps the legacy Polymarket-only behaviour.
     #[serde(default)]
     pub venues: Vec<VenueConfig>,
@@ -164,6 +167,65 @@ impl AppConfig {
     pub fn max_orders_per_cycle(&self) -> usize {
         self.sizing_continuous.max_orders_per_cycle
     }
+}
+
+/// Tracing export. Off unless an endpoint is configured.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TelemetryConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// OTLP/HTTP base URL. A self-hosted Langfuse is
+    /// `http://localhost:3000/api/public/otel`; a plain collector is
+    /// `http://localhost:4318`. `/v1/traces` is appended if absent.
+    #[serde(default)]
+    pub otlp_endpoint: Option<String>,
+    #[serde(default = "default_service_name")]
+    pub service_name: String,
+    /// Whether prompts and completions are exported alongside the metadata.
+    ///
+    /// On by default because the destination is expected to be your own
+    /// infrastructure, and a valuation trace without its prompt cannot explain
+    /// why the model said what it did. Turn it off and the spans keep model,
+    /// token counts, cost and latency.
+    #[serde(default = "default_true")]
+    pub export_content: bool,
+    #[serde(default = "default_export_timeout")]
+    pub export_timeout_seconds: u64,
+    /// Extra OTLP headers, for collectors that want their own auth.
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
+    /// Langfuse credentials. Read from the environment, never the config file.
+    #[serde(skip)]
+    pub langfuse_public_key: Option<String>,
+    #[serde(skip)]
+    pub langfuse_secret_key: Option<String>,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            otlp_endpoint: None,
+            service_name: default_service_name(),
+            export_content: true,
+            export_timeout_seconds: default_export_timeout(),
+            headers: std::collections::HashMap::new(),
+            langfuse_public_key: None,
+            langfuse_secret_key: None,
+        }
+    }
+}
+
+fn default_service_name() -> String {
+    "polymarket-agent".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_export_timeout() -> u64 {
+    10
 }
 
 /// One configured trading venue.
@@ -431,8 +493,21 @@ impl AppConfig {
         let contents = std::fs::read_to_string(config_path)
             .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
 
-        let config: AppConfig = toml::from_str(&contents)
+        let mut config: AppConfig = toml::from_str(&contents)
             .with_context(|| format!("Failed to parse config file: {}", config_path.display()))?;
+
+        // Telemetry credentials come from the environment, never the config
+        // file — the same rule every other secret here follows. The endpoint
+        // may also be overridden, so a deployment can point at its own
+        // collector without editing a tracked file.
+        config.telemetry.langfuse_public_key = non_empty_env("LANGFUSE_PUBLIC_KEY");
+        config.telemetry.langfuse_secret_key = non_empty_env("LANGFUSE_SECRET_KEY");
+        if let Some(endpoint) = non_empty_env("OTEL_EXPORTER_OTLP_ENDPOINT")
+            .or_else(|| non_empty_env("LANGFUSE_HOST").map(|h| format!("{h}/api/public/otel")))
+        {
+            config.telemetry.otlp_endpoint = Some(endpoint);
+            config.telemetry.enabled = true;
+        }
 
         let secrets = Secrets::from_env();
 

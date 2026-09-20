@@ -16,7 +16,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
-use tracing::{info, warn};
+use tracing::{info, instrument, warn};
 
 use crate::agent::venue_exits::unrealized_pnl;
 use crate::db::store::{OrderRecord, Store};
@@ -53,6 +53,7 @@ impl Reconciler<'_> {
     ///
     /// One order failing must not stop the rest: a venue outage would
     /// otherwise leave every other venue's orders unresolved too.
+    #[instrument(skip(self), fields(otel.name = "agent.reconcile"))]
     pub async fn run(&self, now: DateTime<Utc>) -> Result<ReconcileReport> {
         let mut report = ReconcileReport::default();
         let orders = self.store.get_unresolved_orders().await?;

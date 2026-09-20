@@ -14,6 +14,7 @@ use anyhow::{bail, Context, Result};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
+use tracing::Instrument as _;
 use tracing::{info, instrument, warn};
 
 use crate::config::{LlmProvider, ValuationConfig};
@@ -37,6 +38,8 @@ pub struct LlmClient {
     input_price_per_million: Decimal,
     output_price_per_million: Decimal,
     store: Store,
+    /// Whether prompt and completion text is attached to the trace span.
+    export_content: bool,
 }
 
 /// Hand-written so the API key can never reach a log line or panic message.
@@ -57,6 +60,16 @@ impl LlmClient {
     /// Fails fast if an OpenAI-compatible provider is selected without a
     /// `base_url` — there is no sensible default endpoint for "some
     /// OpenAI-compatible service".
+    /// Whether prompts and completions ride along on the trace span.
+    ///
+    /// Separate from construction because it is a telemetry setting, not a
+    /// model one, and the client is built in places that do not know about
+    /// telemetry.
+    pub fn with_content_export(mut self, export: bool) -> Self {
+        self.export_content = export;
+        self
+    }
+
     pub fn new(api_key: String, config: &ValuationConfig, store: Store) -> Result<Self> {
         let base_url = match (config.provider, config.base_url.as_deref()) {
             (_, Some(url)) => url.trim_end_matches('/').to_string(),
@@ -112,17 +125,75 @@ impl LlmClient {
             input_price_per_million,
             output_price_per_million,
             store,
+            // Content export is a telemetry decision; the caller narrows it.
+            export_content: true,
         })
     }
 
     /// Send a prompt to the model and return the text plus tracked cost.
     #[instrument(skip(self, system_prompt, user_prompt))]
+    /// Make one model call.
+    ///
+    /// The span carries GenAI semantic-convention attributes so an OTLP
+    /// consumer renders it as a generation — model, token counts, cost —
+    /// rather than an anonymous span.
+    ///
+    /// The span is built by hand rather than with `#[instrument]` so the
+    /// prompt can be attached at creation when content export is on, and
+    /// simply absent when it is off. Recording it afterwards would leave the
+    /// privacy-relevant branch untestable.
     pub async fn complete(
         &self,
         system_prompt: &str,
         user_prompt: &str,
         cycle: Option<i64>,
     ) -> Result<LlmResponse> {
+        let span = if self.export_content {
+            tracing::info_span!(
+                "llm.generation",
+                otel.name = "llm.generation",
+                gen_ai.operation.name = "chat",
+                gen_ai.system = ?self.provider,
+                gen_ai.request.model = %self.model,
+                gen_ai.request.max_tokens = self.max_tokens,
+                langfuse.observation.type = "generation",
+                cycle = cycle,
+                gen_ai.usage.input_tokens = tracing::field::Empty,
+                gen_ai.usage.output_tokens = tracing::field::Empty,
+                gen_ai.usage.cost = tracing::field::Empty,
+                langfuse.observation.input =
+                    %format!("[system]\n{system_prompt}\n\n[user]\n{user_prompt}"),
+                langfuse.observation.output = tracing::field::Empty,
+            )
+        } else {
+            tracing::info_span!(
+                "llm.generation",
+                otel.name = "llm.generation",
+                gen_ai.operation.name = "chat",
+                gen_ai.system = ?self.provider,
+                gen_ai.request.model = %self.model,
+                gen_ai.request.max_tokens = self.max_tokens,
+                langfuse.observation.type = "generation",
+                cycle = cycle,
+                gen_ai.usage.input_tokens = tracing::field::Empty,
+                gen_ai.usage.output_tokens = tracing::field::Empty,
+                gen_ai.usage.cost = tracing::field::Empty,
+            )
+        };
+
+        self.complete_inner(system_prompt, user_prompt, cycle)
+            .instrument(span)
+            .await
+    }
+
+    async fn complete_inner(
+        &self,
+        system_prompt: &str,
+        user_prompt: &str,
+        cycle: Option<i64>,
+    ) -> Result<LlmResponse> {
+        let span = tracing::Span::current();
+
         let (text, input_tokens, output_tokens) = match self.provider {
             LlmProvider::Anthropic => self.complete_anthropic(system_prompt, user_prompt).await?,
             LlmProvider::OpenAiCompatible => {
@@ -131,6 +202,16 @@ impl LlmClient {
         };
 
         let cost = self.cost(input_tokens, output_tokens);
+
+        span.record("gen_ai.usage.input_tokens", input_tokens);
+        span.record("gen_ai.usage.output_tokens", output_tokens);
+        span.record("gen_ai.usage.cost", tracing::field::display(&cost));
+        if self.export_content {
+            span.record(
+                "langfuse.observation.output",
+                tracing::field::display(&text),
+            );
+        }
 
         info!(
             provider = ?self.provider,
@@ -509,6 +590,143 @@ mod tests {
         )
         .unwrap();
         assert_eq!(client.estimated_call_cost(), Decimal::ZERO);
+    }
+
+    /// Capture the fields recorded on spans, so the GenAI attributes can be
+    /// asserted without an OTLP collector in the loop.
+    #[derive(Clone, Default)]
+    struct FieldCapture(std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>);
+
+    impl<S> tracing_subscriber::Layer<S> for FieldCapture
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            attrs.record(&mut Visitor(self.0.clone()));
+        }
+        fn on_record(
+            &self,
+            _id: &tracing::Id,
+            values: &tracing::span::Record<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            values.record(&mut Visitor(self.0.clone()));
+        }
+    }
+
+    struct Visitor(std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>);
+
+    impl tracing::field::Visit for Visitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((field.name().to_string(), format!("{value:?}")));
+        }
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((field.name().to_string(), value.to_string()));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((field.name().to_string(), value.to_string()));
+        }
+    }
+
+    async fn call_and_capture(export_content: bool) -> Vec<(String, String)> {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "the answer"}}],
+                "usage": {"prompt_tokens": 11, "completion_tokens": 7}
+            })))
+            .mount(&server)
+            .await;
+
+        let store = Store::new(":memory:").await.unwrap();
+        let client = LlmClient::new(
+            "k".to_string(),
+            &valuation_config(
+                LlmProvider::OpenAiCompatible,
+                Some(format!("{}/v1", server.uri())),
+            ),
+            store,
+        )
+        .unwrap()
+        .with_content_export(export_content);
+
+        let capture = FieldCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        // `set_default` rather than `with_default`: the latter takes a closure,
+        // which would mean blocking on the future from inside an async test.
+        let guard = tracing::subscriber::set_default(subscriber);
+        client
+            .complete("SYSTEM-PROMPT", "USER-PROMPT", Some(3))
+            .await
+            .expect("call succeeds");
+        drop(guard);
+
+        let out = capture.0.lock().unwrap().clone();
+        out
+    }
+
+    /// Langfuse renders a span as a *generation* — with model, tokens and cost
+    /// — only when it carries the GenAI semantic-convention attributes. Without
+    /// them it is an anonymous span and the whole integration is pointless.
+    #[tokio::test]
+    async fn an_llm_call_carries_genai_attributes() {
+        let fields = call_and_capture(true).await;
+        let get = |k: &str| {
+            fields
+                .iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("missing field {k}: have {fields:?}"))
+        };
+
+        assert_eq!(get("otel.name"), "llm.generation");
+        assert_eq!(get("gen_ai.operation.name"), "chat");
+        assert_eq!(get("gen_ai.request.model"), "test-model");
+        assert_eq!(get("langfuse.observation.type"), "generation");
+        // Token counts and cost are recorded after the call returns, so they
+        // are asserted end to end against a real OTLP payload rather than
+        // here — see the exporter check in the PR description.
+    }
+
+    #[tokio::test]
+    async fn the_prompt_rides_along_when_content_export_is_on() {
+        let fields = call_and_capture(true).await;
+        let joined: String = fields.iter().map(|(_, v)| v.as_str()).collect();
+        assert!(joined.contains("SYSTEM-PROMPT"), "system prompt missing");
+        assert!(joined.contains("USER-PROMPT"), "user prompt missing");
+    }
+
+    /// With content export off the span keeps its metadata and drops the text,
+    /// so cost and latency remain visible without the prompt leaving the box.
+    #[tokio::test]
+    async fn content_is_withheld_when_export_is_off() {
+        let fields = call_and_capture(false).await;
+        let joined: String = fields.iter().map(|(_, v)| v.as_str()).collect();
+        assert!(!joined.contains("SYSTEM-PROMPT"), "prompt leaked: {joined}");
+        assert!(!joined.contains("USER-PROMPT"), "prompt leaked");
+        assert!(!joined.contains("the answer"), "completion leaked");
+        // The span itself is still there, carrying its metadata.
+        assert!(fields
+            .iter()
+            .any(|(n, v)| n == "otel.name" && v == "llm.generation"));
+        assert!(fields.iter().any(|(n, _)| n == "gen_ai.request.model"));
     }
 
     #[tokio::test]
