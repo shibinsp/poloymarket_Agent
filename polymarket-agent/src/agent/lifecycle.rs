@@ -70,7 +70,15 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub async fn new(config: AppConfig, secrets: Secrets, store: Store) -> Result<Self> {
+    /// `kill_switch` is created by the caller and shared with the dashboard,
+    /// so `POST /api/halt` and the agent loop are the same flag rather than
+    /// two that agree most of the time.
+    pub async fn new(
+        config: AppConfig,
+        secrets: Secrets,
+        store: Store,
+        kill_switch: Arc<KillSwitch>,
+    ) -> Result<Self> {
         let config_arc = Arc::new(config.clone());
         let polymarket = Arc::new(PolymarketClient::new(config_arc, &secrets).await?);
         let scanner = MarketScanner::new(polymarket.clone(), config.scanning.clone());
@@ -97,8 +105,7 @@ impl Agent {
             spent_today,
         ));
 
-        // The halt flag, and any halt that outlived the last process.
-        let kill_switch = Arc::new(KillSwitch::new(config.database.halt_file()));
+        // Reinstate any halt that outlived the last process.
         match store.active_halt().await {
             Ok(Some(stored)) => {
                 let halt = Halt::from_stored(&stored);
@@ -588,36 +595,33 @@ impl Agent {
             }
         }
 
-        // Daily API budget check — skip valuations if we've exceeded the cap
-        let budget_available = match self.store.get_today_api_cost().await {
-            Ok(today_cost) => {
-                if today_cost >= self.config.agent.daily_api_budget {
-                    // Worth alerting rather than only logging: from here the
-                    // agent still runs cycles and still looks healthy, but it
-                    // forms no new views, so it quietly stops doing the thing
-                    // it exists to do until the day rolls over.
-                    let _ = self
-                        .alert_client
-                        .anomaly(
-                            AlertLevel::Warning,
-                            AnomalyKind::BudgetExhausted,
-                            "",
-                            &format!(
-                                "Spent ${today_cost} of ${} — no new valuations until the UTC day rolls over",
-                                self.config.agent.daily_api_budget
-                            ),
-                        )
-                        .await;
-                    false
-                } else {
-                    true
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to check daily API cost — allowing valuations");
-                true
-            }
-        };
+        // Daily API budget. Asked of the ledger, not of the database.
+        //
+        // The old check read the day's total from SQLite and then spawned a
+        // batch of valuations against that one number, so ten concurrent
+        // calls could each see "$0.40 of $0.50 spent, fine" and collectively
+        // spend $1.30. The ledger holds reservations, so what is left here
+        // already accounts for calls that are in flight.
+        let snapshot = self.budget.snapshot(now.date_naive());
+        let budget_available = self.budget.remaining(now.date_naive()) > Decimal::ZERO;
+        if !budget_available {
+            // Worth alerting rather than only logging: from here the agent
+            // still runs cycles and still looks healthy, but it forms no new
+            // views, so it quietly stops doing the thing it exists to do
+            // until the day rolls over.
+            let _ = self
+                .alert_client
+                .anomaly(
+                    AlertLevel::Warning,
+                    AnomalyKind::BudgetExhausted,
+                    "",
+                    &format!(
+                        "Spent ${} of ${} — no new valuations until the UTC day rolls over",
+                        snapshot.spent, snapshot.budget
+                    ),
+                )
+                .await;
+        }
 
         match self.state {
             AgentState::Dead => {
@@ -830,6 +834,27 @@ impl Agent {
         let mut join_set = tokio::task::JoinSet::new();
         let engine_arc = self.valuation_engine.as_ref().unwrap().clone_for_parallel();
         let config_valuation = self.config.valuation.clone();
+
+        // Start only as many valuations as the day's budget can pay for.
+        //
+        // Each spawned call reserves its own estimate before it runs, so an
+        // over-large batch is refused rather than overspent — but it is
+        // refused *after* the data aggregation above has already been done
+        // for every candidate. Sizing the batch up front means the work that
+        // gets started is work that can be paid for.
+        let affordable = self
+            .llm
+            .as_ref()
+            .and_then(|c| c.affordable_calls(Utc::now().date_naive()))
+            .unwrap_or(usize::MAX);
+        let max_evaluations = max_evaluations.min(affordable);
+        if affordable < candidates.len() {
+            info!(
+                affordable,
+                candidates = candidates.len(),
+                "Valuation batch trimmed to what the day's budget allows"
+            );
+        }
 
         // Spawn parallel valuation tasks
         for candidate in candidates.iter().take(max_evaluations) {

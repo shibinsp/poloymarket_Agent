@@ -13,15 +13,17 @@ use axum::extract::{Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use rust_decimal::Decimal;
 use subtle::ConstantTimeEq;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
+use crate::agent::kill_switch::{Halt, HaltSource, KillSwitch};
 use crate::config::AgentMode;
 use crate::db::store::Store;
+use crate::risk::circuit_breaker::HaltScope;
 use crate::monitoring::health::HealthState;
 use crate::monitoring::metrics::compute_metrics;
 
@@ -34,6 +36,12 @@ pub struct DashboardState {
     health: HealthState,
     initial_bankroll: Decimal,
     api_token: Option<Arc<str>>,
+    /// Shared with the agent loop. The dashboard only ever sets or clears
+    /// this flag; the loop is what acts on it — cancelling resting orders,
+    /// alerting, and writing the row that survives a restart. Doing that work
+    /// from an HTTP handler would mean a halt whose side effects depend on
+    /// which route raised it.
+    kill_switch: Arc<KillSwitch>,
 }
 
 impl DashboardState {
@@ -42,11 +50,13 @@ impl DashboardState {
         health: HealthState,
         initial_bankroll: Decimal,
         api_token: Option<String>,
+        kill_switch: Arc<KillSwitch>,
     ) -> Self {
         Self {
             store: Arc::new(store),
             health,
             initial_bankroll,
+            kill_switch,
             // Trim before storing: the page sends a trimmed token, so keeping
             // stray whitespace here would 401 every request with an
             // apparently-correct token.
@@ -122,6 +132,12 @@ fn build_router(state: DashboardState) -> Router {
         .route("/api/cycles", get(cycles_latest_handler))
         .route("/api/cycles/all", get(cycles_all_handler))
         .route("/api/costs", get(costs_handler))
+        .route("/api/halt", post(halt_handler))
+        .route("/api/halt", get(halt_status_handler))
+        .route("/api/resume", post(resume_handler))
+        // The plan's name for the same action. A reconciliation mismatch is
+        // cleared by acknowledging it, which is a resume.
+        .route("/api/reconcile/ack", post(resume_handler))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
 
     Router::new()
@@ -163,6 +179,110 @@ async fn require_token(State(state): State<DashboardState>, req: Request, next: 
 async fn index_handler() -> impl IntoResponse {
     let html = include_str!("../../static/index.html");
     ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html)
+}
+
+/// Stop opening positions.
+///
+/// Sets the flag and returns. The agent loop notices on its next wake and
+/// does the work — cancels resting orders, alerts, writes the row that
+/// survives a restart. So a 200 here means "the halt is recorded", not "every
+/// order is already cancelled"; the response says which, because the
+/// difference matters to whoever is pressing the button.
+async fn halt_handler(
+    State(state): State<DashboardState>,
+    body: Option<Json<serde_json::Value>>,
+) -> impl IntoResponse {
+    let detail = body
+        .and_then(|Json(v)| {
+            v.get("reason")
+                .and_then(|r| r.as_str())
+                .map(|s| s.trim().to_string())
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "halted from the dashboard".to_string());
+
+    let now = chrono::Utc::now();
+    // Raised UntilResume: an operator pressing stop does not mean "until
+    // midnight".
+    let newly = state.kill_switch.trip(Halt::new(
+        HaltSource::Api,
+        HaltScope::UntilResume,
+        detail,
+        now,
+    ));
+
+    warn!(newly, "Halt requested over the API");
+    Json(serde_json::json!({
+        "halted": true,
+        "newly_halted": newly,
+        "note": if newly {
+            "Resting orders are cancelled by the agent on its next wake."
+        } else {
+            "Already halted; the original reason is kept."
+        },
+        "halt": state.kill_switch.current(),
+    }))
+}
+
+/// What is currently stopping the agent, if anything.
+async fn halt_status_handler(State(state): State<DashboardState>) -> impl IntoResponse {
+    Json(serde_json::json!({
+        "halted": state.kill_switch.is_tripped(),
+        "halt": state.kill_switch.current(),
+    }))
+}
+
+/// Lift the halt and let the agent open positions again.
+///
+/// Also removes the `HALT` file, so a resume from here is not silently undone
+/// by the next poll of it.
+async fn resume_handler(State(state): State<DashboardState>) -> impl IntoResponse {
+    let cleared = match state.kill_switch.clear() {
+        Ok(c) => c,
+        Err(e) => {
+            // The flag is down but the file is still there, so the next wake
+            // will halt again. Saying "resumed" would be a lie.
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "halted": true,
+                    "error": format!(
+                        "could not remove {}: {e} — the agent will halt again on its next wake",
+                        state.kill_switch.halt_file().display()
+                    ),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    if let Err(e) = state
+        .store
+        .clear_halts("api", chrono::Utc::now())
+        .await
+    {
+        // Worth a 500: the flag is down, so the agent resumes now, but the
+        // uncleared row would halt it again on the next restart. An operator
+        // who thinks they have resumed and has not is the failure here.
+        warn!(error = %e, "Could not clear the halt rows");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "halted": false,
+                "error": format!(
+                    "resumed, but the halt record could not be cleared ({e}) — a restart would halt again"
+                ),
+            })),
+        )
+            .into_response();
+    }
+
+    info!(?cleared, "Resumed over the API");
+    Json(serde_json::json!({
+        "halted": false,
+        "cleared": cleared,
+    }))
+    .into_response()
 }
 
 async fn health_handler(State(state): State<DashboardState>) -> impl IntoResponse {
@@ -222,14 +342,24 @@ mod tests {
     use tower::ServiceExt;
 
     async fn app_with_token(token: Option<&str>) -> Router {
+        build_router(state_with_token(token).await)
+    }
+
+    async fn state_with_token(token: Option<&str>) -> DashboardState {
         let store = Store::new(":memory:").await.unwrap();
-        let state = DashboardState::new(
+        let dir = tempfile::tempdir().expect("tempdir");
+        let switch = Arc::new(KillSwitch::new(dir.path().join("HALT")));
+        // The directory has to outlive the state, or the HALT path points at
+        // something already deleted and `clear` starts failing for the wrong
+        // reason.
+        std::mem::forget(dir);
+        DashboardState::new(
             store,
             HealthState::new(),
             dec!(100),
             token.map(str::to_string),
-        );
-        build_router(state)
+            switch,
+        )
     }
 
     async fn status(app: Router, uri: &str, auth: Option<&str>) -> StatusCode {
@@ -241,6 +371,130 @@ mod tests {
             .await
             .unwrap()
             .status()
+    }
+
+    async fn post(app: Router, uri: &str, auth: Option<&str>) -> (StatusCode, serde_json::Value) {
+        let mut req = HttpRequest::builder().method("POST").uri(uri);
+        if let Some(a) = auth {
+            req = req.header(header::AUTHORIZATION, a);
+        }
+        let resp = app
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let code = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (code, json)
+    }
+
+    /// The halt endpoint is the one route that changes what the agent does.
+    /// Leaving it open would make the dashboard a remote stop button.
+    #[tokio::test]
+    async fn the_control_routes_sit_behind_the_token() {
+        let app = build_router(state_with_token(Some("s3cret")).await);
+        for route in ["/api/halt", "/api/resume", "/api/reconcile/ack"] {
+            let (code, _) = post(app.clone(), route, None).await;
+            assert_eq!(
+                code,
+                StatusCode::UNAUTHORIZED,
+                "{route} must require the bearer token"
+            );
+        }
+        assert_eq!(
+            status(app, "/api/halt", None).await,
+            StatusCode::UNAUTHORIZED,
+            "reading the halt state is behind the token too"
+        );
+    }
+
+    #[tokio::test]
+    async fn halting_sets_the_flag_and_resuming_clears_it() {
+        let state = state_with_token(None).await;
+        let switch = state.kill_switch.clone();
+        let app = build_router(state);
+
+        assert!(!switch.is_tripped(), "starts clear");
+
+        let (code, body) = post(app.clone(), "/api/halt", None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["halted"], serde_json::json!(true));
+        assert_eq!(body["newly_halted"], serde_json::json!(true));
+        assert!(switch.is_tripped(), "the flag the agent loop reads must be set");
+        assert_eq!(switch.current().unwrap().source, HaltSource::Api);
+
+        let (code, body) = post(app.clone(), "/api/resume", None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["halted"], serde_json::json!(false));
+        assert!(!switch.is_tripped(), "resume must clear the flag");
+    }
+
+    /// Halting twice must not report the second one as new, or the agent
+    /// would cancel orders and re-alert on every press.
+    #[tokio::test]
+    async fn a_second_halt_is_not_a_new_halt() {
+        let app = build_router(state_with_token(None).await);
+        let (_, first) = post(app.clone(), "/api/halt", None).await;
+        assert_eq!(first["newly_halted"], serde_json::json!(true));
+        let (_, second) = post(app, "/api/halt", None).await;
+        assert_eq!(second["halted"], serde_json::json!(true));
+        assert_eq!(second["newly_halted"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
+    async fn acknowledging_a_reconciliation_mismatch_resumes() {
+        // The plan's route name for a resume, pointed at the same handler —
+        // so a mismatch halt raised by the reconciler is cleared by it.
+        let state = state_with_token(None).await;
+        let switch = state.kill_switch.clone();
+        let app = build_router(state);
+        switch.trip(Halt::new(
+            HaltSource::Reconciliation,
+            HaltScope::UntilResume,
+            "alpaca: 1 position held at the venue but absent locally",
+            chrono::Utc::now(),
+        ));
+
+        let (code, body) = post(app, "/api/reconcile/ack", None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["halted"], serde_json::json!(false));
+        assert!(!switch.is_tripped());
+    }
+
+    #[tokio::test]
+    async fn the_halt_status_route_reports_the_reason() {
+        let state = state_with_token(None).await;
+        let switch = state.kill_switch.clone();
+        let app = build_router(state);
+        switch.trip(Halt::new(
+            HaltSource::CircuitBreaker,
+            HaltScope::RestOfDay,
+            "down 6.20% on the day, limit 5.00%",
+            chrono::Utc::now(),
+        ));
+
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/halt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["halted"], serde_json::json!(true));
+        assert_eq!(body["halt"]["source"], serde_json::json!("circuit_breaker"));
+        assert_eq!(body["halt"]["scope"], serde_json::json!("rest_of_day"));
+        assert!(body["halt"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("6.20%"));
     }
 
     #[tokio::test]

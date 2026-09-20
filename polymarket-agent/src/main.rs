@@ -281,11 +281,19 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
     // Create health state and dashboard
     let health_state = monitoring::health::HealthState::new();
     let dashboard_store = Store::from_pool(store.pool().clone());
+    // One flag, shared by the dashboard's `/api/halt`, the `HALT` file poll,
+    // the SIGUSR1 handler and the agent's own breakers. Built here because
+    // the dashboard comes up before the agent does.
+    let kill_switch = std::sync::Arc::new(
+        polymarket_agent::agent::kill_switch::KillSwitch::new(config.database.halt_file()),
+    );
+
     let dashboard_state = DashboardState::new(
         dashboard_store,
         health_state.clone(),
         config.agent.initial_paper_balance,
         secrets.dashboard_token.clone(),
+        kill_switch.clone(),
     );
     let dashboard_handle = spawn_dashboard(
         dashboard_state,
@@ -294,7 +302,8 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
         config.agent.mode,
     )?;
 
-    let mut agent = Agent::new(config.clone(), secrets, store).await?;
+    let mut agent = Agent::new(config.clone(), secrets, store, kill_switch.clone()).await?;
+    let signal_halt = spawn_signal_halt(kill_switch.clone());
     let alerts = agent.alerts();
     let watchdog = spawn_cycle_watchdog(
         health_state.clone(),
@@ -392,6 +401,7 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
     // Clean up background tasks
     watchdog.abort();
     dashboard_handle.abort();
+    signal_halt.abort();
     // Spans are flushed by `main`, on the one path every mode returns
     // through — including the `?` returns above this line.
     tracing::info!("Agent shutdown complete");
@@ -452,6 +462,56 @@ fn spawn_cycle_watchdog(
                 .await;
         }
     })
+}
+
+/// Halt on SIGUSR1.
+///
+/// The third way in, and the one that needs least: no dashboard token, no
+/// filesystem path, just a PID. `kill -USR1 $(pidof polymarket-agent)` stops
+/// the agent opening positions while leaving it running to manage what it
+/// already holds — which is the distinction that makes this worth having
+/// separately from SIGTERM.
+///
+/// Sets the flag only. The agent loop does the rest on its next wake, so this
+/// handler cannot race a cycle that is midway through placing an order.
+#[cfg(unix)]
+fn spawn_signal_halt(
+    kill_switch: std::sync::Arc<polymarket_agent::agent::kill_switch::KillSwitch>,
+) -> tokio::task::JoinHandle<()> {
+    use polymarket_agent::agent::kill_switch::{Halt, HaltSource};
+    use polymarket_agent::risk::circuit_breaker::HaltScope;
+
+    tokio::spawn(async move {
+        let mut stream = match tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::user_defined1(),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "Could not listen for SIGUSR1 — halt by file or API only");
+                return;
+            }
+        };
+        loop {
+            stream.recv().await;
+            let newly = kill_switch.trip(Halt::new(
+                HaltSource::Signal,
+                HaltScope::UntilResume,
+                "SIGUSR1 received",
+                Utc::now(),
+            ));
+            tracing::warn!(
+                newly,
+                "SIGUSR1 — halting new positions (exits and reconciliation continue)"
+            );
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn spawn_signal_halt(
+    _kill_switch: std::sync::Arc<polymarket_agent::agent::kill_switch::KillSwitch>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async {})
 }
 
 /// Persistent OS signal streams so a SIGINT/SIGTERM is never missed, even while
