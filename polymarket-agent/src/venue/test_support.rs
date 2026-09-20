@@ -6,8 +6,11 @@
 //! both need it, and two copies of a fixture drift until they disagree about
 //! the thing under test.
 
+use std::sync::Mutex;
+
 use anyhow::Result;
 use async_trait::async_trait;
+use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 use super::session::TradingSession;
@@ -25,6 +28,14 @@ pub struct StubVenue {
     session: TradingSession,
     instruments: Vec<Instrument>,
     fail: bool,
+    /// Mid price returned by `quote`, when one is configured.
+    mark: Option<Decimal>,
+    /// What `place_order` answers with. Lets a test drive the accepted,
+    /// partially-filled and filled paths, which are handled very differently.
+    ack: Option<OrderAck>,
+    /// Every order this venue was asked to place, so a test can assert that a
+    /// second one was never sent.
+    pub placed: Mutex<Vec<OrderRequest>>,
 }
 
 impl StubVenue {
@@ -82,7 +93,26 @@ impl StubVenue {
             session,
             instruments,
             fail,
+            mark: None,
+            ack: None,
+            placed: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Quote every instrument at this price.
+    pub fn quoting(mut self, mark: Decimal) -> Self {
+        self.mark = Some(mark);
+        self
+    }
+
+    /// Answer `place_order` with this ack.
+    pub fn acking(mut self, ack: OrderAck) -> Self {
+        self.ack = Some(ack);
+        self
+    }
+
+    pub fn orders_placed(&self) -> usize {
+        self.placed.lock().expect("stub mutex").len()
     }
 }
 
@@ -103,8 +133,19 @@ impl Venue for StubVenue {
         }
         Ok(self.instruments.clone())
     }
-    async fn quote(&self, _id: &InstrumentId) -> Result<Quote> {
-        anyhow::bail!("not implemented")
+    async fn quote(&self, id: &InstrumentId) -> Result<Quote> {
+        let Some(mark) = self.mark else {
+            anyhow::bail!("not implemented")
+        };
+        Ok(Quote {
+            instrument: id.clone(),
+            bid: mark,
+            ask: mark,
+            mid: mark,
+            last: None,
+            ts: chrono::Utc::now(),
+            book: None,
+        })
     }
     async fn candles(
         &self,
@@ -114,8 +155,12 @@ impl Venue for StubVenue {
     ) -> Result<Vec<Candle>> {
         Ok(Vec::new())
     }
-    async fn place_order(&self, _r: &OrderRequest) -> Result<OrderAck> {
-        anyhow::bail!("not implemented")
+    async fn place_order(&self, r: &OrderRequest) -> Result<OrderAck> {
+        self.placed.lock().expect("stub mutex").push(r.clone());
+        match &self.ack {
+            Some(a) => Ok(a.clone()),
+            None => anyhow::bail!("not implemented"),
+        }
     }
     async fn get_order(&self, _o: &OrderRef) -> Result<OrderAck> {
         anyhow::bail!("not implemented")

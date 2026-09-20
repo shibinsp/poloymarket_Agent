@@ -379,6 +379,15 @@ impl Store {
     }
 
     /// Update an order after querying the venue for its fate.
+    /// Record what the venue now says about an order.
+    ///
+    /// `None` for an optional field means "nothing new to record", never
+    /// "erase what is there" — hence COALESCE on all three. That matters most
+    /// for `reject_reason`, which for an EXIT order carries the *exit* reason
+    /// (STOP_LOSS, TAKE_PROFIT, MAX_HOLD) written when the order was placed:
+    /// without COALESCE the very next successful update nulls it, and every
+    /// exit that did not fill on submission closes with a generic "EXIT" in
+    /// `trades.close_reason`, losing the only record of why the agent sold.
     pub async fn update_order_state(
         &self,
         client_order_id: &str,
@@ -389,7 +398,7 @@ impl Store {
         reject_reason: Option<&str>,
     ) -> Result<()> {
         sqlx::query(
-            "UPDATE orders SET state = ?, venue_order_id = COALESCE(?, venue_order_id), filled_qty = ?, avg_fill_price = ?, reject_reason = ?, updated_at = ? WHERE client_order_id = ?",
+            "UPDATE orders SET state = ?, venue_order_id = COALESCE(?, venue_order_id), filled_qty = ?, avg_fill_price = COALESCE(?, avg_fill_price), reject_reason = COALESCE(?, reject_reason), updated_at = ? WHERE client_order_id = ?",
         )
         .bind(state)
         .bind(venue_order_id)
