@@ -639,6 +639,248 @@ impl Store {
 
         Ok(result.last_insert_rowid())
     }
+
+    // ---------------------------------------------------------------------
+    // Phase 3: equity marks, halts, and the counters the breakers read.
+    // ---------------------------------------------------------------------
+
+    /// Record today's equity and return the marks the circuit breaker needs.
+    ///
+    /// The first call on a new UTC day fixes that day's *starting* equity —
+    /// every later call on the same day leaves it alone. Recomputing it would
+    /// make the daily-loss breaker measure the loss since the last cycle
+    /// rather than since the open, which is a limit that can never be reached
+    /// no matter how much is lost.
+    ///
+    /// The high-water mark is kept across days, not within one: drawdown is
+    /// peak-to-trough over the life of the account, and resetting the peak
+    /// every midnight would hide a slow bleed completely.
+    pub async fn record_equity(
+        &self,
+        day: chrono::NaiveDate,
+        equity: Decimal,
+    ) -> Result<crate::risk::circuit_breaker::DayMarks> {
+        let day_str = day.to_string();
+
+        // Carry the peak forward from whatever the account has ever reached.
+        let prior_peak: Option<String> =
+            sqlx::query_scalar("SELECT MAX(CAST(high_water_mark AS REAL)) FROM daily_equity")
+                .fetch_optional(&self.pool)
+                .await
+                .context("Failed to read the prior high-water mark")?
+                .flatten();
+        // Read back as TEXT to avoid a float round-trip on money; the MAX
+        // above is only used to pick a row, never as the value itself.
+        let prior_peak: Decimal = match prior_peak {
+            Some(_) => {
+                let best: Option<String> = sqlx::query_scalar(
+                    "SELECT high_water_mark FROM daily_equity
+                     ORDER BY CAST(high_water_mark AS REAL) DESC LIMIT 1",
+                )
+                .fetch_optional(&self.pool)
+                .await
+                .context("Failed to read the prior high-water mark")?;
+                match best {
+                    Some(v) => parse_money(&v, "daily_equity.high_water_mark")?,
+                    None => Decimal::ZERO,
+                }
+            }
+            None => Decimal::ZERO,
+        };
+
+        let high_water_mark = prior_peak.max(equity);
+
+        sqlx::query(
+            "INSERT INTO daily_equity (day, starting_equity, high_water_mark, closing_equity, updated_at)
+             VALUES (?, ?, ?, ?, datetime('now'))
+             ON CONFLICT(day) DO UPDATE SET
+                 high_water_mark = excluded.high_water_mark,
+                 closing_equity = excluded.closing_equity,
+                 updated_at = datetime('now')",
+        )
+        .bind(&day_str)
+        .bind(equity.to_string())
+        .bind(high_water_mark.to_string())
+        .bind(equity.to_string())
+        .execute(&self.pool)
+        .await
+        .context("Failed to record daily equity")?;
+
+        let row: (String, String) = sqlx::query_as(
+            "SELECT starting_equity, high_water_mark FROM daily_equity WHERE day = ?",
+        )
+        .bind(&day_str)
+        .fetch_one(&self.pool)
+        .await
+        .context("Failed to read back daily equity")?;
+
+        Ok(crate::risk::circuit_breaker::DayMarks {
+            day,
+            starting_equity: parse_money(&row.0, "daily_equity.starting_equity")?,
+            high_water_mark: parse_money(&row.1, "daily_equity.high_water_mark")?,
+        })
+    }
+
+    /// Positions opened during the given UTC day.
+    ///
+    /// Counts entries, not fills: the limit is on how many times the agent is
+    /// willing to take a new view in a day, and an entry that filled in three
+    /// parts is still one decision.
+    pub async fn count_trades_opened_on(&self, day: chrono::NaiveDate) -> Result<u32> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM trades WHERE date(created_at) = ?",
+        )
+        .bind(day.to_string())
+        .fetch_one(&self.pool)
+        .await
+        .context("Failed to count today's trades")?;
+        Ok(count.max(0) as u32)
+    }
+
+    /// How many of the most recently closed positions were losses, counting
+    /// back from the latest until a non-loss is reached.
+    ///
+    /// Ordered by when each position *closed*, not when it opened: a streak
+    /// is about the order the results arrived in, and a long-held winner
+    /// opened before three quick losers does not break them up.
+    pub async fn consecutive_losses(&self) -> Result<u32> {
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT status, pnl FROM trades
+             WHERE status IN ('CLOSED', 'RESOLVED_WIN', 'RESOLVED_LOSS')
+             ORDER BY COALESCE(resolved_at, created_at) DESC, id DESC
+             LIMIT 50",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read recent closes")?;
+
+        let mut streak = 0u32;
+        for (status, pnl) in rows {
+            let lost = match status.as_str() {
+                "RESOLVED_LOSS" => true,
+                "RESOLVED_WIN" => false,
+                // A continuous position has no notion of winning; its P&L
+                // decides. A close with no P&L recorded is not evidence of a
+                // loss, so it ends the streak rather than extending it.
+                _ => match pnl.as_deref() {
+                    Some(v) => parse_money(v, "trades.pnl")? < Decimal::ZERO,
+                    None => false,
+                },
+            };
+            if !lost {
+                break;
+            }
+            streak += 1;
+        }
+        Ok(streak)
+    }
+
+    /// Record one venue's reconciliation result.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_reconciliation_run(
+        &self,
+        venue_id: &str,
+        cycle: i64,
+        equity: Option<Decimal>,
+        positions_missing_locally: i64,
+        positions_missing_on_venue: i64,
+        qty_mismatches: i64,
+        unknown_open_orders: i64,
+        passed: bool,
+        detail: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO reconciliation_runs
+                 (venue_id, cycle, balance_delta, positions_missing_locally,
+                  positions_missing_on_venue, qty_mismatches, unknown_open_orders,
+                  passed, detail)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(venue_id)
+        .bind(cycle)
+        // The column predates this pass and was specified for a cash
+        // comparison that is not implemented; the venue's reported equity is
+        // what there is, and recording it gives the audit trail a number.
+        .bind(equity.map(|e| e.to_string()))
+        .bind(positions_missing_locally)
+        .bind(positions_missing_on_venue)
+        .bind(qty_mismatches)
+        .bind(unknown_open_orders)
+        .bind(passed)
+        .bind(detail)
+        .execute(&self.pool)
+        .await
+        .context("Failed to record reconciliation run")?;
+        Ok(())
+    }
+
+    /// Persist a halt so that restarting the process does not lift it.
+    pub async fn insert_halt(
+        &self,
+        source: &str,
+        scope: &str,
+        detail: &str,
+        raised_at: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO halts (source, scope, detail, raised_at, day)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(source)
+        .bind(scope)
+        .bind(detail)
+        .bind(raised_at.to_rfc3339())
+        .bind(raised_at.date_naive().to_string())
+        .execute(&self.pool)
+        .await
+        .context("Failed to record halt")?;
+        Ok(())
+    }
+
+    /// Mark every in-force halt as cleared.
+    pub async fn clear_halts(&self, by: &str, at: DateTime<Utc>) -> Result<()> {
+        sqlx::query(
+            "UPDATE halts SET cleared_at = ?, cleared_by = ? WHERE cleared_at IS NULL",
+        )
+        .bind(at.to_rfc3339())
+        .bind(by)
+        .execute(&self.pool)
+        .await
+        .context("Failed to clear halts")?;
+        Ok(())
+    }
+
+    /// The halt still in force, if any — the newest uncleared row.
+    pub async fn active_halt(&self) -> Result<Option<StoredHalt>> {
+        let row: Option<StoredHalt> = sqlx::query_as(
+            "SELECT source, scope, detail, raised_at, day FROM halts
+             WHERE cleared_at IS NULL
+             ORDER BY raised_at DESC, id DESC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .context("Failed to read the active halt")?;
+        Ok(row)
+    }
+}
+
+/// Parse a money column, loudly.
+///
+/// A silently-zeroed price turns a loss into a reported profit, and a
+/// silently-zeroed equity trips every breaker at once. Neither is a failure
+/// anyone would notice in time.
+fn parse_money(value: &str, field: &str) -> Result<Decimal> {
+    Decimal::from_str(value).with_context(|| format!("Invalid decimal in {field}: {value:?}"))
+}
+
+/// A halt as persisted. Decimal-free, so it needs no parsing pass.
+#[derive(Debug, Clone, FromRow)]
+pub struct StoredHalt {
+    pub source: String,
+    pub scope: String,
+    pub detail: Option<String>,
+    pub raised_at: String,
+    pub day: String,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize)]

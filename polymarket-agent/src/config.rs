@@ -527,11 +527,45 @@ pub struct RateLimitConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct DatabaseConfig {
     pub path: String,
+    /// Directory for everything that is not the database file itself: the
+    /// `HALT` file and the hourly backups.
+    ///
+    /// Defaults to the database file's own directory, so an existing config
+    /// needs no new key and the operational files land next to the data they
+    /// describe. Set it explicitly to put them somewhere else.
+    #[serde(default)]
+    pub data_dir: Option<String>,
 }
 
 impl DatabaseConfig {
     pub fn url(&self) -> String {
         format!("sqlite:{}", self.path)
+    }
+
+    /// Where the `HALT` file and the backups live.
+    pub fn data_dir(&self) -> std::path::PathBuf {
+        if let Some(dir) = self.data_dir.as_deref().filter(|d| !d.is_empty()) {
+            return std::path::PathBuf::from(dir);
+        }
+        // `polymarket-agent.db` — the default — has no parent component, and
+        // `Path::parent` returns an empty path for it rather than `None`.
+        // Joining onto "" produces a relative path that resolves against the
+        // working directory, which is what is wanted, but `PathBuf::from("")`
+        // is not a directory anything can be created in.
+        match Path::new(&self.path).parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => std::path::PathBuf::from("."),
+        }
+    }
+
+    /// The file whose existence halts the agent.
+    pub fn halt_file(&self) -> std::path::PathBuf {
+        self.data_dir().join("HALT")
+    }
+
+    /// Directory for hourly database snapshots.
+    pub fn backup_dir(&self) -> std::path::PathBuf {
+        self.data_dir().join("backups")
     }
 }
 
