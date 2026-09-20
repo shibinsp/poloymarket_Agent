@@ -53,7 +53,7 @@ impl Reconciler<'_> {
     ///
     /// One order failing must not stop the rest: a venue outage would
     /// otherwise leave every other venue's orders unresolved too.
-    #[instrument(skip(self), fields(otel.name = "agent.reconcile"))]
+    #[instrument(skip(self), fields(otel.name = "agent.reconcile"), err)]
     pub async fn run(&self, now: DateTime<Utc>) -> Result<ReconcileReport> {
         let mut report = ReconcileReport::default();
         let orders = self.store.get_unresolved_orders().await?;

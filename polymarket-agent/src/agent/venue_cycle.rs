@@ -100,7 +100,8 @@ impl VenueCycle<'_> {
     /// the Polymarket wallet.
     #[instrument(
         skip(self),
-        fields(otel.name = "venue.cycle", cycle = cycle, state = %state)
+        fields(otel.name = "venue.cycle", cycle = cycle, state = %state),
+        err
     )]
     pub async fn run(
         &self,
@@ -395,10 +396,20 @@ impl VenueCycle<'_> {
             symbol = %instrument.symbol(),
             qty = %qty,
             limit_price = %limit_price,
+            otel.status_code = tracing::field::Empty,
+            otel.status_message = tracing::field::Empty,
         );
+        // Kept alive past the await so the failure can still be recorded on
+        // it. The span is exited when the future returns but not closed until
+        // the last handle drops, and a submission that failed must not export
+        // as a successful span — this is the one call where "did it work"
+        // cannot be inferred from anything else in the trace.
+        let status_handle = place_span.clone();
         let outcome = match venue.place_order(&request).instrument(place_span).await {
             Ok(ack) => Ok(ack),
             Err(e) => {
+                status_handle.record("otel.status_code", "ERROR");
+                status_handle.record("otel.status_message", tracing::field::display(&e));
                 self.store
                     .update_order_state(
                         &client_order_id,

@@ -93,7 +93,7 @@ pub struct VenueExits<'a> {
 }
 
 impl VenueExits<'_> {
-    #[instrument(skip(self), fields(otel.name = "venue.exits", cycle = cycle))]
+    #[instrument(skip(self), fields(otel.name = "venue.exits", cycle = cycle), err)]
     pub async fn run(&self, now: DateTime<Utc>, cycle: i64) -> Result<usize> {
         let open = self.store.get_open_venue_trades().await?;
         let mut closed = 0usize;

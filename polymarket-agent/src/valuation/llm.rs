@@ -11,11 +11,12 @@
 //! free-tier endpoint costs nothing while Claude does not.
 
 use anyhow::{bail, Context, Result};
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 use tracing::Instrument as _;
-use tracing::{info, instrument, warn};
+use tracing::{info, warn};
 
 use crate::config::{LlmProvider, ValuationConfig};
 use crate::db::store::{ApiCostRecord, Store};
@@ -60,16 +61,12 @@ impl LlmClient {
     /// Fails fast if an OpenAI-compatible provider is selected without a
     /// `base_url` — there is no sensible default endpoint for "some
     /// OpenAI-compatible service".
-    /// Whether prompts and completions ride along on the trace span.
     ///
-    /// Separate from construction because it is a telemetry setting, not a
-    /// model one, and the client is built in places that do not know about
-    /// telemetry.
-    pub fn with_content_export(mut self, export: bool) -> Self {
-        self.export_content = export;
-        self
-    }
-
+    /// Content export stays **off** on a client built this way. It is a
+    /// privacy switch, and a privacy switch whose unset state is "on" is one
+    /// that the next call site to be written will silently bypass. Callers
+    /// that have a telemetry config to consult turn it on explicitly with
+    /// [`with_content_export`](Self::with_content_export).
     pub fn new(api_key: String, config: &ValuationConfig, store: Store) -> Result<Self> {
         let base_url = match (config.provider, config.base_url.as_deref()) {
             (_, Some(url)) => url.trim_end_matches('/').to_string(),
@@ -125,13 +122,22 @@ impl LlmClient {
             input_price_per_million,
             output_price_per_million,
             store,
-            // Content export is a telemetry decision; the caller narrows it.
-            export_content: true,
+            // Fails closed. See the doc comment on `new`.
+            export_content: false,
         })
     }
 
-    /// Send a prompt to the model and return the text plus tracked cost.
-    #[instrument(skip(self, system_prompt, user_prompt))]
+    /// Whether prompts and completions ride along on the trace span.
+    ///
+    /// Separate from construction because it is a telemetry setting, not a
+    /// model one, and the client is built in places that do not know about
+    /// telemetry. Pass `config.telemetry.exports_content()`, which is false
+    /// whenever there is no exporter to send them to.
+    pub fn with_content_export(mut self, export: bool) -> Self {
+        self.export_content = export;
+        self
+    }
+
     /// Make one model call.
     ///
     /// The span carries GenAI semantic-convention attributes so an OTLP
@@ -148,12 +154,20 @@ impl LlmClient {
         user_prompt: &str,
         cycle: Option<i64>,
     ) -> Result<LlmResponse> {
+        // The two arms differ in exactly one thing: whether the prompt is
+        // attached at creation. `langfuse.observation.output` is declared in
+        // both, so the `if self.export_content` guard around recording it
+        // later is load-bearing — remove the guard and the completion really
+        // does get exported, which is what makes that guard testable. (It was
+        // previously declared only in the content arm, so `record` on the
+        // other one was a silent no-op and the guard could be deleted with
+        // every test still passing.)
         let span = if self.export_content {
             tracing::info_span!(
                 "llm.generation",
                 otel.name = "llm.generation",
                 gen_ai.operation.name = "chat",
-                gen_ai.system = ?self.provider,
+                gen_ai.system = %self.provider.semconv_name(),
                 gen_ai.request.model = %self.model,
                 gen_ai.request.max_tokens = self.max_tokens,
                 langfuse.observation.type = "generation",
@@ -170,7 +184,7 @@ impl LlmClient {
                 "llm.generation",
                 otel.name = "llm.generation",
                 gen_ai.operation.name = "chat",
-                gen_ai.system = ?self.provider,
+                gen_ai.system = %self.provider.semconv_name(),
                 gen_ai.request.model = %self.model,
                 gen_ai.request.max_tokens = self.max_tokens,
                 langfuse.observation.type = "generation",
@@ -178,6 +192,7 @@ impl LlmClient {
                 gen_ai.usage.input_tokens = tracing::field::Empty,
                 gen_ai.usage.output_tokens = tracing::field::Empty,
                 gen_ai.usage.cost = tracing::field::Empty,
+                langfuse.observation.output = tracing::field::Empty,
             )
         };
 
@@ -205,7 +220,13 @@ impl LlmClient {
 
         span.record("gen_ai.usage.input_tokens", input_tokens);
         span.record("gen_ai.usage.output_tokens", output_tokens);
-        span.record("gen_ai.usage.cost", tracing::field::display(&cost));
+        // As a number, not a string. `display(&Decimal)` produced a String
+        // OTLP attribute, and Langfuse's cost mapping ignores anything that
+        // is not numeric — so the one figure this span exists to carry was
+        // the one it dropped. f64 loses precision that Decimal has, which is
+        // why the authoritative record stays in `api_costs`; this is a
+        // display value.
+        span.record("gen_ai.usage.cost", cost.to_f64().unwrap_or(f64::NAN));
         if self.export_content {
             span.record(
                 "langfuse.observation.output",
@@ -640,6 +661,15 @@ mod tests {
                 .unwrap()
                 .push((field.name().to_string(), value.to_string()));
         }
+        // The cost is an f64 so that OTLP carries it as a number. Without
+        // this arm it would fall through to `record_debug` and the assertion
+        // below would be comparing against a `Debug` rendering instead.
+        fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((field.name().to_string(), value.to_string()));
+        }
     }
 
     async fn call_and_capture(export_content: bool) -> Vec<(String, String)> {
@@ -700,9 +730,22 @@ mod tests {
         assert_eq!(get("gen_ai.operation.name"), "chat");
         assert_eq!(get("gen_ai.request.model"), "test-model");
         assert_eq!(get("langfuse.observation.type"), "generation");
-        // Token counts and cost are recorded after the call returns, so they
-        // are asserted end to end against a real OTLP payload rather than
-        // here — see the exporter check in the PR description.
+        // `gen_ai.system` must be the semantic-convention spelling, not the
+        // Rust variant name: a consumer keying off "OpenAiCompatible" does
+        // not exist.
+        assert_eq!(get("gen_ai.system"), "openai");
+
+        // The post-call values. These are recorded after the future returns,
+        // via `Span::record`, which the capture layer sees through
+        // `on_record` — so there is no reason not to assert them here, and
+        // every reason to: they are the numbers Langfuse bills and charts.
+        assert_eq!(get("gen_ai.usage.input_tokens"), "11");
+        assert_eq!(get("gen_ai.usage.output_tokens"), "7");
+        // Recorded as a number. As a string, Langfuse's cost mapping drops
+        // it silently — the span arrives, the cost column stays empty.
+        let cost = get("gen_ai.usage.cost");
+        cost.parse::<f64>()
+            .unwrap_or_else(|_| panic!("cost must be numeric, got {cost:?}"));
     }
 
     #[tokio::test]

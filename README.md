@@ -316,6 +316,26 @@ the span. It defaults to on, which assumes the destination is infrastructure you
 control. Turn it off and the spans keep model, token counts, cost and latency
 but carry no text.
 
+Two things it deliberately does *not* do:
+
+- **Prompts never reach the ordinary logs.** `export_content` governs what
+  rides on an exported span, and nothing else. With no exporter configured
+  there is no span to ride on, and the JSON log formatter is configured not to
+  copy span fields into log lines at all.
+- **An explicit `enabled = false` beats the environment.** Setting
+  `OTEL_EXPORTER_OTLP_ENDPOINT` turns export on only when the config file has
+  not expressed an opinion. On a platform that injects OTLP variables for every
+  process, write `enabled = false` under `[telemetry]` and the agent will not
+  export no matter what the environment says.
+
+`RUST_LOG` controls the log level only. Span export has its own level, from
+`OTEL_LOG_LEVEL`, defaulting to `polymarket_agent=info` — so quieting the logs
+does not silently turn tracing off, and dependency spans stay out of a paid
+ingest.
+
+A telemetry endpoint that cannot be parsed or reached is a monitoring problem,
+never a startup failure: the agent logs why export is off and trades on.
+
 This is what makes a slow cycle legible: a 200-second cycle caused by a venue
 retrying behind a blocked DNS entry is three unrelated warnings in the logs, and
 one span with three children in a trace.

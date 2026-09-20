@@ -82,7 +82,7 @@ impl Agent {
             let valuation_store = store.clone_for_parallel();
             let client = Arc::new(
                 LlmClient::new(api_key.clone(), &config.valuation, llm_store)?
-                    .with_content_export(config.telemetry.export_content),
+                    .with_content_export(config.telemetry.exports_content()),
             );
             llm_client = Some(client.clone());
             Some(ValuationEngine::new(
@@ -172,7 +172,13 @@ impl Agent {
             agent.state = %self.state,
             markets_scanned = tracing::field::Empty,
             trades_placed = tracing::field::Empty,
-        )
+        ),
+        // `err` emits an ERROR-level event on the failure path, which
+        // tracing-opentelemetry turns into an Error span status. Without it a
+        // cycle that blew up renders in the trace UI as a perfectly ordinary
+        // green span, and the operator has to go back to the logs — which is
+        // the problem tracing was added to solve.
+        err
     )]
     pub async fn run_cycle(&mut self) -> Result<()> {
         let start = Instant::now();
@@ -454,6 +460,16 @@ impl Agent {
                 Err(e) => warn!(error = %e, "Venue cycle failed"),
             }
         }
+
+        // Fill in the two fields the span declared as `Empty` at creation.
+        //
+        // Declaring them and never recording them left every exported
+        // `agent.cycle` span with both blank — so a trace could show that a
+        // cycle took 202 seconds but not whether it had scanned anything or
+        // traded anything, which is the first question anyone asks of it.
+        let span = tracing::Span::current();
+        span.record("markets_scanned", markets_scanned);
+        span.record("trades_placed", trades_placed);
 
         // Phase 7: Log cost breakdown
         let cumulative_api_cost = self

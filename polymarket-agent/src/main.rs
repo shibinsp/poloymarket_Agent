@@ -53,7 +53,7 @@ async fn main() -> Result<()> {
     let (mut config, secrets) = AppConfig::load()?;
 
     // Override mode from CLI if provided
-    if let Some(mode) = args.mode {
+    if let Some(mode) = args.mode.clone() {
         config.agent.mode = mode.into();
     }
 
@@ -63,13 +63,25 @@ async fn main() -> Result<()> {
     // each call took, is worth having.
     let telemetry = logger::init_logging(&config.monitoring, &config.telemetry)?;
 
-    // Dry run mode: single cycle validation
+    // One flush, on the single path every mode returns through.
+    //
+    // Dropping the handle is not a substitute: the SDK only shuts a provider
+    // down when its *last* reference goes, and `tracing_opentelemetry`'s
+    // layer holds one inside the globally-installed subscriber for the life
+    // of the process. So the drop is a no-op, and any `?` that skipped an
+    // explicit flush — a failed store open, a dashboard port already in use,
+    // a backtest shorter than the batch interval — exported nothing at all.
+    // Those are exactly the runs whose traces are worth having.
+    let result = dispatch(args, config, secrets).await;
+    telemetry.shutdown().await;
+    result
+}
+
+/// Run whichever mode was selected. Separated from `main` only so that every
+/// return path passes back through the flush above.
+async fn dispatch(args: CliArgs, config: AppConfig, secrets: config::Secrets) -> Result<()> {
     if args.dry_run {
-        let result = run_dry_run(&config, &secrets).await;
-        // Flush on both paths — a failed dry run is the one whose spans you
-        // actually want.
-        telemetry.shutdown();
-        return result;
+        return run_dry_run(&config, &secrets).await;
     }
 
     tracing::info!(
@@ -80,7 +92,7 @@ async fn main() -> Result<()> {
 
     match config.agent.mode {
         AgentMode::Backtest => run_backtest(&config),
-        AgentMode::Paper | AgentMode::Live => run_agent(config, secrets, telemetry).await,
+        AgentMode::Paper | AgentMode::Live => run_agent(config, secrets).await,
     }
 }
 
@@ -159,7 +171,7 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
                 &config.valuation,
                 probe_store,
             )
-            .map(|c| c.with_content_export(config.telemetry.export_content))
+            .map(|c| c.with_content_export(config.telemetry.exports_content()))
             {
                 Ok(client) => {
                     println!("   Provider: {:?}", config.valuation.provider);
@@ -262,11 +274,7 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
 }
 
 /// Run the agent in paper or live trading mode.
-async fn run_agent(
-    config: AppConfig,
-    secrets: config::Secrets,
-    telemetry: monitoring::telemetry::Telemetry,
-) -> Result<()> {
+async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
     // Create shared database store
     let store = Store::new(&config.database.path).await?;
 
@@ -384,9 +392,8 @@ async fn run_agent(
     // Clean up background tasks
     watchdog.abort();
     dashboard_handle.abort();
-    // Flush before the process goes away, or the last spans — the ones
-    // describing whatever ended the run — never leave the machine.
-    telemetry.shutdown();
+    // Spans are flushed by `main`, on the one path every mode returns
+    // through — including the `?` returns above this line.
     tracing::info!("Agent shutdown complete");
 
     match fatal {
