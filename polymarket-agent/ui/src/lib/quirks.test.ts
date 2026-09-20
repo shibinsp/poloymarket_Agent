@@ -88,8 +88,16 @@ describe("pctFromFraction — every rate on the wire is a fraction", () => {
   it("scales win_rate, roi_pct and edge from fractions", () => {
     // roi_pct is a fraction despite the name: net_profit / initial_bankroll.
     expect(pctFromFraction(0.625)).toBe("62.5%");
-    expect(pctFromFraction("0.095")).toBe("9.5%");
     expect(pctFromFraction(0)).toBe("0.0%");
+  });
+
+  it("takes a parsed number, not the raw wire value", () => {
+    // These arrive as strings, so they go through num() first. The formatter
+    // deliberately does not accept a string: parsing belongs at the boundary,
+    // and a formatter that quietly coerced would let an unparseable value
+    // through as NaN instead of rendering "no data".
+    expect(pctFromFraction(num("0.095"))).toBe("9.5%");
+    expect(pctFromFraction(num("not a number"))).toBe("—");
   });
 
   it("renders an em dash rather than 0% when there is no figure", () => {
