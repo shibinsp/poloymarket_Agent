@@ -153,7 +153,7 @@ impl Agent {
     }
 
     /// One pass of the venue-based loop over continuous assets.
-    async fn run_venue_cycle(&self, bankroll: Decimal) -> Result<CycleOutcome> {
+    async fn run_venue_cycle(&self) -> Result<CycleOutcome> {
         let cycle = VenueCycle {
             registry: &self.venues,
             llm: self.llm.as_deref(),
@@ -161,12 +161,7 @@ impl Agent {
             config: &self.config,
         };
         cycle
-            .run(
-                chrono::Utc::now(),
-                self.state,
-                bankroll,
-                self.cycle_number as i64,
-            )
+            .run(chrono::Utc::now(), self.state, self.cycle_number as i64)
             .await
     }
 
@@ -440,8 +435,7 @@ impl Agent {
         // legacy Polymarket loop above, and only when the agent state permits
         // new positions — the same gate the legacy path applies.
         if !self.venues.is_empty() && budget_available && self.opens_positions() {
-            let bankroll = self.effective_bankroll().await;
-            match self.run_venue_cycle(bankroll).await {
+            match self.run_venue_cycle().await {
                 Ok(outcome) => {
                     markets_scanned += outcome.instruments_scanned as i64;
                     opportunities_found += outcome.views_taken as i64;

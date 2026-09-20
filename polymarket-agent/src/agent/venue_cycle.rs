@@ -10,7 +10,7 @@
 //! until their valuation path is ported; routing both through one loop before
 //! either is proven would make a failure impossible to attribute.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
@@ -52,13 +52,55 @@ pub struct VenueCycle<'a> {
 }
 
 impl VenueCycle<'_> {
+    /// Cash currently committed to open continuous positions.
+    async fn open_venue_notional(&self) -> Result<Decimal> {
+        Ok(self
+            .store
+            .get_open_venue_trades()
+            .await?
+            .iter()
+            .map(|t| t.quantity * t.avg_fill_price.unwrap_or(t.entry_price))
+            .sum())
+    }
+
+    /// Free cash at the venue that will hold the position, cached per cycle.
+    ///
+    /// `None` means the venue would not say, in which case the caller skips
+    /// it — sizing from a number belonging to a different account is how a
+    /// $6 order gets placed against a $30k balance, or vice versa.
+    async fn venue_bankroll(
+        &self,
+        venue: &dyn Venue,
+        cache: &mut HashMap<String, Option<Decimal>>,
+    ) -> Option<Decimal> {
+        let key = venue.id().to_string();
+        if let Some(cached) = cache.get(&key) {
+            return *cached;
+        }
+        let resolved = match venue.balance().await {
+            Ok(b) => Some(b.available),
+            Err(e) => {
+                warn!(
+                    venue = %venue.id(),
+                    error = %e,
+                    "Venue would not report a balance — skipping its instruments this cycle"
+                );
+                None
+            }
+        };
+        cache.insert(key, resolved);
+        resolved
+    }
+
     /// Run one pass. Failures on a single instrument are logged and skipped
     /// rather than aborting the cycle — one bad symbol must not stop the rest.
+    /// No bankroll parameter: each venue is sized against its own balance,
+    /// fetched below. Passing one in is how every venue ended up sized from
+    /// the Polymarket wallet.
     pub async fn run(
         &self,
         now: DateTime<Utc>,
         state: AgentState,
-        bankroll: Decimal,
         cycle: i64,
     ) -> Result<CycleOutcome> {
         let mut outcome = CycleOutcome::default();
@@ -86,12 +128,17 @@ impl VenueCycle<'_> {
             max_results: Some(self.config.scanning.max_markets),
         };
 
-        let ctx = CycleContext {
-            now,
-            state,
-            bankroll,
-            cycle,
-        };
+        // Exposure already committed to continuous positions, and the ceiling
+        // it may not cross. `size_position` caps a *single* position at
+        // `max_position_pct`; nothing capped the total, so a ten-symbol
+        // universe at two orders a cycle could reach near-full deployment in
+        // eight cycles with no layer objecting. The legacy path has had this
+        // via PortfolioManager since the beginning.
+        let mut balances: HashMap<String, Option<Decimal>> = HashMap::new();
+        let mut open_notional = self.open_venue_notional().await?;
+        let mut open_positions = self.store.get_open_venue_trades().await?.len();
+
+        let ctx = CycleContext { now, state, cycle };
         let instruments = self.registry.list_tradeable_instruments(now, &filter).await;
         outcome.instruments_scanned = instruments.len();
 
@@ -109,17 +156,53 @@ impl VenueCycle<'_> {
                 continue;
             };
 
+            // Size against the account that will actually hold the position.
+            // This used to be handed the Polymarket wallet balance for every
+            // venue, so an Alpaca order was sized from USDC on Polygon: $6
+            // orders against a $30k account, or orders the venue rejects for
+            // insufficient buying power. A venue that will not report its
+            // balance is skipped rather than sized from someone else's.
+            let bankroll = match self.venue_bankroll(venue, &mut balances).await {
+                Some(b) => b,
+                None => continue,
+            };
+            if bankroll <= Decimal::ZERO {
+                continue;
+            }
+
+            if let Some(reason) =
+                portfolio_block(open_notional, open_positions, bankroll, &self.config.risk)
+            {
+                info!(
+                    venue = %venue.id(),
+                    open_notional = %open_notional,
+                    open_positions,
+                    reason,
+                    "No further entries this cycle"
+                );
+                break;
+            }
+
             match self
-                .evaluate_instrument(venue, llm, &instrument, &ctx)
+                .evaluate_instrument(venue, llm, &instrument, &ctx, bankroll)
                 .await
             {
-                Ok(EvaluationResult { cost, placed, .. }) => {
+                Ok(EvaluationResult {
+                    cost,
+                    placed,
+                    notional,
+                    ..
+                }) => {
                     outcome.api_cost += cost;
                     if cost > Decimal::ZERO {
                         outcome.views_taken += 1;
                     }
                     if placed {
                         outcome.orders_placed += 1;
+                        // Count it immediately: the cap has to hold within a
+                        // cycle, not just between them.
+                        open_notional += notional;
+                        open_positions += 1;
                     }
                 }
                 Err(e) => warn!(
@@ -149,6 +232,7 @@ impl VenueCycle<'_> {
         llm: &LlmClient,
         instrument: &Instrument,
         ctx: &CycleContext,
+        bankroll: Decimal,
     ) -> Result<EvaluationResult> {
         let quote = venue.quote(&instrument.id).await?;
 
@@ -186,6 +270,7 @@ impl VenueCycle<'_> {
             );
             return Ok(EvaluationResult {
                 cost,
+                notional: Decimal::ZERO,
                 placed: false,
             });
         }
@@ -197,7 +282,7 @@ impl VenueCycle<'_> {
                 probability: view.p_up,
                 price,
                 confidence: view.confidence,
-                bankroll: ctx.bankroll,
+                bankroll,
                 state: ctx.state,
                 candles: &candles,
             },
@@ -213,6 +298,7 @@ impl VenueCycle<'_> {
             );
             return Ok(EvaluationResult {
                 cost,
+                notional: Decimal::ZERO,
                 placed: false,
             });
         }
@@ -222,6 +308,7 @@ impl VenueCycle<'_> {
             warn!(instrument = %instrument.id, "Non-positive limit price — skipping");
             return Ok(EvaluationResult {
                 cost,
+                notional: Decimal::ZERO,
                 placed: false,
             });
         }
@@ -233,6 +320,7 @@ impl VenueCycle<'_> {
             );
             return Ok(EvaluationResult {
                 cost,
+                notional: Decimal::ZERO,
                 placed: false,
             });
         }
@@ -365,7 +453,25 @@ impl VenueCycle<'_> {
                 stop_price: sizing
                     .stop_pct
                     .map(|s| (fill_price * (Decimal::ONE - s)).to_string()),
-                target_price: view.target_price.map(|t| t.to_string()),
+                // A take-profit has to be above what we paid. The model can
+                // return a mis-scaled or hallucinated level —
+                // `parse_directional_response` range-checks p_up, confidence,
+                // expected return and horizon, but cannot know the price — and
+                // a target below entry fires `TakeProfit` on the first mark,
+                // closing at a loss that the ledger and the alert both label a
+                // profit-take. An implausible target is dropped, not obeyed:
+                // the position still has its stop and its max-hold.
+                target_price: plausible_target(view.target_price, fill_price).map(|t| {
+                    if Some(t) != view.target_price {
+                        warn!(
+                            instrument = %instrument.id,
+                            target = ?view.target_price,
+                            entry = %fill_price,
+                            "Model target is not above the entry — ignoring it"
+                        );
+                    }
+                    t.to_string()
+                }),
                 horizon_hours: Some(view.horizon_hours),
                 client_order_id: Some(client_order_id.clone()),
                 venue_order_id: ack.map(|a| a.venue_order_id.clone()),
@@ -394,7 +500,11 @@ impl VenueCycle<'_> {
             "Order submitted"
         );
 
-        Ok(EvaluationResult { cost, placed: true })
+        Ok(EvaluationResult {
+            cost,
+            notional: qty * limit_price,
+            placed: true,
+        })
     }
 }
 
@@ -402,13 +512,54 @@ impl VenueCycle<'_> {
 struct CycleContext {
     now: DateTime<Utc>,
     state: AgentState,
-    bankroll: Decimal,
     cycle: i64,
 }
 
 struct EvaluationResult {
     cost: Decimal,
+    /// Cash committed by an order placed in this evaluation, for the
+    /// running exposure total.
+    notional: Decimal,
     placed: bool,
+}
+
+/// A take-profit level, if the model gave a believable one.
+///
+/// It has to be above what we paid. `parse_directional_response` range-checks
+/// p_up, confidence, expected return and horizon, but cannot know the price,
+/// so a mis-scaled or hallucinated target reaches here intact — and a target
+/// below entry fires `TakeProfit` on the very first mark, closing at a loss
+/// that the ledger and the alert both label a profit-take. An implausible one
+/// is dropped rather than obeyed: the position keeps its stop and its
+/// max-hold, so it is still bounded.
+fn plausible_target(target: Option<Decimal>, entry: Decimal) -> Option<Decimal> {
+    target.filter(|t| *t > entry)
+}
+
+/// Whether portfolio limits forbid another entry, and why.
+///
+/// `size_position` caps one position at `max_position_pct`; nothing capped the
+/// *total*, so a ten-symbol universe at two orders a cycle could reach
+/// near-full deployment in eight cycles with no layer objecting. The legacy
+/// path has had this since the beginning via `PortfolioManager`; the venue path
+/// had nothing.
+///
+/// A free function so the arithmetic can be tested on its own — driving a whole
+/// cycle to reach it needs a live model, which is how the first version of
+/// these tests ended up passing whether the check was there or not.
+fn portfolio_block(
+    open_notional: Decimal,
+    open_positions: usize,
+    bankroll: Decimal,
+    risk: &crate::config::RiskConfig,
+) -> Option<&'static str> {
+    if open_notional >= bankroll * risk.max_total_exposure_pct {
+        return Some("total exposure is at its cap");
+    }
+    if open_positions >= risk.max_positions_per_category as usize {
+        return Some("at the open-position limit");
+    }
+    None
 }
 
 /// Whether an order must carry the extended-hours flag.
@@ -488,6 +639,8 @@ mod tests {
         session: TradingSession,
         placed: Arc<AtomicUsize>,
         fill: bool,
+        /// Make `balance()` fail, as an unreachable or unauthorised venue would.
+        no_balance: bool,
     }
 
     impl StubVenue {
@@ -503,7 +656,13 @@ mod tests {
                 session: TradingSession::Always,
                 placed: Arc::new(AtomicUsize::new(0)),
                 fill,
+                no_balance: false,
             }
+        }
+
+        fn without_balance(mut self) -> Self {
+            self.no_balance = true;
+            self
         }
 
         fn instrument(&self) -> Instrument {
@@ -605,6 +764,9 @@ mod tests {
             Ok(Vec::new())
         }
         async fn balance(&self) -> Result<Balance> {
+            if self.no_balance {
+                anyhow::bail!("venue will not report a balance");
+            }
             Ok(Balance {
                 ccy: "USD".to_string(),
                 available: dec!(1000),
@@ -633,10 +795,7 @@ mod tests {
             config: &config,
         };
 
-        let outcome = cycle
-            .run(Utc::now(), AgentState::Alive, dec!(1000), 1)
-            .await
-            .unwrap();
+        let outcome = cycle.run(Utc::now(), AgentState::Alive, 1).await.unwrap();
         assert_eq!(outcome.orders_placed, 0);
         assert_eq!(outcome.views_taken, 0);
     }
@@ -681,12 +840,128 @@ mod tests {
             config: &config,
         };
 
-        let outcome = cycle
-            .run(Utc::now(), AgentState::Alive, dec!(1000), 1)
-            .await
-            .unwrap();
+        let outcome = cycle.run(Utc::now(), AgentState::Alive, 1).await.unwrap();
         assert_eq!(placed.load(Ordering::SeqCst), 0, "must not double-place");
         assert_eq!(outcome.orders_placed, 0);
+    }
+
+    /// A venue that will not say what it holds must not be sized from some
+    /// other account's balance — that is how an Alpaca order ends up sized
+    /// from USDC on Polygon. `None` means the caller skips the venue.
+    #[tokio::test]
+    async fn a_venue_that_will_not_report_a_balance_yields_no_bankroll() {
+        let store = Store::new(":memory:").await.unwrap();
+        let config = app_config();
+        let registry = VenueRegistry::new(vec![]);
+        let cycle = VenueCycle {
+            registry: &registry,
+            llm: None,
+            store: &store,
+            config: &config,
+        };
+
+        let mut cache = HashMap::new();
+        let ok = StubVenue::new(true);
+        assert_eq!(
+            cycle.venue_bankroll(&ok, &mut cache).await,
+            Some(dec!(1000)),
+            "a venue that reports is sized from its own free cash"
+        );
+
+        let mut cache = HashMap::new();
+        let silent = StubVenue::new(true).without_balance();
+        assert_eq!(
+            cycle.venue_bankroll(&silent, &mut cache).await,
+            None,
+            "a venue that will not report must not fall back to another's balance"
+        );
+    }
+
+    /// The cache exists so a ten-symbol universe does not make ten balance
+    /// calls per cycle.
+    #[tokio::test]
+    async fn a_venue_balance_is_fetched_once_per_cycle() {
+        let store = Store::new(":memory:").await.unwrap();
+        let config = app_config();
+        let registry = VenueRegistry::new(vec![]);
+        let cycle = VenueCycle {
+            registry: &registry,
+            llm: None,
+            store: &store,
+            config: &config,
+        };
+
+        let venue = StubVenue::new(true);
+        let mut cache = HashMap::new();
+        cycle.venue_bankroll(&venue, &mut cache).await;
+        cycle.venue_bankroll(&venue, &mut cache).await;
+        assert_eq!(cache.len(), 1);
+    }
+
+    /// `size_position` caps one position; nothing capped the total, so a
+    /// ten-symbol universe at two orders a cycle could reach near-full
+    /// deployment in eight cycles with no layer objecting.
+    #[test]
+    fn total_exposure_is_capped_across_positions() {
+        let risk = app_config().risk;
+        let bankroll = dec!(1000);
+        let ceiling = bankroll * risk.max_total_exposure_pct;
+
+        assert_eq!(
+            portfolio_block(Decimal::ZERO, 0, bankroll, &risk),
+            None,
+            "an empty book allows an entry"
+        );
+        assert_eq!(
+            portfolio_block(ceiling - dec!(1), 0, bankroll, &risk),
+            None,
+            "just under the ceiling still allows one"
+        );
+        assert_eq!(
+            portfolio_block(ceiling, 0, bankroll, &risk),
+            Some("total exposure is at its cap"),
+            "at the ceiling, no more"
+        );
+        assert_eq!(
+            portfolio_block(ceiling + dec!(1), 0, bankroll, &risk),
+            Some("total exposure is at its cap")
+        );
+    }
+
+    /// A target below the entry books a loss as a take-profit: `evaluate_exit`
+    /// fires TakeProfit on the first mark above it, and the trade closes with
+    /// `close_reason = TAKE_PROFIT` at a loss.
+    #[test]
+    fn a_target_at_or_below_the_entry_is_discarded() {
+        let entry = dec!(100);
+        assert_eq!(plausible_target(Some(dec!(110)), entry), Some(dec!(110)));
+        assert_eq!(
+            plausible_target(Some(dec!(92)), entry),
+            None,
+            "a target below entry would close at a loss labelled a profit"
+        );
+        assert_eq!(
+            plausible_target(Some(entry), entry),
+            None,
+            "a target at entry is not a profit either"
+        );
+        assert_eq!(plausible_target(None, entry), None);
+    }
+
+    #[test]
+    fn the_open_position_count_is_capped_too() {
+        let risk = app_config().risk;
+        let bankroll = dec!(1_000_000); // exposure is nowhere near the cap
+        let limit = risk.max_positions_per_category as usize;
+
+        assert_eq!(
+            portfolio_block(Decimal::ZERO, limit - 1, bankroll, &risk),
+            None
+        );
+        assert_eq!(
+            portfolio_block(Decimal::ZERO, limit, bankroll, &risk),
+            Some("at the open-position limit")
+        );
     }
 
     #[tokio::test]
