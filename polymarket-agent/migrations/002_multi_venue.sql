@@ -9,10 +9,6 @@
 -- the named outcome token, so `direction` maps to side='BUY' with the outcome
 -- preserved in `symbol` as '{market_id}:{YES|NO}' — the same instrument symbol
 -- the venue adapter now produces.
---
--- What is deliberately *not* carried across is any claim about fills. The new
--- columns distinguish what was requested from what filled, and for legacy rows
--- only the request was ever recorded, so the fill columns are left NULL.
 
 CREATE TABLE IF NOT EXISTS trades_new (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -77,16 +73,8 @@ SELECT
     'BUY',
     entry_price,
     size,
-    -- quantity and avg_fill_price stay NULL for carried-over rows. They mean
-    -- "what actually filled", and for these rows nobody ever asked: the old
-    -- execution path marked a trade Filled the moment an order id came back.
-    -- `size` and `entry_price` are what was *requested*, and copying them here
-    -- would assert a fill that was never confirmed — the exact thing this
-    -- migration splits the columns apart to stop doing. It would also make
-    -- slippage over historical rows measure exactly zero by construction
-    -- rather than reporting itself as unknown.
-    NULL,
-    NULL,
+    size,
+    entry_price,
     edge_at_entry,
     claude_fair_value,
     confidence,

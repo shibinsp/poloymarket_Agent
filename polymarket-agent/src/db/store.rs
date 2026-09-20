@@ -131,9 +131,12 @@ impl Store {
         .bind(&trade.direction)
         .bind(&trade.entry_price)
         .bind(&trade.size)
-        // quantity mirrors size for the legacy path; they diverge once fills
-        // are confirmed rather than assumed.
-        .bind(&trade.size)
+        // `quantity` stays NULL here. It means "what actually filled", and the
+        // legacy execution path records a trade the moment an order id comes
+        // back, without confirming anything. Mirroring `size` into it asserts
+        // a fill nobody saw — the same claim migration 003 removes from the
+        // rows 002 carried across.
+        .bind(Option::<String>::None)
         .bind(&trade.edge_at_entry)
         .bind(&trade.claude_fair_value)
         .bind(&trade.confidence)
@@ -216,9 +219,17 @@ impl Store {
     }
 
     /// Get all resolved trades (wins and losses).
+    /// Trades whose outcome is final, whichever way they got there.
+    ///
+    /// A prediction market settles into RESOLVED_WIN/RESOLVED_LOSS; a
+    /// continuous position is closed by trading out of it and lands on CLOSED.
+    /// Selecting only the first two made every crypto and equity trade
+    /// invisible to performance metrics — realized P&L, win rate and the
+    /// Sharpe input all read zero while `total_trades` counted them, so the
+    /// figures were not merely incomplete but mutually inconsistent.
     pub async fn get_resolved_trades(&self) -> Result<Vec<TradeRecord>> {
         let trades = sqlx::query_as::<_, TradeRecord>(
-            "SELECT * FROM trades WHERE status IN ('RESOLVED_WIN', 'RESOLVED_LOSS') ORDER BY resolved_at",
+            "SELECT * FROM trades WHERE status IN ('RESOLVED_WIN', 'RESOLVED_LOSS', 'CLOSED') ORDER BY COALESCE(resolved_at, closed_at)",
         )
         .fetch_all(&self.pool)
         .await
@@ -585,8 +596,8 @@ impl Store {
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_venue_trade(&self, trade: &VenueTradeRecord) -> Result<i64> {
         let result = sqlx::query(
-            "INSERT INTO trades (cycle, venue_id, symbol, asset_class, market_id, market_question, direction, side, entry_price, size, quantity, avg_fill_price, edge_at_entry, claude_fair_value, confidence, kelly_raw, kelly_adjusted, status, stop_price, target_price, horizon_hours, client_order_id, venue_order_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO trades (cycle, venue_id, symbol, asset_class, market_id, market_question, direction, side, entry_price, size, quantity, avg_fill_price, edge_at_entry, claude_fair_value, confidence, kelly_raw, kelly_adjusted, risk_pct, stop_pct, status, stop_price, target_price, horizon_hours, client_order_id, venue_order_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(trade.cycle)
         .bind(&trade.venue_id)
@@ -598,12 +609,22 @@ impl Store {
         .bind(&trade.side)
         .bind(&trade.side)
         .bind(&trade.entry_price)
-        .bind(&trade.quantity)
+        // `size` is the legacy notional column, so it gets the cash value of
+        // the position; `quantity` is units. Binding units to both made the
+        // dashboard's "Size" mean dollars for one kind of trade and units for
+        // the other.
+        .bind(&trade.notional)
         .bind(&trade.quantity)
         .bind(&trade.avg_fill_price)
         .bind(&trade.edge_at_entry)
         .bind(&trade.fair_value)
         .bind(&trade.confidence)
+        // Kelly is not how continuous assets are sized — they use ATR
+        // volatility targeting — so these are zero rather than borrowed to
+        // carry the risk fraction and stop distance, which is what they used
+        // to hold. Those now have columns of their own (migration 003).
+        .bind("0")
+        .bind("0")
         .bind(&trade.risk_pct)
         .bind(&trade.stop_pct)
         .bind(&trade.status)
@@ -725,7 +746,10 @@ pub struct VenueTradeRecord {
     pub display_name: Option<String>,
     pub side: String,
     pub entry_price: String,
+    /// Units. What the legacy model calls `size` is cash, so both are carried.
     pub quantity: String,
+    /// Cash value of the position, for the legacy `size` column.
+    pub notional: String,
     pub avg_fill_price: Option<String>,
     pub edge_at_entry: String,
     pub fair_value: String,
@@ -744,9 +768,116 @@ pub struct VenueTradeRecord {
 mod tests {
     use super::*;
 
+    /// Continuous assets are not sized by Kelly, so the risk fraction and the
+    /// stop distance have columns of their own. They used to be written into
+    /// kelly_raw and kelly_adjusted, which reported a plausible-looking Kelly
+    /// fraction to anything reading those columns — including /api/trades —
+    /// and was unrecoverable afterwards, because nothing recorded which rows
+    /// meant which.
+    #[tokio::test]
+    async fn a_venue_trade_records_sizing_in_its_own_columns() {
+        let store = Store::new(":memory:").await.expect("store");
+        store
+            .insert_venue_trade(&VenueTradeRecord {
+                cycle: 1,
+                venue_id: "alpaca".to_string(),
+                symbol: "BTC/USD".to_string(),
+                asset_class: "crypto_spot".to_string(),
+                display_name: Some("BTC/USD".to_string()),
+                side: "BUY".to_string(),
+                entry_price: "100".to_string(),
+                quantity: "6".to_string(),
+                notional: "600".to_string(),
+                avg_fill_price: Some("100".to_string()),
+                edge_at_entry: "0.05".to_string(),
+                fair_value: "104".to_string(),
+                confidence: "0.8".to_string(),
+                risk_pct: "0.0018".to_string(),
+                stop_pct: "0.03".to_string(),
+                status: "OPEN".to_string(),
+                stop_price: Some("97".to_string()),
+                target_price: Some("110".to_string()),
+                horizon_hours: Some(24),
+                client_order_id: Some("c-1".to_string()),
+                venue_order_id: Some("v-1".to_string()),
+            })
+            .await
+            .expect("insert");
+
+        let row: (
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT size, quantity, kelly_raw, kelly_adjusted, risk_pct, stop_pct FROM trades",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("read back");
+
+        // `size` is the legacy cash column; `quantity` is units. Binding units
+        // to both made the dashboard's Size column mean dollars for one kind
+        // of trade and units for the other.
+        assert_eq!(row.0, "600", "size is the cash value");
+        assert_eq!(row.1, "6", "quantity is units");
+        assert_eq!(row.2, "0", "Kelly was not the sizing method");
+        assert_eq!(row.3, "0");
+        assert_eq!(row.4.as_deref(), Some("0.0018"), "risk fraction");
+        assert_eq!(row.5.as_deref(), Some("0.03"), "stop distance");
+    }
+
+    /// A continuous position is closed by trading out of it, so it lands on
+    /// CLOSED rather than RESOLVED_*. Selecting only the RESOLVED_ statuses
+    /// made the entire continuous-asset P&L invisible to performance metrics
+    /// while `total_trades` still counted it.
+    #[tokio::test]
+    async fn a_closed_position_counts_as_resolved() {
+        let store = Store::new(":memory:").await.expect("store");
+        store
+            .insert_venue_trade(&VenueTradeRecord {
+                cycle: 1,
+                venue_id: "alpaca".to_string(),
+                symbol: "BTC/USD".to_string(),
+                asset_class: "crypto_spot".to_string(),
+                display_name: None,
+                side: "BUY".to_string(),
+                entry_price: "100".to_string(),
+                quantity: "1".to_string(),
+                notional: "100".to_string(),
+                avg_fill_price: Some("100".to_string()),
+                edge_at_entry: "0.05".to_string(),
+                fair_value: "104".to_string(),
+                confidence: "0.8".to_string(),
+                risk_pct: "0.0075".to_string(),
+                stop_pct: "0.03".to_string(),
+                status: "OPEN".to_string(),
+                stop_price: None,
+                target_price: None,
+                horizon_hours: None,
+                client_order_id: Some("c-1".to_string()),
+                venue_order_id: None,
+            })
+            .await
+            .expect("insert");
+
+        let id = store.get_open_venue_trades().await.unwrap()[0].id;
+        store
+            .close_trade(id, "112", "12", "TAKE_PROFIT", "exit-1")
+            .await
+            .expect("close");
+
+        let resolved = store.get_resolved_trades().await.expect("resolved");
+        assert_eq!(resolved.len(), 1, "a closed position is a finished trade");
+        assert_eq!(resolved[0].status, "CLOSED");
+    }
+
     /// A database at 001 with real rows has to survive the rebuild in 002 and
     /// come out mapped — the migration drops and recreates `trades`, so a
-    /// mistake here is silent data loss rather than an error.
+    /// mistake here is silent data loss rather than an error. 003 then strips
+    /// the fill claims 002's backfill invented.
     #[tokio::test]
     async fn a_legacy_database_upgrades_and_maps_its_rows() {
         let path = std::env::temp_dir().join(format!("migrate-{}.db", std::process::id()));
@@ -774,6 +905,15 @@ mod tests {
             .execute(&pool)
             .await
             .expect("002 applies");
+        // 002 carries the row across but copies the requested values into the
+        // fill columns; 003 is what removes that claim. Applying both is the
+        // chain a real database actually goes through.
+        sqlx::raw_sql(include_str!(
+            "../../migrations/003_fill_columns_and_sizing.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("003 applies");
 
         let row: (
             String,

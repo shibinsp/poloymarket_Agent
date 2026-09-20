@@ -513,6 +513,7 @@ mod tests {
                 side: "BUY".to_string(),
                 entry_price: "100".to_string(),
                 quantity: "1".to_string(),
+                notional: "100".to_string(),
                 avg_fill_price: None,
                 edge_at_entry: "0.03".to_string(),
                 fair_value: "0.6".to_string(),

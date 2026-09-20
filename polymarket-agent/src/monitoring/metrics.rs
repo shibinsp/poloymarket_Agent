@@ -90,7 +90,18 @@ pub async fn compute_metrics(
             .and_then(|s| Decimal::from_str(s).ok())
             .unwrap_or(Decimal::ZERO);
 
-        if trade.status == "RESOLVED_WIN" {
+        // A prediction market declares its own outcome; a continuous position
+        // has no notion of winning, so its P&L decides. Without this, folding
+        // CLOSED into the resolved set would book every profitable crypto
+        // trade as a loss. A flat close counts as a loss rather than being
+        // dropped, so wins + losses still equals the resolved count and the
+        // win rate keeps a denominator that means something.
+        let won = match trade.status.as_str() {
+            "RESOLVED_WIN" => true,
+            "RESOLVED_LOSS" => false,
+            _ => pnl > Decimal::ZERO,
+        };
+        if won {
             wins += 1;
         } else {
             losses += 1;
@@ -248,6 +259,81 @@ pub fn log_metrics(metrics: &PerformanceMetrics) {
 mod tests {
     use super::*;
     use crate::db::store::{ApiCostRecord, TradeRecord};
+
+    use crate::db::store::{Store, VenueTradeRecord};
+
+    async fn store_with_closed_trade(exit: &str, pnl: &str) -> Store {
+        let store = Store::new(":memory:").await.expect("store");
+        store
+            .insert_venue_trade(&VenueTradeRecord {
+                cycle: 1,
+                venue_id: "alpaca".to_string(),
+                symbol: "BTC/USD".to_string(),
+                asset_class: "crypto_spot".to_string(),
+                display_name: None,
+                side: "BUY".to_string(),
+                entry_price: "100".to_string(),
+                quantity: "1".to_string(),
+                notional: "100".to_string(),
+                avg_fill_price: Some("100".to_string()),
+                edge_at_entry: "0.05".to_string(),
+                fair_value: "104".to_string(),
+                confidence: "0.8".to_string(),
+                risk_pct: "0.0075".to_string(),
+                stop_pct: "0.03".to_string(),
+                status: "OPEN".to_string(),
+                stop_price: None,
+                target_price: None,
+                horizon_hours: None,
+                client_order_id: Some("c-1".to_string()),
+                venue_order_id: None,
+            })
+            .await
+            .expect("insert");
+        let id = store.get_open_venue_trades().await.unwrap()[0].id;
+        store
+            .close_trade(id, exit, pnl, "TAKE_PROFIT", "exit-1")
+            .await
+            .expect("close");
+        store
+    }
+
+    /// A continuous position has no notion of "winning" — its P&L decides.
+    /// The status test that works for prediction markets would book every
+    /// profitable crypto trade as a loss once CLOSED counts as resolved.
+    #[tokio::test]
+    async fn a_profitable_closed_position_counts_as_a_win() {
+        let store = store_with_closed_trade("112", "12").await;
+        let m = compute_metrics(&store, dec!(100)).await.expect("metrics");
+
+        assert_eq!(m.resolved_trades, 1);
+        assert_eq!(m.wins, 1, "a +$12 close is a win");
+        assert_eq!(m.losses, 0);
+        assert_eq!(m.realized_pnl, dec!(12));
+        assert_eq!(m.win_rate, Decimal::ONE);
+    }
+
+    #[tokio::test]
+    async fn a_losing_closed_position_counts_as_a_loss() {
+        let store = store_with_closed_trade("94", "-6").await;
+        let m = compute_metrics(&store, dec!(100)).await.expect("metrics");
+
+        assert_eq!(m.wins, 0);
+        assert_eq!(m.losses, 1);
+        assert_eq!(m.realized_pnl, dec!(-6));
+    }
+
+    /// A flat close is not a win. It still counts as resolved so that
+    /// wins + losses matches the denominator the win rate divides by.
+    #[tokio::test]
+    async fn a_flat_close_is_not_a_win() {
+        let store = store_with_closed_trade("100", "0").await;
+        let m = compute_metrics(&store, dec!(100)).await.expect("metrics");
+
+        assert_eq!(m.wins, 0);
+        assert_eq!(m.losses, 1);
+        assert_eq!(m.wins + m.losses, m.resolved_trades);
+    }
 
     #[test]
     fn test_decimal_sqrt() {

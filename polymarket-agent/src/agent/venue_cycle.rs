@@ -347,6 +347,14 @@ impl VenueCycle<'_> {
                 } else {
                     qty.to_string()
                 },
+                // Cash value, for the legacy `size` column, so that column
+                // means dollars for every kind of trade.
+                notional: (if filled_qty > Decimal::ZERO {
+                    filled_qty * fill_price
+                } else {
+                    qty * limit_price
+                })
+                .to_string(),
                 avg_fill_price: (filled_qty > Decimal::ZERO).then(|| fill_price.to_string()),
                 edge_at_entry: directional::net_edge(&view, cost_to_trade).to_string(),
                 fair_value: view.p_up.to_string(),
