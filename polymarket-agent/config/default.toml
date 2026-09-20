@@ -91,3 +91,37 @@ min_stop_pct = 0.03
 max_stop_pct = 0.12
 min_p_up = 0.55                 # minimum probability-of-up before a view is tradeable
 max_orders_per_cycle = 2        # cap on new positions opened per cycle
+
+[telemetry]
+# OpenTelemetry span export. Off unless an endpoint is set here or via
+# OTEL_EXPORTER_OTLP_ENDPOINT / LANGFUSE_HOST in the environment.
+#
+# Point it at a self-hosted Langfuse or any OTLP collector; "/v1/traces" is
+# appended if absent. Langfuse renders the valuation spans as generations,
+# with model, token counts and cost, because they carry GenAI
+# semantic-convention attributes.
+#
+#   otlp_endpoint = "http://localhost:3000/api/public/otel"   # self-hosted Langfuse
+#   otlp_endpoint = "http://localhost:4318"                   # plain collector
+#
+# `enabled` is left unset on purpose, not written as `false`.
+#
+# Unset means "no opinion": setting OTEL_EXPORTER_OTLP_ENDPOINT or
+# LANGFUSE_HOST in the environment then turns export on, which is the
+# one-variable path. Writing `enabled = false` here is a different and
+# stronger statement — it means "off, whatever the environment says" — and it
+# is the right thing to write on a host where a platform injects OTLP
+# variables for every process and you do not want this one exporting.
+#
+#   enabled = true     # on, even with no env var (needs otlp_endpoint below)
+#   enabled = false    # off, even if the environment sets an endpoint
+service_name = "polymarket-agent"
+# Whether prompts and completions travel with the span. Leave on for a
+# destination you control; turn it off and the spans keep model, token
+# counts, cost and latency but carry no text.
+#
+# It only takes effect when export is actually configured: with no exporter
+# there is no span for the text to ride on, and prompts are never written to
+# the ordinary logs regardless of this setting.
+export_content = true
+export_timeout_seconds = 10

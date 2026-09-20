@@ -19,6 +19,9 @@ pub struct AppConfig {
     pub polymarket: PolymarketConfig,
     pub rate_limit: RateLimitConfig,
     pub database: DatabaseConfig,
+    /// Tracing export. Absent means off.
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
     /// Trading venues. Empty keeps the legacy Polymarket-only behaviour.
     #[serde(default)]
     pub venues: Vec<VenueConfig>,
@@ -89,6 +92,25 @@ pub enum LlmProvider {
     // Pinned explicitly: snake_case would derive "open_ai_compatible".
     #[serde(rename = "openai_compatible", alias = "open_ai_compatible")]
     OpenAiCompatible,
+}
+
+impl LlmProvider {
+    /// The `gen_ai.system` value from the OpenTelemetry GenAI semantic
+    /// conventions.
+    ///
+    /// Not the Rust variant name. `?self.provider` exported
+    /// `"OpenAiCompatible"`, which no consumer recognises — Langfuse and the
+    /// OTel collectors both key their model handling off the conventional
+    /// spelling, so a span claiming to follow the convention while using
+    /// Rust's identifier gets treated as an unknown provider.
+    pub fn semconv_name(&self) -> &'static str {
+        match self {
+            // An OpenAI-compatible endpoint is, by definition, speaking
+            // OpenAI's wire format; that is what the attribute describes.
+            Self::OpenAiCompatible => "openai",
+            Self::Anthropic => "anthropic",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -164,6 +186,97 @@ impl AppConfig {
     pub fn max_orders_per_cycle(&self) -> usize {
         self.sizing_continuous.max_orders_per_cycle
     }
+}
+
+/// Tracing export. Off unless an endpoint is configured.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TelemetryConfig {
+    /// Three-valued on purpose: absent, `true`, or `false`.
+    ///
+    /// Setting `OTEL_EXPORTER_OTLP_ENDPOINT` turns export on when the config
+    /// file has not expressed an opinion — that is the convenient one-env-var
+    /// path. But it must *not* override a written `enabled = false`, and with
+    /// a plain `bool` there is no way to tell "the operator wrote false" from
+    /// "serde defaulted it". Platforms that inject that variable
+    /// cluster-wide are common, and since `export_content` defaults on, the
+    /// consequence of getting this wrong is the agent's prompts being shipped
+    /// to a collector its operator does not control.
+    ///
+    /// Read through `enabled()`, never directly.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// OTLP/HTTP base URL. A self-hosted Langfuse is
+    /// `http://localhost:3000/api/public/otel`; a plain collector is
+    /// `http://localhost:4318`. `/v1/traces` is appended if absent.
+    #[serde(default)]
+    pub otlp_endpoint: Option<String>,
+    #[serde(default = "default_service_name")]
+    pub service_name: String,
+    /// Whether prompts and completions are exported alongside the metadata.
+    ///
+    /// On by default because the destination is expected to be your own
+    /// infrastructure, and a valuation trace without its prompt cannot explain
+    /// why the model said what it did. Turn it off and the spans keep model,
+    /// token counts, cost and latency.
+    #[serde(default = "default_true")]
+    pub export_content: bool,
+    #[serde(default = "default_export_timeout")]
+    pub export_timeout_seconds: u64,
+    /// Extra OTLP headers, for collectors that want their own auth.
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
+    /// Langfuse credentials. Read from the environment, never the config file.
+    #[serde(skip)]
+    pub langfuse_public_key: Option<String>,
+    #[serde(skip)]
+    pub langfuse_secret_key: Option<String>,
+}
+
+impl TelemetryConfig {
+    /// Whether spans are exported at all.
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(false)
+    }
+
+    /// Whether prompts and completions may leave this process.
+    ///
+    /// Gated on export actually being configured, not just on the flag.
+    /// `export_content` describes what rides along *with a span*; with no
+    /// exporter there is no span to ride, and treating the flag as
+    /// standalone is what attached multi-kilobyte prompts to the local logs
+    /// of deployments that had never turned tracing on.
+    pub fn exports_content(&self) -> bool {
+        self.enabled()
+            && self.export_content
+            && self.otlp_endpoint.as_deref().is_some_and(|e| !e.is_empty())
+    }
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: None,
+            otlp_endpoint: None,
+            service_name: default_service_name(),
+            export_content: true,
+            export_timeout_seconds: default_export_timeout(),
+            headers: std::collections::HashMap::new(),
+            langfuse_public_key: None,
+            langfuse_secret_key: None,
+        }
+    }
+}
+
+fn default_service_name() -> String {
+    "polymarket-agent".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_export_timeout() -> u64 {
+    10
 }
 
 /// One configured trading venue.
@@ -431,8 +544,20 @@ impl AppConfig {
         let contents = std::fs::read_to_string(config_path)
             .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
 
-        let config: AppConfig = toml::from_str(&contents)
+        let mut config: AppConfig = toml::from_str(&contents)
             .with_context(|| format!("Failed to parse config file: {}", config_path.display()))?;
+
+        // Telemetry credentials come from the environment, never the config
+        // file — the same rule every other secret here follows. The endpoint
+        // may also be overridden, so a deployment can point at its own
+        // collector without editing a tracked file.
+        config.telemetry.langfuse_public_key = non_empty_env("LANGFUSE_PUBLIC_KEY");
+        config.telemetry.langfuse_secret_key = non_empty_env("LANGFUSE_SECRET_KEY");
+        apply_telemetry_endpoint(
+            &mut config.telemetry,
+            non_empty_env("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .or_else(|| non_empty_env("LANGFUSE_HOST").map(|h| format!("{h}/api/public/otel"))),
+        );
 
         let secrets = Secrets::from_env();
 
@@ -440,9 +565,131 @@ impl AppConfig {
     }
 }
 
+/// Point telemetry at an endpoint discovered in the environment.
+///
+/// Extracted from `load` so the precedence can be tested without mutating
+/// process-wide environment variables from a parallel test run.
+///
+/// The endpoint is always taken. `enabled` is only *defaulted* — a config
+/// file that wrote `enabled = false` said so deliberately, and platforms
+/// that inject `OTEL_EXPORTER_OTLP_ENDPOINT` cluster-wide must not be able
+/// to overrule it. With `export_content` defaulting on, the cost of losing
+/// that argument is the agent's prompts going somewhere its operator did not
+/// choose.
+fn apply_telemetry_endpoint(telemetry: &mut TelemetryConfig, endpoint: Option<String>) {
+    let Some(endpoint) = endpoint else {
+        return;
+    };
+    telemetry.otlp_endpoint = Some(endpoint);
+    telemetry.enabled.get_or_insert(true);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Telemetry gating -------------------------------------------------
+
+    #[test]
+    fn an_ambient_endpoint_turns_export_on_when_the_config_is_silent() {
+        let mut t = TelemetryConfig::default();
+        assert_eq!(t.enabled, None, "silence is the default");
+        apply_telemetry_endpoint(&mut t, Some("http://collector:4318".to_string()));
+        assert!(t.enabled(), "one env var is meant to be enough");
+        assert_eq!(t.otlp_endpoint.as_deref(), Some("http://collector:4318"));
+    }
+
+    #[test]
+    fn an_ambient_endpoint_cannot_override_an_explicit_disable() {
+        // The failure this prevents: a k8s platform exports
+        // OTEL_EXPORTER_OTLP_ENDPOINT for every pod, and an operator who
+        // wrote `enabled = false` gets export anyway — carrying the agent's
+        // full prompts, because export_content defaults on.
+        let mut t = TelemetryConfig {
+            enabled: Some(false),
+            ..TelemetryConfig::default()
+        };
+        apply_telemetry_endpoint(&mut t, Some("http://collector:4318".to_string()));
+        assert!(
+            !t.enabled(),
+            "an explicit `enabled = false` must win over the environment"
+        );
+        assert!(
+            !t.exports_content(),
+            "and nothing may be exported from a disabled exporter"
+        );
+    }
+
+    #[test]
+    fn an_explicit_enable_survives_having_no_ambient_endpoint() {
+        let mut t = TelemetryConfig {
+            enabled: Some(true),
+            otlp_endpoint: Some("http://configured:4318".to_string()),
+            ..TelemetryConfig::default()
+        };
+        apply_telemetry_endpoint(&mut t, None);
+        assert!(t.enabled());
+        assert_eq!(t.otlp_endpoint.as_deref(), Some("http://configured:4318"));
+    }
+
+    #[test]
+    fn content_is_not_exported_without_an_exporter_to_export_it_to() {
+        // `export_content` describes what rides along with a span. With no
+        // span leaving the process there is nothing to ride, and treating
+        // the flag as standalone is what put multi-kilobyte prompts into the
+        // local log files of deployments that never turned tracing on.
+        let off = TelemetryConfig::default();
+        assert!(off.export_content, "the flag itself defaults on");
+        assert!(
+            !off.exports_content(),
+            "but it must not authorise anything while export is off"
+        );
+
+        let enabled_but_unaddressed = TelemetryConfig {
+            enabled: Some(true),
+            otlp_endpoint: None,
+            ..TelemetryConfig::default()
+        };
+        assert!(
+            !enabled_but_unaddressed.exports_content(),
+            "enabled with nowhere to send it is still nowhere to send it"
+        );
+
+        let empty_endpoint = TelemetryConfig {
+            enabled: Some(true),
+            otlp_endpoint: Some(String::new()),
+            ..TelemetryConfig::default()
+        };
+        assert!(
+            !empty_endpoint.exports_content(),
+            "an empty endpoint string is not an endpoint"
+        );
+
+        let live = TelemetryConfig {
+            enabled: Some(true),
+            otlp_endpoint: Some("http://collector:4318".to_string()),
+            ..TelemetryConfig::default()
+        };
+        assert!(
+            live.exports_content(),
+            "fully configured: content rides along"
+        );
+
+        let opted_out = TelemetryConfig {
+            export_content: false,
+            ..live
+        };
+        assert!(
+            !opted_out.exports_content(),
+            "and the flag still turns it off on its own"
+        );
+    }
+
+    #[test]
+    fn the_provider_attribute_uses_the_semantic_convention_spelling() {
+        assert_eq!(LlmProvider::Anthropic.semconv_name(), "anthropic");
+        assert_eq!(LlmProvider::OpenAiCompatible.semconv_name(), "openai");
+    }
 
     #[test]
     fn test_parse_default_config() {
@@ -454,6 +701,16 @@ mod tests {
         assert_eq!(config.scanning.max_markets, 1000);
         assert_eq!(config.polymarket.chain_id, 137);
         assert_eq!(config.agent.max_sleep_seconds, 3600);
+
+        // The tracked default must leave `enabled` *unset*, not write
+        // `false`. Written false is an override that beats the environment,
+        // which would silently break the documented one-env-var path for
+        // everyone who never edited this file.
+        assert_eq!(
+            config.telemetry.enabled, None,
+            "config/default.toml must not pin telemetry.enabled"
+        );
+        assert!(!config.telemetry.enabled(), "and it is off until asked for");
     }
 
     /// Configs written before the scheduler have no `max_sleep_seconds`, and
