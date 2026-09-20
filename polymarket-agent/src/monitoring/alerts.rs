@@ -69,6 +69,11 @@ pub enum AnomalyKind {
     /// An order has sat unresolved past the point where it should have been
     /// filled or cancelled.
     StaleOrder,
+    /// The agent has stopped opening positions. Whatever the cause — an
+    /// operator, a risk limit, a reconciliation mismatch — this is the one
+    /// that says trading has stopped, which nothing else about a halted
+    /// agent makes visible: it goes on cycling and logging exactly as before.
+    Halted,
 }
 
 impl AnomalyKind {
@@ -84,6 +89,7 @@ impl AnomalyKind {
             AnomalyKind::OrderRejected => "order_rejected",
             AnomalyKind::OrderStateUnknown => "order_state_unknown",
             AnomalyKind::StaleOrder => "stale_order",
+            AnomalyKind::Halted => "halted",
         }
     }
 }
@@ -323,6 +329,10 @@ impl AlertClient {
     ) -> Result<()> {
         let urgency = match new_state {
             AgentState::Dead => "CRITICAL",
+            // A halted agent looks perfectly healthy from the outside — it
+            // keeps cycling, keeps logging, and quietly stops trading. That
+            // is worth waking someone for.
+            AgentState::Halted => "CRITICAL",
             AgentState::CriticalSurvival => "WARNING",
             AgentState::LowFuel => "NOTICE",
             AgentState::Alive => "INFO",

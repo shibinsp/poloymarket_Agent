@@ -104,7 +104,35 @@ pub enum AgentState {
     Alive,
     LowFuel,
     CriticalSurvival,
+    /// Entries are stopped. Exits, order polling, reconciliation and
+    /// settlement all continue.
+    ///
+    /// Deliberately not the same axis as the survival ladder above, which is
+    /// derived from the balance every cycle and would overwrite this on the
+    /// next pass. The precedence is fixed in `apply_halt`: `Dead` outranks a
+    /// halt (an account at zero is not something a human resume can fix), and
+    /// a halt outranks everything else.
+    ///
+    /// Refusing to *close* a position because the day went badly is how a
+    /// bounded loss becomes an unbounded one, so nothing about this state
+    /// touches the exit path.
+    Halted,
     Dead,
+}
+
+/// Fold a halt into the state the survival check computed.
+///
+/// Kept as a free function rather than buried in the lifecycle so the
+/// precedence is stated in one place and can be tested without an agent.
+pub fn apply_halt(survival: AgentState, halted: bool) -> AgentState {
+    match (survival, halted) {
+        // Death wins. A halted agent whose balance has gone to zero still
+        // needs to shut down and settle; waiting for someone to resume it
+        // would leave it cycling forever against an empty account.
+        (AgentState::Dead, _) => AgentState::Dead,
+        (_, true) => AgentState::Halted,
+        (other, false) => other,
+    }
 }
 
 impl std::fmt::Display for AgentState {
@@ -113,6 +141,7 @@ impl std::fmt::Display for AgentState {
             Self::Alive => write!(f, "ALIVE"),
             Self::LowFuel => write!(f, "LOW_FUEL"),
             Self::CriticalSurvival => write!(f, "CRITICAL_SURVIVAL"),
+            Self::Halted => write!(f, "HALTED"),
             Self::Dead => write!(f, "DEAD"),
         }
     }

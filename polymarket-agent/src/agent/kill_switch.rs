@@ -81,6 +81,40 @@ fn serialize_scope<S: serde::Serializer>(v: &HaltScope, s: S) -> Result<S::Ok, S
 }
 
 impl Halt {
+    /// Rebuild a halt from the row that outlived the last process.
+    ///
+    /// Returns `None` for a row this build cannot interpret — an unknown
+    /// source or an unparseable timestamp. Refusing to guess matters here:
+    /// inventing a scope would either resume a halt that should have held or
+    /// hold one that should have expired, and the caller can say so out loud
+    /// instead.
+    pub fn from_stored(stored: &crate::db::store::StoredHalt) -> Option<Self> {
+        let source = match stored.source.as_str() {
+            "halt_file" => HaltSource::HaltFile,
+            "api" => HaltSource::Api,
+            "signal" => HaltSource::Signal,
+            "circuit_breaker" => HaltSource::CircuitBreaker,
+            "reconciliation" => HaltSource::Reconciliation,
+            _ => return None,
+        };
+        let scope = match stored.scope.as_str() {
+            "rest_of_day" => HaltScope::RestOfDay,
+            "until_resume" => HaltScope::UntilResume,
+            _ => return None,
+        };
+        let at = DateTime::parse_from_rfc3339(&stored.raised_at)
+            .ok()?
+            .with_timezone(&Utc);
+        let day = stored.day.parse::<NaiveDate>().ok()?;
+        Some(Self {
+            source,
+            scope,
+            detail: stored.detail.clone().unwrap_or_default(),
+            at,
+            day,
+        })
+    }
+
     pub fn new(source: HaltSource, scope: HaltScope, detail: impl Into<String>, at: DateTime<Utc>) -> Self {
         Self {
             source,

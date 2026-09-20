@@ -387,6 +387,31 @@ fn default_max_live_total_notional_usd() -> Decimal {
     rust_decimal_macros::dec!(60.0)
 }
 
+impl Default for RiskConfig {
+    /// The documented defaults, so a test can spell out only the field it is
+    /// exercising.
+    ///
+    /// Not a loading path: `RiskConfig` has no struct-level `serde(default)`,
+    /// so a config file is still required to state the five sizing fields.
+    /// Only the breaker limits below fall back to these when absent.
+    fn default() -> Self {
+        Self {
+            kelly_fraction: rust_decimal_macros::dec!(0.5),
+            max_position_pct: rust_decimal_macros::dec!(0.06),
+            max_total_exposure_pct: rust_decimal_macros::dec!(0.30),
+            max_positions_per_category: 3,
+            min_position_usd: rust_decimal_macros::dec!(1.0),
+            max_daily_loss_pct: default_max_daily_loss_pct(),
+            max_daily_loss_usd: default_max_daily_loss_usd(),
+            max_drawdown_pct: default_max_drawdown_pct(),
+            max_trades_per_day: default_max_trades_per_day(),
+            max_consecutive_losses: default_max_consecutive_losses(),
+            max_live_notional_per_position_usd: default_max_live_notional_per_position_usd(),
+            max_live_total_notional_usd: default_max_live_total_notional_usd(),
+        }
+    }
+}
+
 /// Volatility-targeted sizing for continuous assets (crypto, equities).
 /// Prediction markets keep using Kelly and ignore this.
 #[derive(Debug, Clone, Deserialize)]
@@ -926,6 +951,7 @@ mod tests {
     fn test_database_url() {
         let db = DatabaseConfig {
             path: "test.db".to_string(),
+            data_dir: None,
         };
         assert_eq!(db.url(), "sqlite:test.db");
     }

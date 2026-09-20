@@ -81,10 +81,12 @@ impl HealthState {
         data.agent_state = state.to_string();
         data.last_cycle_at = Some(Utc::now());
         data.uptime_seconds = (Utc::now() - data.started_at).num_seconds();
-        data.status = if state == AgentState::Dead {
-            "dead".to_string()
-        } else {
-            "ok".to_string()
+        // Distinct from "ok": an uptime probe that cannot tell a trading
+        // agent from a halted one is not monitoring anything.
+        data.status = match state {
+            AgentState::Dead => "dead".to_string(),
+            AgentState::Halted => "halted".to_string(),
+            _ => "ok".to_string(),
         };
     }
 

@@ -207,7 +207,7 @@ fn state_multiplier(state: AgentState) -> Decimal {
     match state {
         AgentState::Alive => Decimal::ONE,
         AgentState::LowFuel => dec!(0.25),
-        AgentState::CriticalSurvival | AgentState::Dead => Decimal::ZERO,
+        AgentState::CriticalSurvival | AgentState::Halted | AgentState::Dead => Decimal::ZERO,
     }
 }
 
@@ -224,6 +224,7 @@ mod tests {
             max_total_exposure_pct: dec!(0.30),
             max_positions_per_category: 3,
             min_position_usd: dec!(1.0),
+            ..RiskConfig::default()
         }
     }
 

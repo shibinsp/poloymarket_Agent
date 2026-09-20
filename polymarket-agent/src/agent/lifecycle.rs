@@ -7,6 +7,8 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tracing::{error, info, instrument, warn};
 
+use crate::agent::budget::BudgetLedger;
+use crate::agent::kill_switch::{Halt, HaltSource, KillSwitch};
 use crate::agent::reconcile::Reconciler;
 use crate::agent::scheduler::{self, WakePlan};
 use crate::agent::self_funding::{
@@ -25,11 +27,13 @@ use crate::execution::fills;
 use crate::execution::order::{self, OrderStatus};
 use crate::execution::resolution;
 use crate::execution::wallet;
-use crate::market::models::{AgentState, MarketCandidate};
+use crate::execution::reconcile::{StateReconciler, Verdict};
+use crate::market::models::{apply_halt, AgentState, MarketCandidate};
 use crate::market::polymarket::PolymarketClient;
 use crate::market::scanner::MarketScanner;
 use crate::monitoring::alerts::{check_milestone, AlertClient, AlertLevel, AnomalyKind};
 use crate::monitoring::metrics::{compute_metrics, log_metrics};
+use crate::risk::circuit_breaker::{self, HaltScope};
 use crate::risk::kelly;
 use crate::risk::limits;
 use crate::risk::portfolio::{PortfolioManager, Position};
@@ -56,6 +60,13 @@ pub struct Agent {
     /// Shared with the valuation engine; the venue cycle calls it directly
     /// because continuous assets use a different prompt.
     llm: Option<Arc<LlmClient>>,
+    /// Stops new positions. Shared with the dashboard's `/api/halt` and with
+    /// the SIGUSR1 handler, so all three routes end at one flag with one
+    /// recorded reason.
+    kill_switch: Arc<KillSwitch>,
+    /// The day's valuation spend. Held here as well as inside the LLM client
+    /// so a batch can be sized to what is affordable before it is spawned.
+    budget: Arc<BudgetLedger>,
 }
 
 impl Agent {
@@ -73,6 +84,46 @@ impl Agent {
         ];
         let data_aggregator = DataAggregator::new(data_sources);
 
+        // The day's spend, seeded from what the database already recorded.
+        // A restart mid-day must not hand the agent a fresh budget — that is
+        // how "spend at most $0.50 a day" becomes "$0.50 per restart".
+        let spent_today = store.get_today_api_cost().await.unwrap_or_else(|e| {
+            warn!(error = %e, "Could not read today's API spend — assuming none");
+            Decimal::ZERO
+        });
+        let budget = Arc::new(BudgetLedger::new(
+            config.agent.daily_api_budget,
+            Utc::now().date_naive(),
+            spent_today,
+        ));
+
+        // The halt flag, and any halt that outlived the last process.
+        let kill_switch = Arc::new(KillSwitch::new(config.database.halt_file()));
+        match store.active_halt().await {
+            Ok(Some(stored)) => {
+                let halt = Halt::from_stored(&stored);
+                match halt {
+                    Some(halt) => {
+                        // Restarting is the first thing anyone does when
+                        // something looks wrong. If that cleared a drawdown
+                        // halt, the breaker would be decorative.
+                        warn!(
+                            source = halt.source.as_str(),
+                            detail = %halt.detail,
+                            "Reinstating a halt that was in force before this process started"
+                        );
+                        kill_switch.trip(halt);
+                    }
+                    None => warn!(
+                        source = %stored.source,
+                        "Ignoring an unreadable halt row — the HALT file still applies"
+                    ),
+                }
+            }
+            Ok(None) => {}
+            Err(e) => warn!(error = %e, "Could not read the halt table"),
+        }
+
         // Phase 4: Initialize valuation engine (only if API key is available)
         let mut llm_client: Option<Arc<LlmClient>> = None;
         let valuation_engine = if let Some(ref api_key) = secrets.llm_api_key {
@@ -82,7 +133,8 @@ impl Agent {
             let valuation_store = store.clone_for_parallel();
             let client = Arc::new(
                 LlmClient::new(api_key.clone(), &config.valuation, llm_store)?
-                    .with_content_export(config.telemetry.exports_content()),
+                    .with_content_export(config.telemetry.exports_content())
+                    .with_budget(budget.clone()),
             );
             llm_client = Some(client.clone());
             Some(ValuationEngine::new(
@@ -138,7 +190,195 @@ impl Agent {
             last_balance: Decimal::ZERO,
             venues,
             llm: llm_client,
+            kill_switch,
+            budget,
         })
+    }
+
+    /// The halt flag, for the dashboard and the signal handler.
+    pub fn kill_switch(&self) -> Arc<KillSwitch> {
+        self.kill_switch.clone()
+    }
+
+    /// Raise a halt, once.
+    ///
+    /// Everything that stops the agent comes through here, so the one-time
+    /// work — cancelling resting orders, alerting, writing the row that
+    /// survives a restart — happens exactly once no matter which of the five
+    /// routes tripped it.
+    async fn raise_halt(&self, halt: Halt) {
+        if !self.kill_switch.trip(halt.clone()) {
+            // Already halted, and the first reason is the diagnostic one.
+            return;
+        }
+
+        error!(
+            source = halt.source.as_str(),
+            scope = ?halt.scope,
+            detail = %halt.detail,
+            "HALTED — no new positions until this is cleared"
+        );
+
+        // Resting orders first. A halt that leaves working orders on the book
+        // has not stopped anything: they can still fill, and the agent has
+        // just stopped watching them closely.
+        for venue in self.venues.all() {
+            if let Err(e) = venue.cancel_all().await {
+                warn!(
+                    venue = %venue.id(),
+                    error = %e,
+                    "Could not cancel resting orders while halting — they may still fill"
+                );
+            }
+        }
+
+        if let Err(e) = self
+            .store
+            .insert_halt(
+                halt.source.as_str(),
+                match halt.scope {
+                    HaltScope::RestOfDay => "rest_of_day",
+                    HaltScope::UntilResume => "until_resume",
+                },
+                &halt.detail,
+                halt.at,
+            )
+            .await
+        {
+            warn!(error = %e, "Could not persist the halt — a restart would lift it");
+        }
+
+        let _ = self
+            .alert_client
+            .anomaly(
+                AlertLevel::Critical,
+                AnomalyKind::Halted,
+                halt.source.as_str(),
+                &halt.detail,
+            )
+            .await;
+    }
+
+    /// Reconcile the halt flag with the `HALT` file and the calendar.
+    async fn sync_halts(&self, now: DateTime<Utc>) {
+        if self.kill_switch.expire_if_day_rolled(now.date_naive()) {
+            info!("A rest-of-day halt expired with the UTC rollover");
+            if let Err(e) = self.store.clear_halts("day_rollover", now).await {
+                warn!(error = %e, "Could not clear the expired halt row");
+            }
+        }
+        if let Some(halt) = self.kill_switch.sync_with_file(now) {
+            self.raise_halt(halt).await;
+        }
+    }
+
+    /// Ask every venue whether the ledger still describes reality.
+    async fn audit_venue_state(&self, now: DateTime<Utc>) {
+        if self.venues.is_empty() {
+            return;
+        }
+        let reconciler = StateReconciler {
+            registry: &self.venues,
+            store: &self.store,
+        };
+        let reports = match reconciler.run(now, self.cycle_number as i64).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "State reconciliation could not run");
+                return;
+            }
+        };
+
+        for report in reports {
+            match report.verdict {
+                Verdict::Clean => {}
+                // Not a halt. A venue that cannot answer also cannot accept
+                // orders, so trading there has already stopped — halting the
+                // *other* venues over it would turn one venue's outage into a
+                // whole-agent outage.
+                Verdict::Unverified => {
+                    warn!(
+                        venue = %report.venue_id,
+                        detail = %report.detail,
+                        "Venue state could not be verified"
+                    );
+                    let _ = self
+                        .alert_client
+                        .anomaly(
+                            AlertLevel::Warning,
+                            AnomalyKind::ReconciliationMismatch,
+                            &report.venue_id,
+                            &format!("State unverified: {}", report.detail),
+                        )
+                        .await;
+                }
+                Verdict::Mismatch => {
+                    self.raise_halt(Halt::new(
+                        HaltSource::Reconciliation,
+                        // Tomorrow will not make the books agree.
+                        HaltScope::UntilResume,
+                        format!("{}: {}", report.venue_id, report.detail),
+                        now,
+                    ))
+                    .await;
+                }
+            }
+        }
+    }
+
+    /// Mark the day's equity and test it against the risk limits.
+    ///
+    /// `equity` is account value including open positions, not free cash.
+    /// Free cash would read every entry as an instant loss of the full
+    /// notional and trip the daily-loss breaker on a flat book.
+    async fn check_breakers(&self, now: DateTime<Utc>, equity: Decimal) {
+        let today = now.date_naive();
+        let marks = match self.store.record_equity(today, equity).await {
+            Ok(m) => m,
+            Err(e) => {
+                // Without marks there is no way to know whether a limit has
+                // been breached. Trading on when the answer is unavailable is
+                // the wrong direction on the one control that bounds the
+                // worst case.
+                self.raise_halt(Halt::new(
+                    HaltSource::CircuitBreaker,
+                    HaltScope::UntilResume,
+                    format!("Could not read or record equity marks, so no risk limit can be evaluated: {e}"),
+                    now,
+                ))
+                .await;
+                return;
+            }
+        };
+
+        let trades_today = self
+            .store
+            .count_trades_opened_on(today)
+            .await
+            .unwrap_or_else(|e| {
+                warn!(error = %e, "Could not count today's trades — treating as zero");
+                0
+            });
+        let losses = self.store.consecutive_losses().await.unwrap_or_else(|e| {
+            warn!(error = %e, "Could not read the losing streak — treating as zero");
+            0
+        });
+
+        if let Some(trip) = circuit_breaker::evaluate(
+            equity,
+            &marks,
+            trades_today,
+            losses,
+            &self.config.risk,
+        ) {
+            self.raise_halt(Halt::new(
+                HaltSource::CircuitBreaker,
+                trip.scope(),
+                format!("{trip}"),
+                now,
+            ))
+            .await;
+        }
     }
 
     fn has_valuation_engine(&self) -> bool {
@@ -184,6 +424,15 @@ impl Agent {
         let start = Instant::now();
         info!(cycle = self.cycle_number, state = %self.state, "Starting cycle");
 
+        let now = Utc::now();
+
+        // 0. Halt housekeeping, before anything else looks at the state.
+        //
+        // Both directions: a `HALT` file that appeared since the last wake
+        // stops the agent, and a rest-of-day halt whose day has passed lifts
+        // itself.
+        self.sync_halts(now).await;
+
         // 1. Enhanced survival check (Phase 7)
         let old_state = self.state;
         let balance = self.current_balance().await;
@@ -192,7 +441,7 @@ impl Agent {
             .unwrap_or(Decimal::ZERO);
         let next_cycle_cost = self_funding::estimate_next_cycle_cost(&self.store, 20).await;
 
-        self.state = enhanced_survival_check(
+        let survival = enhanced_survival_check(
             balance,
             unrealized,
             next_cycle_cost,
@@ -200,6 +449,17 @@ impl Agent {
             self.config.agent.api_reserve,
             self.config.agent.low_fuel_threshold,
         );
+
+        // 2. Does the ledger still match the venues, and is the account
+        // inside its risk limits? Both can halt, so both run before the state
+        // is settled — deciding to trade and *then* discovering the books
+        // disagree is the ordering this exists to prevent.
+        self.audit_venue_state(now).await;
+        self.check_breakers(now, balance + unrealized).await;
+
+        // A halt outranks the survival ladder, except for death. See
+        // `market::models::apply_halt`.
+        self.state = apply_halt(survival, self.kill_switch.is_tripped());
 
         // Alert on state changes (Phase 8)
         if self.state != old_state {
@@ -363,6 +623,20 @@ impl Agent {
             AgentState::Dead => {
                 self.shutdown().await?;
                 return Ok(());
+            }
+            AgentState::Halted => {
+                // Everything above this point has already run: the exit
+                // pass, order reconciliation, settlement and the state
+                // audit. Only entries stop here.
+                warn!(
+                    cycle = self.cycle_number,
+                    reason = %self
+                        .kill_switch
+                        .current()
+                        .map(|h| h.detail)
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    "Halted — exits and reconciliation continue, no new positions"
+                );
             }
             AgentState::CriticalSurvival => {
                 warn!(

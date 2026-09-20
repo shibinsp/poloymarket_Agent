@@ -70,7 +70,7 @@ pub fn kelly_size(
     let state_multiplier = match state {
         AgentState::Alive => Decimal::ONE,
         AgentState::LowFuel => dec!(0.25), // Quarter-Kelly in low fuel
-        AgentState::CriticalSurvival | AgentState::Dead => Decimal::ZERO,
+        AgentState::CriticalSurvival | AgentState::Halted | AgentState::Dead => Decimal::ZERO,
     };
 
     // Adjusted Kelly = raw * fraction * confidence * state_multiplier
@@ -148,6 +148,7 @@ mod tests {
             max_total_exposure_pct: dec!(0.30),
             max_positions_per_category: 3,
             min_position_usd: dec!(1), // $1 min
+            ..RiskConfig::default()
         }
     }
 
