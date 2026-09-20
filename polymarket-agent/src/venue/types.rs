@@ -53,6 +53,16 @@ impl AssetClass {
     pub fn settles(&self) -> bool {
         matches!(self, AssetClass::PredictionBinary)
     }
+
+    /// Whether this class ignores its venue's trading session.
+    ///
+    /// Crypto and prediction contracts trade through nights, weekends and
+    /// holidays; equities do not. This is the one place that fact is stated —
+    /// both instrument filtering and the scheduler read it, and they must not
+    /// be allowed to disagree about whether there is anything to do.
+    pub fn never_closes(&self) -> bool {
+        matches!(self, AssetClass::CryptoSpot | AssetClass::PredictionBinary)
+    }
 }
 
 /// Direction of an order. Unlike the old `Side::{Yes, No}`, this says nothing
@@ -147,6 +157,10 @@ pub struct Instrument {
     /// Smallest order value the venue will accept. Binance.US rejects orders
     /// under roughly $10, which matters a great deal at a $100 bankroll.
     pub min_notional: Option<Decimal>,
+    /// Smallest tradeable quantity, where the venue gates on size rather than
+    /// on value. Alpaca's crypto `min_order_size` works this way (0.000026
+    /// BTC, say), and a notional minimum cannot express it without a price.
+    pub min_qty: Option<Decimal>,
     /// Whether fractional quantities are allowed (Alpaca equities, crypto).
     pub fractional: bool,
     pub meta: InstrumentMeta,
@@ -190,6 +204,14 @@ impl Instrument {
     pub fn meets_min_notional(&self, notional: Decimal) -> bool {
         match self.min_notional {
             Some(min) => notional >= min,
+            None => true,
+        }
+    }
+
+    /// Whether an order of this size clears the venue's minimum quantity.
+    pub fn meets_min_qty(&self, qty: Decimal) -> bool {
+        match self.min_qty {
+            Some(min) => qty >= min,
             None => true,
         }
     }
@@ -395,8 +417,18 @@ pub struct Balance {
     pub ccy: String,
     /// Free to deploy.
     pub available: Decimal,
-    /// Including the value of open positions.
-    pub total: Decimal,
+    /// Account value including the marked value of open positions, or `None`
+    /// when the venue cannot tell us.
+    ///
+    /// Optional on purpose. A venue that cannot see its own positions used to
+    /// report free cash here, which is not the same number and is wrong in a
+    /// specific, expensive direction: entering a position moves cash out and
+    /// the position's value is invisible, so an equity curve built on it reads
+    /// every entry as an instant loss of the full notional and every exit as a
+    /// windfall. A drawdown breaker or a low-fuel threshold reading that would
+    /// trip on a flat book. `None` forces the caller to decide what to do
+    /// about not knowing, which is the honest question.
+    pub total: Option<Decimal>,
 }
 
 /// Outcome of a settled prediction market.
@@ -422,6 +454,12 @@ pub struct VenueCapabilities {
 impl VenueCapabilities {
     pub fn supports(&self, class: AssetClass) -> bool {
         self.asset_classes.contains(&class)
+    }
+
+    /// Whether the venue lists anything that trades while its session is shut.
+    /// Alpaca does — its equity session closes but its crypto book does not.
+    pub fn has_always_on(&self) -> bool {
+        self.asset_classes.iter().any(AssetClass::never_closes)
     }
 }
 
@@ -451,6 +489,7 @@ mod tests {
             tick_size: tick,
             lot_size: lot,
             min_notional: min,
+            min_qty: None,
             fractional: true,
             meta: InstrumentMeta::Equity {
                 exchange: "NASDAQ".to_string(),

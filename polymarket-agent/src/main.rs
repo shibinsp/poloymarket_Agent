@@ -1,10 +1,12 @@
 use anyhow::Result;
+use chrono::Utc;
 use clap::Parser;
 
 use polymarket_agent::agent::lifecycle::Agent;
 use polymarket_agent::config::{self, AgentMode, AppConfig};
 use polymarket_agent::db::store::Store;
 use polymarket_agent::monitoring;
+use polymarket_agent::monitoring::alerts::{AlertLevel, AnomalyKind};
 use polymarket_agent::monitoring::dashboard::{spawn_dashboard, DashboardState};
 use polymarket_agent::monitoring::logger;
 
@@ -271,10 +273,25 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
     )?;
 
     let mut agent = Agent::new(config.clone(), secrets, store).await?;
-    let interval = std::time::Duration::from_secs(config.agent.cycle_interval_seconds);
+    let alerts = agent.alerts();
+    let watchdog = spawn_cycle_watchdog(
+        health_state.clone(),
+        alerts.clone(),
+        std::time::Duration::from_secs(config.agent.cycle_interval_seconds),
+    );
     let mut shutdown = ShutdownSignals::new()?;
     let mut consecutive_failures: u32 = 0;
     let mut fatal: Option<anyhow::Error> = None;
+
+    // Arm the watchdog before the first cycle, not after it. The loop sets a
+    // due time each time it goes to sleep, which leaves the very first cycle
+    // unwatched — and that is the one most likely to hang, because it is the
+    // one that first touches an unreachable venue or a misconfigured endpoint.
+    health_state
+        .expect_cycle_by(
+            Utc::now() + chrono::Duration::seconds(config.agent.cycle_interval_seconds as i64),
+        )
+        .await;
 
     loop {
         // Run the cycle to completion — it is never raced against the shutdown
@@ -302,6 +319,18 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
                     consecutive_failures,
                     "Cycle failed — retrying after the normal interval"
                 );
+                let _ = alerts
+                    .anomaly(
+                        AlertLevel::Critical,
+                        AnomalyKind::VenueUnreachable,
+                        "cycle",
+                        &format!("{consecutive_failures} consecutive cycle failures: {e}"),
+                    )
+                    .await;
+                health_state
+                    .record_alert_delivery(!alerts.delivery_failing())
+                    .await;
+
                 if consecutive_failures >= MAX_CONSECUTIVE_CYCLE_FAILURES {
                     fatal = Some(e.context(format!(
                         "{consecutive_failures} consecutive cycle failures — exiting so the supervisor can restart"
@@ -311,10 +340,26 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
             }
         }
 
-        // Idle between cycles, but wake immediately on a shutdown signal —
-        // this is the only point where a signal can interrupt the loop.
+        // Idle until there is something to do, but wake immediately on a
+        // shutdown signal — this is the only point where a signal can
+        // interrupt the loop. The wake is computed *after* the cycle, not
+        // before it, so a cycle that ran long doesn't sleep on a stale plan.
+        let now = Utc::now();
+        let plan = agent.next_wake(now);
+        let sleep_for = plan.sleep_from(now);
+        // Tell the watchdog when this cycle is next due, so "late" is measured
+        // against the schedule the agent actually chose rather than against a
+        // fixed interval it is no longer following.
+        health_state.expect_cycle_by(plan.at).await;
+        tracing::debug!(
+            reason = plan.reason.as_str(),
+            wake_at = %plan.at,
+            sleep_s = sleep_for.as_secs(),
+            "Idling until the next wake"
+        );
+
         tokio::select! {
-            _ = tokio::time::sleep(interval) => {}
+            _ = tokio::time::sleep(sleep_for) => {}
             signal = shutdown.recv() => {
                 tracing::info!(signal, "Shutdown signal received — stopping after the current cycle");
                 break;
@@ -322,7 +367,8 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
         }
     }
 
-    // Clean up dashboard server
+    // Clean up background tasks
+    watchdog.abort();
     dashboard_handle.abort();
     tracing::info!("Agent shutdown complete");
 
@@ -330,6 +376,58 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
         Some(e) => Err(e),
         None => Ok(()),
     }
+}
+
+/// How far past its due time a cycle has to be before it counts as stalled.
+/// Generous relative to the cadence, because a cycle legitimately takes as
+/// long as its market scan and valuation calls do.
+fn stall_grace(cycle_interval: std::time::Duration) -> chrono::Duration {
+    let grace = (cycle_interval * 2).max(std::time::Duration::from_secs(300));
+    chrono::Duration::from_std(grace).unwrap_or_else(|_| chrono::Duration::minutes(5))
+}
+
+/// Watch for a cycle that never finishes.
+///
+/// This has to live outside the loop. `run_cycle` is awaited to completion and
+/// is never raced against anything, so a cycle that hangs simply never returns
+/// — the loop cannot notice its own stall, and the health endpoint would sit
+/// there reporting the last good cycle forever.
+fn spawn_cycle_watchdog(
+    health: monitoring::health::HealthState,
+    alerts: std::sync::Arc<monitoring::alerts::AlertClient>,
+    cycle_interval: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    let grace = stall_grace(cycle_interval);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+        // The first tick completes immediately; skip it so a freshly started
+        // agent is not reported late before it has run anything.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let Some(late) = health.overdue_by(Utc::now()).await else {
+                continue;
+            };
+            if late < grace {
+                continue;
+            }
+            health.record_failure().await;
+            let _ = alerts
+                .anomaly(
+                    AlertLevel::Critical,
+                    AnomalyKind::StalledCycle,
+                    "",
+                    &format!(
+                        "No cycle has completed for {}s past its scheduled wake",
+                        late.num_seconds()
+                    ),
+                )
+                .await;
+            health
+                .record_alert_delivery(!alerts.delivery_failing())
+                .await;
+        }
+    })
 }
 
 /// Persistent OS signal streams so a SIGINT/SIGTERM is never missed, even while
@@ -413,4 +511,31 @@ fn run_backtest(config: &AppConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stall_grace_scales_with_the_cadence_but_has_a_floor() {
+        // A short cadence must not make the watchdog trigger-happy: a single
+        // cycle can legitimately outlast several intervals while it waits on
+        // market data and valuation calls.
+        assert_eq!(
+            stall_grace(std::time::Duration::from_secs(60)),
+            chrono::Duration::minutes(5),
+            "the floor applies at a one-minute cadence"
+        );
+        assert_eq!(
+            stall_grace(std::time::Duration::from_secs(600)),
+            chrono::Duration::minutes(20),
+            "a ten-minute cadence gets twice the cadence"
+        );
+        assert_eq!(
+            stall_grace(std::time::Duration::ZERO),
+            chrono::Duration::minutes(5),
+            "a zero cadence still gets the floor, not zero"
+        );
+    }
 }

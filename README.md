@@ -33,7 +33,9 @@ A self-sustaining autonomous trading agent built in Rust that trades on [Polymar
 
 ## How It Works
 
-Every 10 minutes, the agent runs a cycle:
+Every 10 minutes — or, once venues are configured, whenever a venue has something
+tradeable, waking at the next market open rather than idling through a closed one —
+the agent runs a cycle:
 
 1. **Scan** — Discovers active markets via the Polymarket CLOB/Gamma API, filtered by volume (>$5k), spread (<5%), and resolution date (<14 days)
 2. **Data** — Gathers external context (weather via NOAA, sports via ESPN, crypto feeds, news) relevant to each market
@@ -166,7 +168,8 @@ cargo run --release
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `mode` | `"paper"` | `paper`, `live`, or `backtest` |
-| `cycle_interval_seconds` | `600` | Time between cycles (10 min) |
+| `cycle_interval_seconds` | `600` | Time between cycles while any venue has something tradeable (10 min) |
+| `max_sleep_seconds` | `3600` | Longest sleep while every venue is closed; the agent still wakes to mark positions and reconcile orders |
 | `initial_paper_balance` | `100.0` | Starting balance in paper mode |
 | `low_fuel_threshold` | `10.0` | Balance threshold for LowFuel state |
 | `death_balance_threshold` | `0.0` | Balance threshold for Dead state |

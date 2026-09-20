@@ -135,6 +135,7 @@ fn build_instruments(venue_id: &VenueId, market: &Market) -> Vec<Instrument> {
                 tick_size: Some(dec!(0.01)),
                 lot_size: None,
                 min_notional: None,
+                min_qty: None,
                 fractional: false,
                 meta: InstrumentMeta::Prediction {
                     condition_id: market.condition_id.clone(),
@@ -375,8 +376,10 @@ impl Venue for PolymarketVenue {
         Ok(Balance {
             ccy: "USDC".to_string(),
             available,
-            // Without venue-side position data, total equals free cash.
-            total: available,
+            // `positions` is unimplemented for this venue, so there is no way
+            // to value what is held. Reporting free cash as account value
+            // would understate the account by the whole of its open exposure.
+            total: None,
         })
     }
 

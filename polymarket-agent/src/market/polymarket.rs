@@ -1505,6 +1505,8 @@ mod tests {
             noaa_api_token: None,
             espn_api_key: None,
             dashboard_token: None,
+            alpaca_key_id: None,
+            alpaca_secret_key: None,
         }
     }
 }
