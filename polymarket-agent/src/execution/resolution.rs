@@ -53,7 +53,18 @@ pub async fn check_and_settle(
     http: &reqwest::Client,
     gamma_base_url: &str,
 ) -> Result<Vec<ResolutionResult>> {
-    let open_trades = store.get_open_trades().await?;
+    // Only prediction markets settle. A continuous position is closed by
+    // trading out of it, and its `market_id` is a symbol like "BTC/USD" —
+    // sending those to the Polymarket resolution API is one wasted request per
+    // open position per cycle, each logging a warning, and if Gamma ever
+    // answered for one of those strings the settlement path would book an
+    // equity position as a prediction-market win or loss.
+    let open_trades: Vec<_> = store
+        .get_open_trades()
+        .await?
+        .into_iter()
+        .filter(|t| t.direction == "YES" || t.direction == "NO")
+        .collect();
     if open_trades.is_empty() {
         return Ok(Vec::new());
     }
@@ -290,6 +301,66 @@ async fn settle_trade(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::db::store::{Store, VenueTradeRecord};
+
+    /// Only prediction markets settle. A continuous position's `market_id` is
+    /// a symbol like "BTC/USD", and sending those to the Polymarket
+    /// resolution API is a wasted request per position per cycle — and if
+    /// Gamma ever answered for one, the settlement path would book an equity
+    /// position as a prediction-market win or loss.
+    ///
+    #[tokio::test]
+    async fn continuous_positions_are_never_sent_to_the_resolution_api() {
+        let store = Store::new(":memory:").await.expect("store");
+        store
+            .insert_venue_trade(&VenueTradeRecord {
+                cycle: 1,
+                venue_id: "alpaca".to_string(),
+                symbol: "BTC/USD".to_string(),
+                asset_class: "crypto_spot".to_string(),
+                display_name: None,
+                side: "BUY".to_string(),
+                entry_price: "100".to_string(),
+                quantity: "1".to_string(),
+                notional: "100".to_string(),
+                avg_fill_price: Some("100".to_string()),
+                edge_at_entry: "0.05".to_string(),
+                fair_value: "0.6".to_string(),
+                confidence: "0.8".to_string(),
+                risk_pct: "0.0075".to_string(),
+                stop_pct: "0.03".to_string(),
+                status: "OPEN".to_string(),
+                stop_price: None,
+                target_price: None,
+                horizon_hours: None,
+                client_order_id: Some("c-1".to_string()),
+                venue_order_id: None,
+            })
+            .await
+            .expect("insert");
+
+        // A live mock, so the assertion is on requests *made* rather than on
+        // the call happening to fail. check_and_settle logs and continues past
+        // a failed lookup, so an unreachable host would pass either way.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let out = check_and_settle(&store, &http, &server.uri())
+            .await
+            .expect("settles nothing");
+
+        assert!(out.is_empty());
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            0,
+            "a crypto position must not be looked up in a prediction-market API"
+        );
+    }
     use crate::db::store::TradeRecord;
 
     fn open_yes_trade(id: i64, entry: &str, size: &str) -> TradeRecord {

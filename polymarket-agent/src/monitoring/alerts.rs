@@ -232,7 +232,26 @@ impl AlertClient {
             detail
         );
         self.send(&msg).await?;
+
+        // The quiet window is recorded optimistically above, before delivery
+        // is attempted. If the attempt failed, take it back: otherwise the
+        // one and only try never arrived and the anomaly stays suppressed for
+        // the next thirty minutes, which is precisely the window in which an
+        // operator most needs to hear about it.
+        if self.delivery_failing() {
+            self.forget(kind, scope);
+            return Ok(false);
+        }
         Ok(true)
+    }
+
+    /// Drop a quiet-window entry so the next tick may try again.
+    fn forget(&self, kind: AnomalyKind, scope: &str) {
+        let mut recent = self
+            .recent
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        recent.remove(&(kind, scope.to_string()));
     }
 
     /// Whether this `(kind, scope)` is outside its quiet window, recording the
@@ -511,6 +530,72 @@ mod tests {
             )
             .await
             .unwrap());
+    }
+
+    /// The quiet window is recorded before delivery is attempted, so a failed
+    /// send would otherwise suppress the anomaly for the next thirty minutes —
+    /// and the single attempt that was made never arrived.
+    ///
+    /// The webhook fails once and then succeeds, which is what makes this
+    /// discriminating: if the window survived the failure the retry would be
+    /// suppressed and never reach the now-healthy endpoint.
+    #[tokio::test]
+    async fn a_failed_delivery_is_retried_rather_than_suppressed() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let client = AlertClient::new(Some(server.uri()), true);
+
+        let first = client
+            .anomaly_at(
+                t(0),
+                AlertLevel::Critical,
+                AnomalyKind::StalledCycle,
+                "",
+                "late",
+            )
+            .await
+            .unwrap();
+        assert!(!first, "the 503 means nobody was told");
+        assert!(client.delivery_failing());
+
+        // One minute later — deep inside the 30-minute window.
+        let second = client
+            .anomaly_at(
+                t(1),
+                AlertLevel::Critical,
+                AnomalyKind::StalledCycle,
+                "",
+                "late",
+            )
+            .await
+            .unwrap();
+        assert!(
+            second,
+            "the retry must go out: the first attempt never arrived"
+        );
+        assert!(!client.delivery_failing());
+
+        // Now that one has landed, the window applies normally.
+        let third = client
+            .anomaly_at(
+                t(2),
+                AlertLevel::Critical,
+                AnomalyKind::StalledCycle,
+                "",
+                "late",
+            )
+            .await
+            .unwrap();
+        assert!(!third, "a delivered alert does start the quiet window");
     }
 
     #[tokio::test]

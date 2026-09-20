@@ -122,6 +122,9 @@ impl VenueCycle<'_> {
 
         let filter = ScanFilter {
             asset_classes: vec![AssetClass::CryptoSpot, AssetClass::Equity],
+            // The union across venues: discovery is one call for the whole
+            // registry, and each venue returns only the symbols it actually
+            // lists. Anything venue-specific is read per venue below.
             symbols: self.config.venue_symbols(),
             min_volume_24h: None,
             max_days_to_resolution: None,
@@ -250,7 +253,10 @@ impl VenueCycle<'_> {
 
         let view = parse_directional_response(&response.text)?;
 
-        let fee_pct = self.config.venue_fee_pct();
+        // The venue's own fee. Charging every venue the highest fee among
+        // them made a cheap venue's edge look unprofitable and stopped it
+        // trading at all.
+        let fee_pct = self.config.venue_fee_pct(venue.id().as_str());
         let cost_to_trade =
             directional::round_trip_cost(&quote, fee_pct, self.config.execution.max_slippage_pct);
 
@@ -452,7 +458,7 @@ impl VenueCycle<'_> {
                 status: status.to_string(),
                 stop_price: sizing
                     .stop_pct
-                    .map(|s| (fill_price * (Decimal::ONE - s)).to_string()),
+                    .map(|s| stop_level(fill_price, s, view.invalidation_price).to_string()),
                 // A take-profit has to be above what we paid. The model can
                 // return a mis-scaled or hallucinated level —
                 // `parse_directional_response` range-checks p_up, confidence,
@@ -521,6 +527,27 @@ struct EvaluationResult {
     /// running exposure total.
     notional: Decimal,
     placed: bool,
+}
+
+/// Where to stop out of a long.
+///
+/// The ATR stop sizes the position so a loss at that level equals the risk
+/// budget. The model separately names an `invalidation_price` — the level at
+/// which its own thesis is wrong — and that was parsed, range-checked, stored
+/// on the view and then read by nobody, so the agent would hold straight
+/// through a level it had itself identified as disproving the trade.
+///
+/// The tighter of the two wins, which for a long is the higher. That can only
+/// reduce the loss at the stop, so the risk arithmetic stays valid; taking the
+/// looser one would quietly widen the risk beyond what was sized for. An
+/// invalidation at or above the entry is nonsense for a long — it would exit
+/// on the first mark — so it is ignored.
+fn stop_level(entry: Decimal, stop_pct: Decimal, invalidation: Option<Decimal>) -> Decimal {
+    let atr_stop = entry * (Decimal::ONE - stop_pct);
+    match invalidation {
+        Some(level) if level > Decimal::ZERO && level < entry => atr_stop.max(level),
+        _ => atr_stop,
+    }
 }
 
 /// A take-profit level, if the model gave a believable one.
@@ -926,6 +953,29 @@ mod tests {
             portfolio_block(ceiling + dec!(1), 0, bankroll, &risk),
             Some("total exposure is at its cap")
         );
+    }
+
+    /// The model names the level at which its own thesis is wrong. That was
+    /// parsed, validated, stored and then read by nobody, so the agent would
+    /// hold straight through it.
+    #[test]
+    fn the_model_invalidation_tightens_the_stop_but_never_loosens_it() {
+        let entry = dec!(100);
+        let atr = dec!(0.03); // ATR stop at 97
+
+        assert_eq!(stop_level(entry, atr, None), dec!(97));
+
+        // Thesis breaks above the ATR stop: exit sooner.
+        assert_eq!(stop_level(entry, atr, Some(dec!(98))), dec!(98));
+
+        // Thesis breaks below it: keep the ATR stop, because widening would
+        // risk more than the position was sized for.
+        assert_eq!(stop_level(entry, atr, Some(dec!(90))), dec!(97));
+
+        // Nonsense levels for a long are ignored rather than obeyed.
+        assert_eq!(stop_level(entry, atr, Some(dec!(105))), dec!(97));
+        assert_eq!(stop_level(entry, atr, Some(entry)), dec!(97));
+        assert_eq!(stop_level(entry, atr, Some(Decimal::ZERO)), dec!(97));
     }
 
     /// A target below the entry books a loss as a take-profit: `evaluate_exit`

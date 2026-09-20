@@ -243,6 +243,8 @@ mod tests {
             atr_multiplier: dec!(2.0),
             min_stop_pct: dec!(0.03),
             max_stop_pct: dec!(0.12),
+            min_p_up: dec!(0.55),
+            max_orders_per_cycle: 2,
         }
     }
 

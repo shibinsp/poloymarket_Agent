@@ -104,7 +104,43 @@ impl Reconciler<'_> {
             Some(id) => OrderRef::Venue(id.clone()),
             None => OrderRef::Client(order.client_order_id.clone()),
         };
-        let ack = venue.get_order(&reference).await?;
+        let ack = match venue.get_order(&reference).await {
+            Ok(ack) => ack,
+            Err(e) => {
+                // The venue cannot tell us what happened. Normally that means
+                // keep blocking the symbol — guessing is how duplicate
+                // positions appear. But an order that was never acknowledged
+                // (no venue id) and is past its TTL has no evidence of ever
+                // having reached the venue, and blocking on it forever stops
+                // the symbol trading for good. `venue_cycle` writes the row
+                // before it submits, so a local failure — a quantity that
+                // rounds below the venue minimum, say — leaves exactly this
+                // shape behind.
+                if order.venue_order_id.is_none() && is_expired(order, now, self.order_ttl) {
+                    warn!(
+                        client_order_id = %order.client_order_id,
+                        symbol = %order.symbol,
+                        error = %e,
+                        "Venue has no record of an unacknowledged order past its TTL — \
+                         giving up on it rather than blocking the symbol indefinitely"
+                    );
+                    self.store
+                        .update_order_state(
+                            &order.client_order_id,
+                            "EXPIRED",
+                            None,
+                            &order.filled_qty,
+                            None,
+                            Some("never acknowledged by the venue; TTL elapsed"),
+                        )
+                        .await?;
+                    report.expired += 1;
+                    report.resolved += 1;
+                    return Ok(());
+                }
+                return Err(e);
+            }
+        };
 
         self.store
             .update_order_state(
@@ -138,7 +174,7 @@ impl Reconciler<'_> {
 
         // Still live at the venue. Cancel it if it has rested too long — an
         // order left resting is exposure the agent has stopped reasoning about.
-        if is_expired(order, now) {
+        if is_expired(order, now, self.order_ttl) {
             venue.cancel_order(&ack.venue_order_id).await?;
             self.store
                 .update_order_state(
@@ -341,22 +377,35 @@ impl Reconciler<'_> {
 /// Whether an order has rested past the deadline recorded when it was placed.
 ///
 /// Free rather than a method so it can be tested without a database.
-pub fn is_expired(order: &OrderRecord, now: DateTime<Utc>) -> bool {
-    match order_deadline(order) {
+pub fn is_expired(order: &OrderRecord, now: DateTime<Utc>, ttl: Duration) -> bool {
+    match order_deadline(order, ttl) {
         Some(deadline) => now >= deadline,
-        // No usable timestamp: leave it alone rather than cancel an order that
-        // may have been placed moments ago.
+        // No usable timestamp at all: leave it alone rather than cancel an
+        // order that may have been placed moments ago.
         None => false,
     }
 }
 
 /// When an order stops being worth waiting for.
-fn order_deadline(order: &OrderRecord) -> Option<DateTime<Utc>> {
-    order
-        .expires_at
-        .as_deref()
-        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.with_timezone(&Utc))
+///
+/// `expires_at` is the authority, but it is not always written — and when it
+/// is absent this used to return `None`, which means "never expires". The
+/// configured TTL is the fallback, applied from the submission time; without
+/// it `Reconciler::order_ttl` was constructed, never read, and any order
+/// lacking an `expires_at` rested forever while blocking its symbol.
+fn order_deadline(order: &OrderRecord, ttl: Duration) -> Option<DateTime<Utc>> {
+    let parse = |s: &str| {
+        DateTime::parse_from_rfc3339(s)
+            .ok()
+            .map(|dt| dt.with_timezone(&Utc))
+    };
+    order.expires_at.as_deref().and_then(parse).or_else(|| {
+        order
+            .submitted_at
+            .as_deref()
+            .and_then(parse)
+            .map(|t| t + ttl)
+    })
 }
 
 /// Whether the venue considers the order finished.
@@ -806,24 +855,55 @@ mod tests {
         assert!(!is_terminal(&OrderState::PartiallyFilled));
     }
 
+    const TTL: Duration = Duration::seconds(300);
+
     #[test]
     fn an_order_expires_only_after_its_recorded_deadline() {
         let deadline = Utc::now();
         let o = order(Some(&deadline.to_rfc3339()));
 
-        assert!(is_expired(&o, deadline + Duration::seconds(1)));
+        assert!(is_expired(&o, deadline + Duration::seconds(1), TTL));
         // At the deadline is expired — the boundary must not leave an order
         // resting one cycle longer than configured.
-        assert!(is_expired(&o, deadline));
-        assert!(!is_expired(&o, deadline - Duration::seconds(1)));
+        assert!(is_expired(&o, deadline, TTL));
+        assert!(!is_expired(&o, deadline - Duration::seconds(1), TTL));
     }
 
     #[test]
-    fn an_order_with_no_deadline_is_never_force_cancelled() {
-        // Cancelling on a missing timestamp would kill orders placed seconds
-        // ago by a build that didn't record one.
-        assert!(!is_expired(&order(None), Utc::now()));
-        assert!(!is_expired(&order(Some("not-a-timestamp")), Utc::now()));
+    fn an_order_with_no_timestamps_at_all_is_never_force_cancelled() {
+        // Nothing to measure from. Cancelling here would kill orders placed
+        // seconds ago by a build that recorded neither time.
+        assert!(!is_expired(&order(None), Utc::now(), TTL));
+        assert!(!is_expired(
+            &order(Some("not-a-timestamp")),
+            Utc::now(),
+            TTL
+        ));
+    }
+
+    /// Without this fallback the configured TTL had no effect whatsoever:
+    /// `Reconciler::order_ttl` was constructed and never read, and any order
+    /// written without an `expires_at` rested forever while blocking its
+    /// symbol from trading again.
+    #[test]
+    fn the_configured_ttl_applies_when_no_deadline_was_recorded() {
+        let submitted = Utc::now();
+        let mut o = order(None);
+        o.submitted_at = Some(submitted.to_rfc3339());
+
+        assert!(!is_expired(&o, submitted + Duration::seconds(299), TTL));
+        assert!(is_expired(&o, submitted + Duration::seconds(300), TTL));
+    }
+
+    /// An explicit deadline wins over the fallback.
+    #[test]
+    fn a_recorded_deadline_takes_precedence_over_the_ttl() {
+        let submitted = Utc::now();
+        let mut o = order(Some(&(submitted + Duration::seconds(10)).to_rfc3339()));
+        o.submitted_at = Some(submitted.to_rfc3339());
+
+        // Past the recorded deadline but well inside the 300s TTL.
+        assert!(is_expired(&o, submitted + Duration::seconds(11), TTL));
     }
 
     #[test]

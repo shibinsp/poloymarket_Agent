@@ -131,24 +131,38 @@ impl AppConfig {
             .collect()
     }
 
-    /// Per-side taker fee assumed when netting edge against costs.
-    pub fn venue_fee_pct(&self) -> Decimal {
+    /// Per-side taker fee for one venue.
+    ///
+    /// Asked per venue, not once for all of them. The previous version
+    /// returned the *maximum* fee across every enabled venue and applied it
+    /// uniformly, so configuring one expensive venue charged every Alpaca
+    /// edge calculation a fee it does not pay — enough to stop anything
+    /// clearing `should_trade`.
+    pub fn venue_fee_pct(&self, venue_id: &str) -> Decimal {
         self.venues
             .iter()
-            .filter(|v| v.enabled)
+            .find(|v| v.enabled && v.id == venue_id)
             .map(|v| v.fee_pct)
-            .max()
-            .unwrap_or(rust_decimal_macros::dec!(0.0025))
+            .unwrap_or(default_fee_pct())
+    }
+
+    /// The universe configured for one venue.
+    pub fn venue_symbols_for(&self, venue_id: &str) -> Vec<String> {
+        self.venues
+            .iter()
+            .find(|v| v.enabled && v.id == venue_id)
+            .map(|v| v.symbols.clone())
+            .unwrap_or_default()
     }
 
     /// Minimum probability-of-up before a directional view is tradeable.
     pub fn min_p_up(&self) -> Decimal {
-        rust_decimal_macros::dec!(0.55)
+        self.sizing_continuous.min_p_up
     }
 
     /// Cap on orders opened in a single cycle.
     pub fn max_orders_per_cycle(&self) -> usize {
-        2
+        self.sizing_continuous.max_orders_per_cycle
     }
 }
 
@@ -219,6 +233,23 @@ pub struct ContinuousSizingConfig {
     pub min_stop_pct: Decimal,
     #[serde(default = "default_max_stop_pct")]
     pub max_stop_pct: Decimal,
+    /// Minimum probability-of-up before a directional view is tradeable.
+    /// Config rather than a literal: it and the order cap are the two knobs an
+    /// operator most needs during a micro-capital rollout, and needing a
+    /// recompile to turn either one down is not a real control.
+    #[serde(default = "default_min_p_up")]
+    pub min_p_up: Decimal,
+    /// Cap on orders opened in a single cycle.
+    #[serde(default = "default_max_orders_per_cycle")]
+    pub max_orders_per_cycle: usize,
+}
+
+fn default_min_p_up() -> Decimal {
+    rust_decimal_macros::dec!(0.55)
+}
+
+fn default_max_orders_per_cycle() -> usize {
+    2
 }
 
 impl Default for ContinuousSizingConfig {
@@ -229,6 +260,8 @@ impl Default for ContinuousSizingConfig {
             atr_multiplier: default_atr_multiplier(),
             min_stop_pct: default_min_stop_pct(),
             max_stop_pct: default_max_stop_pct(),
+            min_p_up: default_min_p_up(),
+            max_orders_per_cycle: default_max_orders_per_cycle(),
         }
     }
 }

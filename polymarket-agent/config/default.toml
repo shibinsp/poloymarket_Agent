@@ -89,3 +89,5 @@ atr_period = 14
 atr_multiplier = 2.0            # stop distance = ATR x this, then clamped
 min_stop_pct = 0.03
 max_stop_pct = 0.12
+min_p_up = 0.55                 # minimum probability-of-up before a view is tradeable
+max_orders_per_cycle = 2        # cap on new positions opened per cycle

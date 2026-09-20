@@ -9,7 +9,7 @@
 //! dashboard see real numbers rather than entry cost) and closed when the stop,
 //! the target, or the maximum holding period is reached.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
@@ -113,6 +113,8 @@ impl VenueExits<'_> {
             .filter_map(|o| o.trade_id)
             .collect();
 
+        let mut instruments: HashMap<String, Vec<Instrument>> = HashMap::new();
+
         for trade in open {
             if exiting.contains(&trade.id) {
                 // Still mark it to market — an exit in flight does not stop
@@ -126,7 +128,7 @@ impl VenueExits<'_> {
                 }
                 continue;
             }
-            match self.process(&trade, now, cycle).await {
+            match self.process(&trade, now, cycle, &mut instruments).await {
                 Ok(true) => closed += 1,
                 Ok(false) => {}
                 Err(e) => warn!(
@@ -165,6 +167,7 @@ impl VenueExits<'_> {
         trade: &VenueOpenTrade,
         now: DateTime<Utc>,
         cycle: i64,
+        instruments: &mut HashMap<String, Vec<Instrument>>,
     ) -> Result<bool> {
         let venue_id = VenueId::new(trade.venue_id.clone());
         let Some(venue) = self.registry.get(&venue_id) else {
@@ -213,8 +216,17 @@ impl VenueExits<'_> {
             "Exit triggered"
         );
 
-        self.submit_exit(venue, trade, &instrument_id, mark, qty, reason, cycle)
-            .await?;
+        self.submit_exit(
+            venue,
+            trade,
+            &instrument_id,
+            mark,
+            qty,
+            reason,
+            cycle,
+            instruments,
+        )
+        .await?;
         Ok(true)
     }
 
@@ -228,10 +240,11 @@ impl VenueExits<'_> {
         qty: Decimal,
         reason: ExitReason,
         cycle: i64,
+        instruments: &mut HashMap<String, Vec<Instrument>>,
     ) -> Result<()> {
         // Re-resolve the instrument so lot/tick rules come from the venue
         // rather than being reconstructed from the stored row.
-        let instrument = self.resolve(venue, instrument_id).await?;
+        let instrument = self.resolve(venue, instrument_id, instruments).await?;
         let limit_price = instrument.round_price(mark, Side::Sell);
         let client_order_id = Uuid::new_v4().to_string();
 
@@ -342,16 +355,29 @@ impl VenueExits<'_> {
         Ok(())
     }
 
-    async fn resolve(&self, venue: &dyn Venue, id: &InstrumentId) -> Result<Instrument> {
-        let filter = crate::venue::types::ScanFilter {
-            symbols: vec![id.symbol.clone()],
-            ..Default::default()
-        };
-        venue
-            .list_instruments(&filter)
-            .await?
-            .into_iter()
-            .find(|i| &i.id == id)
+    /// The instrument, for its tick and lot rules.
+    ///
+    /// Cached for the pass. Each call is a full instrument listing at the
+    /// venue — for Alpaca a `/v2/assets` fetch — and it used to run once per
+    /// exiting position, discarding all but one row. Ten positions leaving in
+    /// one cycle meant ten whole-universe downloads on top of ten quotes,
+    /// against an API whose rate limit the agent is already budgeting for.
+    async fn resolve(
+        &self,
+        venue: &dyn Venue,
+        id: &InstrumentId,
+        cache: &mut HashMap<String, Vec<Instrument>>,
+    ) -> Result<Instrument> {
+        let key = venue.id().to_string();
+        if !cache.contains_key(&key) {
+            let listed = venue
+                .list_instruments(&crate::venue::types::ScanFilter::default())
+                .await?;
+            cache.insert(key.clone(), listed);
+        }
+        cache
+            .get(&key)
+            .and_then(|list| list.iter().find(|i| &i.id == id).cloned())
             .ok_or_else(|| anyhow::anyhow!("Instrument {id} is no longer listed — cannot exit it"))
     }
 }
