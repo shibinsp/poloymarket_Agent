@@ -63,6 +63,9 @@ pub struct Agent {
     last_balance: Decimal,
     /// Venues from `[[venues]]`. Empty keeps the legacy Polymarket-only path.
     venues: VenueRegistry,
+    /// Which platforms are configured and which actually built. Static after
+    /// startup; handed to the dashboard so a skipped venue is visible.
+    venue_status: Vec<crate::venue::VenueStatus>,
     /// Consecutive cycles in which no equity figure could be established.
     unknown_equity_cycles: u32,
     /// Shared with the valuation engine; the venue cycle calls it directly
@@ -189,7 +192,13 @@ impl Agent {
 
         // Venues declared in [[venues]]. Sharing the Polymarket client keeps
         // one paper balance across both the legacy and venue paths.
-        let venues = crate::venue::factory::build_registry(&config, &secrets, polymarket.clone())?;
+        // `_reporting`, so the *reasons* survive: a venue can be skipped for
+        // missing credentials, an unknown `kind`, or a refusal to build in
+        // paper mode, and telling an operator the wrong one sends them to the
+        // wrong file. The dashboard shows them.
+        let (venues, skipped_venues) =
+            crate::venue::factory::build_registry_reporting(&config, &secrets, polymarket.clone());
+        let venue_status = crate::venue::venue_status(&config.venues, &venues, &skipped_venues);
 
         // Phase 5: Initialize portfolio manager
         let portfolio = PortfolioManager::new(config.risk.clone());
@@ -220,6 +229,7 @@ impl Agent {
 
         Ok(Self {
             unknown_equity_cycles: 0,
+            venue_status,
             config,
             store,
             state: AgentState::Alive,
@@ -474,6 +484,11 @@ impl Agent {
     /// Zero in normal operation. Worth reading rather than inferring: it is
     /// the difference between "one book call failed" and "the risk limits
     /// have not been evaluated since this morning".
+    /// Which platforms this agent trades, and whether each one is working.
+    pub fn venue_status(&self) -> &[crate::venue::VenueStatus] {
+        &self.venue_status
+    }
+
     pub fn unknown_equity_cycles(&self) -> u32 {
         self.unknown_equity_cycles
     }

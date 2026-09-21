@@ -415,6 +415,10 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
         config.risk.clone(),
         config.agent.mode,
     );
+    // Filled in below, once the agent has built the registry: which venues
+    // exist is only knowable after trying to construct them.
+    let venue_handle = dashboard_state.venue_handle();
+
     let dashboard_handle = spawn_dashboard(
         dashboard_state,
         &config.monitoring.dashboard_bind,
@@ -423,6 +427,7 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
     )?;
 
     let mut agent = Agent::new(config.clone(), secrets, store, kill_switch.clone()).await?;
+    *venue_handle.write().await = agent.venue_status().to_vec();
     let signal_halt = spawn_signal_halt(kill_switch.clone());
     let halt_poller = spawn_halt_file_poller(kill_switch.clone());
     let mut halt_trips = kill_switch.subscribe();

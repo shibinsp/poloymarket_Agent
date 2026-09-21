@@ -21,6 +21,7 @@ import {
   fetchOrders,
   fetchReconciliation,
   fetchRisk,
+  fetchVenues,
   fetchTrades,
   fetchTradesAll,
   type DatasetKey,
@@ -54,6 +55,7 @@ const FETCHERS: Record<DatasetKey, Fetcher> = {
   equity: fetchEquity,
   reconciliation: fetchReconciliation,
   risk: fetchRisk,
+  venues: fetchVenues,
 };
 
 function blank(): DatasetState {

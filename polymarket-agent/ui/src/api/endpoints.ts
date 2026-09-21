@@ -13,6 +13,7 @@ import type {
   ReconciliationRun,
   RiskStatus,
   TradeRecord,
+  VenueStatus,
 } from "./types";
 
 export const DATASET_KEYS = [
@@ -28,6 +29,7 @@ export const DATASET_KEYS = [
   "equity",
   "reconciliation",
   "risk",
+  "venues",
 ] as const;
 export type DatasetKey = (typeof DATASET_KEYS)[number];
 
@@ -45,6 +47,7 @@ export const DATASET_LABELS: Record<DatasetKey, string> = {
   equity: "Daily equity",
   reconciliation: "Reconciliation",
   risk: "Risk limits",
+  venues: "Venues",
 };
 
 export const DATASET_PATHS: Record<DatasetKey, string> = {
@@ -60,6 +63,7 @@ export const DATASET_PATHS: Record<DatasetKey, string> = {
   equity: "/api/equity",
   reconciliation: "/api/reconciliation",
   risk: "/api/risk",
+  venues: "/api/venues",
 };
 
 /**
@@ -85,6 +89,10 @@ export const DATASET_INTERVAL_MULTIPLIER: Record<DatasetKey, number> = {
   // One row per day and one per reconciliation pass; neither moves fast.
   equity: 4,
   reconciliation: 4,
+  // Fixed at startup: which venues built is decided once and never changes
+  // while the process lives. Polled at all only so the page fills in when the
+  // dashboard came up before the agent finished initialising.
+  venues: 4,
 };
 
 export function fetchHealth(signal?: AbortSignal): Promise<ApiResult<Health>> {
@@ -129,6 +137,10 @@ export function fetchReconciliation(
 
 export function fetchRisk(signal?: AbortSignal): Promise<ApiResult<RiskStatus>> {
   return get({ path: DATASET_PATHS.risk, narrow: asObject<RiskStatus>, signal });
+}
+
+export function fetchVenues(signal?: AbortSignal): Promise<ApiResult<VenueStatus[]>> {
+  return get({ path: DATASET_PATHS.venues, narrow: asArray<VenueStatus>, signal });
 }
 
 /**

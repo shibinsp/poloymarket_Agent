@@ -310,3 +310,8 @@ td.truncate { max-width: 340px; overflow: hidden; text-overflow: ellipsis; }
   padding: 3px 6px;
   font: inherit;
 }
+
+/* Table cells whose content is prose rather than a value. The default is
+   nowrap, which is right for numbers and wrong for a sentence explaining why
+   a venue will not trade. */
+.cell-wrap { white-space: normal; display: inline-block; min-width: 22ch; }

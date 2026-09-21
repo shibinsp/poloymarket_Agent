@@ -248,3 +248,27 @@ export interface ApiCostRecord {
   /** Bare UTC, no zone. Use `parseTs`. */
   created_at: string | null;
 }
+
+/**
+ * `/api/venues`. Which platforms this agent trades, and whether each one is
+ * actually working.
+ *
+ * `enabled` is what the config asked for; `active` is what the registry
+ * actually built. When they disagree, `reason` says why — missing
+ * credentials, a typo in `kind`, or a refusal to build a live-only venue
+ * outside live mode.
+ */
+export interface VenueStatus {
+  id: string;
+  kind: string;
+  enabled: boolean;
+  active: boolean;
+  reason: string | null;
+  symbols: string[];
+  /** Decimal-as-string, like every other money value on this API. */
+  fee_pct: string;
+  asset_classes: string[];
+  session: string;
+  reports_equity: boolean;
+  paper_trading: boolean;
+}

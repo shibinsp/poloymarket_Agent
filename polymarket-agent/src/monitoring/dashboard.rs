@@ -46,6 +46,11 @@ pub struct DashboardState {
     /// from an HTTP handler would mean a halt whose side effects depend on
     /// which route raised it.
     kill_switch: Arc<KillSwitch>,
+    /// Which platforms are configured and whether each one is actually
+    /// trading. Published by the agent once the registry is built, because a
+    /// venue's status is only knowable after an attempt to construct it —
+    /// "enabled in the config" and "in the registry" are different sets.
+    venues: Arc<tokio::sync::RwLock<Vec<crate::venue::VenueStatus>>>,
 }
 
 impl DashboardState {
@@ -72,7 +77,17 @@ impl DashboardState {
                 .map(|t| t.trim().to_string())
                 .filter(|t| !t.is_empty())
                 .map(|t| Arc::from(t.as_str())),
+            venues: Arc::new(tokio::sync::RwLock::new(Vec::new())),
         }
+    }
+
+    /// A handle the agent fills in once it has built the registry.
+    ///
+    /// Empty until then, which the page renders as "starting up" rather than
+    /// as "no platforms configured" — the dashboard deliberately serves
+    /// before the agent finishes initialising.
+    pub fn venue_handle(&self) -> Arc<tokio::sync::RwLock<Vec<crate::venue::VenueStatus>>> {
+        self.venues.clone()
     }
 }
 
@@ -145,6 +160,7 @@ fn build_router(state: DashboardState) -> Router {
         .route("/api/equity", get(equity_handler))
         .route("/api/reconciliation", get(reconciliation_handler))
         .route("/api/risk", get(risk_handler))
+        .route("/api/venues", get(venues_handler))
         .route("/api/halt", get(halt_status_handler))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
 
@@ -328,6 +344,16 @@ async fn reconciliation_handler(State(state): State<DashboardState>) -> impl Int
 /// answers the question an operator actually has, which is *how close am I*.
 /// Reported as raw numbers rather than a single percentage so the page can
 /// show both the limit and the distance to it.
+/// Which platforms this agent trades, and whether each one is working.
+///
+/// Answers the question no other screen could: a venue that is configured but
+/// skipped — missing credentials, a typo in `kind`, or Coinbase in paper mode
+/// — simply did not appear anywhere in the UI, and the only record of why was
+/// one line in the startup log.
+async fn venues_handler(State(state): State<DashboardState>) -> impl IntoResponse {
+    Json(state.venues.read().await.clone())
+}
+
 async fn risk_handler(State(state): State<DashboardState>) -> impl IntoResponse {
     let today = chrono::Utc::now().date_naive();
     let cfg = &state.risk;

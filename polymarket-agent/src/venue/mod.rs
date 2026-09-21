@@ -493,3 +493,187 @@ mod tests {
         assert!(!reg.is_empty());
     }
 }
+
+/// What the dashboard needs to answer "which platforms does this agent trade,
+/// and is each one actually working".
+///
+/// Every field here was already computed at startup and then thrown away:
+/// `build_registry_reporting` returns why a venue was skipped, and nothing
+/// kept it. An operator who enabled Coinbase in paper mode saw it vanish with
+/// no trace anywhere in the UI — the reason was one line in the startup log,
+/// which is not where anyone looks when a venue is simply absent.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct VenueStatus {
+    pub id: String,
+    /// `alpaca`, `coinbase`, `binance_us`, `polymarket`.
+    pub kind: String,
+    /// What the config asked for.
+    pub enabled: bool,
+    /// Whether it is actually in the registry and will be traded.
+    pub active: bool,
+    /// Why not, when `enabled` and `active` disagree.
+    pub reason: Option<String>,
+    pub symbols: Vec<String>,
+    /// Serialized as a string: `rust_decimal`'s `serde-str` is how every
+    /// money value crosses this API, and the UI parses them as such.
+    pub fee_pct: Decimal,
+    pub asset_classes: Vec<String>,
+    /// `always` for 24/7 crypto, otherwise the market's session.
+    pub session: String,
+    /// False for a venue that cannot value its own book — every loss limit is
+    /// measured against equity summed across the registry, so this is the
+    /// difference between the breakers running and the agent halting.
+    pub reports_equity: bool,
+    /// Whether the platform has a paper endpoint at all.
+    ///
+    /// The single most load-bearing fact about a venue here: Alpaca has a
+    /// separate paper host, and Coinbase and Binance.US have nothing — so
+    /// enabling either means real money, which is why the agent refuses to
+    /// build them outside live mode.
+    pub paper_trading: bool,
+}
+
+/// Whether this venue kind has a paper endpoint.
+///
+/// Stated once, here, rather than inferred at each call site: Coinbase's
+/// sandbox serves auth and serialization with no matching engine, and
+/// `testnet.binance.vision` belongs to global Binance, a different exchange
+/// that blocks US persons.
+pub fn kind_supports_paper(kind: &str) -> bool {
+    match kind.to_ascii_lowercase().as_str() {
+        "alpaca" => true,
+        // In-process paper simulation rather than a venue endpoint.
+        "polymarket" => true,
+        _ => false,
+    }
+}
+
+/// Fold the config, the registry and the skip reasons into one answer.
+pub fn venue_status(
+    configured: &[crate::config::VenueConfig],
+    registry: &VenueRegistry,
+    skipped: &[crate::venue::factory::SkippedVenue],
+) -> Vec<VenueStatus> {
+    configured
+        .iter()
+        .map(|cfg| {
+            let built = registry
+                .all()
+                .find(|v| v.id().as_str().eq_ignore_ascii_case(&cfg.id));
+            VenueStatus {
+                id: cfg.id.clone(),
+                kind: cfg.kind.clone(),
+                enabled: cfg.enabled,
+                active: built.is_some(),
+                reason: skipped
+                    .iter()
+                    .find(|s| s.id == cfg.id)
+                    .map(|s| s.reason.clone())
+                    .or_else(|| (!cfg.enabled).then(|| "disabled in the config".to_string())),
+                symbols: cfg.symbols.clone(),
+                fee_pct: cfg.fee_pct,
+                asset_classes: built
+                    .map(|v| {
+                        v.capabilities()
+                            .asset_classes
+                            .iter()
+                            .map(|c| format!("{c:?}"))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                session: built
+                    .map(|v| format!("{:?}", v.session()))
+                    .unwrap_or_else(|| "unknown".to_string()),
+                reports_equity: built.map(|v| v.reports_equity()).unwrap_or(false),
+                paper_trading: kind_supports_paper(&cfg.kind),
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod venue_status_tests {
+    use super::*;
+    use crate::config::VenueConfig;
+    use crate::venue::factory::SkippedVenue;
+    use crate::venue::session::TradingSession;
+    use crate::venue::test_support::StubVenue;
+    use rust_decimal_macros::dec;
+
+    fn cfg(id: &str, kind: &str, enabled: bool) -> VenueConfig {
+        VenueConfig {
+            id: id.to_string(),
+            kind: kind.to_string(),
+            enabled,
+            base_url: None,
+            data_url: None,
+            symbols: vec!["BTC/USD".to_string()],
+            fee_pct: dec!(0.0025),
+        }
+    }
+
+    /// The case the page exists for: enabled, not in the registry, and the
+    /// reason is the only record of why. Before this it was one startup log
+    /// line and the venue simply did not appear in the UI at all.
+    #[test]
+    fn an_enabled_but_skipped_venue_carries_its_reason() {
+        let registry = VenueRegistry::new(Vec::new());
+        let skipped = vec![SkippedVenue {
+            id: "coinbase".to_string(),
+            reason: "Coinbase has no paper endpoint".to_string(),
+        }];
+
+        let status = venue_status(&[cfg("coinbase", "coinbase", true)], &registry, &skipped);
+
+        assert_eq!(status.len(), 1);
+        assert!(status[0].enabled, "the config asked for it");
+        assert!(!status[0].active, "and it is not trading");
+        assert_eq!(
+            status[0].reason.as_deref(),
+            Some("Coinbase has no paper endpoint")
+        );
+    }
+
+    #[test]
+    fn a_venue_that_built_is_active_and_has_no_reason() {
+        let registry = VenueRegistry::new(vec![Box::new(StubVenue::new(
+            "alpaca",
+            TradingSession::Always,
+            &["BTC/USD"],
+            false,
+        ))]);
+
+        let status = venue_status(&[cfg("alpaca", "alpaca", true)], &registry, &[]);
+
+        assert!(status[0].active);
+        assert_eq!(status[0].reason, None);
+        assert_eq!(status[0].session, "Always");
+        assert!(status[0].reports_equity);
+    }
+
+    /// Disabled is not the same as broken, and saying "skipped" for it would
+    /// send an operator looking for a fault they chose.
+    #[test]
+    fn a_disabled_venue_says_so_rather_than_reporting_a_failure() {
+        let registry = VenueRegistry::new(Vec::new());
+        let status = venue_status(&[cfg("polymarket", "polymarket", false)], &registry, &[]);
+
+        assert!(!status[0].enabled);
+        assert_eq!(status[0].reason.as_deref(), Some("disabled in the config"));
+    }
+
+    /// The single most load-bearing fact on the page: a platform with no paper
+    /// endpoint trades real money the moment it is enabled.
+    #[test]
+    fn only_the_platforms_with_a_paper_path_report_one() {
+        assert!(kind_supports_paper("alpaca"));
+        assert!(kind_supports_paper("Alpaca"), "matched case-insensitively");
+        assert!(kind_supports_paper("polymarket"), "simulated in process");
+        assert!(!kind_supports_paper("coinbase"));
+        assert!(!kind_supports_paper("binance_us"));
+        assert!(
+            !kind_supports_paper("something_new"),
+            "absence is not a paper path"
+        );
+    }
+}

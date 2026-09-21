@@ -10,6 +10,7 @@ export const ROUTES: RouteDef[] = [
   { path: "/trades", label: "Trades", title: "Trades" },
   { path: "/orders", label: "Orders", title: "Orders and fills" },
   { path: "/risk", label: "Risk", title: "Risk and reconciliation" },
+  { path: "/venues", label: "Venues", title: "Venues and platforms" },
   { path: "/cycles", label: "Cycles", title: "Cycles" },
   { path: "/costs", label: "Costs", title: "API costs" },
   { path: "/health", label: "Health", title: "Health" },

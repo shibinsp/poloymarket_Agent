@@ -5,6 +5,7 @@ import { Overview } from "./pages/Overview";
 import { Trades } from "./pages/Trades";
 import { Orders } from "./pages/Orders";
 import { Risk } from "./pages/Risk";
+import { Venues } from "./pages/Venues";
 import { Cycles } from "./pages/Cycles";
 import { Costs } from "./pages/Costs";
 import { Health } from "./pages/Health";
@@ -28,6 +29,8 @@ export function App() {
         <Trades />
       ) : path === "/orders" ? (
         <Orders />
+      ) : path === "/venues" ? (
+        <Venues />
       ) : path === "/risk" ? (
         <Risk />
       ) : path === "/cycles" ? (
