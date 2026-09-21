@@ -139,6 +139,33 @@ pub struct KillSwitch {
     tripped: AtomicBool,
     current: Mutex<Option<Halt>>,
     halt_file: PathBuf,
+    /// Bumped on every trip, so the main loop can cut its sleep short.
+    ///
+    /// Without this the agent reacts to a halt only at its next scheduled
+    /// wake — up to `cycle_interval_seconds`, and up to `max_sleep_seconds`
+    /// (an hour by default) when every venue is closed. For the one control
+    /// whose promise is "stop now", and whose go-live criterion is that
+    /// resting orders are cancelled within one cycle, an hour of latency is
+    /// not a detail.
+    ///
+    /// A version counter rather than a `Notify`, for two reasons. A `Notify`
+    /// that reports "is or becomes tripped" fires immediately on every loop
+    /// iteration while a halt is in force, turning the idle sleep into a busy
+    /// spin that runs cycles back to back. And one that reports only
+    /// transitions has a race between the caller's check and its await.
+    /// Watch semantics have neither problem: the loop marks the version it
+    /// has acted on, and `changed()` fires only when a *newer* one arrives.
+    trips: tokio::sync::watch::Sender<u64>,
+    /// Whether the agent loop has run the side effects for the current halt.
+    ///
+    /// Tripping is cheap and happens from four places, two of which are not
+    /// the agent — an HTTP handler and a signal handler, neither of which can
+    /// cancel an order or write to SQLite without racing a cycle. So they set
+    /// the flag and the loop does the work, which means the loop needs to
+    /// know whether that work is still outstanding. Without this, a halt from
+    /// `/api/halt` or SIGUSR1 stopped entries but never cancelled the resting
+    /// orders the dashboard promised it would.
+    handled: AtomicBool,
 }
 
 impl KillSwitch {
@@ -147,7 +174,30 @@ impl KillSwitch {
             tripped: AtomicBool::new(false),
             current: Mutex::new(None),
             halt_file,
+            trips: tokio::sync::watch::Sender::new(0),
+            handled: AtomicBool::new(false),
         }
+    }
+
+    /// The halt whose side effects are still outstanding, if any.
+    ///
+    /// Returns a given halt exactly once, so the caller can cancel resting
+    /// orders, alert and persist without repeating any of it on the cycles
+    /// that follow.
+    pub fn take_unhandled(&self) -> Option<Halt> {
+        let halt = self.lock().clone()?;
+        if self.handled.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        Some(halt)
+    }
+
+    /// A receiver that fires when a halt is raised.
+    ///
+    /// Call `borrow_and_update()` once the caller has acted on the current
+    /// state; `changed()` then resolves only on a trip after that point.
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.trips.subscribe()
     }
 
     pub fn halt_file(&self) -> &Path {
@@ -181,6 +231,9 @@ impl KillSwitch {
         // Release-ordered, and written while the lock is held, so any thread
         // that observes `tripped` can also observe the reason.
         self.tripped.store(true, Ordering::Release);
+        self.handled.store(false, Ordering::Release);
+        drop(current);
+        self.trips.send_modify(|v| *v += 1);
         true
     }
 
@@ -193,6 +246,7 @@ impl KillSwitch {
         let mut current = self.lock();
         let was = current.take();
         self.tripped.store(false, Ordering::Release);
+        self.handled.store(false, Ordering::Release);
         drop(current);
 
         match std::fs::remove_file(&self.halt_file) {
@@ -232,6 +286,7 @@ impl KillSwitch {
                 let mut current = self.lock();
                 *current = None;
                 self.tripped.store(false, Ordering::Release);
+                self.handled.store(false, Ordering::Release);
                 None
             }
             _ => None,
@@ -256,6 +311,7 @@ impl KillSwitch {
         if lift {
             *current = None;
             self.tripped.store(false, Ordering::Release);
+            self.handled.store(false, Ordering::Release);
         }
         lift
     }
@@ -282,6 +338,199 @@ mod tests {
 
     fn switch(dir: &tempfile::TempDir) -> KillSwitch {
         KillSwitch::new(dir.path().join("HALT"))
+    }
+
+    /// The signal exists so an idle loop does not sleep through a halt.
+    #[tokio::test]
+    async fn a_subscriber_is_woken_when_the_switch_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = switch(&dir);
+        let mut rx = s.subscribe();
+        rx.borrow_and_update();
+
+        s.trip(Halt::new(
+            HaltSource::Api,
+            HaltScope::UntilResume,
+            "x",
+            at(21),
+        ));
+
+        // Already sent, so this resolves without needing a timeout.
+        rx.changed().await.expect("the sender outlives this");
+    }
+
+    /// The bug this shape was chosen to avoid: a signal meaning "is tripped"
+    /// rather than "has just tripped" fires on every loop iteration while a
+    /// halt is in force, so the idle sleep never happens and the agent runs
+    /// cycles back to back for as long as it is halted.
+    #[tokio::test]
+    async fn an_already_handled_halt_does_not_wake_the_loop_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = switch(&dir);
+        let mut rx = s.subscribe();
+
+        s.trip(Halt::new(
+            HaltSource::Api,
+            HaltScope::UntilResume,
+            "x",
+            at(21),
+        ));
+        // The loop runs its cycle and marks what it has acted on.
+        rx.changed().await.unwrap();
+        rx.borrow_and_update();
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.changed())
+                .await
+                .is_err(),
+            "a halt already acted on must not wake the loop again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_distinct_halt_after_a_resume_wakes_the_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = switch(&dir);
+        let mut rx = s.subscribe();
+        rx.borrow_and_update();
+
+        s.trip(Halt::new(
+            HaltSource::Api,
+            HaltScope::UntilResume,
+            "first",
+            at(21),
+        ));
+        rx.changed().await.unwrap();
+        rx.borrow_and_update();
+
+        s.clear().unwrap();
+        s.trip(Halt::new(
+            HaltSource::CircuitBreaker,
+            HaltScope::RestOfDay,
+            "second",
+            at(21),
+        ));
+        rx.changed()
+            .await
+            .expect("a genuinely new halt must wake the loop");
+    }
+
+    /// A trip that is not new — the switch was already halted — must not
+    /// wake anyone: the loop has already acted on that halt.
+    #[tokio::test]
+    async fn a_redundant_trip_does_not_wake_the_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = switch(&dir);
+        s.trip(Halt::new(
+            HaltSource::Api,
+            HaltScope::UntilResume,
+            "first",
+            at(21),
+        ));
+        let mut rx = s.subscribe();
+        rx.borrow_and_update();
+
+        assert!(
+            !s.trip(Halt::new(
+                HaltSource::Signal,
+                HaltScope::UntilResume,
+                "second",
+                at(21)
+            )),
+            "already halted"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.changed())
+                .await
+                .is_err(),
+            "a refused trip must not signal"
+        );
+    }
+
+    /// The hole this closed: a halt from `/api/halt` or SIGUSR1 set the flag
+    /// but never reached the code that cancels resting orders, sends the
+    /// alert and writes the row that survives a restart — because that work
+    /// keyed off the return value of `trip`, which only the agent's own
+    /// callers ever saw. The dashboard meanwhile promised the cancellation.
+    #[test]
+    fn a_halt_raised_from_outside_the_loop_is_still_handed_to_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = switch(&dir);
+
+        // Exactly what the HTTP handler and the signal handler do.
+        s.trip(Halt::new(
+            HaltSource::Api,
+            HaltScope::UntilResume,
+            "operator",
+            at(21),
+        ));
+
+        let pending = s
+            .take_unhandled()
+            .expect("the loop must be given work to do");
+        assert_eq!(pending.source, HaltSource::Api);
+    }
+
+    #[test]
+    fn a_halt_is_handed_over_exactly_once() {
+        // Otherwise every cycle for the rest of the halt re-cancels orders
+        // and re-sends the alert.
+        let dir = tempfile::tempdir().unwrap();
+        let s = switch(&dir);
+        s.trip(Halt::new(
+            HaltSource::Api,
+            HaltScope::UntilResume,
+            "x",
+            at(21),
+        ));
+
+        assert!(s.take_unhandled().is_some());
+        assert!(s.take_unhandled().is_none(), "second look must be empty");
+        assert!(s.take_unhandled().is_none());
+    }
+
+    #[test]
+    fn nothing_is_pending_when_nothing_is_halted() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = switch(&dir);
+        assert!(s.take_unhandled().is_none());
+    }
+
+    #[test]
+    fn a_fresh_halt_after_a_resume_is_pending_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = switch(&dir);
+        s.trip(Halt::new(
+            HaltSource::Api,
+            HaltScope::UntilResume,
+            "first",
+            at(21),
+        ));
+        s.take_unhandled();
+        s.clear().unwrap();
+
+        s.trip(Halt::new(
+            HaltSource::CircuitBreaker,
+            HaltScope::RestOfDay,
+            "second",
+            at(21),
+        ));
+        let pending = s
+            .take_unhandled()
+            .expect("a new halt needs its own orders cancelled");
+        assert_eq!(pending.source, HaltSource::CircuitBreaker);
+    }
+
+    #[test]
+    fn a_halt_from_the_file_is_pending_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = switch(&dir);
+        std::fs::write(s.halt_file(), "stop").unwrap();
+        s.sync_with_file(at(21));
+        assert_eq!(
+            s.take_unhandled().map(|h| h.source),
+            Some(HaltSource::HaltFile)
+        );
     }
 
     #[test]

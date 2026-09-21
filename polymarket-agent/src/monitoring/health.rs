@@ -37,13 +37,6 @@ struct HealthData {
     /// getting out, this says what there was to send. Without it a deduped
     /// webhook makes "once" and "four hundred times" look identical.
     anomalies: std::collections::BTreeMap<String, u64>,
-    /// Whether new positions are stopped, and why.
-    ///
-    /// Reported separately from `agent_state` rather than only folded into
-    /// it, because the reason is the part an operator needs and a state name
-    /// cannot carry it.
-    halted: bool,
-    halt: Option<serde_json::Value>,
 }
 
 impl HealthState {
@@ -59,8 +52,6 @@ impl HealthState {
                 next_cycle_due: None,
                 alerts_delivering: true,
                 anomalies: std::collections::BTreeMap::new(),
-                halted: false,
-                halt: None,
             })),
         }
     }
@@ -106,19 +97,21 @@ impl HealthState {
         };
     }
 
-    /// Publish the anomaly tally and the current halt, if any.
-    pub async fn record_diagnostics(
-        &self,
-        anomalies: std::collections::BTreeMap<&'static str, u64>,
-        halt: Option<&crate::agent::kill_switch::Halt>,
-    ) {
+    /// Publish the anomaly tally.
+    ///
+    /// Halt state is deliberately *not* published here. This snapshot is
+    /// written once a cycle completes, and a cycle can legitimately take
+    /// minutes — the first one against an unreachable venue took several.
+    /// A halt raised during that window would have been reported as `false`
+    /// by `/api/health` while `/api/halt` reported `true`, and the dashboard
+    /// reads health. The handler reads the switch itself instead, so there
+    /// is one source of truth and it is never stale.
+    pub async fn record_anomalies(&self, anomalies: std::collections::BTreeMap<&'static str, u64>) {
         let mut data = self.inner.write().await;
         data.anomalies = anomalies
             .into_iter()
             .map(|(k, v)| (k.to_string(), v))
             .collect();
-        data.halted = halt.is_some();
-        data.halt = halt.and_then(|h| serde_json::to_value(h).ok());
     }
 
     /// Record when the next cycle should have completed by.

@@ -310,6 +310,8 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
 
     let mut agent = Agent::new(config.clone(), secrets, store, kill_switch.clone()).await?;
     let signal_halt = spawn_signal_halt(kill_switch.clone());
+    let halt_poller = spawn_halt_file_poller(kill_switch.clone());
+    let mut halt_trips = kill_switch.subscribe();
 
     // Hourly snapshots. Skipped for an in-memory database, which has no file
     // to vacuum and no reason to want one.
@@ -355,9 +357,7 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
                 health_state
                     .record_cycle(agent.cycle_number(), agent.current_state())
                     .await;
-                health_state
-                    .record_diagnostics(alerts.anomaly_counts(), kill_switch.current().as_ref())
-                    .await;
+                health_state.record_anomalies(alerts.anomaly_counts()).await;
 
                 if agent.is_dead() {
                     tracing::error!("Agent has died. Shutting down.");
@@ -367,9 +367,7 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
             Err(e) => {
                 consecutive_failures += 1;
                 health_state.record_failure().await;
-                health_state
-                    .record_diagnostics(alerts.anomaly_counts(), kill_switch.current().as_ref())
-                    .await;
+                health_state.record_anomalies(alerts.anomaly_counts()).await;
                 tracing::error!(
                     error = %e,
                     consecutive_failures,
@@ -414,8 +412,20 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
             "Idling until the next wake"
         );
 
+        // Whatever halt state exists now has just been through a cycle, so
+        // mark it seen. Without this the loop would wake instantly on a halt
+        // it has already acted on, and spin.
+        halt_trips.borrow_and_update();
+
         tokio::select! {
             _ = tokio::time::sleep(sleep_for) => {}
+            // A halt raised while the loop is idle cuts the sleep short, so
+            // the agent cancels its resting orders now rather than at the
+            // next scheduled wake — which, across a closed weekend, is an
+            // hour away.
+            _ = halt_trips.changed() => {
+                tracing::warn!("Halted while idle — waking to cancel resting orders");
+            }
             signal = shutdown.recv() => {
                 tracing::info!(signal, "Shutdown signal received — stopping after the current cycle");
                 break;
@@ -427,6 +437,7 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
     watchdog.abort();
     dashboard_handle.abort();
     signal_halt.abort();
+    halt_poller.abort();
     if let Some(backups) = backups {
         backups.abort();
     }
@@ -488,6 +499,41 @@ fn spawn_cycle_watchdog(
             health
                 .record_alert_delivery(!alerts.delivery_failing())
                 .await;
+        }
+    })
+}
+
+/// How often the `HALT` file is checked.
+///
+/// Short, because this is the route that works when nothing else does — no
+/// dashboard token, no PID, just a file an operator can touch over SSH. It is
+/// a `stat` on one path; five seconds of it costs nothing and turns the
+/// worst-case latency of the kill switch from an hour into five seconds.
+const HALT_FILE_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Watch the `HALT` file.
+///
+/// Separate from the cycle for the same reason the cycle watchdog is: the
+/// loop cannot notice anything while it is asleep, and it may legitimately
+/// sleep for `max_sleep_seconds` across a closed weekend. Tripping the switch
+/// here also wakes the loop, so the agent acts on the halt rather than only
+/// recording it.
+fn spawn_halt_file_poller(
+    kill_switch: std::sync::Arc<polymarket_agent::agent::kill_switch::KillSwitch>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(HALT_FILE_POLL);
+        loop {
+            ticker.tick().await;
+            // Both directions: creating the file halts, removing it resumes.
+            // The agent loop does the rest — cancelling resting orders,
+            // alerting, writing the row that survives a restart.
+            if let Some(halt) = kill_switch.sync_with_file(Utc::now()) {
+                tracing::warn!(
+                    detail = %halt.detail,
+                    "HALT file present — halting new positions"
+                );
+            }
         }
     })
 }

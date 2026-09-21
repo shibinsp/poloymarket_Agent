@@ -809,7 +809,9 @@ impl Store {
         raised_at: DateTime<Utc>,
     ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO halts (source, scope, detail, raised_at, day)
+            // OR IGNORE, because the same halt is re-offered on every restart
+            // while it is in force. See the UNIQUE constraint in 004.
+            "INSERT OR IGNORE INTO halts (source, scope, detail, raised_at, day)
              VALUES (?, ?, ?, ?, ?)",
         )
         .bind(source)
@@ -832,6 +834,14 @@ impl Store {
             .await
             .context("Failed to clear halts")?;
         Ok(())
+    }
+
+    /// Record one halt however many times it is offered.
+    #[cfg(test)]
+    pub async fn halt_count(&self) -> Result<i64> {
+        Ok(sqlx::query_scalar("SELECT COUNT(*) FROM halts")
+            .fetch_one(&self.pool)
+            .await?)
     }
 
     /// The halt still in force, if any — the newest uncleared row.
@@ -1250,5 +1260,66 @@ mod tests {
             .expect("should get open trades");
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].market_id, "0xabc");
+    }
+
+    /// A halt in force is re-offered on every restart, because the loop
+    /// deliberately re-runs its side effects then — re-cancelling resting
+    /// orders after a crash is worth doing. The audit trail must not grow a
+    /// row each time, or "when did this halt start" stops being answerable.
+    #[tokio::test]
+    async fn re_recording_the_same_halt_does_not_duplicate_it() {
+        use chrono::TimeZone;
+        let at = Utc.with_ymd_and_hms(2026, 9, 21, 12, 0, 30).unwrap();
+        let store = Store::new(":memory:").await.unwrap();
+        for _ in 0..5 {
+            store
+                .insert_halt("api", "until_resume", "operator", at)
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.halt_count().await.unwrap(), 1);
+        assert_eq!(store.active_halt().await.unwrap().unwrap().source, "api");
+    }
+
+    #[tokio::test]
+    async fn a_genuinely_later_halt_is_a_new_row() {
+        use chrono::TimeZone;
+        let first = Utc.with_ymd_and_hms(2026, 9, 21, 12, 0, 30).unwrap();
+        let second = Utc.with_ymd_and_hms(2026, 9, 21, 12, 0, 31).unwrap();
+        let store = Store::new(":memory:").await.unwrap();
+        store
+            .insert_halt("api", "until_resume", "first", first)
+            .await
+            .unwrap();
+        store
+            .insert_halt("circuit_breaker", "rest_of_day", "second", second)
+            .await
+            .unwrap();
+        assert_eq!(store.halt_count().await.unwrap(), 2);
+        assert_eq!(
+            store.active_halt().await.unwrap().unwrap().source,
+            "circuit_breaker",
+            "the newest uncleared row is the one in force"
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_lifts_every_halt_in_force() {
+        use chrono::TimeZone;
+        let t = |s| Utc.with_ymd_and_hms(2026, 9, 21, 12, 0, s).unwrap();
+        let store = Store::new(":memory:").await.unwrap();
+        store
+            .insert_halt("api", "until_resume", "first", t(30))
+            .await
+            .unwrap();
+        store
+            .insert_halt("signal", "until_resume", "second", t(31))
+            .await
+            .unwrap();
+        store.clear_halts("api", t(40)).await.unwrap();
+        assert!(
+            store.active_halt().await.unwrap().is_none(),
+            "a resume must not leave a second halt silently in force"
+        );
     }
 }

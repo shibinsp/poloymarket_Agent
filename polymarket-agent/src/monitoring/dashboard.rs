@@ -282,7 +282,22 @@ async fn resume_handler(State(state): State<DashboardState>) -> impl IntoRespons
 }
 
 async fn health_handler(State(state): State<DashboardState>) -> impl IntoResponse {
-    let data = state.health.to_json().await;
+    let mut data = state.health.to_json().await;
+    // Read the flag now rather than serving whatever the last completed cycle
+    // published. A cycle can run for minutes, and a halt raised inside that
+    // window is exactly the one an operator is refreshing this page to see.
+    if let Some(obj) = data.as_object_mut() {
+        let halt = state.kill_switch.current();
+        obj.insert(
+            "halted".to_string(),
+            serde_json::json!(state.kill_switch.is_tripped()),
+        );
+        obj.insert(
+            "halt".to_string(),
+            halt.and_then(|h| serde_json::to_value(h).ok())
+                .unwrap_or(serde_json::Value::Null),
+        );
+    }
     Json(data)
 }
 
@@ -367,6 +382,17 @@ mod tests {
             .await
             .unwrap()
             .status()
+    }
+
+    async fn get_json(app: Router, uri: &str) -> serde_json::Value {
+        let resp = app
+            .oneshot(HttpRequest::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
     }
 
     async fn post(app: Router, uri: &str, auth: Option<&str>) -> (StatusCode, serde_json::Value) {
@@ -457,6 +483,63 @@ mod tests {
         assert_eq!(code, StatusCode::OK);
         assert_eq!(body["halted"], serde_json::json!(false));
         assert!(!switch.is_tripped());
+    }
+
+    /// The two endpoints must never disagree about whether trading is
+    /// stopped. They did: `/api/health` served a snapshot written at the end
+    /// of each cycle, so a halt raised during a long cycle showed as `false`
+    /// there and `true` on `/api/halt` — and the dashboard reads health.
+    #[tokio::test]
+    async fn health_reports_a_halt_raised_since_the_last_cycle_completed() {
+        let state = state_with_token(None).await;
+        let switch = state.kill_switch.clone();
+        let app = build_router(state);
+
+        // No cycle has completed, so nothing has been published.
+        let before = get_json(app.clone(), "/api/health").await;
+        assert_eq!(before["halted"], serde_json::json!(false));
+
+        switch.trip(Halt::new(
+            HaltSource::HaltFile,
+            HaltScope::UntilResume,
+            "margin call",
+            chrono::Utc::now(),
+        ));
+
+        let after = get_json(app.clone(), "/api/health").await;
+        assert_eq!(
+            after["halted"],
+            serde_json::json!(true),
+            "health must not wait for a cycle to notice a halt"
+        );
+        assert_eq!(after["halt"]["source"], serde_json::json!("halt_file"));
+        assert_eq!(after["halt"]["detail"], serde_json::json!("margin call"));
+
+        // And the two routes agree.
+        let halt_route = get_json(app, "/api/halt").await;
+        assert_eq!(halt_route["halted"], after["halted"]);
+        assert_eq!(halt_route["halt"], after["halt"]);
+    }
+
+    #[tokio::test]
+    async fn health_reports_a_resume_immediately_too() {
+        let state = state_with_token(None).await;
+        let switch = state.kill_switch.clone();
+        let app = build_router(state);
+        switch.trip(Halt::new(
+            HaltSource::Api,
+            HaltScope::UntilResume,
+            "x",
+            chrono::Utc::now(),
+        ));
+        assert_eq!(
+            get_json(app.clone(), "/api/health").await["halted"],
+            serde_json::json!(true)
+        );
+        switch.clear().unwrap();
+        let resumed = get_json(app, "/api/health").await;
+        assert_eq!(resumed["halted"], serde_json::json!(false));
+        assert_eq!(resumed["halt"], serde_json::Value::Null);
     }
 
     #[tokio::test]

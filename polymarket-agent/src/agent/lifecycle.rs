@@ -214,17 +214,26 @@ impl Agent {
         self.kill_switch.clone()
     }
 
-    /// Raise a halt, once.
+    /// Raise a halt.
     ///
-    /// Everything that stops the agent comes through here, so the one-time
-    /// work — cancelling resting orders, alerting, writing the row that
-    /// survives a restart — happens exactly once no matter which of the five
-    /// routes tripped it.
-    async fn raise_halt(&self, halt: Halt) {
-        if !self.kill_switch.trip(halt.clone()) {
-            // Already halted, and the first reason is the diagnostic one.
+    /// Only sets the flag. The side effects run in `apply_pending_halt`,
+    /// which is also where halts raised from outside the loop — the
+    /// dashboard, SIGUSR1, the `HALT` file — get theirs. Doing the work here
+    /// would mean an `/api/halt` press cancelled nothing, which is what it
+    /// used to mean.
+    fn raise_halt(&self, halt: Halt) {
+        self.kill_switch.trip(halt);
+    }
+
+    /// Run the one-time work for a halt, whoever raised it.
+    ///
+    /// Cancelling resting orders, alerting, and writing the row that survives
+    /// a restart. Exactly once per halt: `take_unhandled` hands back a given
+    /// halt only the first time.
+    async fn apply_pending_halt(&self) {
+        let Some(halt) = self.kill_switch.take_unhandled() else {
             return;
-        }
+        };
 
         error!(
             source = halt.source.as_str(),
@@ -281,9 +290,12 @@ impl Agent {
                 warn!(error = %e, "Could not clear the expired halt row");
             }
         }
-        if let Some(halt) = self.kill_switch.sync_with_file(now) {
-            self.raise_halt(halt).await;
-        }
+        // The background poller usually gets here first; this covers the gap
+        // between process start and its first tick.
+        self.kill_switch.sync_with_file(now);
+        // Anything raised since the last cycle — by the poller, the
+        // dashboard, or a signal — gets its side effects now.
+        self.apply_pending_halt().await;
     }
 
     /// Ask every venue whether the ledger still describes reality.
@@ -333,8 +345,7 @@ impl Agent {
                         HaltScope::UntilResume,
                         format!("{}: {}", report.venue_id, report.detail),
                         now,
-                    ))
-                    .await;
+                    ));
                 }
             }
         }
@@ -359,8 +370,7 @@ impl Agent {
                     HaltScope::UntilResume,
                     format!("Could not read or record equity marks, so no risk limit can be evaluated: {e}"),
                     now,
-                ))
-                .await;
+                ));
                 return;
             }
         };
@@ -386,8 +396,7 @@ impl Agent {
                 trip.scope(),
                 format!("{trip}"),
                 now,
-            ))
-            .await;
+            ));
         }
     }
 
@@ -466,6 +475,9 @@ impl Agent {
         // disagree is the ordering this exists to prevent.
         self.audit_venue_state(now).await;
         self.check_breakers(now, balance + unrealized).await;
+        // Whatever either of those raised gets its orders cancelled, its
+        // alert sent and its row written — here, once, in one place.
+        self.apply_pending_halt().await;
 
         // A halt outranks the survival ladder, except for death. See
         // `market::models::apply_halt`.

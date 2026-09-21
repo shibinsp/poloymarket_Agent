@@ -22,7 +22,14 @@ CREATE TABLE IF NOT EXISTS halts (
     -- a timezone slip gets in.
     day TEXT NOT NULL,
     cleared_at TEXT,
-    cleared_by TEXT
+    cleared_by TEXT,
+    -- A halt reinstated after a restart carries its original timestamp, and
+    -- the loop deliberately re-runs the side effects each time it starts —
+    -- re-cancelling resting orders after a crash is worth doing. Without this
+    -- constraint that also wrote a fresh row on every restart, so a flapping
+    -- process turned one halt into a hundred rows and made the trail useless
+    -- for the one question it exists to answer: when did this start?
+    UNIQUE (source, raised_at)
 );
 
 CREATE INDEX IF NOT EXISTS idx_halts_active ON halts(cleared_at, raised_at);
