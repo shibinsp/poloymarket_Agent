@@ -26,10 +26,43 @@ pub fn build_registry(
     secrets: &Secrets,
     polymarket_client: Option<Arc<PolymarketClient>>,
 ) -> Result<VenueRegistry> {
+    Ok(build_registry_reporting(config, secrets, polymarket_client).0)
+}
+
+/// Why a configured venue is not in the registry.
+///
+/// Returned rather than only logged, because "enabled in the config" and
+/// "present in the registry" are different sets and the caller — the dry run
+/// — has to be able to say *which* of three unrelated reasons applies.
+/// Telling an operator their credentials are missing when they mistyped a
+/// `kind` sends them to the wrong file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedVenue {
+    pub id: String,
+    pub reason: String,
+}
+
+/// `build_registry`, plus the skips.
+pub fn build_registry_reporting(
+    config: &AppConfig,
+    secrets: &Secrets,
+    polymarket_client: Option<Arc<PolymarketClient>>,
+) -> (VenueRegistry, Vec<SkippedVenue>) {
     let mut venues: Vec<Box<dyn Venue>> = Vec::new();
+    let mut skipped: Vec<SkippedVenue> = Vec::new();
+    let mut skip = |id: &str, reason: String| {
+        warn!(venue = %id, reason = %reason, "Venue skipped");
+        skipped.push(SkippedVenue {
+            id: id.to_string(),
+            reason,
+        });
+    };
 
     for venue_config in config.venues.iter().filter(|v| v.enabled) {
-        match venue_config.kind.as_str() {
+        // Matched case-insensitively. A `kind = "Alpaca"` is a one-character
+        // mistake that used to fall through to "unknown kind" and take the
+        // venue with it.
+        match venue_config.kind.to_ascii_lowercase().as_str() {
             "alpaca" => match build_alpaca(venue_config, secrets, config.agent.mode) {
                 Ok(Some(venue)) => {
                     info!(
@@ -40,33 +73,30 @@ pub fn build_registry(
                     );
                     venues.push(Box::new(venue));
                 }
-                Ok(None) => warn!(
-                    venue = %venue_config.id,
-                    "Alpaca is enabled but ALPACA_API_KEY_ID/ALPACA_API_SECRET_KEY are unset — skipping"
+                Ok(None) => skip(
+                    &venue_config.id,
+                    "ALPACA_API_KEY_ID/ALPACA_API_SECRET_KEY are unset".to_string(),
                 ),
-                Err(e) => {
-                    warn!(venue = %venue_config.id, error = %e, "Failed to build Alpaca venue — skipping")
-                }
+                Err(e) => skip(&venue_config.id, format!("{e:#}")),
             },
             "polymarket" => match &polymarket_client {
                 Some(client) => {
                     info!(venue = %venue_config.id, "Venue enabled");
                     venues.push(Box::new(PolymarketVenue::new(client.clone())));
                 }
-                None => warn!(
-                    venue = %venue_config.id,
-                    "Polymarket is enabled but no client was supplied — skipping"
+                None => skip(
+                    &venue_config.id,
+                    "no Polymarket client was supplied".to_string(),
                 ),
             },
-            other => warn!(
-                venue = %venue_config.id,
-                kind = other,
-                "Unknown venue kind — skipping"
+            other => skip(
+                &venue_config.id,
+                format!("unknown venue kind {other:?} — expected \"alpaca\" or \"polymarket\""),
             ),
         }
     }
 
-    Ok(VenueRegistry::new(venues))
+    (VenueRegistry::new(venues), skipped)
 }
 
 /// `Ok(None)` means "configured but no credentials", which is a skip, not an
@@ -89,6 +119,12 @@ fn build_alpaca(
             AlpacaConfig::paper(key_id.expose_secret(), secret_key.expose_secret())
         }
     }
+    // The configured id, not the adapter's hardcoded default. Every
+    // per-venue lookup keys on the id the venue reports —
+    // `venue_symbols_for`, `venue_fee_pct`, `registry.get` — so a venue
+    // configured as anything other than "alpaca" silently traded no symbols
+    // and paid the default fee.
+    .with_venue_id(venue_config.id.clone())
     .with_symbols(venue_config.symbols.clone());
 
     // An explicit base_url overrides the mode-derived host. Worth noting in

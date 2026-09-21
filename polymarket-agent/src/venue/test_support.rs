@@ -30,6 +30,8 @@ pub struct StubVenue {
     fail: bool,
     /// Mid price returned by `quote`, when one is configured.
     mark: Option<Decimal>,
+    /// Whether `balance` refuses, independently of `fail`.
+    no_balance: bool,
     /// What `place_order` answers with. Lets a test drive the accepted,
     /// partially-filled and filled paths, which are handled very differently.
     ack: Option<OrderAck>,
@@ -104,6 +106,7 @@ impl StubVenue {
             instruments,
             fail,
             mark: None,
+            no_balance: false,
             ack: None,
             placed: Mutex::new(Vec::new()),
             cancel_all_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -111,6 +114,14 @@ impl StubVenue {
     }
 
     /// Quote every instrument at this price.
+    /// A venue whose balance call fails — the shape of a rejected
+    /// credential, which `fail` alone does not produce because `balance`
+    /// answers unconditionally.
+    pub fn without_balance(mut self) -> Self {
+        self.no_balance = true;
+        self
+    }
+
     pub fn quoting(mut self, mark: Decimal) -> Self {
         self.mark = Some(mark);
         self
@@ -142,11 +153,24 @@ impl Venue for StubVenue {
     fn session(&self) -> &TradingSession {
         &self.session
     }
-    async fn list_instruments(&self, _f: &ScanFilter) -> Result<Vec<Instrument>> {
+    async fn list_instruments(&self, f: &ScanFilter) -> Result<Vec<Instrument>> {
         if self.fail {
             anyhow::bail!("venue unreachable");
         }
-        Ok(self.instruments.clone())
+        // Filter and truncate as a real adapter does. Ignoring `ScanFilter`
+        // made the stub unable to reproduce the `max_markets = 0` failure —
+        // the one that truncates live discovery to nothing — so a caller's
+        // handling of it could not be tested at all.
+        let mut out: Vec<Instrument> = self
+            .instruments
+            .iter()
+            .filter(|i| f.symbols.is_empty() || f.symbols.iter().any(|s| s == i.symbol()))
+            .cloned()
+            .collect();
+        if let Some(max) = f.max_results {
+            out.truncate(max);
+        }
+        Ok(out)
     }
     async fn quote(&self, id: &InstrumentId) -> Result<Quote> {
         let Some(mark) = self.mark else {
@@ -198,6 +222,9 @@ impl Venue for StubVenue {
         Ok(Vec::new())
     }
     async fn balance(&self) -> Result<Balance> {
+        if self.no_balance {
+            anyhow::bail!("{}: credentials rejected", self.id);
+        }
         Ok(Balance {
             ccy: "USD".to_string(),
             available: dec!(100),

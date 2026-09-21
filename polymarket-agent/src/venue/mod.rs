@@ -9,6 +9,7 @@
 pub mod alpaca;
 pub mod factory;
 pub mod polymarket;
+pub mod preflight;
 pub mod session;
 #[cfg(test)]
 pub mod test_support;
@@ -75,6 +76,20 @@ pub trait Venue: Send + Sync {
     async fn positions(&self) -> Result<Vec<Position>>;
 
     async fn balance(&self) -> Result<Balance>;
+
+    /// Whether the account is *permitted* to trade.
+    ///
+    /// Distinct from `balance`, which a blocked account answers perfectly
+    /// well: Alpaca returns cash and equity on a `trading_blocked` or
+    /// `account_blocked` account and then rejects every order. A PDT
+    /// violation or a compliance hold would otherwise pass every startup
+    /// check and be discovered one rejected order at a time.
+    ///
+    /// Defaults to permitted, so a venue with no such concept need not
+    /// implement it.
+    async fn trading_readiness(&self) -> Result<()> {
+        Ok(())
+    }
 
     /// Settlement result for a resolved instrument. `None` while unresolved;
     /// venues whose assets never settle always return `None`.
@@ -224,7 +239,11 @@ impl VenueRegistry {
 
 /// Whether a venue can serve a tradeable instrument at `at` — either its
 /// session is open, or it lists a class that ignores sessions entirely.
-fn venue_has_work_at(venue: &dyn Venue, at: DateTime<Utc>) -> bool {
+///
+/// Public because a closed equity session and a 24/7 crypto venue that is
+/// somehow reporting closed look identical from `is_open_at` alone, and the
+/// dry run has to be able to tell an operator which they are looking at.
+pub fn venue_has_work_at(venue: &dyn Venue, at: DateTime<Utc>) -> bool {
     venue.is_open_at(at) || venue.capabilities().has_always_on()
 }
 

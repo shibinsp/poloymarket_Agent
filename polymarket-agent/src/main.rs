@@ -124,12 +124,32 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
     println!("   ✅ Configuration valid\n");
 
     // 2. Check database
+    //
+    // Collected rather than returned. The shipped paper template points at
+    // `/var/lib/polymarket-agent`, which a normal user cannot create — so
+    // the very first `--dry-run` an operator runs died here, with SQLite's
+    // "unable to open database file" and nothing about which path or what to
+    // do, before reaching any of the checks they ran it for. One run should
+    // surface everything that is wrong, not the first thing.
     println!("2. Database:");
-    let store = Store::new(&config.database.path).await?;
-    let cycle_count = store.get_cycle_count().await?;
     println!("   Path: {}", config.database.path);
-    println!("   Previous cycles: {}", cycle_count);
-    println!("   ✅ Database connected\n");
+    let mut failures: Vec<String> = Vec::new();
+    match Store::new(&config.database.path).await {
+        Ok(store) => {
+            let cycles = store.get_cycle_count().await.unwrap_or(0);
+            println!("   Previous cycles: {cycles}");
+            println!("   ✅ Database connected");
+        }
+        Err(e) => {
+            println!("   ❌ {e:#}");
+            println!(
+                "      create the directory and make it writable, or point \
+                 database.path\n      somewhere you can write"
+            );
+            failures.push(format!("database {}: {e}", config.database.path));
+        }
+    }
+    println!();
 
     // 3. Check API keys
     println!("3. API Keys:");
@@ -160,7 +180,6 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
     // Failures are recorded and reported at the summary rather than returned
     // here, so one bad setting doesn't hide the remaining checks.
     println!("4. Valuation Model:");
-    let mut failures: Vec<String> = Vec::new();
     match &secrets.llm_api_key {
         Some(key) => {
             // Probe against a throwaway in-memory store: the real one would
@@ -210,45 +229,112 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
     }
     println!();
 
-    // 5. Test Polymarket connectivity
-    println!("5. Polymarket Connectivity:");
-    let config_arc = std::sync::Arc::new(config.clone());
-    let polymarket =
-        polymarket_agent::market::polymarket::PolymarketClient::new(config_arc.clone(), secrets)
-            .await?;
+    // 5. The venues the agent will actually trade
+    //
+    // The check the dry run existed to provide and did not: it validated
+    // Polymarket and nothing else, so an Alpaca deployment — which is what
+    // the safety gate is for — learned nothing here.
+    println!("5. Venues:");
+    let polymarket_configured = config
+        .venues
+        .iter()
+        .any(|v| v.enabled && v.kind.eq_ignore_ascii_case("polymarket"));
 
-    let filters = polymarket_agent::market::polymarket::MarketFilters {
-        min_volume_24h: config.scanning.min_volume_24h,
-        max_resolution_days: config.scanning.max_resolution_days,
-        max_markets: 10,
-        max_spread_pct: config.scanning.max_spread_pct,
+    // Built only when something needs it. Constructing it unconditionally put
+    // a fatal `?` — an authenticating network call in live mode — ahead of
+    // the venue section, so for a US operator with an unreachable CLOB the
+    // run still died before reporting anything about Alpaca. That was the
+    // bug, moved one call earlier rather than fixed.
+    let legacy_only = config.venues.iter().all(|v| !v.enabled);
+    let polymarket = if polymarket_configured || legacy_only {
+        match polymarket_agent::market::polymarket::PolymarketClient::new(
+            std::sync::Arc::new(config.clone()),
+            secrets,
+        )
+        .await
+        {
+            Ok(c) => Some(std::sync::Arc::new(c)),
+            Err(e) => {
+                println!("   Polymarket client: ❌ {e:#}");
+                failures.push(format!("Polymarket client: {e:#}"));
+                None
+            }
+        }
+    } else {
+        None
     };
 
-    let markets = polymarket.get_markets(&filters).await?;
-    println!(
-        "   Gamma API: ✅ Connected (found {} markets)",
-        markets.len()
+    let (registry, skipped) = polymarket_agent::venue::factory::build_registry_reporting(
+        config,
+        secrets,
+        polymarket.clone(),
     );
 
-    if let Some(first) = markets.first() {
-        if let Some(first_token) = first.tokens.first() {
-            let book = polymarket.get_order_book(&first_token.token_id).await?;
-            println!(
-                "   CLOB API: ✅ Connected (spread: {}%)",
-                book.spread * rust_decimal_macros::dec!(100)
-            );
+    if legacy_only {
+        println!("   ⚠️  No [[venues]] configured — the agent falls back to the");
+        println!("      legacy Polymarket-only loop, which the safety gate does");
+        println!("      not cover. See 'Starting the paper window' in the README.");
+    }
+
+    // A skipped venue is enabled in the config but absent from the registry,
+    // for one of three unrelated reasons. Reporting "missing credentials" for
+    // all of them sends an operator who mistyped a `kind` to the wrong file.
+    for s in &skipped {
+        println!("   {}:", s.id);
+        println!("      ❌ enabled but not built — {}", s.reason);
+        failures.push(format!("{}: {}", s.id, s.reason));
+    }
+
+    for venue in registry.all() {
+        let id = venue.id().to_string();
+        let report = polymarket_agent::venue::preflight::check(
+            venue,
+            &config.venue_symbols_for(&id),
+            // The real scan limit, not a sample size — this is what makes a
+            // `max_markets` below the universe visible here rather than as a
+            // fortnight of empty cycles.
+            config.scanning.max_markets,
+            Utc::now(),
+        )
+        .await;
+
+        println!("   {}:", report.venue_id);
+        for (label, check) in &report.checks {
+            println!("      {label}: {} {}", check.mark(), check.message());
+        }
+        for failure in report.failures() {
+            failures.push(format!("{}: {}", report.venue_id, failure.message()));
         }
     }
     println!();
 
-    // 6. Check balance
-    println!("6. Balance:");
-    let balance = polymarket.get_balance().await?;
-    println!("   Current balance: ${}", balance);
-    if balance <= rust_decimal_macros::dec!(0) && config.agent.mode != AgentMode::Backtest {
-        println!("   ⚠️  Balance is zero — agent would be in Dead state");
-    } else {
-        println!("   ✅ Balance sufficient");
+    // 6. Polymarket, only when it is not already covered above
+    //
+    // Reported, never enforced: its international CLOB prohibits US persons,
+    // so for many operators an unreachable Gamma is the expected state and
+    // must not fail a dry run about an Alpaca deployment.
+    println!("6. Polymarket:");
+    match (&polymarket, polymarket_configured) {
+        // Already checked as a venue; asking again is two more round trips
+        // against a rate-limited API and a second failure line for one cause.
+        (Some(_), true) => println!("   Checked above as a venue."),
+        (Some(client), false) => {
+            let filters = polymarket_agent::market::polymarket::MarketFilters {
+                min_volume_24h: config.scanning.min_volume_24h,
+                max_resolution_days: config.scanning.max_resolution_days,
+                max_markets: 10,
+                max_spread_pct: config.scanning.max_spread_pct,
+            };
+            match client.get_markets(&filters).await {
+                Ok(markets) => println!("   Gamma API: ✅ {} markets", markets.len()),
+                Err(e) => println!("   Gamma API: ⚠️  {e:#}"),
+            }
+            match client.get_balance().await {
+                Ok(balance) => println!("   Balance: ${balance}"),
+                Err(e) => println!("   Balance: ⚠️  {e:#}"),
+            }
+        }
+        (None, _) => println!("   Skipped — not an enabled venue."),
     }
     println!();
 
