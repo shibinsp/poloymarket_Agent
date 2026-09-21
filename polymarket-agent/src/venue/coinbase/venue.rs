@@ -194,6 +194,29 @@ impl CoinbaseVenue {
         })
     }
 
+    /// The configured symbol whose base is `base`, or a `/USD` fallback.
+    ///
+    /// Spot balances name only the currency — `BTC` — and the pair it
+    /// belongs to is a choice: a universe of `BTC/USDC` and a position
+    /// reported as `BTC/USD` reconciles against nothing, which reads as two
+    /// mismatches at once and halts a healthy agent `UntilResume`.
+    ///
+    /// The fallback matters too: a holding outside the configured universe —
+    /// dust from a manual trade, or a symbol since removed — is still real
+    /// exposure, and dropping it would hide it from the very check that
+    /// exists to find it.
+    fn symbol_for_base(&self, base: &str) -> String {
+        self.symbols
+            .iter()
+            .map(|s| s.trim().to_uppercase())
+            .find(|s| {
+                s.split('/')
+                    .next()
+                    .is_some_and(|b| b.eq_ignore_ascii_case(base))
+            })
+            .unwrap_or_else(|| format!("{}/USD", base.to_uppercase()))
+    }
+
     async fn fetch_order(&self, venue_order_id: &str) -> Result<Order> {
         let path = format!(
             "/api/v3/brokerage/orders/historical/{}",
@@ -206,6 +229,15 @@ impl CoinbaseVenue {
             .with_context(|| format!("Failed to fetch Coinbase order {venue_order_id}"))?;
         Ok(response.order)
     }
+}
+
+/// Whether a currency is the cash side rather than a position.
+///
+/// Both are quote currencies on Coinbase and both spend as dollars here;
+/// treating USDC as a position would report the cash balance as exposure and
+/// have reconciliation hunt for a matching trade that does not exist.
+fn is_cash(currency: &str) -> bool {
+    currency.eq_ignore_ascii_case("USD") || currency.eq_ignore_ascii_case("USDC")
 }
 
 /// Coinbase's order status vocabulary, mapped to ours.
@@ -612,9 +644,16 @@ impl Venue for CoinbaseVenue {
                 // Coinbase has no lookup by client id, so this lists and
                 // filters. Bounded by the open set plus recent history, which
                 // at a ten-minute cadence is small.
+                // Bounded. Coinbase pages this endpoint and an unbounded
+                // request can return a great deal of history to find one id;
+                // the reconciler only reaches here before a venue id has been
+                // recorded, so recent orders are the only ones that can match.
                 let response: OrdersResponse = self
                     .rest
-                    .get("/api/v3/brokerage/orders/historical/batch", &[])
+                    .get(
+                        "/api/v3/brokerage/orders/historical/batch",
+                        &[("limit", "250".to_string())],
+                    )
                     .await
                     .context("Failed to list Coinbase orders")?;
                 let found = response
@@ -681,7 +720,7 @@ impl Venue for CoinbaseVenue {
                 continue;
             };
             // The quote currency is cash, not a position.
-            if currency.eq_ignore_ascii_case("USD") || currency.eq_ignore_ascii_case("USDC") {
+            if is_cash(currency) {
                 continue;
             }
             let Some(amount) = &account.available_balance else {
@@ -692,7 +731,7 @@ impl Venue for CoinbaseVenue {
                 continue;
             }
             out.push(Position {
-                instrument: InstrumentId::new(self.id.clone(), format!("{currency}/USD")),
+                instrument: InstrumentId::new(self.id.clone(), self.symbol_for_base(currency)),
                 qty,
                 // Coinbase does not report a cost basis on the accounts
                 // endpoint. Zero would claim the position was free and make
@@ -713,7 +752,7 @@ impl Venue for CoinbaseVenue {
             let Some(currency) = account.currency.as_deref() else {
                 continue;
             };
-            if !(currency.eq_ignore_ascii_case("USD") || currency.eq_ignore_ascii_case("USDC")) {
+            if !is_cash(currency) {
                 continue;
             }
             if let Some(amount) = &account.available_balance {
@@ -1216,5 +1255,57 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
             reject_message: None,
         };
         assert_eq!(to_ack(&order).unwrap().avg_fill_price, None);
+    }
+
+    /// The position symbol has to match the configured one, not a guess.
+    ///
+    /// A `BTC/USDC` universe reporting positions as `BTC/USD` makes
+    /// reconciliation see two mismatches at once — one held at the venue and
+    /// absent locally, one the reverse — and halt a perfectly healthy agent
+    /// `UntilResume`.
+    #[tokio::test]
+    async fn positions_use_the_configured_quote_currency() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/brokerage/accounts"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "accounts": [
+                    {"currency": "USDC", "available_balance": {"value": "500"}},
+                    {"currency": "BTC",  "available_balance": {"value": "0.01"}}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["BTC/USDC"]);
+        let positions = venue.positions().await.unwrap();
+
+        assert_eq!(positions.len(), 1);
+        assert_eq!(
+            positions[0].instrument.symbol, "BTC/USDC",
+            "a guessed /USD suffix reconciles against nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_holding_outside_the_configured_universe_still_reports() {
+        // Dust from a manual trade, or a symbol removed from the config. It
+        // is real exposure and reconciliation must be able to see it.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/brokerage/accounts"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "accounts": [{"currency": "SOL", "available_balance": {"value": "2"}}]
+            })))
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["BTC/USD"]);
+        let positions = venue.positions().await.unwrap();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(
+            positions[0].instrument.symbol, "SOL/USD",
+            "falls back to USD"
+        );
     }
 }
