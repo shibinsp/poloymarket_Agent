@@ -95,6 +95,45 @@ pub struct VenueReconcileReport {
     pub detail: String,
 }
 
+/// A venue's equity, or `None` if it will not give one.
+///
+/// Separate from the positions call on purpose: they fail independently, and
+/// an equity figure is worth having even when the position listing is not.
+async fn read_equity(venue: &dyn crate::venue::Venue) -> Option<Decimal> {
+    match venue.balance().await {
+        Ok(balance) => balance.total,
+        Err(e) => {
+            warn!(venue = %venue.id(), error = %format!("{e:#}"), "Could not read venue equity");
+            None
+        }
+    }
+}
+
+/// Total equity across every venue, or `None` if any one will not report.
+///
+/// All or nothing, deliberately. Summing only the venues that answer — which
+/// is what `filter_map` did — measured every loss limit against the venues
+/// that happen to report while the others went on trading: an Alpaca+crypto
+/// deployment watched the Alpaca account alone, so a crypto position could go
+/// to zero without moving the number the drawdown breaker reads. That is the
+/// Phase 3 finding "breakers measured the wrong account" through a different
+/// door.
+///
+/// A partial equity is a wrong equity, and no breaker can tell one from a real
+/// loss — so the honest answer is that it could not be established, which the
+/// caller turns into a halt.
+pub fn combined_equity(reports: &[VenueReconcileReport]) -> Option<Decimal> {
+    if reports.is_empty() {
+        return None;
+    }
+    // One pass: a guard plus a second `filter_map` left the rule stated twice,
+    // and a later edit to either line would have them disagree about whether a
+    // missing venue is fatal.
+    reports
+        .iter()
+        .try_fold(Decimal::ZERO, |sum, report| Some(sum + report.equity?))
+}
+
 impl VenueReconcileReport {
     pub fn passed(&self) -> bool {
         self.verdict == Verdict::Clean
@@ -195,7 +234,11 @@ impl StateReconciler<'_> {
                     missing_on_venue: Vec::new(),
                     qty_mismatches: Vec::new(),
                     unknown_open_orders: Vec::new(),
-                    equity: None,
+                    // Still asked for: `balance()` is an independent call, and
+                    // returning early without it threw away an equity figure
+                    // the venue would have given — which the caller reads as
+                    // "no venue would report", and halts on.
+                    equity: read_equity(venue).await,
                     detail: format!("positions unavailable: {e}"),
                 };
             }
@@ -305,7 +348,7 @@ impl StateReconciler<'_> {
         let orders_unverified = unknown_open_orders.is_none();
         let unknown_open_orders = unknown_open_orders.unwrap_or_default();
 
-        let equity = venue.balance().await.ok().and_then(|b| b.total);
+        let equity = read_equity(venue).await;
 
         let mismatched = !missing_locally.is_empty()
             || !missing_on_venue.is_empty()
@@ -411,4 +454,91 @@ fn describe(positions: &[OrphanPosition]) -> String {
         .map(|p| format!("{} x{}", p.symbol, p.qty))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::venue::session::TradingSession;
+    use crate::venue::test_support::StubVenue;
+    use rust_decimal_macros::dec;
+
+    /// `positions()` and `balance()` fail independently at a real venue, and
+    /// giving up on equity because the position listing broke throws away a
+    /// figure the venue would have given — which the caller reads as "no
+    /// venue would report" and halts the whole agent over.
+    #[tokio::test]
+    async fn a_venue_whose_positions_fail_still_reports_its_equity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::db::store::Store::new(dir.path().join("t.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let registry = crate::venue::VenueRegistry::new(vec![Box::new(
+            StubVenue::new("stub", TradingSession::Always, &["BTC/USD"], false).without_positions(),
+        )]);
+
+        let reconciler = StateReconciler {
+            registry: &registry,
+            store: &store,
+        };
+        let reports = reconciler.run(Utc::now(), 1).await.unwrap();
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0].verdict,
+            Verdict::Unverified,
+            "the positions really are unknown"
+        );
+        assert_eq!(
+            reports[0].equity,
+            Some(dec!(100)),
+            "but equity is a separate call, and it answered"
+        );
+    }
+
+    fn equity_report(venue_id: &str, equity: Option<Decimal>) -> VenueReconcileReport {
+        VenueReconcileReport {
+            venue_id: venue_id.to_string(),
+            verdict: Verdict::Clean,
+            missing_locally: Vec::new(),
+            missing_on_venue: Vec::new(),
+            qty_mismatches: Vec::new(),
+            unknown_open_orders: Vec::new(),
+            equity,
+            detail: String::new(),
+        }
+    }
+
+    /// An Alpaca+crypto deployment measured every loss limit against the
+    /// Alpaca account alone, because the crypto venue reported no equity and
+    /// was silently dropped from the sum — while it went on trading, since
+    /// `Verdict::Unverified` warns and alerts but does not stop that venue
+    /// trading, by design.
+    #[test]
+    fn equity_is_unknown_when_any_venue_will_not_report_it() {
+        let reports = vec![
+            equity_report("alpaca", Some(dec!(4200))),
+            equity_report("coinbase", None),
+        ];
+        assert_eq!(
+            combined_equity(&reports),
+            None,
+            "4200 here is the Alpaca account, and the crypto positions are not in it"
+        );
+    }
+
+    #[test]
+    fn equity_sums_the_venues_when_every_one_reports() {
+        let reports = vec![
+            equity_report("alpaca", Some(dec!(4200))),
+            equity_report("coinbase", Some(dec!(250.50))),
+        ];
+        assert_eq!(combined_equity(&reports), Some(dec!(4450.50)));
+    }
+
+    /// Zero would read as a total loss and trip every breaker at once.
+    #[test]
+    fn no_venues_at_all_is_no_equity_rather_than_zero() {
+        assert_eq!(combined_equity(&[]), None);
+    }
 }

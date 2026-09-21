@@ -9,6 +9,7 @@
 pub mod alpaca;
 pub mod binance_us;
 pub mod coinbase;
+pub mod equity;
 pub mod factory;
 pub mod polymarket;
 pub mod preflight;
@@ -89,6 +90,17 @@ pub trait Venue: Send + Sync {
     ///
     /// Defaults to permitted, so a venue with no such concept need not
     /// implement it.
+    /// Whether this venue can report account equity at all.
+    ///
+    /// Not "did it answer this time" — whether it ever can. Every loss limit
+    /// is measured against equity summed across the registry, so a venue that
+    /// structurally cannot report one makes that sum unknowable for as long as
+    /// it is enabled. The registry refuses to build such a venue rather than
+    /// let it halt the agent on every cycle.
+    fn reports_equity(&self) -> bool {
+        true
+    }
+
     async fn trading_readiness(&self) -> Result<()> {
         Ok(())
     }

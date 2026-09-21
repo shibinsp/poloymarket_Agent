@@ -48,6 +48,10 @@ pub struct StubVenue {
     /// pointer cast that compiles happily after the registry's contents
     /// change and then reads whatever is there.
     cancel_all_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Positions fail while everything else answers. They fail independently
+    /// of `balance` at a real venue, and code that gives up on equity because
+    /// the position listing broke throws away a figure it could have had.
+    no_positions: bool,
 }
 
 impl StubVenue {
@@ -95,6 +99,7 @@ impl StubVenue {
             })
             .collect();
         Self {
+            no_positions: false,
             id: venue_id,
             caps: VenueCapabilities {
                 asset_classes: classes,
@@ -117,6 +122,12 @@ impl StubVenue {
     /// A venue whose balance call fails — the shape of a rejected
     /// credential, which `fail` alone does not produce because `balance`
     /// answers unconditionally.
+    /// A venue whose position listing fails but whose balance does not.
+    pub fn without_positions(mut self) -> Self {
+        self.no_positions = true;
+        self
+    }
+
     pub fn without_balance(mut self) -> Self {
         self.no_balance = true;
         self
@@ -219,6 +230,9 @@ impl Venue for StubVenue {
         Ok(Vec::new())
     }
     async fn positions(&self) -> Result<Vec<Position>> {
+        if self.no_positions {
+            anyhow::bail!("{}: position listing unavailable", self.id);
+        }
         Ok(Vec::new())
     }
     async fn balance(&self) -> Result<Balance> {

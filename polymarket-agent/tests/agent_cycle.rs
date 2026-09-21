@@ -761,3 +761,85 @@ async fn an_agent_with_venues_builds_without_a_polymarket_key() {
         .await
         .expect("a venue-based agent has no use for a Polymarket key");
 }
+
+/// A venue whose `/v2/account` fails, so no equity figure can be established.
+///
+/// Every other endpoint answers normally: the point is that one call failing
+/// must not read as "this deployment has no risk controls, halt it".
+async fn no_equity_alpaca_server() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/account"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("upstream is down"))
+        .mount(&server)
+        .await;
+    mount_common(&server).await;
+    server
+}
+
+/// An `UntilResume` halt needs a human. Raising one the first time a book
+/// endpoint 500s turns a thirty-second hiccup into an indefinite outage — and
+/// an operator who meets that weekly learns to resume without reading, which
+/// is worse than the gap it was guarding.
+#[tokio::test]
+async fn one_cycle_without_an_equity_figure_warns_rather_than_halts() {
+    let mut h = harness_with(no_equity_alpaca_server().await, |_| {}).await;
+    h.agent.run_cycle().await.unwrap();
+
+    assert!(
+        !h.kill_switch.is_tripped(),
+        "a single unreadable equity must not need a human to clear"
+    );
+}
+
+/// A second consecutive failure is not a hiccup. Trading on when the one input
+/// to every loss limit is unavailable has no risk controls at all, however
+/// many are configured.
+#[tokio::test]
+async fn a_second_cycle_without_an_equity_figure_halts() {
+    let mut h = harness_with(no_equity_alpaca_server().await, |_| {}).await;
+    h.agent.run_cycle().await.unwrap();
+    h.agent.run_cycle().await.unwrap();
+
+    assert!(
+        h.kill_switch.is_tripped(),
+        "a persistent gap is a real problem and must stop entries"
+    );
+}
+
+/// The grace is for a *transient*, so the streak has to reset when equity
+/// comes back. Without the reset, two hiccups an hour apart would halt the
+/// agent as if they had been consecutive.
+#[tokio::test]
+async fn a_recovered_equity_figure_clears_the_streak() {
+    let alpaca = MockServer::start().await;
+    // Registered first, so it wins over the healthy mock beneath it — and
+    // scoped, so dropping the guard heals the endpoint mid-test. That is what
+    // lets one agent go unknown and then known, which is the only way to see
+    // the counter reset.
+    let broken = alpaca
+        .register_as_scoped(
+            Mock::given(method("GET"))
+                .and(path("/v2/account"))
+                .respond_with(ResponseTemplate::new(500).set_body_string("down")),
+        )
+        .await;
+    mount_common(&alpaca).await;
+
+    let mut h = harness_with(alpaca, |_| {}).await;
+    h.agent.run_cycle().await.unwrap();
+    assert_eq!(
+        h.agent.unknown_equity_cycles(),
+        1,
+        "one cycle without a figure"
+    );
+    assert!(!h.kill_switch.is_tripped(), "and no halt for a single one");
+
+    drop(broken);
+    h.agent.run_cycle().await.unwrap();
+    assert_eq!(
+        h.agent.unknown_equity_cycles(),
+        0,
+        "equity came back, so the next failure is a first failure again"
+    );
+}

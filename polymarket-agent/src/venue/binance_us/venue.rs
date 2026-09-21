@@ -16,7 +16,7 @@
 //! * **There is no average fill price**, only a cumulative quote value; the
 //!   average is that divided by the filled quantity.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -30,6 +30,7 @@ use super::auth::BinanceSigner;
 use super::models::{money, AccountInfo, Depth, ExchangeInfo, Kline, Order, SymbolInfo, Trade};
 use super::rest::BinanceRest;
 use crate::market::models::{OrderBookSnapshot, PriceLevel};
+use crate::venue::equity::{mark_equity, single_quote_currency, Holding};
 use crate::venue::session::TradingSession;
 use crate::venue::types::{
     AssetClass, Balance, Candle, CandleInterval, Instrument, InstrumentId, InstrumentMeta,
@@ -54,10 +55,6 @@ const ORDER_PATH: &str = "/api/v3/order";
 const OPEN_ORDERS_PATH: &str = "/api/v3/openOrders";
 const ACCOUNT_PATH: &str = "/api/v3/account";
 const MY_TRADES_PATH: &str = "/api/v3/myTrades";
-
-/// Stablecoins Binance.US quotes against, used only when no symbol is
-/// configured to say which quote currency this account actually trades.
-const DEFAULT_CASH: [&str; 3] = ["USD", "USDT", "USDC"];
 
 /// A Binance order reference: the symbol and the numeric id, together.
 ///
@@ -162,6 +159,7 @@ pub struct BinanceUsVenue {
     caps: VenueCapabilities,
     session: TradingSession,
     symbols: Vec<String>,
+    quote_ccy: String,
     rest: BinanceRest,
 }
 
@@ -177,6 +175,18 @@ impl std::fmt::Debug for BinanceUsVenue {
 
 impl BinanceUsVenue {
     pub fn new(config: BinanceUsConfig) -> Result<Self> {
+        // One quote currency, or the balance cannot be reported faithfully:
+        // BTC/USD and BTC/USDT hold cash in different assets, and a single
+        // `available`/`total` pair can only describe one of them.
+        let quote_ccy = single_quote_currency(&config.symbols).map_err(|found| {
+            anyhow::anyhow!(
+                "Binance.US venue {} has symbols quoting in {} — one venue reports one \
+                 currency, so configure a venue entry per quote currency",
+                config.venue_id,
+                found.join(" and ")
+            )
+        })?;
+
         let signer = BinanceSigner::new(&config.api_key, &config.secret_key)?;
         let rest = BinanceRest::new(&config.base_url, signer, config.request_timeout)?;
 
@@ -197,6 +207,7 @@ impl BinanceUsVenue {
             },
             session: TradingSession::Always,
             symbols: config.symbols,
+            quote_ccy: quote_ccy.unwrap_or_else(|| "USD".to_string()),
             rest,
         })
     }
@@ -218,64 +229,13 @@ impl BinanceUsVenue {
             .as_millis() as u64)
     }
 
-    /// The quote currencies this account's cash is held in.
+    /// The single currency this venue's cash and equity are reported in.
     ///
-    /// Derived from the configured symbols rather than hardcoded: an account
-    /// trading `BTC/USDT` holds its cash in USDT, and counting USD as well
-    /// would report money that cannot be spent on the pairs being traded.
-    fn cash_currencies(&self) -> HashSet<String> {
-        let derived: HashSet<String> = self
-            .symbols
-            .iter()
-            .filter_map(|s| s.split('/').nth(1))
-            .map(|q| q.trim().to_uppercase())
-            .filter(|q| !q.is_empty())
-            .collect();
-
-        if derived.is_empty() {
-            return DEFAULT_CASH.iter().map(|s| s.to_string()).collect();
-        }
-        derived
-    }
-
-    /// The single currency this venue's cash is reported in.
-    ///
-    /// `Balance` carries one number and one currency, so a venue whose pairs
-    /// quote in more than one cannot be reported faithfully: summing USD and
-    /// USDT into one figure asserts they are interchangeable, and tells the
-    /// sizing gate there are 1000 spendable dollars when 900 of them can only
-    /// fund USDT pairs. The most-used quote currency is reported instead, and
-    /// the rest are named in a warning rather than folded in.
-    fn reporting_currency(&self) -> String {
-        let mut counts: HashMap<String, usize> = HashMap::new();
-        for symbol in &self.symbols {
-            if let Some(quote) = symbol.split('/').nth(1) {
-                let quote = quote.trim().to_uppercase();
-                if !quote.is_empty() {
-                    *counts.entry(quote).or_default() += 1;
-                }
-            }
-        }
-
-        if counts.len() > 1 {
-            let mut others: Vec<&String> = counts.keys().collect();
-            others.sort();
-            warn!(
-                venue = %self.id,
-                currencies = %others.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
-                "Configured pairs quote in more than one currency — only the most-used one is \
-                 reported as available cash, because summing them would invent money that \
-                 cannot fund the other pairs"
-            );
-        }
-
-        counts
-            .into_iter()
-            // Most symbols wins; the name breaks a tie so the figure does not
-            // flap between cycles.
-            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
-            .map(|(name, _)| name)
-            .unwrap_or_else(|| "USD".to_string())
+    /// Derived from the configured pairs at construction and refused there if
+    /// they span more than one: summing USD and USDT asserts they are
+    /// interchangeable, and dropping one silently understates the account.
+    fn cash_ccy(&self) -> &str {
+        &self.quote_ccy
     }
 
     /// The configured symbol whose base asset is `asset`, if the agent trades
@@ -1120,13 +1080,13 @@ impl Venue for BinanceUsVenue {
         // Spot crypto has no position endpoint: a position *is* a non-zero
         // balance in the base asset.
         let account = self.account().await?;
-        let cash = self.cash_currencies();
+        let cash = self.cash_ccy().to_string();
 
         let mut out = Vec::new();
         let mut outside = Vec::new();
         for balance in &account.balances {
             let asset = balance.asset.to_uppercase();
-            if cash.contains(&asset) {
+            if asset == cash {
                 continue;
             }
 
@@ -1176,31 +1136,51 @@ impl Venue for BinanceUsVenue {
     #[instrument(skip(self), fields(venue = %self.id))]
     async fn balance(&self) -> Result<Balance> {
         let account = self.account().await?;
-        // One currency, never a sum across several: see `reporting_currency`.
-        let ccy = self.reporting_currency();
+        let ccy = self.cash_ccy().to_string();
 
-        let available = account
+        let cash = account
             .balances
             .iter()
-            .filter(|b| b.asset.eq_ignore_ascii_case(&ccy))
-            // `free` only: what is locked is committed to a resting order and
-            // cannot fund a new one.
+            .find(|b| b.asset.eq_ignore_ascii_case(&ccy));
+        // `free` only funds an order; what is locked is committed to a resting
+        // one — but it is still equity.
+        let available = cash
             .map(|b| b.free_amount())
-            .next()
+            .transpose()?
+            .unwrap_or(Decimal::ZERO);
+        let cash_total = cash
+            .map(|b| b.total_amount())
             .transpose()?
             .unwrap_or(Decimal::ZERO);
 
+        let mut holdings: Vec<Holding> = Vec::new();
+        for balance in &account.balances {
+            let asset = balance.asset.to_uppercase();
+            if asset == ccy {
+                continue;
+            }
+            let qty = balance.total_amount()?;
+            if qty <= Decimal::ZERO {
+                continue;
+            }
+            holdings.push(Holding {
+                asset: asset.clone(),
+                qty,
+                // The configured pair when there is one; otherwise the shared
+                // helper prices it against this venue's quote currency. Every
+                // holding is priced, configured or not — cash in another
+                // currency included, since leaving it out understates the
+                // account rather than reporting that it could not be valued.
+                symbol: self.symbol_for_base(&asset),
+            });
+        }
+
+        let total = mark_equity(self, &self.id, &ccy, cash_total, &holdings).await;
+
         Ok(Balance {
-            // The quote currency this account trades in, not a hardcoded USD:
-            // a USDT account's numbers are USDT.
             ccy,
             available,
-            // Deliberately `None`. Equity would be cash plus the marked value
-            // of every holding, and the account endpoint reports quantities
-            // without prices. Reporting cash here instead would read every
-            // entry as an instant loss of the full notional and trip the
-            // drawdown breaker on a flat book.
-            total: None,
+            total,
         })
     }
 
@@ -2134,6 +2114,25 @@ mod tests {
         )
         .await;
 
+        Mock::given(http_method("GET"))
+            .and(path(DEPTH_PATH))
+            .and(query_param("symbol", "BTCUSD"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "bids": [["59990.00", "1"]], "asks": [["60010.00", "1"]]
+            })))
+            .mount(&server)
+            .await;
+        // The USDT is not this venue's cash, so it is a holding like any other
+        // and has to be priced rather than assumed to be a dollar.
+        Mock::given(http_method("GET"))
+            .and(path(DEPTH_PATH))
+            .and(query_param("symbol", "USDTUSD"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "bids": [["0.9999", "1"]], "asks": [["1.0001", "1"]]
+            })))
+            .mount(&server)
+            .await;
+
         let venue = venue(&server, &["BTC/USD"]);
         let balance = venue.balance().await.unwrap();
 
@@ -2144,9 +2143,9 @@ mod tests {
         );
         assert_eq!(balance.ccy, "USD");
         assert_eq!(
-            balance.total, None,
-            "equity needs a price per holding; reporting cash would read every entry \
-             as an instant loss of the full notional"
+            balance.total,
+            Some(dec!(1650.50)),
+            "150.50 cash (free + locked) + 0.01 BTC at 60000 + 900 USDT at 1.00"
         );
     }
 
@@ -2226,34 +2225,177 @@ mod tests {
     }
 
     /// Summing USD and USDT into one figure asserts they are interchangeable
-    /// and tells the sizing gate there are 1000 spendable dollars when 900 of
-    /// them can only fund USDT pairs.
+    /// and would tell the sizing gate there are spendable dollars that can in
+    /// fact only fund the other pairs. Dropping one instead understates the
+    /// account. `Balance` has room for one currency, so the configuration
+    /// itself is refused — at construction, where an operator is looking.
+    #[test]
+    fn a_venue_quoting_in_two_currencies_is_refused_at_construction() {
+        let err = BinanceUsVenue::new(
+            BinanceUsConfig::new("api-key", "secret-key")
+                .with_symbols(vec!["BTC/USD".to_string(), "ETH/USDT".to_string()]),
+        )
+        .unwrap_err();
+
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("USD and USDT"), "name both: {rendered}");
+        assert!(
+            rendered.contains("venue entry per quote currency"),
+            "and say what to do instead: {rendered}"
+        );
+    }
+
+    /// The single-currency case is the normal one and must still build.
+    #[test]
+    fn one_quote_currency_builds() {
+        assert!(BinanceUsVenue::new(
+            BinanceUsConfig::new("api-key", "secret-key")
+                .with_symbols(vec!["BTC/USDT".to_string(), "ETH/USDT".to_string()]),
+        )
+        .is_ok());
+    }
+
+    /// The number every loss limit is measured against. Without it
+    /// `check_breakers` halts, so a crypto-only deployment could not trade
+    /// live at all.
     #[tokio::test]
-    async fn two_quote_currencies_are_never_summed_into_one_figure() {
+    async fn equity_marks_each_holding_at_the_current_mid() {
         let server = MockServer::start().await;
         mount_account(
             &server,
             json!({
                 "balances": [
-                    {"asset": "USD",  "free": "100.00"},
-                    {"asset": "USDT", "free": "900.00"}
+                    {"asset": "USD", "free": "100.00", "locked": "0"},
+                    {"asset": "BTC", "free": "0.001",  "locked": "0.001"}
                 ]
             }),
         )
         .await;
+        Mock::given(http_method("GET"))
+            .and(path(DEPTH_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "bids": [["60000.00", "1"]], "asks": [["60010.00", "1"]]
+            })))
+            .mount(&server)
+            .await;
 
-        // Two BTC/USD pairs against one USDT pair: USD is the most-used.
-        let venue = venue(&server, &["BTC/USD", "ETH/USD", "SOL/USDT"]);
+        let venue = venue(&server, &["BTC/USD"]);
         let balance = venue.balance().await.unwrap();
-        assert_eq!(balance.ccy, "USD");
+
+        assert_eq!(balance.available, dec!(100.00));
+        // 0.002 BTC (free + locked) at a 60005 mid = 120.01.
         assert_eq!(
-            balance.available,
-            dec!(100.00),
-            "the USDT cannot fund a USD pair and must not be counted as if it could"
+            balance.total,
+            Some(dec!(220.01)),
+            "cash plus the marked holding, locked coins included"
         );
     }
 
-    /// An account can hold dust in dozens of assets. One unparseable amount
+    /// A partial equity is a wrong equity, and the drawdown breaker cannot
+    /// tell one from a real loss — a missing position reads exactly like a
+    /// position that went to zero.
+    #[tokio::test]
+    async fn equity_is_unknown_rather_than_partial_when_a_holding_cannot_be_priced() {
+        let server = MockServer::start().await;
+        mount_account(
+            &server,
+            json!({
+                "balances": [
+                    {"asset": "USD", "free": "100.00"},
+                    {"asset": "BTC", "free": "0.01"}
+                ]
+            }),
+        )
+        .await;
+        Mock::given(http_method("GET"))
+            .and(path(DEPTH_PATH))
+            .respond_with(ResponseTemplate::new(500).set_body_string("down"))
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["BTC/USD"]);
+        let balance = venue.balance().await.unwrap();
+        assert_eq!(balance.available, dec!(100.00), "cash is still readable");
+        assert_eq!(
+            balance.total, None,
+            "reporting 100 here would book the whole position as an instant loss"
+        );
+    }
+
+    /// Cash in another currency, and coins the agent does not trade, are both
+    /// still the account's money. Dropping them reports a partial equity as
+    /// authoritative — the review proved a $542 account reporting $42.
+    #[tokio::test]
+    async fn equity_prices_everything_the_account_holds() {
+        let server = MockServer::start().await;
+        mount_account(
+            &server,
+            json!({
+                "balances": [
+                    {"asset": "USDT", "free": "42.00"},
+                    {"asset": "USD",  "free": "500.00"},
+                    {"asset": "SOL",  "free": "2"}
+                ]
+            }),
+        )
+        .await;
+        Mock::given(http_method("GET"))
+            .and(path(DEPTH_PATH))
+            .and(query_param("symbol", "USDUSDT"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "bids": [["0.9999", "1"]], "asks": [["1.0001", "1"]]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(http_method("GET"))
+            .and(path(DEPTH_PATH))
+            .and(query_param("symbol", "SOLUSDT"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "bids": [["149.00", "1"]], "asks": [["151.00", "1"]]
+            })))
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["BTC/USDT"]);
+        let balance = venue.balance().await.unwrap();
+
+        assert_eq!(balance.ccy, "USDT");
+        assert_eq!(
+            balance.available,
+            dec!(42.00),
+            "only USDT funds a USDT pair"
+        );
+        // 42 + (500 x 1.0) + (2 x 150) = 842
+        assert_eq!(
+            balance.total,
+            Some(dec!(842.00)),
+            "the USD cash and the SOL are the account's too"
+        );
+    }
+
+    /// A closed position leaves billionths of a coin behind. Demanding a quote
+    /// for that would let a failed book call over a fraction of a cent blank
+    /// the account's equity and halt the agent.
+    #[tokio::test]
+    async fn dust_does_not_need_a_quote_and_cannot_blank_equity() {
+        let server = MockServer::start().await;
+        mount_account(
+            &server,
+            json!({
+                "balances": [
+                    {"asset": "USD", "free": "1000.00"},
+                    {"asset": "BTC", "free": "0.00000001"}
+                ]
+            }),
+        )
+        .await;
+        // No depth mock at all: asking for one would fail the call.
+
+        let venue = venue(&server, &["BTC/USD"]);
+        assert_eq!(venue.balance().await.unwrap().total, Some(dec!(1000.00)));
+    }
+
+    /// An account can hold dust in dozens of assets. One unparseable amount    /// An account can hold dust in dozens of assets. One unparseable amount
     /// must not fail the whole call and blind the audit — least of all for a
     /// row that was going to be discarded anyway.
     #[tokio::test]

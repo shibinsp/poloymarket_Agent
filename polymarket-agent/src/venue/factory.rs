@@ -117,8 +117,27 @@ pub fn build_registry_reporting(
             }
             "polymarket" => match &polymarket_client {
                 Some(client) => {
-                    info!(venue = %venue_config.id, "Venue enabled");
-                    venues.push(Box::new(PolymarketVenue::new(client.clone())));
+                    let venue = PolymarketVenue::new(client.clone());
+                    // Refused, not merely warned about. Every loss limit is
+                    // measured against equity summed across the registry, and
+                    // this venue cannot report one — its position listing is
+                    // unimplemented, so `balance().total` is always `None`.
+                    // Enabling it therefore made the sum unknowable and halted
+                    // the agent `UntilResume` on every cycle, whatever the
+                    // other venues said. The legacy Polymarket loop, which has
+                    // its own equity, runs when no venue is configured.
+                    if !venue.reports_equity() {
+                        skip(
+                            &venue_config.id,
+                            "Polymarket cannot report account equity, so the risk limits \
+                             could not be evaluated for any venue while it is enabled — \
+                             leave `[[venues]]` unset to use the legacy Polymarket loop"
+                                .to_string(),
+                        );
+                    } else {
+                        info!(venue = %venue_config.id, "Venue enabled");
+                        venues.push(Box::new(venue));
+                    }
                 }
                 None => skip(
                     &venue_config.id,
@@ -608,6 +627,37 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
         let config = config_with(vec![venue]);
         let registry = build_registry(&config, &secrets_with_alpaca(true), None).unwrap();
         assert!(registry.is_empty());
+    }
+
+    /// Every loss limit is measured against equity summed across the
+    /// registry, and this venue cannot report one — so enabling it made that
+    /// sum unknowable and halted the agent `UntilResume` on every cycle,
+    /// whatever the other venues said.
+    #[tokio::test]
+    async fn a_polymarket_venue_is_refused_because_it_cannot_report_equity() {
+        let mut venue = alpaca_config(true);
+        venue.kind = "polymarket".to_string();
+        venue.id = "polymarket".to_string();
+
+        let config = config_with(vec![venue]);
+        let client = std::sync::Arc::new(
+            crate::market::polymarket::PolymarketClient::new(
+                std::sync::Arc::new(config.clone()),
+                &Secrets::default(),
+            )
+            .await
+            .expect("a paper client needs no key"),
+        );
+        let (registry, skipped) =
+            build_registry_reporting(&config, &secrets_with_alpaca(false), Some(client));
+
+        assert!(registry.is_empty(), "it would halt the agent every cycle");
+        assert_eq!(skipped.len(), 1);
+        assert!(
+            skipped[0].reason.contains("equity"),
+            "the reason must name why: {}",
+            skipped[0].reason
+        );
     }
 
     #[test]

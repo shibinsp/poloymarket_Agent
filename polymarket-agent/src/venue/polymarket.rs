@@ -363,6 +363,14 @@ impl Venue for PolymarketVenue {
         bail!("Polymarket open-order listing is not implemented")
     }
 
+    /// `positions` is unimplemented here, so there is no way to value what is
+    /// held and `balance().total` is always `None`. Saying so lets the
+    /// registry refuse this venue instead of halting every cycle over an
+    /// equity figure it was never going to get.
+    fn reports_equity(&self) -> bool {
+        false
+    }
+
     async fn positions(&self) -> Result<Vec<Position>> {
         bail!("Polymarket position listing is not implemented")
     }

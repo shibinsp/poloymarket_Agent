@@ -149,6 +149,31 @@ pub struct Account {
     pub active: Option<bool>,
 }
 
+impl Account {
+    /// Spendable now: what an order can be funded from.
+    pub fn available(&self) -> Result<Decimal> {
+        amount_or_zero(self.available_balance.as_ref(), "available_balance")
+    }
+
+    /// Everything the account holds in this currency, spendable or not.
+    ///
+    /// `hold` is money committed to a resting order. It is still the
+    /// account's — omitting it from a *position* makes the holding appear to
+    /// shrink the moment an exit order rests, which reads as drift and halts
+    /// the agent; omitting it from *equity* books an unrealised loss of the
+    /// whole order the instant it is placed.
+    pub fn total(&self) -> Result<Decimal> {
+        Ok(self.available()? + amount_or_zero(self.hold.as_ref(), "hold")?)
+    }
+}
+
+fn amount_or_zero(amount: Option<&Amount>, field: &str) -> Result<Decimal> {
+    match amount {
+        Some(a) => money(&a.value, field),
+        None => Ok(Decimal::ZERO),
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Amount {
     pub value: String,
@@ -367,6 +392,30 @@ mod tests {
         let mut p = product(Some("online"));
         p.product_type = Some("FUTURE".to_string());
         assert!(!p.tradeable());
+    }
+
+    /// Money committed to a resting order is still the account's. Omitting it
+    /// makes a position appear to shrink the moment an exit rests — which the
+    /// reconciler reads as drift and halts on.
+    #[test]
+    fn an_accounts_total_counts_what_is_held_against_resting_orders() {
+        let account: Account = serde_json::from_value(serde_json::json!({
+            "currency": "BTC",
+            "available_balance": {"value": "0.004"},
+            "hold": {"value": "0.006"}
+        }))
+        .unwrap();
+        assert_eq!(account.available().unwrap(), dec!(0.004));
+        assert_eq!(account.total().unwrap(), dec!(0.01));
+    }
+
+    #[test]
+    fn an_absent_hold_is_zero_rather_than_an_error() {
+        let account: Account = serde_json::from_value(serde_json::json!({
+            "currency": "USD", "available_balance": {"value": "100"}
+        }))
+        .unwrap();
+        assert_eq!(account.total().unwrap(), dec!(100));
     }
 
     /// Coinbase populates a different field depending on where the order was
