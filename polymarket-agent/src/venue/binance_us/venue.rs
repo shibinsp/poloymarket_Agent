@@ -27,9 +27,7 @@ use rust_decimal::Decimal;
 use tracing::{info, instrument, warn};
 
 use super::auth::BinanceSigner;
-use super::models::{
-    money, AccountInfo, AssetBalance, Depth, ExchangeInfo, Kline, Order, SymbolInfo, Trade,
-};
+use super::models::{money, AccountInfo, Depth, ExchangeInfo, Kline, Order, SymbolInfo, Trade};
 use super::rest::BinanceRest;
 use crate::market::models::{OrderBookSnapshot, PriceLevel};
 use crate::venue::session::TradingSession;
@@ -240,6 +238,69 @@ impl BinanceUsVenue {
         derived
     }
 
+    /// The single currency this venue's cash is reported in.
+    ///
+    /// `Balance` carries one number and one currency, so a venue whose pairs
+    /// quote in more than one cannot be reported faithfully: summing USD and
+    /// USDT into one figure asserts they are interchangeable, and tells the
+    /// sizing gate there are 1000 spendable dollars when 900 of them can only
+    /// fund USDT pairs. The most-used quote currency is reported instead, and
+    /// the rest are named in a warning rather than folded in.
+    fn reporting_currency(&self) -> String {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for symbol in &self.symbols {
+            if let Some(quote) = symbol.split('/').nth(1) {
+                let quote = quote.trim().to_uppercase();
+                if !quote.is_empty() {
+                    *counts.entry(quote).or_default() += 1;
+                }
+            }
+        }
+
+        if counts.len() > 1 {
+            let mut others: Vec<&String> = counts.keys().collect();
+            others.sort();
+            warn!(
+                venue = %self.id,
+                currencies = %others.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
+                "Configured pairs quote in more than one currency — only the most-used one is \
+                 reported as available cash, because summing them would invent money that \
+                 cannot fund the other pairs"
+            );
+        }
+
+        counts
+            .into_iter()
+            // Most symbols wins; the name breaks a tie so the figure does not
+            // flap between cycles.
+            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+            .map(|(name, _)| name)
+            .unwrap_or_else(|| "USD".to_string())
+    }
+
+    /// The configured symbol whose base asset is `asset`, if the agent trades
+    /// one.
+    ///
+    /// A spot balance names only the asset — `BTC` — and the pair it belongs
+    /// to is a choice. `None` means the agent does not trade this asset, and
+    /// the caller reports it rather than inventing a symbol for it.
+    /// The base and quote assets of a Binance symbol, from the configured
+    /// pair rather than from splitting the concatenated name.
+    ///
+    /// `BTCUSD` could split as `BTC/USD` or `BT/CUSD`; this module's header
+    /// says so and then the commission arithmetic guessed anyway. The
+    /// configured symbol already carries the split, so it is read from there.
+    fn assets_for(&self, binance_symbol: &str) -> Option<(String, String)> {
+        self.symbols.iter().find_map(|s| {
+            if Self::to_binance_symbol(s) != binance_symbol.to_uppercase() {
+                return None;
+            }
+            let upper = s.trim().to_uppercase();
+            let (base, quote) = upper.split_once('/')?;
+            Some((base.to_string(), quote.to_string()))
+        })
+    }
+
     /// The configured symbol whose base asset is `asset`, if the agent trades
     /// one.
     ///
@@ -364,6 +425,22 @@ impl BinanceUsVenue {
         let mut total = Decimal::ZERO;
         let mut unconvertible: Vec<String> = Vec::new();
 
+        // Without the pair's own split there is no way to tell a base-asset
+        // commission from a quote-asset one, and guessing it wrong multiplies
+        // a dollar fee by the fill price — a 60000x overstatement on a BTC
+        // pair. Reporting zero and saying so is the honest alternative.
+        let Some((base, quote)) = self.assets_for(symbol) else {
+            if trades.iter().any(|t| t.commission_asset.is_some()) {
+                warn!(
+                    venue = %self.id,
+                    symbol,
+                    "Binance.US reported a commission on a symbol this venue does not have \
+                     configured — it cannot be priced, so the recorded fee is zero"
+                );
+            }
+            return Decimal::ZERO;
+        };
+
         for trade in trades {
             let Some(asset) = trade.commission_asset.as_deref() else {
                 continue;
@@ -379,18 +456,19 @@ impl BinanceUsVenue {
                 continue;
             }
 
-            if symbol.to_uppercase().ends_with(&asset.to_uppercase()) {
+            let asset_upper = asset.to_uppercase();
+            if asset_upper == quote {
                 // Already the quote currency.
                 total += commission;
-            } else if symbol.to_uppercase().starts_with(&asset.to_uppercase()) {
+            } else if asset_upper == base {
                 match trade.price_amount() {
                     Ok(price) if price > Decimal::ZERO => total += commission * price,
-                    _ => unconvertible.push(asset.to_uppercase()),
+                    _ => unconvertible.push(asset_upper),
                 }
             } else {
                 // BNB, typically. Converting needs a third quote this call
                 // does not have.
-                unconvertible.push(asset.to_uppercase());
+                unconvertible.push(asset_upper);
             }
         }
 
@@ -405,6 +483,15 @@ impl BinanceUsVenue {
         }
         total
     }
+}
+
+/// Whether a cancel failed only because there was nothing to cancel.
+///
+/// Binance answers `DELETE /openOrders` for an empty book with `-2011 Unknown
+/// order sent`. Treating that as a failure would have the kill switch report a
+/// book it did in fact clear.
+fn is_no_orders_to_cancel(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains("(-2011)")
 }
 
 /// Binance's order status vocabulary, mapped to ours.
@@ -548,14 +635,19 @@ impl Venue for BinanceUsVenue {
             .iter()
             .map(|s| Self::to_binance_symbol(s))
             .collect();
-        // Ask for exactly these. `exchangeInfo` otherwise returns every pair
-        // Binance.US lists, which is both wasteful and a weight-20 call.
-        let symbols_param = serde_json::to_string(&wanted)
-            .context("Failed to encode the Binance.US symbol filter")?;
+        let wanted_set: HashSet<&String> = wanted.iter().collect();
 
+        // Deliberately unfiltered, and filtered locally instead.
+        //
+        // `exchangeInfo?symbols=[...]` fails the *whole* request with
+        // `-1121 Invalid symbol` if any one of them is unknown, so a single
+        // delisted pair would take the rest of the universe down with it —
+        // and the per-symbol "does not list this symbol" warning below could
+        // never fire, because Binance never sends a partial answer. One
+        // unfiltered call costs the same weight and cannot fail this way.
         let info: ExchangeInfo = self
             .rest
-            .public(EXCHANGE_INFO_PATH, &[("symbols", symbols_param)])
+            .public(EXCHANGE_INFO_PATH, &[])
             .await
             .context("Failed to list Binance.US symbols")?;
 
@@ -563,6 +655,9 @@ impl Venue for BinanceUsVenue {
         let mut seen: HashSet<String> = HashSet::new();
         for symbol_info in &info.symbols {
             let upper = symbol_info.symbol.to_uppercase();
+            if !wanted_set.contains(&upper) {
+                continue;
+            }
             if !seen.insert(upper) {
                 continue;
             }
@@ -729,6 +824,33 @@ impl Venue for BinanceUsVenue {
         let mut params: Vec<(&str, String)> =
             vec![("symbol", symbol.clone()), ("side", side.to_string())];
 
+        // Apply the instrument's own constraints before Binance does. The
+        // filters are parsed out of `exchangeInfo` into the `Instrument` and
+        // then have to be *used*: an exit sized from a spot balance
+        // (0.00456789 BTC against a 0.00001 step) comes back `-1013 Filter
+        // failure: LOT_SIZE`, and the position stays open through the next
+        // drawdown. Alpaca grew this same guard after the same bug.
+        let qty = request.instrument.round_qty(request.qty);
+        if qty <= Decimal::ZERO {
+            bail!(
+                "Quantity {} for {symbol} rounds to zero against the venue's lot size — \
+                 the order would only be rejected",
+                request.qty
+            );
+        }
+        // Checked after rounding, because the size submitted is the one that
+        // has to clear.
+        if !request.instrument.meets_min_qty(qty) {
+            bail!(
+                "Quantity {qty} for {symbol} is below Binance.US's minimum order size of {}",
+                request
+                    .instrument
+                    .min_qty
+                    .unwrap_or(Decimal::ZERO)
+                    .normalize()
+            );
+        }
+
         match request.kind {
             OrderKind::Limit { price } => {
                 // Binance has no good-till-date on spot, and no day orders on
@@ -743,16 +865,39 @@ impl Venue for BinanceUsVenue {
                          use Gtc or Ioc"
                     ),
                 };
+                if price <= Decimal::ZERO {
+                    bail!("Binance.US limit price must be positive, got {price} for {symbol}");
+                }
+                let ticked = request.instrument.round_price(price, request.side);
+                if ticked <= Decimal::ZERO {
+                    bail!(
+                        "Limit price {price} for {symbol} rounds to zero against the \
+                         venue's tick size"
+                    );
+                }
+                // The value floor is on the rounded pair, not the requested
+                // one — rounding down can cross it.
+                if !request.instrument.meets_min_notional(qty * ticked) {
+                    bail!(
+                        "Order value {} for {symbol} is below Binance.US's minimum of {}",
+                        (qty * ticked).normalize(),
+                        request
+                            .instrument
+                            .min_notional
+                            .unwrap_or(Decimal::ZERO)
+                            .normalize()
+                    );
+                }
                 params.push(("type", "LIMIT".to_string()));
                 params.push(("timeInForce", tif.to_string()));
-                params.push(("quantity", request.qty.normalize().to_string()));
-                params.push(("price", price.normalize().to_string()));
+                params.push(("quantity", qty.normalize().to_string()));
+                params.push(("price", ticked.normalize().to_string()));
             }
             // Unlike Coinbase, Binance sizes a market order in the base asset
             // on both sides, so a market buy needs no price to express.
             OrderKind::Market => {
                 params.push(("type", "MARKET".to_string()));
-                params.push(("quantity", request.qty.normalize().to_string()));
+                params.push(("quantity", qty.normalize().to_string()));
             }
         }
 
@@ -784,8 +929,25 @@ impl Venue for BinanceUsVenue {
             OrderRef::Client(client_order_id) => {
                 // Binance looks up by client id natively — but still only
                 // within one symbol. The reconciler reaches this path when no
-                // venue id was recorded, so the symbol is not known here; the
-                // configured universe is the only place it can come from.
+                // venue id was recorded, so the symbol is not known here.
+                //
+                // `openOrders` returns `clientOrderId` account-wide in one
+                // request, so a still-resting order — which is what this path
+                // is usually chasing — costs one round trip instead of one
+                // signed request per configured symbol, every cycle.
+                if let Ok(open) = self.open_orders().await {
+                    if let Some(ack) = open.iter().find(|a| a.client_order_id == *client_order_id) {
+                        let key = OrderKey::parse(&ack.venue_order_id)?;
+                        let params = vec![
+                            ("symbol", key.symbol.clone()),
+                            ("orderId", key.order_id.to_string()),
+                        ];
+                        return self.fetch_order(&key, params).await;
+                    }
+                }
+
+                // Not resting: it filled, was cancelled, or never arrived. Now
+                // the per-symbol search is the only way left to tell which.
                 let mut last_error = None;
                 for symbol in &self.symbols {
                     let binance_symbol = Self::to_binance_symbol(symbol);
@@ -832,35 +994,28 @@ impl Venue for BinanceUsVenue {
 
     #[instrument(skip(self), fields(venue = %self.id))]
     async fn cancel_all(&self) -> Result<()> {
-        // One call per symbol that actually has a resting order, rather than
-        // one per order: `DELETE /openOrders` takes a symbol and cancels that
-        // symbol's book in a single request.
-        let open = self.open_orders().await?;
-        let mut symbols: Vec<String> = Vec::new();
-        let mut seen = HashSet::new();
-        let mut unreadable = Vec::new();
-        for ack in &open {
-            // Not `?`: an id this cannot read is one order that will not be
-            // cancelled, and failing here would leave the whole book resting.
-            match OrderKey::parse(&ack.venue_order_id) {
-                Ok(key) => {
-                    if seen.insert(key.symbol.clone()) {
-                        symbols.push(key.symbol);
-                    }
-                }
-                Err(e) => unreadable.push(format!("{}: {e:#}", ack.venue_order_id)),
-            }
-        }
-        if symbols.is_empty() && unreadable.is_empty() {
+        // Driven from the **configured** universe, not from what the account
+        // happens to be holding, for two reasons.
+        //
+        // Mandate: `DELETE /openOrders` cancels a whole symbol's book. Taking
+        // the symbol list from an account-wide listing would have the kill
+        // switch cancel the operator's own resting orders on pairs the agent
+        // does not trade — money it has no business touching.
+        //
+        // Reach: deriving it from `open_orders()` also made a failed listing
+        // abort before a single cancel, which is the failure this is supposed
+        // to be the answer to. The symbols are known locally, so no call has
+        // to succeed first.
+        if self.symbols.is_empty() {
             return Ok(());
         }
 
-        let mut failed = unreadable;
-        for symbol in &symbols {
-            let params = [("symbol", symbol.clone())];
-            // One symbol failing must not cost the cancels for the others:
-            // this is the kill switch.
-            if let Err(e) = self
+        let mut failed = Vec::new();
+        let mut cancelled = 0usize;
+        for symbol in &self.symbols {
+            let binance_symbol = Self::to_binance_symbol(symbol);
+            let params = [("symbol", binance_symbol.clone())];
+            match self
                 .rest
                 .signed::<serde_json::Value>(
                     Method::DELETE,
@@ -870,42 +1025,58 @@ impl Venue for BinanceUsVenue {
                 )
                 .await
             {
-                failed.push(format!("{symbol}: {e:#}"));
+                Ok(_) => cancelled += 1,
+                // Nothing was resting on that symbol. That is the outcome
+                // wanted, not a failure — and treating it as one would have
+                // the kill switch report a book it actually cleared.
+                Err(e) if is_no_orders_to_cancel(&e) => {}
+                // One symbol failing must not cost the cancels for the rest.
+                Err(e) => failed.push(format!("{binance_symbol}: {e:#}")),
             }
         }
 
         if !failed.is_empty() {
             bail!(
-                "Binance.US could not cancel every symbol's book — {} may still be resting: {}",
+                "Binance.US could not cancel {} symbol(s) — orders may still be resting: {}",
                 failed.len(),
                 failed.join("; ")
             );
         }
-        info!(
-            orders = open.len(),
-            symbols = symbols.len(),
-            "Cancelled resting Binance.US orders"
-        );
+        info!(symbols = cancelled, "Cancelled resting Binance.US orders");
         Ok(())
     }
 
     #[instrument(skip(self), fields(venue = %self.id))]
     async fn open_orders(&self) -> Result<Vec<OrderAck>> {
-        // Without a symbol this returns every open order across the account,
-        // in one unpaged response — which is what the kill switch and the
-        // orphan audit both need.
+        // Account-wide in one unpaged response, then filtered to the
+        // configured universe. The filter is the point: the orphan audit
+        // turns any resting order it has no local record of into an
+        // `UntilResume` halt, so an operator's own manual order on a pair the
+        // agent does not trade would halt it on the first cycle — the same
+        // trap `positions()` guards against, which this originally did not.
         let orders: Vec<Order> = self
             .rest
             .signed(Method::GET, OPEN_ORDERS_PATH, &[], Self::now_ms()?)
             .await
             .context("Failed to list open Binance.US orders")?;
 
+        let mine: HashSet<String> = self
+            .symbols
+            .iter()
+            .map(|s| Self::to_binance_symbol(s))
+            .collect();
+
         let mut acks = Vec::new();
+        let mut outside = 0usize;
         for order in &orders {
-            let symbol = order.symbol.clone().unwrap_or_default();
-            // Lossy on purpose: `cancel_all` starts here, so one unparseable
-            // quantity must not cost the cancels for the whole book. The id
-            // and the symbol are what cancelling needs, and both survive.
+            let symbol = order.symbol.clone().unwrap_or_default().to_uppercase();
+            if !mine.contains(&symbol) {
+                outside += 1;
+                continue;
+            }
+            // Lossy on purpose: one unparseable field must not cost the whole
+            // listing. The id and the symbol are what the audit needs, and
+            // both survive.
             match to_ack(order, &symbol) {
                 Ok(ack) => acks.push(ack),
                 Err(e) => {
@@ -913,20 +1084,33 @@ impl Venue for BinanceUsVenue {
                         order_id = order.order_id,
                         symbol = %symbol,
                         error = %format!("{e:#}"),
-                        "Binance.US sent an unparseable order field — keeping the order so it \
-                         can still be cancelled, with its numeric fields zeroed"
+                        "Binance.US sent an unparseable order field — keeping the order, with \
+                         its state reported as unknown"
                     );
                     acks.push(OrderAck {
-                        venue_order_id: OrderKey::new(symbol.to_uppercase(), order.order_id)
-                            .to_string(),
+                        venue_order_id: OrderKey::new(symbol, order.order_id).to_string(),
                         client_order_id: order.client_order_id.clone().unwrap_or_default(),
-                        state: to_order_state(order),
+                        // Not `to_order_state`: it reads an unparseable
+                        // quantity as zero, which turns a cancelled order that
+                        // caught a partial fill into a plain `Cancelled` — and
+                        // the filled part is a real position that must stay
+                        // exitable. Unknown is the honest answer.
+                        state: OrderState::Unknown,
                         filled_qty: Decimal::ZERO,
                         avg_fill_price: None,
                         fees: Decimal::ZERO,
                     });
                 }
             }
+        }
+
+        if outside > 0 {
+            warn!(
+                venue = %self.id,
+                orders = outside,
+                "Binance.US has resting orders outside the configured universe — not reported, \
+                 since the orphan audit would read them as drift and halt"
+            );
         }
         Ok(acks)
     }
@@ -945,6 +1129,21 @@ impl Venue for BinanceUsVenue {
             if cash.contains(&asset) {
                 continue;
             }
+
+            // Only what the agent actually trades. A Binance.US account is a
+            // personal wallet as well as an agent account, and reporting a
+            // holding the ledger has no record of is an `UntilResume` halt
+            // needing a human.
+            //
+            // Checked *before* parsing: an account can hold dust in dozens of
+            // assets, and letting one unparseable amount fail the whole call
+            // would blind the audit over a row that was going to be discarded
+            // anyway.
+            let Some(symbol) = self.symbol_for_base(&asset) else {
+                outside.push(asset);
+                continue;
+            };
+
             // Free *and* locked: coins held against a resting order are still
             // the account's position, and omitting them would read as drift
             // the moment an exit order rests.
@@ -953,21 +1152,14 @@ impl Venue for BinanceUsVenue {
                 continue;
             }
 
-            // Only what the agent actually trades. A Binance.US account is a
-            // personal wallet as well as an agent account, and reporting a
-            // holding the ledger has no record of is an `UntilResume` halt
-            // needing a human.
-            match self.symbol_for_base(&asset) {
-                Some(symbol) => out.push(Position {
-                    instrument: InstrumentId::new(self.id.clone(), symbol),
-                    qty,
-                    // Binance reports no cost basis on the account endpoint.
-                    // Zero would claim the position was free and make every
-                    // P&L wrong; the reconciler compares quantities.
-                    avg_entry: Decimal::ZERO,
-                }),
-                None => outside.push(format!("{asset} {}", qty.normalize())),
-            }
+            out.push(Position {
+                instrument: InstrumentId::new(self.id.clone(), symbol),
+                qty,
+                // Binance reports no cost basis on the account endpoint. Zero
+                // would claim the position was free and make every P&L wrong;
+                // the reconciler compares quantities.
+                avg_entry: Decimal::ZERO,
+            });
         }
 
         if !outside.is_empty() {
@@ -984,27 +1176,24 @@ impl Venue for BinanceUsVenue {
     #[instrument(skip(self), fields(venue = %self.id))]
     async fn balance(&self) -> Result<Balance> {
         let account = self.account().await?;
-        let cash = self.cash_currencies();
+        // One currency, never a sum across several: see `reporting_currency`.
+        let ccy = self.reporting_currency();
 
-        let by_asset: HashMap<String, &AssetBalance> = account
+        let available = account
             .balances
             .iter()
-            .map(|b| (b.asset.to_uppercase(), b))
-            .collect();
-
-        let mut available = Decimal::ZERO;
-        for asset in &cash {
-            if let Some(balance) = by_asset.get(asset) {
-                // `free` only: what is locked is committed to a resting order
-                // and cannot fund a new one.
-                available += balance.free_amount()?;
-            }
-        }
+            .filter(|b| b.asset.eq_ignore_ascii_case(&ccy))
+            // `free` only: what is locked is committed to a resting order and
+            // cannot fund a new one.
+            .map(|b| b.free_amount())
+            .next()
+            .transpose()?
+            .unwrap_or(Decimal::ZERO);
 
         Ok(Balance {
             // The quote currency this account trades in, not a hardcoded USD:
             // a USDT account's numbers are USDT.
-            ccy: primary_currency(&cash),
+            ccy,
             available,
             // Deliberately `None`. Equity would be cash plus the marked value
             // of every holding, and the account endpoint reports quantities
@@ -1022,26 +1211,14 @@ impl Venue for BinanceUsVenue {
     }
 }
 
-/// A stable name for the account's cash, for reporting.
-///
-/// Sorted so a two-stablecoin account does not report a different currency
-/// from one call to the next — a `ccy` that flaps is a metric that cannot be
-/// charted.
-fn primary_currency(cash: &HashSet<String>) -> String {
-    let mut names: Vec<&String> = cash.iter().collect();
-    names.sort();
-    names
-        .first()
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "USD".to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
     use serde_json::{json, Value};
-    use wiremock::matchers::{header, method as http_method, path, query_param};
+    use wiremock::matchers::{
+        header, method as http_method, path, query_param, query_param_is_missing,
+    };
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn venue(server: &MockServer, symbols: &[&str]) -> BinanceUsVenue {
@@ -1204,31 +1381,59 @@ mod tests {
             .is_empty());
     }
 
-    /// `exchangeInfo` otherwise returns every pair Binance.US lists.
+    /// `exchangeInfo?symbols=[...]` fails the **whole** request with `-1121`
+    /// if any one symbol is unknown, so one delisted pair would take the rest
+    /// of the universe down with it — and Binance never sends the partial
+    /// answer the "does not list this symbol" warning was written for.
     #[tokio::test]
-    async fn only_the_configured_symbols_are_requested() {
+    async fn one_delisted_symbol_does_not_take_the_others_down() {
         let server = MockServer::start().await;
         Mock::given(http_method("GET"))
             .and(path(EXCHANGE_INFO_PATH))
-            .and(query_param("symbols", r#"["BTCUSD","ETHUSD"]"#))
+            // Unfiltered: a `symbols` parameter would have made this a 400.
+            .and(query_param_is_missing("symbols"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(json!({"symbols": [btc_symbol()]})),
             )
             .mount(&server)
             .await;
 
-        let venue = venue(&server, &["BTC/USD", "ETH/USD"]);
-        assert_eq!(
-            venue
-                .list_instruments(&ScanFilter::default())
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
+        // MATIC/USD is configured but no longer listed.
+        let venue = venue(&server, &["BTC/USD", "MATIC/USD"]);
+        let found = venue
+            .list_instruments(&ScanFilter::default())
+            .await
+            .unwrap();
+
+        assert_eq!(found.len(), 1, "BTC keeps trading");
+        assert_eq!(found[0].symbol(), "BTC/USD");
     }
 
-    // ---- quotes and candles ---------------------------------------------
+    /// Filtering moved to this side, so it still has to actually filter.
+    #[tokio::test]
+    async fn symbols_the_venue_does_not_trade_are_left_out() {
+        let server = MockServer::start().await;
+        let mut doge = btc_symbol();
+        doge["symbol"] = json!("DOGEUSD");
+        doge["baseAsset"] = json!("DOGE");
+        Mock::given(http_method("GET"))
+            .and(path(EXCHANGE_INFO_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"symbols": [btc_symbol(), doge]})),
+            )
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["BTC/USD"]);
+        let found = venue
+            .list_instruments(&ScanFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].symbol(), "BTC/USD");
+    }
+
+    // ---- quotes and candles ---------------------------------------------    // ---- quotes and candles ---------------------------------------------
 
     #[tokio::test]
     async fn a_quote_reads_the_positional_book_levels() {
@@ -1485,6 +1690,79 @@ mod tests {
         assert_eq!(to_order_state(&order), OrderState::Unknown);
     }
 
+    /// The filters are parsed into the `Instrument` and then have to be
+    /// *used*. An exit sized from a spot balance (0.00456789 against a
+    /// 0.00001 step) comes back `-1013 Filter failure: LOT_SIZE` and the
+    /// position stays open through the next drawdown.
+    #[tokio::test]
+    async fn the_quantity_and_price_are_rounded_to_the_venues_filters() {
+        let server = MockServer::start().await;
+        Mock::given(http_method("POST"))
+            .and(path(ORDER_PATH))
+            .and(query_param("quantity", "0.004567"))
+            .and(query_param("price", "60000.01"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "symbol": "BTCUSD", "orderId": 40, "status": "NEW",
+                "executedQty": "0", "cummulativeQuoteQty": "0"
+            })))
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["BTC/USD"]);
+        let mut req = request(
+            OrderKind::Limit {
+                price: dec!(60000.019),
+            },
+            Side::Buy,
+            TimeInForce::Gtc,
+        );
+        req.qty = dec!(0.00456789);
+        venue
+            .place_order(&req)
+            .await
+            .expect("rounded to step 0.000001 and tick 0.01");
+    }
+
+    /// Rounding down can cross the floor, so it is checked after.
+    #[tokio::test]
+    async fn an_order_that_rounds_below_the_minimum_is_refused_here() {
+        let server = MockServer::start().await;
+        let venue = venue(&server, &["BTC/USD"]);
+        let mut req = request(
+            OrderKind::Limit { price: dec!(60000) },
+            Side::Buy,
+            TimeInForce::Gtc,
+        );
+        // Below the 0.00001 minQty once rounded.
+        req.qty = dec!(0.000004);
+        let err = venue.place_order(&req).await.unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("rounds to zero") || rendered.contains("minimum order size"),
+            "{rendered}"
+        );
+    }
+
+    /// Binance gates on order *value* as well as size, and at micro capital
+    /// that floor is the one that binds.
+    #[tokio::test]
+    async fn an_order_below_the_minimum_notional_is_refused_here() {
+        let server = MockServer::start().await;
+        let venue = venue(&server, &["BTC/USD"]);
+        let mut req = request(
+            OrderKind::Limit { price: dec!(60000) },
+            Side::Buy,
+            TimeInForce::Gtc,
+        );
+        // 0.0001 x 60000 = $6, under the $10 NOTIONAL filter.
+        req.qty = dec!(0.0001);
+        let err = venue.place_order(&req).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("below Binance.US's minimum"),
+            "{err:#}"
+        );
+    }
+
     // ---- commissions -----------------------------------------------------
 
     /// A buy is commissioned in the base asset. Adding that to a dollar fee
@@ -1578,6 +1856,44 @@ mod tests {
             .expect("the fill must survive a missing fee");
         assert_eq!(ack.filled_qty, dec!(0.001));
         assert_eq!(ack.fees, Decimal::ZERO);
+    }
+
+    /// `BTCUSD` could split as `BTC/USD` or `BT/CUSD`, so which side a
+    /// commission was charged on cannot come from string surgery: guessing a
+    /// quote fee for a base one multiplies it by the fill price — a 60000x
+    /// overstatement on a BTC pair.
+    #[tokio::test]
+    async fn the_commission_side_comes_from_the_configured_pair() {
+        let server = MockServer::start().await;
+        Mock::given(http_method("POST"))
+            .and(path(ORDER_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "symbol": "ETHBTC", "orderId": 41, "status": "FILLED",
+                "executedQty": "1", "cummulativeQuoteQty": "0.05",
+                // Charged in BTC — the QUOTE asset of ETH/BTC, though "BTC"
+                // is also a prefix of nothing here and a suffix of the name.
+                "fills": [{"price": "0.05", "qty": "1",
+                           "commission": "0.0001", "commissionAsset": "BTC"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["ETH/BTC"]);
+        let mut req = request(
+            OrderKind::Limit { price: dec!(0.05) },
+            Side::Buy,
+            TimeInForce::Gtc,
+        );
+        req.instrument.id = InstrumentId::new(VenueId::new(DEFAULT_VENUE_ID), "ETH/BTC");
+        req.instrument.min_notional = None;
+        req.instrument.min_qty = None;
+        req.qty = dec!(1);
+        let ack = venue.place_order(&req).await.unwrap();
+        assert_eq!(
+            ack.fees,
+            dec!(0.0001),
+            "BTC is the quote here, so the fee is already in quote terms"
+        );
     }
 
     // ---- cancels ---------------------------------------------------------
@@ -1694,20 +2010,13 @@ mod tests {
         venue.cancel_all().await.expect("the book is still cleared");
     }
 
-    /// An order id this cannot read is one order that will not be cancelled.
-    /// Failing on it would leave the whole book resting.
+    /// The kill switch must not need a listing to work. Deriving its symbols
+    /// from `open_orders()` made a failed listing abort before a single
+    /// cancel — the exact failure it is supposed to be the answer to.
     #[tokio::test]
-    async fn an_unreadable_order_id_does_not_stop_the_rest_of_the_book() {
+    async fn cancel_all_works_without_listing_anything() {
         let server = MockServer::start().await;
-        Mock::given(http_method("GET"))
-            .and(path(OPEN_ORDERS_PATH))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-                // No symbol: nothing can be cancelled under this id.
-                {"orderId": 1, "status": "NEW", "executedQty": "0"},
-                {"symbol": "BTCUSD", "orderId": 2, "status": "NEW", "executedQty": "0"}
-            ])))
-            .mount(&server)
-            .await;
+        // Deliberately no GET /openOrders mock: calling it would 404 here.
         Mock::given(http_method("DELETE"))
             .and(path(OPEN_ORDERS_PATH))
             .and(query_param("symbol", "BTCUSD"))
@@ -1717,15 +2026,97 @@ mod tests {
             .await;
 
         let venue = venue(&server, &["BTC/USD"]);
-        let err = venue.cancel_all().await.unwrap_err();
-        assert!(
-            format!("{err:#}").contains("may still be resting"),
-            "the caller has to know one order was not reachable: {err:#}"
-        );
-        // The `expect(1)` is the other half: BTCUSD was still cleared.
+        venue.cancel_all().await.expect("no listing is required");
     }
 
-    // ---- balances and positions -----------------------------------------
+    /// `DELETE /openOrders` cancels a whole symbol's book. Taking the symbol
+    /// list from the account would have the kill switch cancel the operator's
+    /// own resting orders on pairs the agent has no mandate over.
+    #[tokio::test]
+    async fn cancel_all_touches_only_the_configured_symbols() {
+        let server = MockServer::start().await;
+        Mock::given(http_method("DELETE"))
+            .and(path(OPEN_ORDERS_PATH))
+            .and(query_param("symbol", "BTCUSD"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Any request for another symbol would not match a mock and fail the
+        // call, so a mandate breach shows up as an error here.
+        let venue = venue(&server, &["BTC/USD"]);
+        venue
+            .cancel_all()
+            .await
+            .expect("only BTCUSD is the agent's");
+    }
+
+    /// Binance answers an empty book with `-2011`. Reading that as a failure
+    /// would have the kill switch report a book it did in fact clear.
+    #[tokio::test]
+    async fn an_empty_book_is_not_a_failed_cancel() {
+        let server = MockServer::start().await;
+        Mock::given(http_method("DELETE"))
+            .and(path(OPEN_ORDERS_PATH))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "code": -2011, "msg": "Unknown order sent."
+            })))
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["BTC/USD"]);
+        venue.cancel_all().await.expect("nothing was resting");
+    }
+
+    /// The orphan audit turns a resting order it has no local record of into
+    /// an `UntilResume` halt — so an operator's own manual order on a pair
+    /// the agent does not trade would halt it on the first cycle. The same
+    /// trap `positions()` guards, which this originally did not.
+    #[tokio::test]
+    async fn open_orders_ignores_pairs_the_agent_does_not_trade() {
+        let server = MockServer::start().await;
+        Mock::given(http_method("GET"))
+            .and(path(OPEN_ORDERS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"symbol": "SOLUSD", "orderId": 99, "clientOrderId": "web_7f2",
+                 "status": "NEW", "executedQty": "0"},
+                {"symbol": "BTCUSD", "orderId": 1, "status": "NEW", "executedQty": "0"}
+            ])))
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["BTC/USD"]);
+        let open = venue.open_orders().await.unwrap();
+        assert_eq!(open.len(), 1, "the personal SOL order is not the agent's");
+        assert_eq!(open[0].venue_order_id, "BTCUSD:1");
+    }
+
+    /// `to_order_state` reads an unparseable quantity as zero, which turns a
+    /// cancelled order that caught a partial fill into a plain `Cancelled` —
+    /// and the filled part is a real position that must stay exitable.
+    #[tokio::test]
+    async fn an_order_whose_quantity_will_not_parse_is_unknown_not_cancelled() {
+        let server = MockServer::start().await;
+        Mock::given(http_method("GET"))
+            .and(path(OPEN_ORDERS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"symbol": "BTCUSD", "orderId": 1, "status": "CANCELED",
+                 "executedQty": "not-a-number"}
+            ])))
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["BTC/USD"]);
+        let open = venue.open_orders().await.unwrap();
+        assert_eq!(open.len(), 1, "it is kept so it can still be cancelled");
+        assert_eq!(
+            open[0].state,
+            OrderState::Unknown,
+            "reading the quantity as zero would write off a real position"
+        );
+    }
+
+    // ---- balances and positions -----------------------------------------    // ---- balances and positions -----------------------------------------
 
     #[tokio::test]
     async fn balance_counts_free_cash_in_the_configured_quote_currency() {
@@ -1832,6 +2223,60 @@ mod tests {
             "only what the agent trades, and not a zero"
         );
         assert_eq!(positions[0].instrument.symbol, "BTC/USD");
+    }
+
+    /// Summing USD and USDT into one figure asserts they are interchangeable
+    /// and tells the sizing gate there are 1000 spendable dollars when 900 of
+    /// them can only fund USDT pairs.
+    #[tokio::test]
+    async fn two_quote_currencies_are_never_summed_into_one_figure() {
+        let server = MockServer::start().await;
+        mount_account(
+            &server,
+            json!({
+                "balances": [
+                    {"asset": "USD",  "free": "100.00"},
+                    {"asset": "USDT", "free": "900.00"}
+                ]
+            }),
+        )
+        .await;
+
+        // Two BTC/USD pairs against one USDT pair: USD is the most-used.
+        let venue = venue(&server, &["BTC/USD", "ETH/USD", "SOL/USDT"]);
+        let balance = venue.balance().await.unwrap();
+        assert_eq!(balance.ccy, "USD");
+        assert_eq!(
+            balance.available,
+            dec!(100.00),
+            "the USDT cannot fund a USD pair and must not be counted as if it could"
+        );
+    }
+
+    /// An account can hold dust in dozens of assets. One unparseable amount
+    /// must not fail the whole call and blind the audit — least of all for a
+    /// row that was going to be discarded anyway.
+    #[tokio::test]
+    async fn a_junk_balance_outside_the_universe_does_not_blind_the_audit() {
+        let server = MockServer::start().await;
+        mount_account(
+            &server,
+            json!({
+                "balances": [
+                    {"asset": "JUNK", "free": "not-a-number"},
+                    {"asset": "BTC",  "free": "0.01"}
+                ]
+            }),
+        )
+        .await;
+
+        let venue = venue(&server, &["BTC/USD"]);
+        let positions = venue
+            .positions()
+            .await
+            .expect("the BTC position is readable");
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].qty, dec!(0.01));
     }
 
     /// A restricted account still answers `/account` with balances, so without

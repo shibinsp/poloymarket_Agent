@@ -428,6 +428,15 @@ does not know it has, and exit by selling coins it never bought.
 they can take, and `round_trip_cost` doubles the number. Quoting the maker rate
 would let trades that are negative after fees clear the edge threshold.
 
+Credentials are `COINBASE_API_KEY_NAME` (`organizations/{org}/apiKeys/{key}`)
+and `COINBASE_API_PRIVATE_KEY`, the EC PEM issued with it. Escaped newlines
+are accepted, since that is how the key arrives when pasted out of the
+downloaded JSON.
+
+Requests are signed with a per-request ES256 JWT whose `uri` claim names the
+method, host and path, so a token cannot be replayed against another
+endpoint. It expires in two minutes.
+
 ### Binance.US
 
 Also live-only, and for the same reason: **Binance.US has no testnet.**
@@ -451,7 +460,11 @@ Three things are worth knowing before enabling it:
   this adapter reports `BTCUSD:12345`, and parses it back on the way in.
 - **The quote currency is part of the pair.** `BTC/USD` and `BTC/USDT` hold
   cash in different assets, and the adapter reads its cash currency from the
-  symbols you configure rather than assuming dollars. `balance().ccy` follows.
+  symbols you configure rather than assuming dollars. It reports **one**
+  currency, never a sum: adding USD to USDT asserts they are interchangeable
+  and would tell the sizing gate there are spendable dollars that can in fact
+  only fund the other pairs. Configure pairs that quote in one currency; if
+  you mix them, the most-used one is reported and the rest are warned about.
 - **Commissions are charged in whichever asset was received** — the base, the
   quote, or BNB. Adding those together would add bitcoin to dollars, so a
   base-asset commission is converted at the price of the trade that incurred
@@ -462,15 +475,6 @@ Three things are worth knowing before enabling it:
 
 `fee_pct` in the template is the taker rate at the base volume tier. Check it
 against your own tier before trading real money.
-
-Credentials are `COINBASE_API_KEY_NAME` (`organizations/{org}/apiKeys/{key}`)
-and `COINBASE_API_PRIVATE_KEY`, the EC PEM issued with it. Escaped newlines
-are accepted, since that is how the key arrives when pasted out of the
-downloaded JSON.
-
-Requests are signed with a per-request ES256 JWT whose `uri` claim names the
-method, host and path, so a token cannot be replayed against another
-endpoint. It expires in two minutes.
 
 ### Tracing (OpenTelemetry / Langfuse)
 

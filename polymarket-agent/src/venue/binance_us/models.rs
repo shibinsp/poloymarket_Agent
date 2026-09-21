@@ -169,9 +169,13 @@ impl BookLevel {
     }
 }
 
-/// A kline is a twelve-element array. Only the first six are used here, but
-/// the shape is pinned so a change in arity is an error rather than a silent
-/// misread of a neighbouring field.
+/// A kline is a twelve-element array; only the first six are used here.
+///
+/// Arity is checked **per access**, not on deserialization: a short array
+/// parses cleanly and only errors when a missing index is actually read. So a
+/// new accessor must not assume its column exists because the others did —
+/// `at` is what makes a missing one an error rather than a silent misread of
+/// a neighbouring field.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Kline(pub Vec<serde_json::Value>);
 

@@ -240,18 +240,24 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
     // Polymarket and nothing else, so an Alpaca deployment — which is what
     // the safety gate is for — learned nothing here.
     println!("5. Venues:");
+    // These two are reported separately below — "configured but skipped" and
+    // "no venues at all" are different things to tell an operator. Whether
+    // Polymarket is *needed* is `config.uses_polymarket()`, asked once and
+    // shared with the key check above and with `Agent::new`: two copies of
+    // one predicate is two answers waiting to disagree, and the disagreement
+    // decides whether a live credential is demanded.
     let polymarket_configured = config
         .venues
         .iter()
         .any(|v| v.enabled && v.kind.eq_ignore_ascii_case("polymarket"));
+    let legacy_only = config.venues.iter().all(|v| !v.enabled);
 
     // Built only when something needs it. Constructing it unconditionally put
     // a fatal `?` — an authenticating network call in live mode — ahead of
     // the venue section, so for a US operator with an unreachable CLOB the
     // run still died before reporting anything about Alpaca. That was the
     // bug, moved one call earlier rather than fixed.
-    let legacy_only = config.venues.iter().all(|v| !v.enabled);
-    let polymarket = if polymarket_configured || legacy_only {
+    let polymarket = if poly_needed {
         match polymarket_agent::market::polymarket::PolymarketClient::new(
             std::sync::Arc::new(config.clone()),
             secrets,

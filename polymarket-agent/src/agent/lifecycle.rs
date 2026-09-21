@@ -48,8 +48,14 @@ pub struct Agent {
     store: Store,
     state: AgentState,
     cycle_number: u64,
-    polymarket: Arc<PolymarketClient>,
-    scanner: MarketScanner,
+    /// `None` when this deployment does not use Polymarket at all — a
+    /// venue-based agent never touches it, and a US operator may not legally
+    /// trade it. Constructing it regardless made `Agent::new` demand a
+    /// credential the run had no use for, which killed the process after
+    /// `--dry-run` had already reported the config as sound.
+    polymarket: Option<Arc<PolymarketClient>>,
+    /// `None` alongside `polymarket`: the scanner only scans Polymarket.
+    scanner: Option<MarketScanner>,
     data_aggregator: DataAggregator,
     valuation_engine: Option<ValuationEngine>,
     portfolio: PortfolioManager,
@@ -69,6 +75,20 @@ pub struct Agent {
     budget: Arc<BudgetLedger>,
 }
 
+/// Scan the legacy Polymarket universe, or nothing when it is not configured.
+///
+/// A venue-based deployment has no Polymarket scanner, and "zero candidates"
+/// is the honest answer there rather than an error: the venue path does its
+/// own instrument discovery.
+async fn scan_legacy(
+    scanner: Option<&MarketScanner>,
+) -> Result<Vec<crate::market::models::MarketCandidate>> {
+    match scanner {
+        Some(s) => s.scan().await,
+        None => Ok(Vec::new()),
+    }
+}
+
 impl Agent {
     /// `kill_switch` is created by the caller and shared with the dashboard,
     /// so `POST /api/halt` and the agent loop are the same flag rather than
@@ -80,8 +100,15 @@ impl Agent {
         kill_switch: Arc<KillSwitch>,
     ) -> Result<Self> {
         let config_arc = Arc::new(config.clone());
-        let polymarket = Arc::new(PolymarketClient::new(config_arc, &secrets).await?);
-        let scanner = MarketScanner::new(polymarket.clone(), config.scanning.clone());
+        let polymarket = if config.uses_polymarket() {
+            Some(Arc::new(PolymarketClient::new(config_arc, &secrets).await?))
+        } else {
+            info!("No Polymarket venue is enabled — not building a Polymarket client");
+            None
+        };
+        let scanner = polymarket
+            .as_ref()
+            .map(|c| MarketScanner::new(c.clone(), config.scanning.clone()));
 
         // Phase 3: Initialize data sources
         let data_sources: Vec<Box<dyn crate::data::DataSource>> = vec![
@@ -160,8 +187,7 @@ impl Agent {
 
         // Venues declared in [[venues]]. Sharing the Polymarket client keeps
         // one paper balance across both the legacy and venue paths.
-        let venues =
-            crate::venue::factory::build_registry(&config, &secrets, Some(polymarket.clone()))?;
+        let venues = crate::venue::factory::build_registry(&config, &secrets, polymarket.clone())?;
 
         // Phase 5: Initialize portfolio manager
         let portfolio = PortfolioManager::new(config.risk.clone());
@@ -675,13 +701,19 @@ impl Agent {
         // Check for resolved markets and settle trades.
         // Always run, even in Dead state — must settle P&L for final accounting (TRD-06).
         {
-            match resolution::check_and_settle(
-                &self.store,
-                self.polymarket.http_client(),
-                self.polymarket.gamma_base_url(),
-            )
-            .await
-            {
+            // Only meaningful on the Polymarket path: nothing else resolves.
+            let settlement = match &self.polymarket {
+                Some(client) => {
+                    resolution::check_and_settle(
+                        &self.store,
+                        client.http_client(),
+                        client.gamma_base_url(),
+                    )
+                    .await
+                }
+                None => Ok(Vec::new()),
+            };
+            match settlement {
                 Ok(settled) if !settled.is_empty() => {
                     let pnl: Decimal = settled.iter().map(|r| r.pnl).sum();
                     info!(
@@ -753,7 +785,7 @@ impl Agent {
                     cycle = self.cycle_number,
                     "Low fuel mode — reduced operations"
                 );
-                match self.scanner.scan().await {
+                match scan_legacy(self.scanner.as_ref()).await {
                     Ok(candidates) => {
                         markets_scanned = candidates.len() as i64;
                         if self.has_valuation_engine() && budget_available {
@@ -785,7 +817,7 @@ impl Agent {
             }
             AgentState::Alive => {
                 info!(cycle = self.cycle_number, "Normal operation");
-                match self.scanner.scan().await {
+                match scan_legacy(self.scanner.as_ref()).await {
                     Ok(candidates) => {
                         markets_scanned = candidates.len() as i64;
                         info!(
@@ -1154,7 +1186,15 @@ impl Agent {
                 "Executing trade"
             );
 
-            let execution = order::execute_order(&self.polymarket, &prepared).await;
+            let Some(polymarket) = self.polymarket.as_ref() else {
+                // Unreachable in practice: candidates only come from the
+                // Polymarket scanner, which does not exist without a client.
+                // Stated rather than unwrapped, because an order is the one
+                // place a wrong assumption costs money.
+                warn!("Refusing to execute a Polymarket trade without a Polymarket client");
+                continue;
+            };
+            let execution = order::execute_order(polymarket, &prepared).await;
 
             // Record trade in database
             if let Err(e) =
@@ -1266,11 +1306,11 @@ impl Agent {
             };
 
             // Fetch current YES price from Gamma API
-            let current_yes_price = match self
-                .polymarket
-                .get_current_yes_price(&trade.market_id)
-                .await
-            {
+            let Some(polymarket) = self.polymarket.as_ref() else {
+                // Legacy Polymarket exits only; the venue path has its own.
+                break;
+            };
+            let current_yes_price = match polymarket.get_current_yes_price(&trade.market_id).await {
                 Ok(p) => p,
                 Err(e) => {
                     warn!(
@@ -1321,8 +1361,7 @@ impl Agent {
                         crate::market::models::Side::No => Decimal::ONE - current_yes_price,
                     };
 
-                    match self
-                        .polymarket
+                    match polymarket
                         .exit_position(&token_id, side, exit_price, size)
                         .await
                     {
@@ -1370,9 +1409,9 @@ impl Agent {
         side: crate::market::models::Side,
     ) -> Option<String> {
         // Query the Gamma API to get market tokens
-        let url = format!("{}/markets", self.polymarket.gamma_base_url());
-        let markets: Vec<serde_json::Value> = match self
-            .polymarket
+        let polymarket = self.polymarket.as_ref()?;
+        let url = format!("{}/markets", polymarket.gamma_base_url());
+        let markets: Vec<serde_json::Value> = match polymarket
             .http_client()
             .get(&url)
             .query(&[("condition_id", market_id)])
@@ -1430,14 +1469,40 @@ impl Agent {
         );
     }
 
+    /// Spendable cash, from whichever account actually holds it.
+    ///
+    /// The Polygon USDC wallet when this is a Polymarket deployment; the sum
+    /// of the venues' free cash when it is not. Returning zero for a venue
+    /// deployment — which is what dropping the wallet naively would do — makes
+    /// the survival ladder declare a fully funded agent dead on its first
+    /// cycle and stop it trading.
+    ///
+    /// Venue cash is summed across venues, which assumes they quote in the
+    /// same currency. Every venue here reports US dollars; a venue that did
+    /// not would need this to become per-currency rather than a total.
     async fn current_balance(&self) -> Decimal {
-        match self.polymarket.get_balance().await {
-            Ok(balance) => balance,
-            Err(e) => {
-                warn!(error = %e, "Failed to get balance, using zero");
-                Decimal::ZERO
+        if let Some(polymarket) = self.polymarket.as_ref() {
+            return match polymarket.get_balance().await {
+                Ok(balance) => balance,
+                Err(e) => {
+                    warn!(error = %e, "Failed to get balance, using zero");
+                    Decimal::ZERO
+                }
+            };
+        }
+
+        let mut total = Decimal::ZERO;
+        for venue in self.venues.all() {
+            match venue.balance().await {
+                Ok(balance) => total += balance.available,
+                Err(e) => warn!(
+                    venue = %venue.id(),
+                    error = %format!("{e:#}"),
+                    "Could not read venue cash — it is missing from the balance"
+                ),
             }
         }
+        total
     }
 
     /// Calculate effective bankroll: wallet balance minus reserve and unrealized exposure.

@@ -727,3 +727,37 @@ async fn a_position_the_venue_does_not_report_halts_the_agent() {
         "the halt must name what disagreed: {halt:?}"
     );
 }
+
+/// A venue-based deployment must not need a Polymarket credential.
+///
+/// `--dry-run` was changed to stop demanding `POLYMARKET_PRIVATE_KEY` when no
+/// Polymarket venue is enabled — but `Agent::new` still built a
+/// `PolymarketClient` unconditionally, so the dry run reported a config as
+/// sound and the agent then died at startup on the very key the dry run had
+/// just said was not needed. The user this repo targets is a US resident who
+/// may not legally trade Polymarket at all, so that is the normal case here,
+/// not an edge one.
+#[tokio::test]
+async fn an_agent_with_venues_builds_without_a_polymarket_key() {
+    let alpaca = alpaca_server().await;
+    let model = model_server().await;
+    let poly = polymarket_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("agent.db");
+
+    let mut cfg = config(&alpaca, &model, &poly, db.to_str().unwrap());
+    // Live is the mode that demanded the key.
+    cfg.agent.mode = AgentMode::Live;
+
+    let store = Store::new(db.to_str().unwrap()).await.unwrap();
+    let kill_switch = std::sync::Arc::new(KillSwitch::new(dir.path().join("HALT")));
+
+    let without_polymarket = Secrets {
+        polymarket_private_key: None,
+        ..secrets()
+    };
+
+    Agent::new(cfg, without_polymarket, store, kill_switch)
+        .await
+        .expect("a venue-based agent has no use for a Polymarket key");
+}

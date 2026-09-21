@@ -10,7 +10,7 @@ use std::fmt;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use reqwest::{Method, RequestBuilder, StatusCode};
+use reqwest::{Method, StatusCode};
 use serde::de::DeserializeOwned;
 
 use super::auth::{query_string, BinanceSigner};
@@ -73,7 +73,7 @@ impl BinanceRest {
         params: &[(&str, String)],
     ) -> Result<T> {
         let url = self.url(path, &query_string(params));
-        let response = self.send(Method::GET, self.http.get(&url), &url).await?;
+        let response = self.send(&Method::GET, &url, false).await?;
         decode(&response, Method::GET, path)
     }
 
@@ -96,11 +96,7 @@ impl BinanceRest {
         // Appended, not inserted: the signature covers everything before it.
         let url = self.url(path, &format!("{query}&signature={signature}"));
 
-        let builder = self
-            .http
-            .request(method.clone(), &url)
-            .header("X-MBX-APIKEY", self.signer.api_key());
-        let response = self.send(method.clone(), builder, &url).await?;
+        let response = self.send(&method, &url, true).await?;
         decode(&response, method, path)
     }
 
@@ -115,7 +111,14 @@ impl BinanceRest {
     /// Execute, and turn any non-2xx into an error carrying Binance's own
     /// code — without it a rejected order is undebuggable, and the code is the
     /// part that says whether to look at the order, the clock or the key.
-    async fn send(&self, method: Method, request: RequestBuilder, url: &str) -> Result<String> {
+    /// Builds the request itself rather than taking one already bound to a
+    /// verb: passing both left two sources of truth for which method was sent
+    /// and cloned it twice to say so.
+    async fn send(&self, method: &Method, url: &str, authed: bool) -> Result<String> {
+        let mut request = self.http.request(method.clone(), url);
+        if authed {
+            request = request.header("X-MBX-APIKEY", self.signer.api_key());
+        }
         let response = request
             .send()
             .await
