@@ -69,6 +69,11 @@ pub enum AnomalyKind {
     /// An order has sat unresolved past the point where it should have been
     /// filled or cancelled.
     StaleOrder,
+    /// The agent has stopped opening positions. Whatever the cause — an
+    /// operator, a risk limit, a reconciliation mismatch — this is the one
+    /// that says trading has stopped, which nothing else about a halted
+    /// agent makes visible: it goes on cycling and logging exactly as before.
+    Halted,
 }
 
 impl AnomalyKind {
@@ -84,6 +89,7 @@ impl AnomalyKind {
             AnomalyKind::OrderRejected => "order_rejected",
             AnomalyKind::OrderStateUnknown => "order_state_unknown",
             AnomalyKind::StaleOrder => "stale_order",
+            AnomalyKind::Halted => "halted",
         }
     }
 }
@@ -101,6 +107,13 @@ pub struct AlertClient {
     /// failure domain: if the webhook is down, silence means nothing, so the
     /// health endpoint has to be able to say so.
     delivery_failing: AtomicBool,
+    /// How many times each kind has occurred since start.
+    ///
+    /// Counts *occurrences*, not alerts sent. Dedupe exists so an operator
+    /// is not paged every thirty seconds, not so the frequency is hidden —
+    /// and "the same anomaly 400 times" and "once" are very different
+    /// situations that a deduped webhook renders identically.
+    counts: Mutex<HashMap<AnomalyKind, u64>>,
 }
 
 /// Discord webhook message format.
@@ -127,7 +140,23 @@ impl AlertClient {
             http,
             recent: Mutex::new(HashMap::new()),
             delivery_failing: AtomicBool::new(false),
+            counts: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Occurrences per anomaly kind since the process started, keyed by the
+    /// stable `as_str` identifier so `/api/health` does not drift with the
+    /// `Debug` formatting.
+    ///
+    /// Only non-zero kinds appear. A map of eighteen zeroes buries the one
+    /// number that matters.
+    pub fn anomaly_counts(&self) -> std::collections::BTreeMap<&'static str, u64> {
+        self.counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(kind, count)| (kind.as_str(), *count))
+            .collect()
     }
 
     /// Send a raw message to Discord.
@@ -216,6 +245,11 @@ impl AlertClient {
                 error!(kind = kind.as_str(), scope, detail, "Anomaly")
             }
             AlertLevel::Notice => warn!(kind = kind.as_str(), scope, detail, "Anomaly"),
+        }
+
+        {
+            let mut counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+            *counts.entry(kind).or_insert(0) += 1;
         }
 
         if !self.should_fire(now, kind, scope) {
@@ -323,6 +357,10 @@ impl AlertClient {
     ) -> Result<()> {
         let urgency = match new_state {
             AgentState::Dead => "CRITICAL",
+            // A halted agent looks perfectly healthy from the outside — it
+            // keeps cycling, keeps logging, and quietly stops trading. That
+            // is worth waking someone for.
+            AgentState::Halted => "CRITICAL",
             AgentState::CriticalSurvival => "WARNING",
             AgentState::LowFuel => "NOTICE",
             AgentState::Alive => "INFO",

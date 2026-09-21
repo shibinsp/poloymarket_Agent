@@ -164,6 +164,7 @@ mod tests {
             max_total_exposure_pct: dec!(0.30),
             max_positions_per_category: 3,
             min_position_usd: dec!(1),
+            ..RiskConfig::default()
         }
     }
 

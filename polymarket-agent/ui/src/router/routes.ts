@@ -8,6 +8,8 @@ export interface RouteDef {
 export const ROUTES: RouteDef[] = [
   { path: "/overview", label: "Overview", title: "Overview" },
   { path: "/trades", label: "Trades", title: "Trades" },
+  { path: "/orders", label: "Orders", title: "Orders and fills" },
+  { path: "/risk", label: "Risk", title: "Risk and reconciliation" },
   { path: "/cycles", label: "Cycles", title: "Cycles" },
   { path: "/costs", label: "Costs", title: "API costs" },
   { path: "/health", label: "Health", title: "Health" },

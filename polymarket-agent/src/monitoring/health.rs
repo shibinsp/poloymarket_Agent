@@ -31,6 +31,12 @@ struct HealthData {
     /// Whether alert delivery itself is failing, so an operator can tell the
     /// difference between nothing going wrong and nothing getting through.
     alerts_delivering: bool,
+    /// Occurrences per anomaly kind since start, non-zero kinds only.
+    ///
+    /// The counterpart to `alerts_delivering`: that says whether alerts are
+    /// getting out, this says what there was to send. Without it a deduped
+    /// webhook makes "once" and "four hundred times" look identical.
+    anomalies: std::collections::BTreeMap<String, u64>,
 }
 
 impl HealthState {
@@ -45,6 +51,7 @@ impl HealthState {
                 uptime_seconds: 0,
                 next_cycle_due: None,
                 alerts_delivering: true,
+                anomalies: std::collections::BTreeMap::new(),
             })),
         }
     }
@@ -81,11 +88,30 @@ impl HealthState {
         data.agent_state = state.to_string();
         data.last_cycle_at = Some(Utc::now());
         data.uptime_seconds = (Utc::now() - data.started_at).num_seconds();
-        data.status = if state == AgentState::Dead {
-            "dead".to_string()
-        } else {
-            "ok".to_string()
+        // Distinct from "ok": an uptime probe that cannot tell a trading
+        // agent from a halted one is not monitoring anything.
+        data.status = match state {
+            AgentState::Dead => "dead".to_string(),
+            AgentState::Halted => "halted".to_string(),
+            _ => "ok".to_string(),
         };
+    }
+
+    /// Publish the anomaly tally.
+    ///
+    /// Halt state is deliberately *not* published here. This snapshot is
+    /// written once a cycle completes, and a cycle can legitimately take
+    /// minutes — the first one against an unreachable venue took several.
+    /// A halt raised during that window would have been reported as `false`
+    /// by `/api/health` while `/api/halt` reported `true`, and the dashboard
+    /// reads health. The handler reads the switch itself instead, so there
+    /// is one source of truth and it is never stale.
+    pub async fn record_anomalies(&self, anomalies: std::collections::BTreeMap<&'static str, u64>) {
+        let mut data = self.inner.write().await;
+        data.anomalies = anomalies
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
     }
 
     /// Record when the next cycle should have completed by.

@@ -92,6 +92,15 @@ pub struct SizeInputs<'a> {
     pub state: AgentState,
     /// Recent bars, required for continuous assets.
     pub candles: &'a [Candle],
+    /// Absolute cash ceiling for this one position, in live mode.
+    ///
+    /// `None` in paper. Applied here rather than clamped onto the result
+    /// afterwards so `risk_pct` still describes the size actually returned —
+    /// a caller aggregating a post-hoc clamp would over-count every position.
+    ///
+    /// See `circuit_breaker::live_notional_ceiling`, which accounts for what
+    /// is already committed against the total cap.
+    pub live_ceiling: Option<Decimal>,
 }
 
 /// Size a position using the method appropriate to the asset class.
@@ -161,6 +170,15 @@ fn size_continuous(
         position_usd = max_position;
     }
 
+    // The absolute cash ceiling, in live mode only. A percentage of a paper
+    // balance is a number nobody agreed to: 6% of a $100,000 paper account is
+    // a $6,000 position, and the first live run must not inherit it.
+    if let Some(ceiling) = inputs.live_ceiling {
+        if position_usd > ceiling {
+            position_usd = ceiling;
+        }
+    }
+
     if position_usd < risk.min_position_usd {
         return SizeResult::none("below minimum position size");
     }
@@ -207,7 +225,7 @@ fn state_multiplier(state: AgentState) -> Decimal {
     match state {
         AgentState::Alive => Decimal::ONE,
         AgentState::LowFuel => dec!(0.25),
-        AgentState::CriticalSurvival | AgentState::Dead => Decimal::ZERO,
+        AgentState::CriticalSurvival | AgentState::Halted | AgentState::Dead => Decimal::ZERO,
     }
 }
 
@@ -224,6 +242,7 @@ mod tests {
             max_total_exposure_pct: dec!(0.30),
             max_positions_per_category: 3,
             min_position_usd: dec!(1.0),
+            ..RiskConfig::default()
         }
     }
 
@@ -314,7 +333,107 @@ mod tests {
             bankroll,
             state,
             candles,
+            live_ceiling: None,
         }
+    }
+
+    /// The absolute cash cap has to actually bind, not merely exist.
+    ///
+    /// It was computed by `live_notional_ceiling` and then never passed to
+    /// anything, so a $30,000 live Alpaca account would have sized its first
+    /// position from `max_position_pct` — 6%, or $1,800 — while the README
+    /// and the config file both promised $10.
+    #[test]
+    fn the_live_cash_ceiling_binds_below_the_percentage_cap() {
+        let bars = candles();
+        let inst = equity(None);
+        let cfg = uncapped_risk_config();
+
+        let uncapped = size_position(
+            &inputs(&inst, &bars, dec!(30_000), AgentState::Alive),
+            &cfg,
+            &continuous_config(),
+        );
+        assert!(
+            uncapped.position_usd > dec!(10),
+            "the control: without the ceiling this sizes far above $10, got {}",
+            uncapped.position_usd
+        );
+
+        let mut capped_inputs = inputs(&inst, &bars, dec!(30_000), AgentState::Alive);
+        capped_inputs.live_ceiling = Some(dec!(10));
+        let capped = size_position(&capped_inputs, &cfg, &continuous_config());
+        assert_eq!(capped.position_usd, dec!(10), "the live cash cap must bind");
+    }
+
+    /// The ceiling caps; it does not inflate. A tiny account must not be
+    /// sized *up* to the live cap.
+    #[test]
+    fn the_live_ceiling_never_raises_a_smaller_size() {
+        let bars = candles();
+        let inst = equity(None);
+        let mut i = inputs(&inst, &bars, dec!(100), AgentState::Alive);
+        let natural = size_position(&i, &risk_config(), &continuous_config()).position_usd;
+        i.live_ceiling = Some(dec!(10));
+        let with_ceiling = size_position(&i, &risk_config(), &continuous_config()).position_usd;
+        assert!(
+            with_ceiling <= natural,
+            "a ceiling must never increase a position"
+        );
+    }
+
+    /// A ceiling of zero — the total cap already full — must stop the trade
+    /// rather than submit a zero-size order.
+    #[test]
+    fn an_exhausted_total_cap_stops_the_trade() {
+        let bars = candles();
+        let inst = equity(None);
+        let mut i = inputs(&inst, &bars, dec!(30_000), AgentState::Alive);
+        i.live_ceiling = Some(Decimal::ZERO);
+        let sized = size_position(&i, &uncapped_risk_config(), &continuous_config());
+        assert!(!sized.should_trade());
+        assert!(sized.position_usd.is_zero());
+    }
+
+    #[test]
+    fn a_halted_agent_is_sized_out_of_every_asset_class() {
+        // The innermost of the three gates. `Agent::opens_positions` stops
+        // the cycle being run at all and `apply_halt` settles the state, but
+        // both of those are in the caller. This is the one that holds if a
+        // future caller forgets — and it covers the prediction path too,
+        // which goes through Kelly rather than through volatility targeting.
+        let bars = candles();
+        for inst in [equity(None), prediction()] {
+            let result = size_position(
+                &inputs(&inst, &bars, dec!(10_000), AgentState::Halted),
+                &uncapped_risk_config(),
+                &continuous_config(),
+            );
+            assert!(
+                !result.should_trade(),
+                "{:?} must not be sized while halted, got {result:?}",
+                inst.asset_class
+            );
+            assert!(
+                result.position_usd.is_zero(),
+                "a halted size must be zero, got {}",
+                result.position_usd
+            );
+        }
+    }
+
+    /// The control: the same inputs, not halted, do produce a position. Without
+    /// this the test above would pass if sizing were broken for every state.
+    #[test]
+    fn the_same_inputs_are_sized_normally_when_not_halted() {
+        let bars = candles();
+        let result = size_position(
+            &inputs(&equity(None), &bars, dec!(10_000), AgentState::Alive),
+            &uncapped_risk_config(),
+            &continuous_config(),
+        );
+        assert!(result.should_trade(), "the control case must trade");
+        assert!(result.position_usd > Decimal::ZERO);
     }
 
     #[test]

@@ -285,32 +285,38 @@ impl Store {
         Ok(result.last_insert_rowid())
     }
 
+    /// Lifetime API spend.
+    ///
+    /// Summed in SQLite over the TEXT column, not in Rust. The float
+    /// round-trip this used to do (`SUM(CAST(cost AS REAL))`) is gone, but so
+    /// is the fix that replaced it: `api_costs` gains a row per model call
+    /// forever, and `/api/metrics` calls this on every dashboard poll, so
+    /// streaming the table decoded tens of thousands of rows to produce one
+    /// display number.
+    ///
+    /// `SUM` over TEXT still goes through a float internally, which is why
+    /// this is used for display only — the budget ledger and the daily cap
+    /// read `get_today_api_cost`, which is bounded by the day and summed
+    /// exactly in `Decimal`.
     pub async fn get_total_api_cost(&self) -> Result<Decimal> {
-        let row: (Option<String>,) =
-            sqlx::query_as("SELECT CAST(SUM(CAST(cost AS REAL)) AS TEXT) FROM api_costs")
-                .fetch_one(&self.pool)
-                .await
-                .context("Failed to get total API cost")?;
-
-        match row.0 {
-            Some(s) => Ok(Decimal::from_str(&s).unwrap_or(Decimal::ZERO)),
-            None => Ok(Decimal::ZERO),
-        }
+        let total: Option<f64> = sqlx::query_scalar("SELECT SUM(cost) FROM api_costs")
+            .fetch_one(&self.pool)
+            .await
+            .context("Failed to get total API cost")?;
+        Ok(total
+            .and_then(Decimal::from_f64_retain)
+            .unwrap_or(Decimal::ZERO)
+            .round_dp(6))
     }
 
     /// Get total API spend for the current UTC day.
     pub async fn get_today_api_cost(&self) -> Result<Decimal> {
-        let row: (Option<String>,) = sqlx::query_as(
-            "SELECT CAST(SUM(CAST(cost AS REAL)) AS TEXT) FROM api_costs WHERE created_at >= date('now')",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .context("Failed to get today's API cost")?;
-
-        match row.0 {
-            Some(s) => Ok(Decimal::from_str(&s).unwrap_or(Decimal::ZERO)),
-            None => Ok(Decimal::ZERO),
-        }
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT cost FROM api_costs WHERE created_at >= date('now')")
+                .fetch_all(&self.pool)
+                .await
+                .context("Failed to get today's API cost")?;
+        sum_money(&rows, "api_costs.cost")
     }
 
     /// Get all cycles ordered by cycle number.
@@ -343,18 +349,15 @@ impl Store {
     }
 
     pub async fn get_api_cost_for_cycle(&self, cycle: i64) -> Result<Decimal> {
-        let row: (Option<String>,) = sqlx::query_as(
-            "SELECT CAST(SUM(CAST(cost AS REAL)) AS TEXT) FROM api_costs WHERE cycle = ?",
-        )
-        .bind(cycle)
-        .fetch_one(&self.pool)
-        .await
-        .context("Failed to get API cost for cycle")?;
-
-        match row.0 {
-            Some(s) => Ok(Decimal::from_str(&s).unwrap_or(Decimal::ZERO)),
-            None => Ok(Decimal::ZERO),
-        }
+        // Previously `fetch_one` against a SUM, which returns exactly one row
+        // even when nothing matches. Now that the rows are summed in Rust,
+        // `fetch_all` is both correct and what a cycle with no calls needs.
+        let rows: Vec<(String,)> = sqlx::query_as("SELECT cost FROM api_costs WHERE cycle = ?")
+            .bind(cycle)
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to get API cost for cycle")?;
+        sum_money(&rows, "api_costs.cost")
     }
 
     // === Orders (multi-venue) ===
@@ -639,6 +642,398 @@ impl Store {
 
         Ok(result.last_insert_rowid())
     }
+
+    // ---------------------------------------------------------------------
+    // Phase 3: equity marks, halts, and the counters the breakers read.
+    // ---------------------------------------------------------------------
+
+    /// Record today's equity and return the marks the circuit breaker needs.
+    ///
+    /// The first call on a new UTC day fixes that day's *starting* equity —
+    /// every later call on the same day leaves it alone. Recomputing it would
+    /// make the daily-loss breaker measure the loss since the last cycle
+    /// rather than since the open, which is a limit that can never be reached
+    /// no matter how much is lost.
+    ///
+    /// The high-water mark is kept across days, not within one: drawdown is
+    /// peak-to-trough over the life of the account, and resetting the peak
+    /// every midnight would hide a slow bleed completely.
+    pub async fn record_equity(
+        &self,
+        day: chrono::NaiveDate,
+        equity: Decimal,
+    ) -> Result<crate::risk::circuit_breaker::DayMarks> {
+        let day_str = day.to_string();
+
+        // Carry the peak forward from whatever the account has ever reached.
+        //
+        // Every stored mark is read and compared in `Decimal`, not picked by a
+        // SQL `MAX` over a float cast. The number of rows is one per day, so
+        // reading them all costs nothing, and money never goes out through a
+        // binary float and back — the discipline the rest of this file keeps.
+        let marks: Vec<(String,)> = sqlx::query_as("SELECT high_water_mark FROM daily_equity")
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to read the prior high-water marks")?;
+        let prior_peak = marks
+            .iter()
+            .map(|(v,)| parse_money(v, "daily_equity.high_water_mark"))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .max()
+            .unwrap_or(Decimal::ZERO);
+
+        let high_water_mark = prior_peak.max(equity);
+
+        sqlx::query(
+            "INSERT INTO daily_equity (day, starting_equity, high_water_mark, closing_equity, updated_at)
+             VALUES (?, ?, ?, ?, datetime('now'))
+             ON CONFLICT(day) DO UPDATE SET
+                 high_water_mark = excluded.high_water_mark,
+                 closing_equity = excluded.closing_equity,
+                 updated_at = datetime('now')",
+        )
+        .bind(&day_str)
+        .bind(equity.to_string())
+        .bind(high_water_mark.to_string())
+        .bind(equity.to_string())
+        .execute(&self.pool)
+        .await
+        .context("Failed to record daily equity")?;
+
+        let row: (String, String) = sqlx::query_as(
+            "SELECT starting_equity, high_water_mark FROM daily_equity WHERE day = ?",
+        )
+        .bind(&day_str)
+        .fetch_one(&self.pool)
+        .await
+        .context("Failed to read back daily equity")?;
+
+        Ok(crate::risk::circuit_breaker::DayMarks {
+            day,
+            starting_equity: parse_money(&row.0, "daily_equity.starting_equity")?,
+            high_water_mark: parse_money(&row.1, "daily_equity.high_water_mark")?,
+        })
+    }
+
+    /// Positions opened during the given UTC day.
+    ///
+    /// Counts entries, not fills: the limit is on how many times the agent is
+    /// willing to take a new view in a day, and an entry that filled in three
+    /// parts is still one decision.
+    pub async fn count_trades_opened_on(&self, day: chrono::NaiveDate) -> Result<u32> {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM trades WHERE date(created_at) = ?")
+                .bind(day.to_string())
+                .fetch_one(&self.pool)
+                .await
+                .context("Failed to count today's trades")?;
+        Ok(count.max(0) as u32)
+    }
+
+    /// How many of the most recently closed positions were losses, counting
+    /// back from the latest until a non-loss is reached.
+    ///
+    /// Ordered by when each position *closed*, not when it opened: a streak
+    /// is about the order the results arrived in, and a long-held winner
+    /// opened before three quick losers does not break them up.
+    ///
+    /// Both close columns are consulted, because two paths write two of them:
+    /// venue exits set `closed_at` and only the legacy prediction resolution
+    /// sets `resolved_at`. Falling back to `created_at` alone sorted by entry
+    /// time, so the streak read zero during an actual losing run.
+    pub async fn consecutive_losses(&self) -> Result<u32> {
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT status, pnl FROM trades
+             WHERE status IN ('CLOSED', 'RESOLVED_WIN', 'RESOLVED_LOSS')
+             ORDER BY COALESCE(resolved_at, closed_at, created_at) DESC, id DESC
+             LIMIT 50",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read recent closes")?;
+
+        let mut streak = 0u32;
+        for (status, pnl) in rows {
+            let lost = match status.as_str() {
+                "RESOLVED_LOSS" => true,
+                "RESOLVED_WIN" => false,
+                // A continuous position has no notion of winning; its P&L
+                // decides. A close with no P&L recorded is not evidence of a
+                // loss, so it ends the streak rather than extending it.
+                _ => match pnl.as_deref() {
+                    Some(v) => parse_money(v, "trades.pnl")? < Decimal::ZERO,
+                    None => false,
+                },
+            };
+            if !lost {
+                break;
+            }
+            streak += 1;
+        }
+        Ok(streak)
+    }
+
+    /// Record one venue's reconciliation result.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_reconciliation_run(
+        &self,
+        venue_id: &str,
+        cycle: i64,
+        equity: Option<Decimal>,
+        positions_missing_locally: i64,
+        positions_missing_on_venue: i64,
+        qty_mismatches: i64,
+        unknown_open_orders: i64,
+        passed: bool,
+        detail: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO reconciliation_runs
+                 (venue_id, cycle, balance_delta, positions_missing_locally,
+                  positions_missing_on_venue, qty_mismatches, unknown_open_orders,
+                  passed, detail)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(venue_id)
+        .bind(cycle)
+        // The column predates this pass and was specified for a cash
+        // comparison that is not implemented; the venue's reported equity is
+        // what there is, and recording it gives the audit trail a number.
+        .bind(equity.map(|e| e.to_string()))
+        .bind(positions_missing_locally)
+        .bind(positions_missing_on_venue)
+        .bind(qty_mismatches)
+        .bind(unknown_open_orders)
+        .bind(passed)
+        .bind(detail)
+        .execute(&self.pool)
+        .await
+        .context("Failed to record reconciliation run")?;
+        Ok(())
+    }
+
+    /// Persist a halt so that restarting the process does not lift it.
+    pub async fn insert_halt(
+        &self,
+        source: &str,
+        scope: &str,
+        detail: &str,
+        raised_at: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            // OR IGNORE, because the same halt is re-offered on every restart
+            // while it is in force. See the UNIQUE constraint in 004.
+            "INSERT OR IGNORE INTO halts (source, scope, detail, raised_at, day)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(source)
+        .bind(scope)
+        .bind(detail)
+        .bind(raised_at.to_rfc3339())
+        .bind(raised_at.date_naive().to_string())
+        .execute(&self.pool)
+        .await
+        .context("Failed to record halt")?;
+        Ok(())
+    }
+
+    /// Mark every in-force halt as cleared.
+    pub async fn clear_halts(&self, by: &str, at: DateTime<Utc>) -> Result<()> {
+        sqlx::query("UPDATE halts SET cleared_at = ?, cleared_by = ? WHERE cleared_at IS NULL")
+            .bind(at.to_rfc3339())
+            .bind(by)
+            .execute(&self.pool)
+            .await
+            .context("Failed to clear halts")?;
+        Ok(())
+    }
+
+    /// Orders, newest first. The execution record: what was asked for, what
+    /// came back, and what it actually filled at.
+    pub async fn get_orders(&self, limit: i64) -> Result<Vec<OrderRecord>> {
+        sqlx::query_as::<_, OrderRecord>(
+            "SELECT id, client_order_id, venue_order_id, venue_id, symbol, side, intent,
+                    trade_id, limit_price, qty, filled_qty, avg_fill_price, state,
+                    reject_reason, cycle, submitted_at, updated_at, expires_at
+             FROM orders ORDER BY id DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to fetch orders")
+    }
+
+    /// Individual executions, newest first, with the order they belong to.
+    ///
+    /// Slippage and time-to-fill live here rather than on `orders` because an
+    /// order can fill in several pieces at several prices, and averaging them
+    /// away is how "median slippage 10bps" stops meaning anything.
+    pub async fn get_fills(&self, limit: i64) -> Result<Vec<FillRecord>> {
+        sqlx::query_as::<_, FillRecord>(
+            "SELECT f.id, f.order_id, o.client_order_id, o.venue_id, o.symbol, o.side,
+                    o.intent, f.qty, f.price, f.fee, f.mid_at_submit, f.slippage_bps,
+                    f.time_to_fill_ms, f.filled_at
+             FROM fills f JOIN orders o ON o.id = f.order_id
+             ORDER BY f.id DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to fetch fills")
+    }
+
+    /// One row per UTC day: where equity opened, its running peak, where it
+    /// closed. The series the drawdown breaker reads.
+    pub async fn get_daily_equity(&self) -> Result<Vec<DailyEquityRecord>> {
+        sqlx::query_as::<_, DailyEquityRecord>(
+            "SELECT day, starting_equity, high_water_mark, closing_equity, realized_pnl, updated_at
+             FROM daily_equity ORDER BY day ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to fetch daily equity")
+    }
+
+    /// Reconciliation history, newest first.
+    pub async fn get_reconciliation_runs(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<ReconciliationRunRecord>> {
+        sqlx::query_as::<_, ReconciliationRunRecord>(
+            "SELECT id, venue_id, cycle, balance_delta, positions_missing_locally,
+                    positions_missing_on_venue, qty_mismatches, unknown_open_orders,
+                    passed, detail, created_at
+             FROM reconciliation_runs ORDER BY id DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to fetch reconciliation runs")
+    }
+
+    /// Marked profit and loss across every open position.
+    ///
+    /// Written by the mark pass each cycle. Needed because cost basis alone
+    /// does not move when a position loses: buying $10 of something takes $10
+    /// out of cash and adds $10 of exposure, and if it then halves, neither
+    /// number changes. Account equity is cash + cost basis + this.
+    ///
+    /// A position the mark pass has not reached yet contributes nothing,
+    /// which is the honest answer — not a guess at what it might be worth.
+    pub async fn total_unrealized_pnl(&self) -> Result<Decimal> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT unrealized_pnl FROM trades
+             WHERE status IN ('OPEN', 'PARTIAL') AND unrealized_pnl IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read unrealized P&L")?;
+        sum_money(&rows, "trades.unrealized_pnl")
+    }
+
+    /// Record one halt however many times it is offered.
+    #[cfg(test)]
+    pub async fn halt_count(&self) -> Result<i64> {
+        Ok(sqlx::query_scalar("SELECT COUNT(*) FROM halts")
+            .fetch_one(&self.pool)
+            .await?)
+    }
+
+    /// The halt still in force, if any — the newest uncleared row.
+    pub async fn active_halt(&self) -> Result<Option<StoredHalt>> {
+        let row: Option<StoredHalt> = sqlx::query_as(
+            "SELECT source, scope, detail, raised_at, day FROM halts
+             WHERE cleared_at IS NULL
+             ORDER BY raised_at DESC, id DESC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .context("Failed to read the active halt")?;
+        Ok(row)
+    }
+}
+
+/// Add up a money column in `Decimal`, not in `f64`.
+///
+/// These used to be `SUM(CAST(cost AS REAL))`: SQLite stores these values as
+/// TEXT, so the sum went out through a binary float and back. That is exactly
+/// the round-trip `rust_decimal` is in this project to avoid, and the result
+/// was being compared against a budget — a number whose whole job is to be
+/// exact.
+///
+/// A row that will not parse is an error rather than a zero. A silently
+/// dropped cost makes the day's spend read low, which is the direction that
+/// keeps spending.
+fn sum_money(rows: &[(String,)], field: &str) -> Result<Decimal> {
+    rows.iter().try_fold(Decimal::ZERO, |acc, (value,)| {
+        Ok(acc + parse_money(value, field)?)
+    })
+}
+
+/// Parse a money column, loudly.
+///
+/// A silently-zeroed price turns a loss into a reported profit, and a
+/// silently-zeroed equity trips every breaker at once. Neither is a failure
+/// anyone would notice in time.
+fn parse_money(value: &str, field: &str) -> Result<Decimal> {
+    Decimal::from_str(value).with_context(|| format!("Invalid decimal in {field}: {value:?}"))
+}
+
+/// One execution, with the order it belongs to. All decimals stay as strings
+/// on the way to the dashboard — the UI parses them, and re-encoding through
+/// f64 here is the round-trip the rest of this file exists to avoid.
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct FillRecord {
+    pub id: i64,
+    pub order_id: i64,
+    pub client_order_id: String,
+    pub venue_id: String,
+    pub symbol: String,
+    pub side: String,
+    pub intent: String,
+    pub qty: String,
+    pub price: String,
+    pub fee: Option<String>,
+    pub mid_at_submit: Option<String>,
+    pub slippage_bps: Option<String>,
+    pub time_to_fill_ms: Option<i64>,
+    pub filled_at: Option<String>,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct DailyEquityRecord {
+    pub day: String,
+    pub starting_equity: String,
+    pub high_water_mark: String,
+    pub closing_equity: Option<String>,
+    pub realized_pnl: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct ReconciliationRunRecord {
+    pub id: i64,
+    pub venue_id: String,
+    pub cycle: Option<i64>,
+    pub balance_delta: Option<String>,
+    pub positions_missing_locally: i64,
+    pub positions_missing_on_venue: i64,
+    pub qty_mismatches: i64,
+    pub unknown_open_orders: i64,
+    pub passed: bool,
+    pub detail: Option<String>,
+    pub created_at: Option<String>,
+}
+
+/// A halt as persisted. Decimal-free, so it needs no parsing pass.
+#[derive(Debug, Clone, FromRow)]
+pub struct StoredHalt {
+    pub source: String,
+    pub scope: String,
+    pub detail: Option<String>,
+    pub raised_at: String,
+    pub day: String,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize)]
@@ -767,6 +1162,7 @@ pub struct VenueTradeRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal_macros::dec;
 
     /// Continuous assets are not sized by Kelly, so the risk fraction and the
     /// stop distance have columns of their own. They used to be written into
@@ -1007,5 +1403,405 @@ mod tests {
             .expect("should get open trades");
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].market_id, "0xabc");
+    }
+
+    /// A halt in force is re-offered on every restart, because the loop
+    /// deliberately re-runs its side effects then — re-cancelling resting
+    /// orders after a crash is worth doing. The audit trail must not grow a
+    /// row each time, or "when did this halt start" stops being answerable.
+    #[tokio::test]
+    async fn re_recording_the_same_halt_does_not_duplicate_it() {
+        use chrono::TimeZone;
+        let at = Utc.with_ymd_and_hms(2026, 9, 21, 12, 0, 30).unwrap();
+        let store = Store::new(":memory:").await.unwrap();
+        for _ in 0..5 {
+            store
+                .insert_halt("api", "until_resume", "operator", at)
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.halt_count().await.unwrap(), 1);
+        assert_eq!(store.active_halt().await.unwrap().unwrap().source, "api");
+    }
+
+    #[tokio::test]
+    async fn a_genuinely_later_halt_is_a_new_row() {
+        use chrono::TimeZone;
+        let first = Utc.with_ymd_and_hms(2026, 9, 21, 12, 0, 30).unwrap();
+        let second = Utc.with_ymd_and_hms(2026, 9, 21, 12, 0, 31).unwrap();
+        let store = Store::new(":memory:").await.unwrap();
+        store
+            .insert_halt("api", "until_resume", "first", first)
+            .await
+            .unwrap();
+        store
+            .insert_halt("circuit_breaker", "rest_of_day", "second", second)
+            .await
+            .unwrap();
+        assert_eq!(store.halt_count().await.unwrap(), 2);
+        assert_eq!(
+            store.active_halt().await.unwrap().unwrap().source,
+            "circuit_breaker",
+            "the newest uncleared row is the one in force"
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_lifts_every_halt_in_force() {
+        use chrono::TimeZone;
+        let t = |s| Utc.with_ymd_and_hms(2026, 9, 21, 12, 0, s).unwrap();
+        let store = Store::new(":memory:").await.unwrap();
+        store
+            .insert_halt("api", "until_resume", "first", t(30))
+            .await
+            .unwrap();
+        store
+            .insert_halt("signal", "until_resume", "second", t(31))
+            .await
+            .unwrap();
+        store.clear_halts("api", t(40)).await.unwrap();
+        assert!(
+            store.active_halt().await.unwrap().is_none(),
+            "a resume must not leave a second halt silently in force"
+        );
+    }
+
+    /// The day's *opening* equity is fixed by the first cycle of that day and
+    /// never moves again.
+    ///
+    /// The daily-loss breaker measures against it. Letting a later cycle
+    /// rewrite it would make the limit measure the loss since the last cycle
+    /// rather than since the open — a limit that can never be reached no
+    /// matter how much is lost.
+    #[tokio::test]
+    async fn the_days_opening_equity_is_fixed_by_the_first_cycle() {
+        let store = Store::new(":memory:").await.unwrap();
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 21).unwrap();
+
+        let first = store.record_equity(day, dec!(100)).await.unwrap();
+        assert_eq!(first.starting_equity, dec!(100));
+
+        let later = store.record_equity(day, dec!(80)).await.unwrap();
+        assert_eq!(
+            later.starting_equity,
+            dec!(100),
+            "the open must not follow the current value down"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_high_water_mark_rises_with_a_new_high_and_never_falls() {
+        let store = Store::new(":memory:").await.unwrap();
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 21).unwrap();
+
+        assert_eq!(
+            store
+                .record_equity(day, dec!(100))
+                .await
+                .unwrap()
+                .high_water_mark,
+            dec!(100)
+        );
+        assert_eq!(
+            store
+                .record_equity(day, dec!(120))
+                .await
+                .unwrap()
+                .high_water_mark,
+            dec!(120),
+            "a new high raises the peak"
+        );
+        assert_eq!(
+            store
+                .record_equity(day, dec!(90))
+                .await
+                .unwrap()
+                .high_water_mark,
+            dec!(120),
+            "a fall must not lower it, or drawdown is always zero"
+        );
+    }
+
+    /// Drawdown is peak-to-trough over the life of the account. A peak that
+    /// reset each midnight would let an account bleed a few percent a day for
+    /// a fortnight without ever reporting a drawdown worth halting on.
+    #[tokio::test]
+    async fn the_high_water_mark_carries_across_days() {
+        let store = Store::new(":memory:").await.unwrap();
+        let d = |n| chrono::NaiveDate::from_ymd_opt(2026, 9, n).unwrap();
+
+        store.record_equity(d(19), dec!(100)).await.unwrap();
+        store.record_equity(d(19), dec!(140)).await.unwrap();
+
+        let next_day = store.record_equity(d(20), dec!(90)).await.unwrap();
+        assert_eq!(
+            next_day.starting_equity,
+            dec!(90),
+            "a new day opens where it opens"
+        );
+        assert_eq!(
+            next_day.high_water_mark,
+            dec!(140),
+            "yesterday's peak is still the yardstick"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_first_ever_reading_becomes_the_peak() {
+        let store = Store::new(":memory:").await.unwrap();
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 21).unwrap();
+        let marks = store.record_equity(day, dec!(250)).await.unwrap();
+        assert_eq!(marks.high_water_mark, dec!(250));
+        assert_eq!(marks.starting_equity, dec!(250));
+    }
+
+    /// The peak is compared in `Decimal`, not by a SQL MAX over a float cast.
+    /// These two differ only past f64's precision, which is exactly where a
+    /// float comparison would pick the wrong row.
+    #[tokio::test]
+    async fn the_peak_is_chosen_by_decimal_comparison() {
+        let store = Store::new(":memory:").await.unwrap();
+        let d = |n| chrono::NaiveDate::from_ymd_opt(2026, 9, n).unwrap();
+        store
+            .record_equity(d(19), dec!(10000.00000000000001))
+            .await
+            .unwrap();
+        store
+            .record_equity(d(20), dec!(10000.00000000000002))
+            .await
+            .unwrap();
+        let marks = store.record_equity(d(21), dec!(1)).await.unwrap();
+        assert_eq!(marks.high_water_mark, dec!(10000.00000000000002));
+    }
+
+    #[tokio::test]
+    async fn todays_equity_is_readable_back_through_the_dashboard_query() {
+        // The risk page reads this series; a mark the breaker wrote and the
+        // page cannot see is a silent disagreement between two screens.
+        let store = Store::new(":memory:").await.unwrap();
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 21).unwrap();
+        store.record_equity(day, dec!(100)).await.unwrap();
+        store.record_equity(day, dec!(97.5)).await.unwrap();
+
+        let rows = store.get_daily_equity().await.unwrap();
+        assert_eq!(rows.len(), 1, "one row per day, not one per cycle");
+        assert_eq!(rows[0].starting_equity, "100");
+        assert_eq!(
+            rows[0].closing_equity.as_deref(),
+            Some("97.5"),
+            "the latest reading is what the page shows as current"
+        );
+    }
+
+    /// Insert a closed trade with explicit open and close times.
+    #[cfg(test)]
+    async fn seed_closed(store: &Store, opened: &str, closed: &str, pnl: &str) {
+        sqlx::query(
+            "INSERT INTO trades (cycle, venue_id, market_id, symbol, asset_class, direction,
+                                 side, entry_price, size, edge_at_entry, claude_fair_value,
+                                 confidence, kelly_raw, kelly_adjusted, status, pnl,
+                                 created_at, closed_at)
+             VALUES (1,'alpaca','BTC/USD','BTC/USD','crypto_spot','LONG','BUY','100','1',
+                     '0.1','0.6','0.8','0','0','CLOSED', ?, ?, ?)",
+        )
+        .bind(pnl)
+        .bind(opened)
+        .bind(closed)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    }
+
+    /// A streak is about the order results *arrived* in, not the order the
+    /// positions were opened in.
+    ///
+    /// Venue trades record their close in `closed_at`; only the legacy
+    /// prediction path writes `resolved_at`. Ordering by `created_at` as the
+    /// fallback sorted by entry time, so a long-held loser that closed most
+    /// recently was buried under a position opened later and closed sooner —
+    /// and the losing streak read zero while the account was on a losing run.
+    #[tokio::test]
+    async fn a_losing_streak_is_ordered_by_when_positions_closed() {
+        let store = Store::new(":memory:").await.unwrap();
+
+        // Opened first, closed last, and lost.
+        seed_closed(&store, "2026-09-19T09:00:00Z", "2026-09-21T09:00:00Z", "-5").await;
+        // Opened later, closed sooner, and won.
+        seed_closed(&store, "2026-09-20T09:00:00Z", "2026-09-20T10:00:00Z", "10").await;
+
+        assert_eq!(
+            store.consecutive_losses().await.unwrap(),
+            1,
+            "the most recent close was a loss, so the streak is one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_win_arriving_last_ends_the_streak() {
+        let store = Store::new(":memory:").await.unwrap();
+        seed_closed(&store, "2026-09-19T09:00:00Z", "2026-09-19T10:00:00Z", "-5").await;
+        seed_closed(&store, "2026-09-20T09:00:00Z", "2026-09-20T10:00:00Z", "-3").await;
+        seed_closed(&store, "2026-09-21T09:00:00Z", "2026-09-21T10:00:00Z", "2").await;
+        assert_eq!(store.consecutive_losses().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn consecutive_losses_counts_back_to_the_first_non_loss() {
+        let store = Store::new(":memory:").await.unwrap();
+        seed_closed(&store, "2026-09-18T09:00:00Z", "2026-09-18T10:00:00Z", "-1").await;
+        seed_closed(&store, "2026-09-19T09:00:00Z", "2026-09-19T10:00:00Z", "7").await;
+        seed_closed(&store, "2026-09-20T09:00:00Z", "2026-09-20T10:00:00Z", "-2").await;
+        seed_closed(&store, "2026-09-21T09:00:00Z", "2026-09-21T10:00:00Z", "-3").await;
+        assert_eq!(
+            store.consecutive_losses().await.unwrap(),
+            2,
+            "the win two closes back ends the count"
+        );
+    }
+
+    /// A flat close is not a loss. Counting it as one would trip the breaker
+    /// on a run of break-even exits, which is not a losing streak.
+    #[tokio::test]
+    async fn a_flat_close_ends_the_streak() {
+        let store = Store::new(":memory:").await.unwrap();
+        seed_closed(&store, "2026-09-20T09:00:00Z", "2026-09-20T10:00:00Z", "-4").await;
+        seed_closed(&store, "2026-09-21T09:00:00Z", "2026-09-21T10:00:00Z", "0").await;
+        assert_eq!(store.consecutive_losses().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn no_closes_is_no_streak() {
+        let store = Store::new(":memory:").await.unwrap();
+        assert_eq!(store.consecutive_losses().await.unwrap(), 0);
+    }
+
+    /// `max_trades_per_day` is only a limit if the count can see the rows.
+    ///
+    /// Neither insert sets `created_at`; both rely on the column default
+    /// `datetime('now')`, which writes zone-less UTC as `YYYY-MM-DD HH:MM:SS`.
+    /// The count compares `date(created_at)` against a `NaiveDate`. A format
+    /// mismatch between those two would not error — it would silently return
+    /// zero forever, and the trade-count breaker would never bind.
+    #[tokio::test]
+    async fn todays_trades_are_counted_through_the_real_insert_path() {
+        let store = Store::new(":memory:").await.unwrap();
+        let today = Utc::now().date_naive();
+
+        assert_eq!(store.count_trades_opened_on(today).await.unwrap(), 0);
+
+        store
+            .insert_trade(&TradeRecord {
+                id: None,
+                cycle: 1,
+                market_id: "0xabc".to_string(),
+                market_question: Some("Will it rain?".to_string()),
+                direction: "YES".to_string(),
+                entry_price: "0.40".to_string(),
+                size: "10".to_string(),
+                edge_at_entry: "0.1".to_string(),
+                claude_fair_value: "0.5".to_string(),
+                confidence: "0.8".to_string(),
+                kelly_raw: "0.05".to_string(),
+                kelly_adjusted: "0.02".to_string(),
+                status: "OPEN".to_string(),
+                pnl: None,
+                created_at: None,
+                resolved_at: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.count_trades_opened_on(today).await.unwrap(),
+            1,
+            "a trade opened today must be visible to the daily cap"
+        );
+        assert_eq!(
+            store
+                .count_trades_opened_on(today - chrono::Duration::days(1))
+                .await
+                .unwrap(),
+            0,
+            "and must not be counted against yesterday"
+        );
+    }
+
+    #[tokio::test]
+    async fn trades_opened_on_another_day_are_not_counted_today() {
+        let store = Store::new(":memory:").await.unwrap();
+        seed_closed(&store, "2026-01-02T09:00:00Z", "2026-01-02T10:00:00Z", "-1").await;
+        let that_day = chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap();
+        assert_eq!(store.count_trades_opened_on(that_day).await.unwrap(), 1);
+        assert_eq!(
+            store
+                .count_trades_opened_on(Utc::now().date_naive())
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[cfg(test)]
+    async fn seed_open(store: &Store, cost: &str, unrealized: Option<&str>) {
+        sqlx::query(
+            "INSERT INTO trades (cycle, venue_id, market_id, symbol, asset_class, direction,
+                                 side, entry_price, size, edge_at_entry, claude_fair_value,
+                                 confidence, kelly_raw, kelly_adjusted, status, unrealized_pnl)
+             VALUES (1,'alpaca','BTC/USD','BTC/USD','crypto_spot','LONG','BUY', ?, '1',
+                     '0.1','0.6','0.8','0','0','OPEN', ?)",
+        )
+        .bind(cost)
+        .bind(unrealized)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    }
+
+    /// Equity must move when an open position loses, or the daily-loss and
+    /// drawdown breakers only ever see *realised* P&L.
+    ///
+    /// Cash plus cost basis does not move: buying $10 of something takes $10
+    /// out of cash and puts $10 of exposure on, and if it halves, neither
+    /// number changes. This is the term that makes the difference.
+    #[tokio::test]
+    async fn unrealized_pnl_sums_across_open_positions() {
+        let store = Store::new(":memory:").await.unwrap();
+        seed_open(&store, "10", Some("-6")).await;
+        seed_open(&store, "20", Some("2.5")).await;
+        assert_eq!(store.total_unrealized_pnl().await.unwrap(), dec!(-3.5));
+    }
+
+    /// A position the mark pass has not reached yet contributes nothing —
+    /// the honest answer, rather than a guess at what it might be worth.
+    #[tokio::test]
+    async fn an_unmarked_position_contributes_nothing_to_unrealized_pnl() {
+        let store = Store::new(":memory:").await.unwrap();
+        seed_open(&store, "10", None).await;
+        seed_open(&store, "10", Some("-4")).await;
+        assert_eq!(store.total_unrealized_pnl().await.unwrap(), dec!(-4));
+    }
+
+    #[tokio::test]
+    async fn closed_positions_are_excluded_from_unrealized_pnl() {
+        let store = Store::new(":memory:").await.unwrap();
+        seed_open(&store, "10", Some("-4")).await;
+        seed_closed(
+            &store,
+            "2026-09-20T09:00:00Z",
+            "2026-09-20T10:00:00Z",
+            "-99",
+        )
+        .await;
+        assert_eq!(
+            store.total_unrealized_pnl().await.unwrap(),
+            dec!(-4),
+            "a closed position's P&L is realised, and is already in the cash balance"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_open_positions_is_zero_not_an_error() {
+        let store = Store::new(":memory:").await.unwrap();
+        assert_eq!(store.total_unrealized_pnl().await.unwrap(), Decimal::ZERO);
     }
 }

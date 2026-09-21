@@ -28,6 +28,120 @@ export interface Health {
   uptime_seconds: number;
   next_cycle_due?: string | null;
   alerts_delivering?: boolean;
+  /**
+   * Occurrences per anomaly kind since the agent started, non-zero only.
+   * Absent on builds before the circuit breakers.
+   */
+  anomalies?: Record<string, number>;
+  /** Whether new positions are stopped, and why. */
+  halted?: boolean;
+  halt?: Halt | null;
+}
+
+/** A halt in force, as `/api/halt` and `/api/health` report it. */
+export interface Halt {
+  source: "halt_file" | "api" | "signal" | "circuit_breaker" | "reconciliation";
+  /** `rest_of_day` lifts at the UTC rollover; `until_resume` does not. */
+  scope: "rest_of_day" | "until_resume";
+  detail: string;
+  at: string;
+  day: string;
+}
+
+/** `/api/orders`. What was asked for, and what came back. */
+export interface OrderRecord {
+  id: number | null;
+  client_order_id: string;
+  venue_order_id: string | null;
+  venue_id: string;
+  symbol: string;
+  side: string;
+  intent: string;
+  trade_id: number | null;
+  limit_price: string | null;
+  qty: string;
+  filled_qty: string;
+  avg_fill_price: string | null;
+  state: string;
+  reject_reason: string | null;
+  cycle: number | null;
+  submitted_at: string | null;
+  updated_at: string | null;
+  expires_at: string | null;
+}
+
+/** `/api/fills`. One execution; an order can have several. */
+export interface FillRecord {
+  id: number;
+  order_id: number;
+  client_order_id: string;
+  venue_id: string;
+  symbol: string;
+  side: string;
+  intent: string;
+  qty: string;
+  price: string;
+  fee: string | null;
+  mid_at_submit: string | null;
+  slippage_bps: string | null;
+  time_to_fill_ms: number | null;
+  filled_at: string | null;
+}
+
+/** `/api/equity`. One row per UTC day. */
+export interface DailyEquity {
+  day: string;
+  starting_equity: string;
+  high_water_mark: string;
+  closing_equity: string | null;
+  realized_pnl: string | null;
+  updated_at: string | null;
+}
+
+/** `/api/reconciliation`. */
+export interface ReconciliationRun {
+  id: number;
+  venue_id: string;
+  cycle: number | null;
+  balance_delta: string | null;
+  positions_missing_locally: number;
+  positions_missing_on_venue: number;
+  qty_mismatches: number;
+  unknown_open_orders: number;
+  passed: boolean;
+  detail: string | null;
+  created_at: string | null;
+}
+
+/** `/api/risk`. Headroom under each circuit breaker. */
+export interface RiskStatus {
+  mode: string;
+  day: string;
+  starting_equity: string | null;
+  current_equity: string | null;
+  high_water_mark: string | null;
+  trades_today: number;
+  consecutive_losses: number;
+  limits: {
+    max_daily_loss_pct: string;
+    max_daily_loss_usd: string;
+    max_drawdown_pct: string;
+    max_trades_per_day: number;
+    max_consecutive_losses: number;
+    max_live_notional_per_position_usd: string;
+    max_live_total_notional_usd: string;
+    live_caps_apply: boolean;
+  };
+}
+
+/** `POST /api/halt` and `POST /api/resume`. */
+export interface HaltResponse {
+  halted: boolean;
+  newly_halted?: boolean;
+  note?: string;
+  halt?: Halt | null;
+  cleared?: Halt | null;
+  error?: string;
 }
 
 /** `/api/metrics`. */

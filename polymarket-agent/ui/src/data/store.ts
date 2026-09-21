@@ -13,9 +13,14 @@ import {
   DATASET_KEYS,
   fetchCosts,
   fetchCyclesAll,
+  fetchEquity,
+  fetchFills,
   fetchHealth,
   fetchLatestCycle,
   fetchMetrics,
+  fetchOrders,
+  fetchReconciliation,
+  fetchRisk,
   fetchTrades,
   fetchTradesAll,
   type DatasetKey,
@@ -44,6 +49,11 @@ const FETCHERS: Record<DatasetKey, Fetcher> = {
   cycle: fetchLatestCycle,
   cyclesAll: fetchCyclesAll,
   costs: fetchCosts,
+  orders: fetchOrders,
+  fills: fetchFills,
+  equity: fetchEquity,
+  reconciliation: fetchReconciliation,
+  risk: fetchRisk,
 };
 
 function blank(): DatasetState {

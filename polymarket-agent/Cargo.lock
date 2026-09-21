@@ -2994,6 +2994,7 @@ dependencies = [
  "prost",
  "reqwest 0.12.28",
  "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]
@@ -3265,6 +3266,7 @@ dependencies = [
  "sha2",
  "sqlx",
  "subtle",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-test",

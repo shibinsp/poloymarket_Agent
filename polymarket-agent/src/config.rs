@@ -2,6 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use rust_decimal::Decimal;
+pub use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -44,7 +45,12 @@ pub struct AgentConfig {
     pub api_reserve: Decimal,
     pub initial_paper_balance: Decimal,
     /// Maximum API spend per calendar day (UTC). Stops new evaluations once hit.
-    /// Default: $5.00 — sufficient for ~550 Claude calls at ~$0.009 each.
+    ///
+    /// Default: $0.50, roughly 55 Claude calls at ~$0.009 each. Deliberately
+    /// low. The first live capital here is $50–100, and a research budget
+    /// that can exceed the day's realistic P&L is not a research budget, it
+    /// is the largest position the agent takes. Raise it once the paper
+    /// window shows what a day actually costs.
     #[serde(default = "default_daily_api_budget")]
     pub daily_api_budget: Decimal,
     /// Longest the agent will sleep when every venue is closed. Bounds only
@@ -56,7 +62,7 @@ pub struct AgentConfig {
 }
 
 fn default_daily_api_budget() -> Decimal {
-    rust_decimal_macros::dec!(5.0)
+    rust_decimal_macros::dec!(0.50)
 }
 
 fn default_max_sleep_seconds() -> u64 {
@@ -326,6 +332,90 @@ pub struct RiskConfig {
     pub max_total_exposure_pct: Decimal,
     pub max_positions_per_category: u32,
     pub min_position_usd: Decimal,
+
+    // --- Circuit breakers (see `risk::circuit_breaker`) ---
+    //
+    // Every field below has a default, so an existing config file keeps
+    // working — and keeps the breakers *on*, which is the point. A safety
+    // limit that has to be opted into is a safety limit nobody has.
+    //
+    // Losses trip on a strict `>` and counts on a `>=`, so a limit of zero
+    // means "none tolerated" rather than silently meaning "disabled". To
+    // switch a check off, set it high.
+    /// Fraction of the day's starting equity that may be lost before entries
+    /// stop for the rest of the UTC day.
+    #[serde(default = "default_max_daily_loss_pct")]
+    pub max_daily_loss_pct: Decimal,
+    /// Cash equivalent of the above. At micro capital the percentage is a
+    /// rounding error and this is the number the operator actually agreed to.
+    #[serde(default = "default_max_daily_loss_usd")]
+    pub max_daily_loss_usd: Decimal,
+    /// Fraction below the all-time equity high that halts until a human
+    /// resumes. Does not clear at midnight: sleeping on a drawdown changes
+    /// nothing about it.
+    #[serde(default = "default_max_drawdown_pct")]
+    pub max_drawdown_pct: Decimal,
+    /// Positions opened per UTC day.
+    #[serde(default = "default_max_trades_per_day")]
+    pub max_trades_per_day: u32,
+    /// Consecutive losing closes before entries stop for the day.
+    #[serde(default = "default_max_consecutive_losses")]
+    pub max_consecutive_losses: u32,
+    /// Absolute ceiling on one live position, in dollars. Applies only in
+    /// live mode: a percentage of a paper balance is a number nobody agreed
+    /// to, and the first live run must not inherit it.
+    #[serde(default = "default_max_live_notional_per_position_usd")]
+    pub max_live_notional_per_position_usd: Decimal,
+    /// Absolute ceiling on all live positions together, in dollars.
+    #[serde(default = "default_max_live_total_notional_usd")]
+    pub max_live_total_notional_usd: Decimal,
+}
+
+fn default_max_daily_loss_pct() -> Decimal {
+    rust_decimal_macros::dec!(0.05)
+}
+fn default_max_daily_loss_usd() -> Decimal {
+    rust_decimal_macros::dec!(5.0)
+}
+fn default_max_drawdown_pct() -> Decimal {
+    rust_decimal_macros::dec!(0.15)
+}
+fn default_max_trades_per_day() -> u32 {
+    10
+}
+fn default_max_consecutive_losses() -> u32 {
+    4
+}
+fn default_max_live_notional_per_position_usd() -> Decimal {
+    rust_decimal_macros::dec!(10.0)
+}
+fn default_max_live_total_notional_usd() -> Decimal {
+    rust_decimal_macros::dec!(60.0)
+}
+
+impl Default for RiskConfig {
+    /// The documented defaults, so a test can spell out only the field it is
+    /// exercising.
+    ///
+    /// Not a loading path: `RiskConfig` has no struct-level `serde(default)`,
+    /// so a config file is still required to state the five sizing fields.
+    /// Only the breaker limits below fall back to these when absent.
+    fn default() -> Self {
+        Self {
+            kelly_fraction: rust_decimal_macros::dec!(0.5),
+            max_position_pct: rust_decimal_macros::dec!(0.06),
+            max_total_exposure_pct: rust_decimal_macros::dec!(0.30),
+            max_positions_per_category: 3,
+            min_position_usd: rust_decimal_macros::dec!(1.0),
+            max_daily_loss_pct: default_max_daily_loss_pct(),
+            max_daily_loss_usd: default_max_daily_loss_usd(),
+            max_drawdown_pct: default_max_drawdown_pct(),
+            max_trades_per_day: default_max_trades_per_day(),
+            max_consecutive_losses: default_max_consecutive_losses(),
+            max_live_notional_per_position_usd: default_max_live_notional_per_position_usd(),
+            max_live_total_notional_usd: default_max_live_total_notional_usd(),
+        }
+    }
 }
 
 /// Volatility-targeted sizing for continuous assets (crypto, equities).
@@ -468,11 +558,71 @@ pub struct RateLimitConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct DatabaseConfig {
     pub path: String,
+    /// Directory for everything that is not the database file itself: the
+    /// `HALT` file and the hourly backups.
+    ///
+    /// Defaults to the database file's own directory, so an existing config
+    /// needs no new key and the operational files land next to the data they
+    /// describe. Set it explicitly to put them somewhere else.
+    #[serde(default)]
+    pub data_dir: Option<String>,
 }
 
 impl DatabaseConfig {
     pub fn url(&self) -> String {
         format!("sqlite:{}", self.path)
+    }
+
+    /// Where the `HALT` file and the backups live.
+    pub fn data_dir(&self) -> std::path::PathBuf {
+        if let Some(dir) = self.data_dir.as_deref().filter(|d| !d.is_empty()) {
+            return std::path::PathBuf::from(dir);
+        }
+        // `polymarket-agent.db` — the default — has no parent component, and
+        // `Path::parent` returns an empty path for it rather than `None`.
+        // Joining onto "" produces a relative path that resolves against the
+        // working directory, which is what is wanted, but `PathBuf::from("")`
+        // is not a directory anything can be created in.
+        match Path::new(&self.path).parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => std::path::PathBuf::from("."),
+        }
+    }
+
+    /// Warn if the database will land somewhere that depends on where the
+    /// process happened to be started.
+    ///
+    /// A relative `path` resolves against the working directory, which is the
+    /// repo when run by hand and `WorkingDirectory=` — or `/` — under
+    /// systemd. The two are different files, and the symptom is not an error:
+    /// the agent starts cleanly against an empty database and reports no open
+    /// positions, while the real ledger sits untouched somewhere else. That
+    /// is indistinguishable from "nothing has happened yet" right up until it
+    /// places a duplicate of every position it already holds.
+    pub fn warn_if_relative(&self) {
+        if self.path == ":memory:" || Path::new(&self.path).is_absolute() {
+            return;
+        }
+        let resolved = std::env::current_dir()
+            .map(|cwd| cwd.join(&self.path))
+            .unwrap_or_else(|_| std::path::PathBuf::from(&self.path));
+        tracing::warn!(
+            configured = %self.path,
+            resolved = %resolved.display(),
+            "database.path is relative — it resolves against the working \
+             directory, so starting the agent from elsewhere silently opens a \
+             different ledger. Set an absolute path."
+        );
+    }
+
+    /// The file whose existence halts the agent.
+    pub fn halt_file(&self) -> std::path::PathBuf {
+        self.data_dir().join("HALT")
+    }
+
+    /// Directory for hourly database snapshots.
+    pub fn backup_dir(&self) -> std::path::PathBuf {
+        self.data_dir().join("backups")
     }
 }
 
@@ -481,21 +631,32 @@ impl DatabaseConfig {
 ///
 /// `Default` is "no credentials at all", which is a legitimate configuration:
 /// paper mode needs none.
+///
+/// Every field is a `SecretString`, which is what stops these ending up in a
+/// log line. The previous `String` fields relied on nobody ever deriving
+/// `Debug` on this struct or on anything holding one of its values — true
+/// today, and a property no reviewer can check by reading the diff in front
+/// of them. `SecretString` has no `Debug` or `Display` that reveals anything,
+/// so the mistake stops compiling rather than stops being noticed, and it
+/// zeroes its buffer on drop.
+///
+/// Read one with `.expose_secret()`, which is deliberately conspicuous.
 #[derive(Default)]
 pub struct Secrets {
-    pub polymarket_private_key: Option<String>,
+    pub polymarket_private_key: Option<SecretString>,
     /// API key for the configured valuation provider. Read from `LLM_API_KEY`,
     /// falling back to `ANTHROPIC_API_KEY`.
-    pub llm_api_key: Option<String>,
-    pub discord_webhook_url: Option<String>,
-    pub noaa_api_token: Option<String>,
-    pub espn_api_key: Option<String>,
+    pub llm_api_key: Option<SecretString>,
+    /// A capability URL: anyone holding it can post to the channel.
+    pub discord_webhook_url: Option<SecretString>,
+    pub noaa_api_token: Option<SecretString>,
+    pub espn_api_key: Option<SecretString>,
     /// Bearer token protecting the dashboard's `/api/*` routes. Required when
     /// the dashboard is bound to a non-loopback address.
-    pub dashboard_token: Option<String>,
+    pub dashboard_token: Option<SecretString>,
     /// Alpaca trading credentials. Paper and live use different keys.
-    pub alpaca_key_id: Option<String>,
-    pub alpaca_secret_key: Option<String>,
+    pub alpaca_key_id: Option<SecretString>,
+    pub alpaca_secret_key: Option<SecretString>,
 }
 
 /// Read an env var, treating blank/whitespace-only as unset.
@@ -506,21 +667,25 @@ fn non_empty_env(key: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// `non_empty_env` for a value that must not be logged.
+fn secret_env(key: &str) -> Option<SecretString> {
+    non_empty_env(key).map(SecretString::from)
+}
+
 impl Secrets {
     pub fn from_env() -> Self {
         Self {
-            polymarket_private_key: non_empty_env("POLYMARKET_PRIVATE_KEY"),
+            polymarket_private_key: secret_env("POLYMARKET_PRIVATE_KEY"),
             // An unset var and one set to "" must behave the same, or the
             // blank `LLM_API_KEY=` line in .env.example would shadow the
             // ANTHROPIC_API_KEY fallback with Some("").
-            llm_api_key: non_empty_env("LLM_API_KEY")
-                .or_else(|| non_empty_env("ANTHROPIC_API_KEY")),
-            discord_webhook_url: non_empty_env("DISCORD_WEBHOOK_URL"),
-            noaa_api_token: non_empty_env("NOAA_API_TOKEN"),
-            espn_api_key: non_empty_env("ESPN_API_KEY"),
-            dashboard_token: non_empty_env("DASHBOARD_TOKEN"),
-            alpaca_key_id: non_empty_env("ALPACA_API_KEY_ID"),
-            alpaca_secret_key: non_empty_env("ALPACA_API_SECRET_KEY"),
+            llm_api_key: secret_env("LLM_API_KEY").or_else(|| secret_env("ANTHROPIC_API_KEY")),
+            discord_webhook_url: secret_env("DISCORD_WEBHOOK_URL"),
+            noaa_api_token: secret_env("NOAA_API_TOKEN"),
+            espn_api_key: secret_env("ESPN_API_KEY"),
+            dashboard_token: secret_env("DASHBOARD_TOKEN"),
+            alpaca_key_id: secret_env("ALPACA_API_KEY_ID"),
+            alpaca_secret_key: secret_env("ALPACA_API_SECRET_KEY"),
         }
     }
 }
@@ -830,9 +995,53 @@ mod tests {
     }
 
     #[test]
+    fn the_data_directory_defaults_to_the_database_files_own_directory() {
+        let db = DatabaseConfig {
+            path: "/var/lib/agent/agent.db".to_string(),
+            data_dir: None,
+        };
+        assert_eq!(db.data_dir(), Path::new("/var/lib/agent"));
+        assert_eq!(db.halt_file(), Path::new("/var/lib/agent/HALT"));
+        assert_eq!(db.backup_dir(), Path::new("/var/lib/agent/backups"));
+    }
+
+    #[test]
+    fn a_bare_database_filename_still_yields_a_usable_directory() {
+        // `Path::parent` on "agent.db" returns an *empty* path rather than
+        // None, and `PathBuf::from("")` is not somewhere a file can be
+        // created — so the HALT file and the backup directory would both have
+        // been unusable with the default config.
+        let db = DatabaseConfig {
+            path: "polymarket-agent.db".to_string(),
+            data_dir: None,
+        };
+        assert_eq!(db.data_dir(), Path::new("."));
+        assert_eq!(db.halt_file(), Path::new("./HALT"));
+    }
+
+    #[test]
+    fn an_explicit_data_dir_wins_over_the_database_location() {
+        let db = DatabaseConfig {
+            path: "/var/lib/agent/agent.db".to_string(),
+            data_dir: Some("/run/agent".to_string()),
+        };
+        assert_eq!(db.halt_file(), Path::new("/run/agent/HALT"));
+    }
+
+    #[test]
+    fn a_blank_data_dir_is_treated_as_unset() {
+        let db = DatabaseConfig {
+            path: "/var/lib/agent/agent.db".to_string(),
+            data_dir: Some(String::new()),
+        };
+        assert_eq!(db.data_dir(), Path::new("/var/lib/agent"));
+    }
+
+    #[test]
     fn test_database_url() {
         let db = DatabaseConfig {
             path: "test.db".to_string(),
+            data_dir: None,
         };
         assert_eq!(db.url(), "sqlite:test.db");
     }

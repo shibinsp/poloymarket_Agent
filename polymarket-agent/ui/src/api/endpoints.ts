@@ -1,11 +1,17 @@
 /** One function per route. The only place API paths are written down. */
-import { get, type ApiResult } from "./client";
+import { get, post, type ApiResult } from "./client";
 import { asArray, asObject, asObjectOrNull } from "./narrow";
 import type {
   ApiCostRecord,
   CycleRecord,
+  DailyEquity,
+  FillRecord,
+  HaltResponse,
   Health,
   Metrics,
+  OrderRecord,
+  ReconciliationRun,
+  RiskStatus,
   TradeRecord,
 } from "./types";
 
@@ -17,6 +23,11 @@ export const DATASET_KEYS = [
   "cycle",
   "cyclesAll",
   "costs",
+  "orders",
+  "fills",
+  "equity",
+  "reconciliation",
+  "risk",
 ] as const;
 export type DatasetKey = (typeof DATASET_KEYS)[number];
 
@@ -29,6 +40,11 @@ export const DATASET_LABELS: Record<DatasetKey, string> = {
   cycle: "Latest cycle",
   cyclesAll: "All cycles",
   costs: "API costs",
+  orders: "Orders",
+  fills: "Fills",
+  equity: "Daily equity",
+  reconciliation: "Reconciliation",
+  risk: "Risk limits",
 };
 
 export const DATASET_PATHS: Record<DatasetKey, string> = {
@@ -39,6 +55,11 @@ export const DATASET_PATHS: Record<DatasetKey, string> = {
   cycle: "/api/cycles",
   cyclesAll: "/api/cycles/all",
   costs: "/api/costs",
+  orders: "/api/orders",
+  fills: "/api/fills",
+  equity: "/api/equity",
+  reconciliation: "/api/reconciliation",
+  risk: "/api/risk",
 };
 
 /**
@@ -55,10 +76,75 @@ export const DATASET_INTERVAL_MULTIPLIER: Record<DatasetKey, number> = {
   tradesAll: 4,
   cyclesAll: 4,
   costs: 4,
+  // Capped server-side at 500 rows, so these are cheap enough to poll every
+  // tick — and an order changing state is exactly what an operator watching
+  // this page is waiting for.
+  orders: 1,
+  fills: 1,
+  risk: 1,
+  // One row per day and one per reconciliation pass; neither moves fast.
+  equity: 4,
+  reconciliation: 4,
 };
 
 export function fetchHealth(signal?: AbortSignal): Promise<ApiResult<Health>> {
   return get({ path: DATASET_PATHS.health, narrow: asObject<Health>, signal });
+}
+
+export function fetchOrders(
+  signal?: AbortSignal,
+): Promise<ApiResult<OrderRecord[]>> {
+  return get({
+    path: DATASET_PATHS.orders,
+    narrow: asArray<OrderRecord>,
+    signal,
+  });
+}
+
+export function fetchFills(
+  signal?: AbortSignal,
+): Promise<ApiResult<FillRecord[]>> {
+  return get({ path: DATASET_PATHS.fills, narrow: asArray<FillRecord>, signal });
+}
+
+export function fetchEquity(
+  signal?: AbortSignal,
+): Promise<ApiResult<DailyEquity[]>> {
+  return get({
+    path: DATASET_PATHS.equity,
+    narrow: asArray<DailyEquity>,
+    signal,
+  });
+}
+
+export function fetchReconciliation(
+  signal?: AbortSignal,
+): Promise<ApiResult<ReconciliationRun[]>> {
+  return get({
+    path: DATASET_PATHS.reconciliation,
+    narrow: asArray<ReconciliationRun>,
+    signal,
+  });
+}
+
+export function fetchRisk(signal?: AbortSignal): Promise<ApiResult<RiskStatus>> {
+  return get({ path: DATASET_PATHS.risk, narrow: asObject<RiskStatus>, signal });
+}
+
+/**
+ * Stop the agent opening positions. Exits, order polling and reconciliation
+ * keep running — this is not a shutdown.
+ *
+ * The 200 means the flag is set, not that resting orders are already
+ * cancelled: the agent does that on its next wake. The response says so.
+ */
+export function halt(): Promise<ApiResult<HaltResponse>> {
+  return post<HaltResponse>("/api/halt");
+}
+
+/** Lift the halt, and remove the HALT file so it does not come straight back. */
+export function resume(): Promise<ApiResult<HaltResponse>> {
+  return post<HaltResponse>("/api/resume");
 }
 
 export function fetchMetrics(

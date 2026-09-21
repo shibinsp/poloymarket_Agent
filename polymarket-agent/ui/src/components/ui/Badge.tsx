@@ -31,6 +31,10 @@ export function Badge({
 export function agentStateTone(state: string): StatusTone {
   const s = state.toUpperCase();
   if (s === "DEAD") return "critical";
+  // Halted is a deliberate stop, not a failure — but it does mean the agent
+  // has quietly stopped doing the thing it exists to do, which "neutral"
+  // would understate.
+  if (s === "HALTED") return "serious";
   if (s.includes("CRITICAL")) return "serious";
   if (s.includes("LOW") || s.includes("FUEL")) return "warning";
   if (s === "ALIVE") return "good";

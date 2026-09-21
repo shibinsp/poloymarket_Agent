@@ -41,6 +41,19 @@ pub struct LlmClient {
     store: Store,
     /// Whether prompt and completion text is attached to the trace span.
     export_content: bool,
+    /// The day's spend, claimed before a call is made.
+    ///
+    /// Held by the client rather than passed in at each call site on
+    /// purpose. The overspend this prevents came from a *correct* budget
+    /// check done in the wrong place — read once, then ten calls spawned
+    /// against it — and any design where the caller is responsible for
+    /// reserving has the same shape: it works until someone adds a call site
+    /// and does not know they had to. Here there is no way to make the call
+    /// without passing the gate.
+    ///
+    /// `None` leaves spend unbounded, which is only right for the throwaway
+    /// probe clients in the dry run and in tests.
+    budget: Option<std::sync::Arc<crate::agent::budget::BudgetLedger>>,
 }
 
 /// Hand-written so the API key can never reach a log line or panic message.
@@ -124,7 +137,29 @@ impl LlmClient {
             store,
             // Fails closed. See the doc comment on `new`.
             export_content: false,
+            budget: None,
         })
+    }
+
+    /// Meter this client against the day's valuation budget.
+    pub fn with_budget(
+        mut self,
+        budget: std::sync::Arc<crate::agent::budget::BudgetLedger>,
+    ) -> Self {
+        self.budget = Some(budget);
+        self
+    }
+
+    /// What the ledger says is left today, for a caller sizing a batch.
+    pub fn budget_remaining(&self, today: chrono::NaiveDate) -> Option<Decimal> {
+        self.budget.as_ref().map(|b| b.remaining(today))
+    }
+
+    /// How many more calls of typical size the day's budget allows.
+    pub fn affordable_calls(&self, today: chrono::NaiveDate) -> Option<usize> {
+        self.budget
+            .as_ref()
+            .map(|b| b.affordable_calls(today, self.estimated_call_cost()))
     }
 
     /// Whether prompts and completions ride along on the trace span.
@@ -209,6 +244,19 @@ impl LlmClient {
     ) -> Result<LlmResponse> {
         let span = tracing::Span::current();
 
+        // Claim the estimated cost *before* the call, not after.
+        //
+        // The reservation is released automatically if this function returns
+        // early — which is the path a timeout takes. Without that, a provider
+        // outage would consume the whole day's budget on calls that returned
+        // nothing at all.
+        let reservation = match &self.budget {
+            Some(ledger) => {
+                Some(ledger.reserve(chrono::Utc::now().date_naive(), self.estimated_call_cost())?)
+            }
+            None => None,
+        };
+
         let (text, input_tokens, output_tokens) = match self.provider {
             LlmProvider::Anthropic => self.complete_anthropic(system_prompt, user_prompt).await?,
             LlmProvider::OpenAiCompatible => {
@@ -217,6 +265,13 @@ impl LlmClient {
         };
 
         let cost = self.cost(input_tokens, output_tokens);
+
+        // Convert the claim into spend. The estimate and the actual rarely
+        // match exactly; the difference is booked here so the day's running
+        // total is what was really spent, not what was predicted.
+        if let Some(reservation) = reservation {
+            reservation.settle(cost);
+        }
 
         span.record("gen_ai.usage.input_tokens", input_tokens);
         span.record("gen_ai.usage.output_tokens", output_tokens);

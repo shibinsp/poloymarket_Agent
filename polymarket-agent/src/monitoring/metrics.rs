@@ -3,7 +3,7 @@
 //! Computes win rate, total P&L, Sharpe ratio, ROI, and other
 //! trading statistics from SQLite trade history.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::Serialize;
@@ -84,11 +84,16 @@ pub async fn compute_metrics(
     let mut pnl_values: Vec<Decimal> = Vec::new();
 
     for trade in &resolved {
-        let pnl = trade
-            .pnl
-            .as_deref()
-            .and_then(|s| Decimal::from_str(s).ok())
-            .unwrap_or(Decimal::ZERO);
+        // Fail loud. A P&L that will not parse silently became zero, which
+        // reads as a flat trade: it counts as a loss in the win rate and
+        // contributes nothing to realised P&L, so a corrupted row makes the
+        // performance numbers quietly optimistic in exactly the place
+        // somebody would be deciding whether to go live.
+        let pnl = match trade.pnl.as_deref() {
+            Some(raw) => Decimal::from_str(raw)
+                .with_context(|| format!("trade {:?} has an unparseable pnl: {raw:?}", trade.id))?,
+            None => Decimal::ZERO,
+        };
 
         // A prediction market declares its own outcome; a continuous position
         // has no notion of winning, so its P&L decides. Without this, folding

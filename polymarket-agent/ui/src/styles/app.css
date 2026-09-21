@@ -220,3 +220,93 @@ td.truncate { max-width: 340px; overflow: hidden; text-overflow: ellipsis; }
   .topbar { padding: 10px 16px; }
   td.truncate { max-width: 180px; }
 }
+
+/* --- Halt control -------------------------------------------------------- */
+
+/* The one control on the dashboard that changes what the agent does, so it is
+   visually separated from the read-only tiles around it rather than sitting
+   inline with them. */
+.halt {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  background: var(--surface-2);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-start;
+}
+.halt__state { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.halt__why { font-size: 12px; color: var(--text-muted); }
+.halt__detail {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  /* A breaker's detail is a sentence of numbers; let it wrap rather than
+     truncating the limit that was breached. */
+  overflow-wrap: anywhere;
+}
+.halt__confirm { margin: 0; font-size: 13px; max-width: 62ch; }
+.halt__actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.halt__error {
+  margin: 0;
+  font-size: 12px;
+  color: var(--status-critical);
+  overflow-wrap: anywhere;
+}
+
+/* Destructive only in the sense that it stops trading; the colour is a
+   deliberate speed bump, and the label always says what will happen. */
+.btn--danger {
+  border-color: color-mix(in srgb, var(--status-critical) 55%, transparent);
+  color: var(--status-critical);
+}
+.btn--danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--status-critical) 12%, transparent);
+}
+.btn--quiet { border-color: transparent; color: var(--text-muted); }
+
+/* --- Limit usage bar ----------------------------------------------------- */
+
+/* A bar and a number together: the bar makes "nearly there" readable at a
+   glance, the number makes it checkable, and neither relies on colour alone. */
+.usage {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  min-width: 96px;
+  height: 18px;
+  padding: 0 4px;
+  border-radius: 4px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+.usage__bar {
+  position: absolute;
+  inset: 0 auto 0 0;
+  opacity: 0.35;
+}
+.usage__bar--good     { background: var(--status-good); }
+.usage__bar--warning  { background: var(--status-warning); }
+.usage__bar--serious  { background: var(--status-serious); }
+.usage__bar--critical { background: var(--status-critical); }
+.usage__label {
+  position: relative;
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+}
+
+/* --- Page filters -------------------------------------------------------- */
+
+.filters { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; font-size: 13px; }
+.filters select,
+.filters input {
+  background: var(--surface-1);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 3px 6px;
+  font: inherit;
+}

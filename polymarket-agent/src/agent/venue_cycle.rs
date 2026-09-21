@@ -19,9 +19,10 @@ use tracing::Instrument as _;
 use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
-use crate::config::AppConfig;
+use crate::config::{AgentMode, AppConfig};
 use crate::db::store::{OrderRecord, Store, VenueTradeRecord};
 use crate::market::models::AgentState;
+use crate::risk::circuit_breaker;
 use crate::risk::sizing::{size_position, SizeInputs};
 use crate::valuation::directional::{
     self, build_system_prompt, build_user_prompt, parse_directional_response,
@@ -193,7 +194,7 @@ impl VenueCycle<'_> {
             }
 
             match self
-                .evaluate_instrument(venue, llm, &instrument, &ctx, bankroll)
+                .evaluate_instrument(venue, llm, &instrument, &ctx, bankroll, open_notional)
                 .await
             {
                 Ok(EvaluationResult {
@@ -242,6 +243,10 @@ impl VenueCycle<'_> {
         instrument: &Instrument,
         ctx: &CycleContext,
         bankroll: Decimal,
+        // Cash already committed to open positions, including orders placed
+        // earlier in this same cycle. The absolute total cap has to hold
+        // *within* a cycle, not just between them.
+        open_notional: Decimal,
     ) -> Result<EvaluationResult> {
         let quote = venue.quote(&instrument.id).await?;
 
@@ -297,6 +302,13 @@ impl VenueCycle<'_> {
                 bankroll,
                 state: ctx.state,
                 candles: &candles,
+                // Absolute cash caps, live only, accounting for what is
+                // already committed against the total.
+                live_ceiling: circuit_breaker::live_notional_ceiling(
+                    self.config.agent.mode == AgentMode::Live,
+                    open_notional,
+                    &self.config.risk,
+                ),
             },
             &self.config.risk,
             &self.config.sizing_continuous,

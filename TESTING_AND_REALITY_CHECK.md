@@ -96,12 +96,18 @@ Live mode requires:
 3. Being legally allowed to trade on Polymarket — its international CLOB prohibits
    US persons under its Terms of Service
 
-**Live mode IS implemented (since commit `7c351e8`) but is NOT yet safe to run.**
-`--mode live` places real EIP-712-signed orders. As of 2026-09-17 the live path
-still records orders as filled without confirming the fill, hardcodes a 7-day order
-expiry, has no kill switch, drawdown breaker, or daily-loss limit, and submits
-NO-side entries with an inverted order side. Treat `--mode live` as disabled
-until the go-live gate in the project roadmap is complete.
+**Live mode IS implemented (since commit `7c351e8`) but the Polymarket path is
+still NOT safe to run.** `--mode live` places real EIP-712-signed orders. That
+path still records orders as filled without confirming the fill and still
+hardcodes a 7-day order expiry regardless of `order_ttl_seconds`. The inverted
+NO-side bug previously listed here has been fixed. Treat `--mode live` against
+Polymarket as disabled.
+
+The **venue path** (`[[venues]]`, e.g. Alpaca) is a different code path and
+does have the safety gate — kill switch, circuit breakers, per-cycle
+reconciliation, budget ledger, verified backups. See *Safety controls* in the
+README. That makes it *mechanically* ready; whether it should be given money
+is the question Part 2 is about, and the answer there has not changed.
 
 ---
 

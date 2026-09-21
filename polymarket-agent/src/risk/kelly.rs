@@ -70,7 +70,7 @@ pub fn kelly_size(
     let state_multiplier = match state {
         AgentState::Alive => Decimal::ONE,
         AgentState::LowFuel => dec!(0.25), // Quarter-Kelly in low fuel
-        AgentState::CriticalSurvival | AgentState::Dead => Decimal::ZERO,
+        AgentState::CriticalSurvival | AgentState::Halted | AgentState::Dead => Decimal::ZERO,
     };
 
     // Adjusted Kelly = raw * fraction * confidence * state_multiplier
@@ -148,7 +148,38 @@ mod tests {
             max_total_exposure_pct: dec!(0.30),
             max_positions_per_category: 3,
             min_position_usd: dec!(1), // $1 min
+            ..RiskConfig::default()
         }
+    }
+
+    #[test]
+    fn a_halted_agent_gets_no_kelly_position() {
+        let config = default_config();
+        let halted = kelly_size(
+            dec!(0.70),
+            dec!(0.50),
+            dec!(0.80),
+            dec!(1000),
+            AgentState::Halted,
+            &config,
+        );
+        assert_eq!(
+            halted.position_usd,
+            Decimal::ZERO,
+            "a halted agent must be sized out of prediction markets too"
+        );
+
+        // The control: identical inputs while alive do produce a position, so
+        // this cannot pass by the sizing being broken for everything.
+        let alive = kelly_size(
+            dec!(0.70),
+            dec!(0.50),
+            dec!(0.80),
+            dec!(1000),
+            AgentState::Alive,
+            &config,
+        );
+        assert!(alive.position_usd > Decimal::ZERO);
     }
 
     #[test]

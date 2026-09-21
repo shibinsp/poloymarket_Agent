@@ -40,6 +40,12 @@ export function failureText(f: ApiFailure): string {
   }
 }
 
+/**
+ * Sent on every control request. Must match `CONTROL_HEADER` in
+ * `monitoring/dashboard.rs`.
+ */
+export const CONTROL_HEADER = "x-agent-control";
+
 /** A failure the operator can fix by supplying a token. */
 export function isAuthFailure(f: ApiFailure): boolean {
   return f.kind === "unauthorized";
@@ -118,6 +124,81 @@ export async function get<T>(opts: GetOptions<T>): Promise<ApiResult<T>> {
   if (token === "") return { ok: false, error: { kind: "unauthorized" } };
 
   const second = await attempt(opts, token);
+  if (!("retryWithAuth" in second)) return second;
+
+  auth.clearToken();
+  return { ok: false, error: { kind: "unauthorized" } };
+}
+
+/**
+ * POST a control action.
+ *
+ * Separate from `get` rather than folded into it, because the retry semantics
+ * differ in a way that matters: `get` retries a 401 after prompting for a
+ * token, which is safe because reading twice is reading once. Halting twice
+ * is not the same as halting once — the server is idempotent about the flag,
+ * but a retry loop around a state change is a habit worth not forming. So
+ * this attempts once with whatever token is already held, prompts on a 401,
+ * and attempts once more. No further retries, ever.
+ *
+ * Also unlike `get`: a non-2xx body is still parsed, because the halt routes
+ * return a JSON explanation with their 500 and that explanation is the whole
+ * point ("resumed, but the halt record could not be cleared").
+ */
+export async function post<T>(path: string): Promise<ApiResult<T>> {
+  const once = async (token: string): Promise<ApiResult<T> | { retryWithAuth: true }> => {
+    let res: Response;
+    try {
+      res = await fetch(path, {
+        method: "POST",
+        headers: {
+          // Required by the server on every state-changing route. Its value
+          // is irrelevant; its presence is what stops the request being a
+          // CORS *simple request*, which any page the operator browses could
+          // otherwise fire at localhost:8080 to halt — or resume — trading.
+          [CONTROL_HEADER]: "1",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        cache: "no-store",
+      });
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      return { ok: false, error: { kind: "network", message } };
+    }
+
+    if (res.status === 401) return { retryWithAuth: true };
+
+    let body: unknown;
+    try {
+      body = await res.json();
+    } catch {
+      body = null;
+    }
+
+    if (!res.ok) {
+      const explained =
+        body && typeof body === "object" && "error" in body
+          ? String((body as { error: unknown }).error)
+          : "";
+      return {
+        ok: false,
+        error: { kind: "http", status: res.status, message: explained },
+      };
+    }
+
+    if (body === null || typeof body !== "object") {
+      return { ok: false, error: { kind: "malformed", message: "expected an object" } };
+    }
+    return { ok: true, value: body as T };
+  };
+
+  const first = await once(auth.getToken());
+  if (!("retryWithAuth" in first)) return first;
+
+  const token = await auth.requestToken();
+  if (token === "") return { ok: false, error: { kind: "unauthorized" } };
+
+  const second = await once(token);
   if (!("retryWithAuth" in second)) return second;
 
   auth.clearToken();

@@ -3,7 +3,7 @@ use chrono::Utc;
 use clap::Parser;
 
 use polymarket_agent::agent::lifecycle::Agent;
-use polymarket_agent::config::{self, AgentMode, AppConfig};
+use polymarket_agent::config::{self, AgentMode, AppConfig, ExposeSecret};
 use polymarket_agent::db::store::Store;
 use polymarket_agent::monitoring;
 use polymarket_agent::monitoring::alerts::{AlertLevel, AnomalyKind};
@@ -167,7 +167,7 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
             // record this call in api_costs and eat into the daily budget.
             let probe_store = Store::new(":memory:").await?;
             match polymarket_agent::valuation::llm::LlmClient::new(
-                key.clone(),
+                key.expose_secret().to_string(),
                 &config.valuation,
                 probe_store,
             )
@@ -276,16 +276,33 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
 /// Run the agent in paper or live trading mode.
 async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
     // Create shared database store
+    config.database.warn_if_relative();
     let store = Store::new(&config.database.path).await?;
+    // Shared pool, not a second connection: opening the same file twice means
+    // two WAL writers and two migration runs.
+    let agent_pool = store.pool().clone();
 
     // Create health state and dashboard
     let health_state = monitoring::health::HealthState::new();
     let dashboard_store = Store::from_pool(store.pool().clone());
+    // One flag, shared by the dashboard's `/api/halt`, the `HALT` file poll,
+    // the SIGUSR1 handler and the agent's own breakers. Built here because
+    // the dashboard comes up before the agent does.
+    let kill_switch = std::sync::Arc::new(polymarket_agent::agent::kill_switch::KillSwitch::new(
+        config.database.halt_file(),
+    ));
+
     let dashboard_state = DashboardState::new(
         dashboard_store,
         health_state.clone(),
         config.agent.initial_paper_balance,
-        secrets.dashboard_token.clone(),
+        secrets
+            .dashboard_token
+            .as_ref()
+            .map(|t| t.expose_secret().to_string()),
+        kill_switch.clone(),
+        config.risk.clone(),
+        config.agent.mode,
     );
     let dashboard_handle = spawn_dashboard(
         dashboard_state,
@@ -294,7 +311,23 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
         config.agent.mode,
     )?;
 
-    let mut agent = Agent::new(config.clone(), secrets, store).await?;
+    let mut agent = Agent::new(config.clone(), secrets, store, kill_switch.clone()).await?;
+    let signal_halt = spawn_signal_halt(kill_switch.clone());
+    let halt_poller = spawn_halt_file_poller(kill_switch.clone());
+    let mut halt_trips = kill_switch.subscribe();
+
+    // Hourly snapshots. Skipped for an in-memory database, which has no file
+    // to vacuum and no reason to want one.
+    let backups = if config.database.path == ":memory:" {
+        None
+    } else {
+        let dir = config.database.backup_dir();
+        tracing::info!(dir = %dir.display(), "Hourly database snapshots enabled");
+        Some(polymarket_agent::db::backup::spawn(
+            Store::from_pool(agent_pool),
+            dir,
+        ))
+    };
     let alerts = agent.alerts();
     let watchdog = spawn_cycle_watchdog(
         health_state.clone(),
@@ -321,12 +354,17 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
         // through just because SIGTERM arrived; if a cycle genuinely hangs,
         // systemd's TimeoutStopSec (see deploy/polymarket-agent.service) is
         // the backstop that forces an exit.
+        // Consumed before the cycle, so a trip raised while it runs is still
+        // pending when the loop reaches its sleep.
+        halt_trips.borrow_and_update();
+
         match agent.run_cycle().await {
             Ok(()) => {
                 consecutive_failures = 0;
                 health_state
                     .record_cycle(agent.cycle_number(), agent.current_state())
                     .await;
+                health_state.record_anomalies(alerts.anomaly_counts()).await;
 
                 if agent.is_dead() {
                     tracing::error!("Agent has died. Shutting down.");
@@ -336,6 +374,7 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
             Err(e) => {
                 consecutive_failures += 1;
                 health_state.record_failure().await;
+                health_state.record_anomalies(alerts.anomaly_counts()).await;
                 tracing::error!(
                     error = %e,
                     consecutive_failures,
@@ -380,8 +419,33 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
             "Idling until the next wake"
         );
 
+        // A halt raised *during* the cycle — by the file poller, a signal or
+        // the dashboard — must not be marked seen here. The version was
+        // consumed before `run_cycle` (below, at the top of the loop), so
+        // anything that arrived since is still pending and `changed()` will
+        // resolve immediately.
+        //
+        // Belt and braces: if the switch is holding work the loop has not
+        // acted on, do not sleep at all. Marking the version seen after the
+        // cycle — which is what this used to do — silently consumed a trip
+        // raised in the window between the cycle's last halt check and the
+        // sleep, and the agent then idled for up to `max_sleep_seconds` with
+        // resting orders still working. That is exactly the latency the watch
+        // channel was added to remove.
+        if kill_switch.has_unhandled() {
+            tracing::warn!("A halt arrived during the cycle — not sleeping on it");
+            continue;
+        }
+
         tokio::select! {
             _ = tokio::time::sleep(sleep_for) => {}
+            // A halt raised while the loop is idle cuts the sleep short, so
+            // the agent cancels its resting orders now rather than at the
+            // next scheduled wake — which, across a closed weekend, is an
+            // hour away.
+            _ = halt_trips.changed() => {
+                tracing::warn!("Halted while idle — waking to cancel resting orders");
+            }
             signal = shutdown.recv() => {
                 tracing::info!(signal, "Shutdown signal received — stopping after the current cycle");
                 break;
@@ -389,9 +453,27 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
         }
     }
 
+    // Pull everything off the book before the process goes away.
+    //
+    // Gate item 1: no orphaned live orders on stop or crash. Without this a
+    // `systemctl stop` — a deploy, a reboot, an operator tidying up — left
+    // resting orders working at the venue with nothing polling them. They can
+    // still fill, and the position they open belongs to nobody until the
+    // agent comes back and reconciles it.
+    //
+    // Runs on every exit path, including the fatal one: a run that ended in
+    // five consecutive cycle failures is exactly when the book should not be
+    // left unattended.
+    agent.cancel_resting_orders("shutdown").await;
+
     // Clean up background tasks
     watchdog.abort();
     dashboard_handle.abort();
+    signal_halt.abort();
+    halt_poller.abort();
+    if let Some(backups) = backups {
+        backups.abort();
+    }
     // Spans are flushed by `main`, on the one path every mode returns
     // through — including the `?` returns above this line.
     tracing::info!("Agent shutdown complete");
@@ -452,6 +534,100 @@ fn spawn_cycle_watchdog(
                 .await;
         }
     })
+}
+
+/// How often the `HALT` file is checked.
+///
+/// Short, because this is the route that works when nothing else does — no
+/// dashboard token, no PID, just a file an operator can touch over SSH. It is
+/// a `stat` on one path; five seconds of it costs nothing and turns the
+/// worst-case latency of the kill switch from an hour into five seconds.
+const HALT_FILE_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Watch the `HALT` file.
+///
+/// Separate from the cycle for the same reason the cycle watchdog is: the
+/// loop cannot notice anything while it is asleep, and it may legitimately
+/// sleep for `max_sleep_seconds` across a closed weekend. Tripping the switch
+/// here also wakes the loop, so the agent acts on the halt rather than only
+/// recording it.
+fn spawn_halt_file_poller(
+    kill_switch: std::sync::Arc<polymarket_agent::agent::kill_switch::KillSwitch>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(HALT_FILE_POLL);
+        loop {
+            ticker.tick().await;
+            // Both directions: creating the file halts, removing it resumes.
+            // The agent loop does the rest — cancelling resting orders,
+            // alerting, writing the row that survives a restart.
+            match kill_switch.sync_with_file(Utc::now()) {
+                polymarket_agent::agent::kill_switch::FileSync::Raised(halt) => {
+                    tracing::warn!(
+                        detail = %halt.detail,
+                        "HALT file present — halting new positions"
+                    );
+                }
+                // The persisted row is cleared by the agent loop's own
+                // `sync_halts`, which has the store; this task only has the
+                // flag. Logged here so the two are not confused.
+                polymarket_agent::agent::kill_switch::FileSync::Resumed => {
+                    tracing::info!("HALT file removed — resuming on the next wake");
+                }
+                polymarket_agent::agent::kill_switch::FileSync::Unchanged => {}
+            }
+        }
+    })
+}
+
+/// Halt on SIGUSR1.
+///
+/// The third way in, and the one that needs least: no dashboard token, no
+/// filesystem path, just a PID. `kill -USR1 $(pidof polymarket-agent)` stops
+/// the agent opening positions while leaving it running to manage what it
+/// already holds — which is the distinction that makes this worth having
+/// separately from SIGTERM.
+///
+/// Sets the flag only. The agent loop does the rest on its next wake, so this
+/// handler cannot race a cycle that is midway through placing an order.
+#[cfg(unix)]
+fn spawn_signal_halt(
+    kill_switch: std::sync::Arc<polymarket_agent::agent::kill_switch::KillSwitch>,
+) -> tokio::task::JoinHandle<()> {
+    use polymarket_agent::agent::kill_switch::{Halt, HaltSource};
+    use polymarket_agent::risk::circuit_breaker::HaltScope;
+
+    tokio::spawn(async move {
+        let mut stream = match tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::user_defined1(),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "Could not listen for SIGUSR1 — halt by file or API only");
+                return;
+            }
+        };
+        loop {
+            stream.recv().await;
+            let newly = kill_switch.trip(Halt::new(
+                HaltSource::Signal,
+                HaltScope::UntilResume,
+                "SIGUSR1 received",
+                Utc::now(),
+            ));
+            tracing::warn!(
+                newly,
+                "SIGUSR1 — halting new positions (exits and reconciliation continue)"
+            );
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn spawn_signal_halt(
+    _kill_switch: std::sync::Arc<polymarket_agent::agent::kill_switch::KillSwitch>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async {})
 }
 
 /// Persistent OS signal streams so a SIGINT/SIGTERM is never missed, even while

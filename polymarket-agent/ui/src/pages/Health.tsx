@@ -9,6 +9,8 @@ import { DATASET_KEYS, DATASET_LABELS, DATASET_PATHS, type DatasetKey } from "..
 import { useNow } from "../data/useNow";
 import { absTime, durationSec, int, relTime, DASH } from "../lib/format";
 import { parseTs } from "../lib/time";
+import { HaltControl } from "../components/shell/HaltControl";
+import { dataStore } from "../data/store";
 import type { Health as HealthPayload } from "../api/types";
 
 export function Health() {
@@ -31,6 +33,13 @@ export function Health() {
            */
           const hasDue = "next_cycle_due" in h;
           const hasAlerts = "alerts_delivering" in h;
+          // Same rule: test for the key. `halted` is legitimately `false` on
+          // a healthy new build, and `anomalies` is legitimately `{}`.
+          const hasHalt = "halted" in h;
+          const hasAnomalies = "anomalies" in h;
+          const anomalies = Object.entries(h.anomalies ?? {}).sort(
+            (a, b) => b[1] - a[1],
+          );
 
           const due = hasDue ? parseTs(h.next_cycle_due ?? null) : null;
           const overdueMs = due ? now - due.getTime() : null;
@@ -81,6 +90,49 @@ export function Health() {
                   />
                 )}
               </div>
+
+              {hasHalt && (
+                <div style={{ marginTop: 16 }}>
+                  <HaltControl
+                    halted={h.halted === true}
+                    current={h.halt}
+                    /* Re-read health immediately rather than waiting out the
+                       poll interval: the button's whole job is to change this
+                       value, and a control that appears not to have worked
+                       gets pressed again. */
+                    onChanged={() => dataStore.refresh("health")}
+                  />
+                </div>
+              )}
+
+              {hasAnomalies && (
+                <div style={{ marginTop: 16 }}>
+                  <h3 style={{ fontSize: 13, margin: "0 0 6px" }}>
+                    Anomalies since start
+                  </h3>
+                  {anomalies.length === 0 ? (
+                    <p className="muted" style={{ fontSize: 12, margin: 0 }}>
+                      None recorded.
+                    </p>
+                  ) : (
+                    <>
+                      <DataTable
+                        rows={anomalies.map(([kind, count]) => ({ kind, count }))}
+                        rowKey={(r) => r.kind}
+                        columns={[
+                          { key: "k", header: "Kind", render: (r) => <code className="mono">{r.kind}</code> },
+                          { key: "c", header: "Count", numeric: true, render: (r) => int(r.count), sortValue: (r) => r.count },
+                        ]}
+                      />
+                      <p className="muted" style={{ fontSize: 12, marginBottom: 0 }}>
+                        Occurrences, not alerts sent — alerts are deduped per
+                        kind and scope for 30 minutes, so one webhook message
+                        can stand for hundreds of these.
+                      </p>
+                    </>
+                  )}
+                </div>
+              )}
 
               {hasAlerts && h.alerts_delivering === false && (
                 <div style={{ marginTop: 12 }}>

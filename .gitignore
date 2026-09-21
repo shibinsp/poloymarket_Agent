@@ -8,3 +8,6 @@
 
 # Temporary files
 *.tmp
+
+# macOS
+.DS_Store
