@@ -552,3 +552,27 @@ async fn a_placed_order_records_the_mid_it_was_decided_at() {
         "the mid of a 60000/60010 book"
     );
 }
+
+/// The last unmeasurable promotion criterion. Nothing on the venue path
+/// wrote a forecast down, so "Brier ≤0.24 on ≥30 closed positions" could not
+/// be evaluated on the only path the paper window actually exercises.
+#[tokio::test]
+async fn a_venue_entry_records_a_forecast_for_calibration() {
+    let mut h = harness(|_| {}).await;
+    h.agent.run_cycle().await.expect("cycle runs");
+
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT market_id, fair_value FROM confidence_calibration WHERE resolved = 0",
+    )
+    .fetch_all(h.store.pool())
+    .await
+    .unwrap();
+
+    assert_eq!(rows.len(), 1, "one forecast per entry, got {rows:?}");
+    assert_eq!(rows[0].0, "alpaca:BTC/USD", "namespaced by venue");
+    assert_eq!(
+        Decimal::from_str(&rows[0].1).unwrap(),
+        dec!(0.72),
+        "the forecast recorded is p_up, which is what a Brier score is over"
+    );
+}

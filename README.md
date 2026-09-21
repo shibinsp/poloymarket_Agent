@@ -315,6 +315,51 @@ orders and fills, and the page says so. Fill rate is measured over orders that
 reached a terminal state, so submitting an order does not make the venue look
 worse until it finishes.
 
+### Starting the paper window
+
+The agent only exercises the venue path when `[[venues]]` is configured.
+Without it, it falls back to the legacy Polymarket-only loop — which is not
+what the safety gate covers, and is not available to US persons at all.
+
+```bash
+cp config/paper.toml config/local.toml      # gitignored; edit paths in it
+echo 'CONFIG_PATH=config/local.toml' >> .env
+# Alpaca → Paper account → API keys. Paper keys do not work against the live
+# endpoint, or the reverse; the failure is a 403 at startup.
+echo 'ALPACA_API_KEY_ID=...'     >> .env
+echo 'ALPACA_API_SECRET_KEY=...' >> .env
+cargo run --release -- --dry-run            # auth, balance, instruments, quote
+cargo run --release -- --mode paper
+```
+
+`config/paper.toml` raises `max_daily_loss_usd` above the shipped default,
+deliberately and with the reason in the file: $5 is the right number for a
+$50–100 live rollout and the wrong one against a $100,000 paper account,
+where it halts most mornings and the window never reaches the ≥40 orders the
+criteria ask for.
+
+#### Where each promotion criterion is read
+
+| Criterion | Where |
+|---|---|
+| ≥40 orders, fill rate ≥60% | Orders → Execution quality |
+| median slippage ≤10 bps, p95 ≤30 bps | Orders → Execution quality |
+| zero `UNKNOWN` orders older than a cycle | Orders → Unknown tile |
+| ≥30 closed positions, ≥1 stop and ≥1 take-profit filled | Trades |
+| zero unresolved reconciliation mismatches | Risk → Reconciliation |
+| max drawdown ≤10%, no day ≤−5% | Risk → Equity and drawdown |
+| Brier ≤0.24 on ≥30 closes | `/api/risk` → `brier_score` |
+| spend ≤80% of budget daily | Costs |
+| cycle uptime ≥99% | Cycles |
+| kill-switch and `kill -9` drills | manual; see *Stopping the agent* |
+
+Brier is reported as `null` until 30 forecasts have resolved — over four
+closes it is noise with a decimal point, and a number there would be read as
+a pass. 0.25 is what always guessing 50% scores, so 0.24 is barely a view at
+all; that is the point of the threshold.
+
+**30 closed positions proves the plumbing, not edge.**
+
 ### Tracing (OpenTelemetry / Langfuse)
 
 The agent exports spans over OTLP when an endpoint is configured, and stays

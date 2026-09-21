@@ -526,6 +526,25 @@ impl VenueCycle<'_> {
             })
             .await?;
 
+        // Write the forecast down so it can be scored when the position
+        // closes. Nothing on the venue path did this, which left the paper
+        // window's Brier criterion unevaluable — the only path that will
+        // actually be running during that window.
+        //
+        // Best-effort: losing a calibration row must never cost a trade.
+        if let Err(e) = crate::valuation::calibration::record_directional_prediction(
+            self.store.pool(),
+            instrument.venue().as_str(),
+            instrument.symbol(),
+            view.confidence,
+            view.p_up,
+            fill_price,
+        )
+        .await
+        {
+            warn!(instrument = %instrument.id, error = %e, "Could not record the forecast for calibration");
+        }
+
         self.store
             .link_order_to_trade(&client_order_id, trade_id)
             .await?;

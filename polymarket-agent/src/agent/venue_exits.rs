@@ -347,6 +347,20 @@ impl VenueExits<'_> {
                     &client_order_id,
                 )
                 .await?;
+            // Score the forecast that opened this position: it said the
+            // price would be higher at the horizon, and now we know.
+            if let Err(e) = crate::valuation::calibration::resolve_directional_prediction(
+                self.store.pool(),
+                &trade.venue_id,
+                &trade.symbol,
+                entry,
+                exit_price,
+            )
+            .await
+            {
+                warn!(trade_id = trade.id, error = %e, "Could not score the forecast");
+            }
+
             info!(
                 trade_id = trade.id,
                 realized_pnl = %realized,
