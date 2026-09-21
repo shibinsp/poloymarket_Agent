@@ -124,12 +124,32 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
     println!("   ✅ Configuration valid\n");
 
     // 2. Check database
+    //
+    // Collected rather than returned. The shipped paper template points at
+    // `/var/lib/polymarket-agent`, which a normal user cannot create — so
+    // the very first `--dry-run` an operator runs died here, with SQLite's
+    // "unable to open database file" and nothing about which path or what to
+    // do, before reaching any of the checks they ran it for. One run should
+    // surface everything that is wrong, not the first thing.
     println!("2. Database:");
-    let store = Store::new(&config.database.path).await?;
-    let cycle_count = store.get_cycle_count().await?;
     println!("   Path: {}", config.database.path);
-    println!("   Previous cycles: {}", cycle_count);
-    println!("   ✅ Database connected\n");
+    let mut failures: Vec<String> = Vec::new();
+    match Store::new(&config.database.path).await {
+        Ok(store) => {
+            let cycles = store.get_cycle_count().await.unwrap_or(0);
+            println!("   Previous cycles: {cycles}");
+            println!("   ✅ Database connected");
+        }
+        Err(e) => {
+            println!("   ❌ {e:#}");
+            println!(
+                "      create the directory and make it writable, or point \
+                 database.path\n      somewhere you can write"
+            );
+            failures.push(format!("database {}: {e}", config.database.path));
+        }
+    }
+    println!();
 
     // 3. Check API keys
     println!("3. API Keys:");
@@ -160,7 +180,6 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
     // Failures are recorded and reported at the summary rather than returned
     // here, so one bad setting doesn't hide the remaining checks.
     println!("4. Valuation Model:");
-    let mut failures: Vec<String> = Vec::new();
     match &secrets.llm_api_key {
         Some(key) => {
             // Probe against a throwaway in-memory store: the real one would

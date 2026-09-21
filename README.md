@@ -322,7 +322,10 @@ Without it, it falls back to the legacy Polymarket-only loop — which is not
 what the safety gate covers, and is not available to US persons at all.
 
 ```bash
-cp config/paper.toml config/local.toml      # gitignored; edit paths in it
+cp config/paper.toml config/local.toml      # gitignored
+# Edit [database] in it. The template ships the production path
+# (/var/lib/polymarket-agent), which a normal user cannot create — either
+# make that directory writable or point it somewhere you can write.
 echo 'CONFIG_PATH=config/local.toml' >> .env
 # Alpaca → Paper account → API keys. Paper keys do not work against the live
 # endpoint, or the reverse; the failure is a 403 at startup.
