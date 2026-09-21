@@ -224,7 +224,11 @@ impl VenueRegistry {
 
 /// Whether a venue can serve a tradeable instrument at `at` — either its
 /// session is open, or it lists a class that ignores sessions entirely.
-fn venue_has_work_at(venue: &dyn Venue, at: DateTime<Utc>) -> bool {
+///
+/// Public because a closed equity session and a 24/7 crypto venue that is
+/// somehow reporting closed look identical from `is_open_at` alone, and the
+/// dry run has to be able to tell an operator which they are looking at.
+pub fn venue_has_work_at(venue: &dyn Venue, at: DateTime<Utc>) -> bool {
     venue.is_open_at(at) || venue.capabilities().has_always_on()
 }
 

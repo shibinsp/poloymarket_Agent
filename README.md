@@ -328,20 +328,38 @@ echo 'CONFIG_PATH=config/local.toml' >> .env
 # endpoint, or the reverse; the failure is a 403 at startup.
 echo 'ALPACA_API_KEY_ID=...'     >> .env
 echo 'ALPACA_API_SECRET_KEY=...' >> .env
+cargo run --release -- --dry-run            # check the keys before committing 14 days
 cargo run --release -- --mode paper
 ```
 
-`--dry-run` is **not** a venue check. It validates config, the database, the
-model endpoint and *Polymarket* connectivity — it never builds the venue
-registry, so it does not authenticate to Alpaca, list an instrument or fetch
-a quote. For a US operator it also fails outright on the Polymarket step
-before reaching anything useful. Extending it to cover venues is worth doing;
-until then, the first paper cycle is the first real check, and the startup
-log lines (`Valuation LLM configured`, the venue's instrument count) are what
-tell you the keys work.
+`--dry-run` iterates every enabled venue and reports, in order:
 
-Paper keys and live keys are not interchangeable; a mismatched pair fails on
-the first Alpaca call of the first cycle, not at startup.
+```
+5. Venues:
+   alpaca:
+      auth + balance: ✅ 100000.00 USD available, 100000.00 equity
+      instruments: ✅ 4 of the configured universe
+      quote: ✅ BTC/USD 60000/60010 (mid 60005)
+      session: open (has tradeable assets now)
+```
+
+It exits non-zero if any of that fails, and prints the whole error chain —
+"Failed to fetch the Alpaca account: HTTP 403" rather than just the first
+line, because a 403 from mismatched paper/live keys needs a different fix
+from a timeout. Paper keys work only against `paper-api.alpaca.markets` and
+live keys only against `api.alpaca.markets`.
+
+Two failures it is specifically there to catch, because neither shows up as
+an error once the agent is running — it logs healthy cycles and trades
+nothing, for as long as you leave it:
+
+- **no instruments discovered** — usually `scanning.max_markets` set below
+  the symbol universe, which caps the venue scan and not just the legacy one
+- **no equity figure** — the circuit breakers cannot run without one
+
+Polymarket is checked only when it is an enabled venue. It is not one in the
+paper template, so an unreachable Gamma no longer fails a dry run about an
+Alpaca deployment.
 
 `config/paper.toml` raises `max_daily_loss_usd` above the shipped default,
 deliberately and with the reason in the file: $5 is the right number for a
