@@ -1174,9 +1174,13 @@ impl Venue for AlpacaVenue {
         Ok(Balance {
             ccy: account.currency,
             available,
-            // Alpaca reports account equity directly, positions included.
-            total: Some(account.equity),
         })
+    }
+
+    /// Alpaca reports account equity directly, positions included — no
+    /// per-holding quote, so this is one ordinary account call.
+    async fn equity(&self) -> Result<Option<Decimal>> {
+        Ok(Some(self.account().await?.equity))
     }
 
     /// Neither equities nor crypto spot settle — a position is closed by
@@ -1960,7 +1964,7 @@ mod tests {
         let balance = venue.balance().await.unwrap();
         assert_eq!(balance.ccy, "USD");
         assert_eq!(balance.available, dec!(150.00));
-        assert_eq!(balance.total, Some(dec!(275.50)));
+        assert_eq!(venue.equity().await.unwrap(), Some(dec!(275.50)));
     }
 
     #[tokio::test]

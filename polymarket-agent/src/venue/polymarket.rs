@@ -375,6 +375,13 @@ impl Venue for PolymarketVenue {
         bail!("Polymarket position listing is not implemented")
     }
 
+    /// Always `None`: `positions` is unimplemented here, so there is no way to
+    /// value what is held. `reports_equity` says as much, and the registry
+    /// refuses to build this venue rather than let it halt every cycle.
+    async fn equity(&self) -> Result<Option<Decimal>> {
+        Ok(None)
+    }
+
     async fn balance(&self) -> Result<Balance> {
         let available = self
             .client
@@ -384,10 +391,6 @@ impl Venue for PolymarketVenue {
         Ok(Balance {
             ccy: "USDC".to_string(),
             available,
-            // `positions` is unimplemented for this venue, so there is no way
-            // to value what is held. Reporting free cash as account value
-            // would understate the account by the whole of its open exposure.
-            total: None,
         })
     }
 

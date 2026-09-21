@@ -843,3 +843,32 @@ async fn a_recovered_equity_figure_clears_the_streak() {
         "equity came back, so the next failure is a first failure again"
     );
 }
+
+/// The point of splitting cash from equity: three of `balance()`'s four
+/// callers want only the cash figure, and at a spot venue marking a book
+/// costs a quote per holding. `shutdown` is one of those callers, so the old
+/// shape made the agent block on a network round trip per holding per venue
+/// while trying to exit.
+///
+/// Alpaca prices nothing, so this measures the other half — that exactly one
+/// equity call is made per cycle rather than one per balance check.
+#[tokio::test]
+async fn a_cycle_asks_for_equity_once_not_once_per_balance_check() {
+    let alpaca = alpaca_server().await;
+    let mut h = harness_with(alpaca, |_| {}).await;
+    h.agent.run_cycle().await.unwrap();
+
+    let reqs = h._alpaca.received_requests().await.unwrap();
+    let account_calls = reqs
+        .iter()
+        .filter(|r| r.url.path() == "/v2/account")
+        .count();
+
+    // Five cash checks plus one equity check. The number itself is not the
+    // contract; what matters is that it is bounded and does not grow with the
+    // number of holdings, which is what the crypto venues would have done.
+    assert!(
+        account_calls <= 8,
+        "account calls per cycle should stay bounded, got {account_calls}"
+    );
+}

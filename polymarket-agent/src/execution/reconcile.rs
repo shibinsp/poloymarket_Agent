@@ -100,8 +100,8 @@ pub struct VenueReconcileReport {
 /// Separate from the positions call on purpose: they fail independently, and
 /// an equity figure is worth having even when the position listing is not.
 async fn read_equity(venue: &dyn crate::venue::Venue) -> Option<Decimal> {
-    match venue.balance().await {
-        Ok(balance) => balance.total,
+    match venue.equity().await {
+        Ok(equity) => equity,
         Err(e) => {
             warn!(venue = %venue.id(), error = %format!("{e:#}"), "Could not read venue equity");
             None

@@ -21,6 +21,7 @@ pub mod types;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use tracing::warn;
 
 use self::session::{SessionState, TradingSession};
@@ -78,7 +79,27 @@ pub trait Venue: Send + Sync {
     /// reconciliation against local records.
     async fn positions(&self) -> Result<Vec<Position>>;
 
+    /// Spendable cash. **Cheap**: no position pricing, no per-holding quotes.
+    ///
+    /// Split from equity deliberately. Marking a book costs a quote per
+    /// holding at a spot venue, and three of this method's four callers want
+    /// only the cash figure — the survival ladder, the per-cycle bankroll, and
+    /// `shutdown`, which was made to block on a network round trip per holding
+    /// per venue while trying to exit.
     async fn balance(&self) -> Result<Balance>;
+
+    /// Account value including the marked value of open positions.
+    ///
+    /// `None` when it cannot be established — which the caller must not
+    /// confuse with zero, and must not paper over with cash: entering a
+    /// position moves cash out and the position's value is invisible, so an
+    /// equity curve built on cash reads every entry as an instant loss of the
+    /// full notional.
+    ///
+    /// Expensive at a venue whose account endpoint reports quantities without
+    /// prices, so it is asked for explicitly and once a cycle rather than
+    /// falling out of every balance check.
+    async fn equity(&self) -> Result<Option<Decimal>>;
 
     /// Whether the account is *permitted* to trade.
     ///

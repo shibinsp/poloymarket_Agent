@@ -12,6 +12,7 @@
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
+use tracing::warn;
 
 use crate::venue::types::ScanFilter;
 use crate::venue::{venue_has_work_at, Venue};
@@ -99,23 +100,28 @@ pub async fn check(
         }
     };
 
-    let equity = balance
-        .total
-        .map(|t| format!(", {t} equity"))
-        .unwrap_or_default();
+    // Asked for separately, because it is a separate call now: at a spot venue
+    // it costs a quote per holding, and the dry run is the one place that
+    // cost is worth paying to find out whether the breakers can run at all.
+    let equity = venue.equity().await.unwrap_or_else(|e| {
+        warn!(venue = %venue_id, error = %format!("{e:#}"), "Equity check failed");
+        None
+    });
+
+    let equity_note = equity.map(|t| format!(", {t} equity")).unwrap_or_default();
     checks.push((
         "auth + balance",
         Check::Ok(format!(
-            "{} {} available{equity}",
+            "{} {} available{equity_note}",
             balance.available, balance.ccy
         )),
     ));
 
-    if balance.total.is_none() {
+    if equity.is_none() {
         checks.push((
             "equity",
-            // Not fatal, but it disables the drawdown and daily-loss limits
-            // entirely, which is not something to discover after funding.
+            // Not fatal here, but the agent halts rather than trade with no
+            // loss limits — which is not something to discover after funding.
             Check::Warn(
                 "venue reports no equity figure — the circuit breakers cannot run".to_string(),
             ),
@@ -321,6 +327,45 @@ mod tests {
             "four copies of one failure buries it: {report:#?}"
         );
         assert_eq!(report.checks[0].0, "auth + balance");
+    }
+
+    /// A venue that authenticates fine but cannot value its own book. Not
+    /// fatal here, but the agent halts rather than trade with no loss limits,
+    /// and that is not something to discover after funding the account.
+    #[tokio::test]
+    async fn a_venue_with_no_equity_figure_is_warned_about_not_passed_over() {
+        let venue = StubVenue::new("coinbase", TradingSession::Always, &["BTC/USD"], false)
+            .quoting(dec!(100))
+            .without_equity();
+        let report = check(&venue, &syms(&["BTC/USD"]), 50, at()).await;
+
+        let (_, equity) = report
+            .checks
+            .iter()
+            .find(|(name, _)| *name == "equity")
+            .expect("the equity gap must be reported: {report:#?}");
+        assert!(
+            matches!(equity, Check::Warn(m) if m.contains("circuit breakers")),
+            "and must say what it costs: {equity:?}"
+        );
+    }
+
+    /// The happy path reports the figure rather than staying silent about it.
+    #[tokio::test]
+    async fn a_venue_that_reports_equity_shows_it_beside_the_cash() {
+        let venue = StubVenue::new("alpaca", TradingSession::Always, &["BTC/USD"], false)
+            .quoting(dec!(100));
+        let report = check(&venue, &syms(&["BTC/USD"]), 50, at()).await;
+
+        let (_, auth) = report
+            .checks
+            .iter()
+            .find(|(name, _)| *name == "auth + balance")
+            .expect("balance is always checked");
+        assert!(
+            matches!(auth, Check::Ok(m) if m.contains("equity")),
+            "the operator should see the number the breakers will use: {auth:?}"
+        );
     }
 
     /// Symbols the venue does not list are dropped with a log warning the

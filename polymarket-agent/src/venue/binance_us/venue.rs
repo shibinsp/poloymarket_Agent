@@ -1135,20 +1135,35 @@ impl Venue for BinanceUsVenue {
 
     #[instrument(skip(self), fields(venue = %self.id))]
     async fn balance(&self) -> Result<Balance> {
+        // Cash only, and therefore no quotes: the survival ladder and the
+        // per-cycle bankroll ask for this several times a cycle, and
+        // `shutdown` asks while trying to exit.
         let account = self.account().await?;
         let ccy = self.cash_ccy().to_string();
 
-        let cash = account
+        let available = account
             .balances
             .iter()
-            .find(|b| b.asset.eq_ignore_ascii_case(&ccy));
-        // `free` only funds an order; what is locked is committed to a resting
-        // one — but it is still equity.
-        let available = cash
+            .find(|b| b.asset.eq_ignore_ascii_case(&ccy))
+            // `free` only: what is locked is committed to a resting order and
+            // cannot fund a new one.
             .map(|b| b.free_amount())
             .transpose()?
             .unwrap_or(Decimal::ZERO);
-        let cash_total = cash
+
+        Ok(Balance { ccy, available })
+    }
+
+    #[instrument(skip(self), fields(venue = %self.id))]
+    async fn equity(&self) -> Result<Option<Decimal>> {
+        let account = self.account().await?;
+        let ccy = self.cash_ccy().to_string();
+
+        let cash_total = account
+            .balances
+            .iter()
+            .find(|b| b.asset.eq_ignore_ascii_case(&ccy))
+            // Locked cash is committed to a resting order but still equity.
             .map(|b| b.total_amount())
             .transpose()?
             .unwrap_or(Decimal::ZERO);
@@ -1166,22 +1181,14 @@ impl Venue for BinanceUsVenue {
             holdings.push(Holding {
                 asset: asset.clone(),
                 qty,
-                // The configured pair when there is one; otherwise the shared
-                // helper prices it against this venue's quote currency. Every
-                // holding is priced, configured or not — cash in another
-                // currency included, since leaving it out understates the
-                // account rather than reporting that it could not be valued.
+                // Cash in another currency included: leaving it out
+                // understates the account rather than reporting that it could
+                // not be valued.
                 symbol: self.symbol_for_base(&asset),
             });
         }
 
-        let total = mark_equity(self, &self.id, &ccy, cash_total, &holdings).await;
-
-        Ok(Balance {
-            ccy,
-            available,
-            total,
-        })
+        Ok(mark_equity(self, &self.id, &ccy, cash_total, &holdings).await)
     }
 
     #[instrument(skip(self), fields(venue = %self.id))]
@@ -2143,7 +2150,7 @@ mod tests {
         );
         assert_eq!(balance.ccy, "USD");
         assert_eq!(
-            balance.total,
+            venue.equity().await.unwrap(),
             Some(dec!(1650.50)),
             "150.50 cash (free + locked) + 0.01 BTC at 60000 + 900 USDT at 1.00"
         );
@@ -2285,7 +2292,7 @@ mod tests {
         assert_eq!(balance.available, dec!(100.00));
         // 0.002 BTC (free + locked) at a 60005 mid = 120.01.
         assert_eq!(
-            balance.total,
+            venue.equity().await.unwrap(),
             Some(dec!(220.01)),
             "cash plus the marked holding, locked coins included"
         );
@@ -2317,9 +2324,39 @@ mod tests {
         let balance = venue.balance().await.unwrap();
         assert_eq!(balance.available, dec!(100.00), "cash is still readable");
         assert_eq!(
-            balance.total, None,
+            venue.equity().await.unwrap(),
+            None,
             "reporting 100 here would book the whole position as an instant loss"
         );
+    }
+
+    /// The whole point of the split: `balance()` must price nothing.
+    #[tokio::test]
+    async fn balance_makes_no_quote_calls_even_with_holdings() {
+        let server = MockServer::start().await;
+        mount_account(
+            &server,
+            json!({
+                "balances": [
+                    {"asset": "USD", "free": "100.00"},
+                    {"asset": "BTC", "free": "0.5"},
+                    {"asset": "ETH", "free": "3"}
+                ]
+            }),
+        )
+        .await;
+        Mock::given(http_method("GET"))
+            .and(path(DEPTH_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "bids": [["1", "1"]], "asks": [["1", "1"]]
+            })))
+            // Asserted on drop: not one book call belongs in a cash check.
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["BTC/USD"]);
+        assert_eq!(venue.balance().await.unwrap().available, dec!(100.00));
     }
 
     /// Cash in another currency, and coins the agent does not trade, are both
@@ -2367,7 +2404,7 @@ mod tests {
         );
         // 42 + (500 x 1.0) + (2 x 150) = 842
         assert_eq!(
-            balance.total,
+            venue.equity().await.unwrap(),
             Some(dec!(842.00)),
             "the USD cash and the SOL are the account's too"
         );
@@ -2392,7 +2429,7 @@ mod tests {
         // No depth mock at all: asking for one would fail the call.
 
         let venue = venue(&server, &["BTC/USD"]);
-        assert_eq!(venue.balance().await.unwrap().total, Some(dec!(1000.00)));
+        assert_eq!(venue.equity().await.unwrap(), Some(dec!(1000.00)));
     }
 
     /// An account can hold dust in dozens of assets. One unparseable amount    /// An account can hold dust in dozens of assets. One unparseable amount

@@ -417,18 +417,6 @@ pub struct Balance {
     pub ccy: String,
     /// Free to deploy.
     pub available: Decimal,
-    /// Account value including the marked value of open positions, or `None`
-    /// when the venue cannot tell us.
-    ///
-    /// Optional on purpose. A venue that cannot see its own positions used to
-    /// report free cash here, which is not the same number and is wrong in a
-    /// specific, expensive direction: entering a position moves cash out and
-    /// the position's value is invisible, so an equity curve built on it reads
-    /// every entry as an instant loss of the full notional and every exit as a
-    /// windfall. A drawdown breaker or a low-fuel threshold reading that would
-    /// trip on a flat book. `None` forces the caller to decide what to do
-    /// about not knowing, which is the honest question.
-    pub total: Option<Decimal>,
 }
 
 /// Outcome of a settled prediction market.
