@@ -97,20 +97,27 @@ pub async fn record_resolution(
     Ok(())
 }
 
-/// Compute the confidence discount factor based on historical calibration data.
-///
-/// Returns a value between `MIN_DISCOUNT` and `1.0` that should multiply
-/// Claude's self-reported confidence before it's used in Kelly sizing.
-///
-/// If fewer than `MIN_CALIBRATION_SAMPLES` resolved trades exist,
-/// returns `DEFAULT_DISCOUNT` (0.85).
+/// Prefix marking a row as a continuous-asset forecast.
+const DIRECTIONAL_PREFIX: &str = "trade:";
+
 /// Calibration key for a continuous-asset position.
 ///
-/// The table was built for prediction markets and keys on `market_id`; a
-/// venue symbol is the same thing for this purpose, namespaced so two venues
-/// quoting "BTC/USD" cannot be confused for one forecast.
-pub fn directional_key(venue_id: &str, symbol: &str) -> String {
-    format!("{venue_id}:{symbol}")
+/// Keyed by **trade id**, not by symbol.
+///
+/// Symbol keying looked natural and is wrong: nothing stops two positions
+/// being open on one symbol — `busy` only blocks while an order is
+/// *unresolved*, so the symbol frees up the moment the entry fills — and
+/// `record_resolution` matches the newest unresolved row. With two forecasts
+/// outstanding on BTC/USD, the first position to exit resolves the *second*
+/// forecast, and every Brier term afterwards pairs a forecast with a
+/// different trade's outcome. `created_at` has second granularity, so
+/// same-cycle ties broke arbitrarily on top.
+///
+/// One row per position removes the matching problem rather than narrowing
+/// it, and the prefix keeps these separable from the legacy prediction-market
+/// rows that share the table.
+pub fn directional_key(trade_id: i64) -> String {
+    format!("{DIRECTIONAL_PREFIX}{trade_id}")
 }
 
 /// Record a directional forecast so it can be scored when the position closes.
@@ -125,15 +132,14 @@ pub fn directional_key(venue_id: &str, symbol: &str) -> String {
 /// evaluated at all, because nothing on the venue path wrote a forecast down.
 pub async fn record_directional_prediction(
     pool: &SqlitePool,
-    venue_id: &str,
-    symbol: &str,
+    trade_id: i64,
     confidence: Decimal,
     p_up: Decimal,
     entry_price: Decimal,
 ) -> Result<()> {
     record_prediction(
         pool,
-        &directional_key(venue_id, symbol),
+        &directional_key(trade_id),
         confidence,
         p_up,
         entry_price,
@@ -148,8 +154,7 @@ pub async fn record_directional_prediction(
 /// forecast said up, and it did not go up.
 pub async fn resolve_directional_prediction(
     pool: &SqlitePool,
-    venue_id: &str,
-    symbol: &str,
+    trade_id: i64,
     entry_price: Decimal,
     exit_price: Decimal,
 ) -> Result<()> {
@@ -158,7 +163,7 @@ pub async fn resolve_directional_prediction(
     } else {
         Decimal::ZERO
     };
-    record_resolution(pool, &directional_key(venue_id, symbol), outcome).await
+    record_resolution(pool, &directional_key(trade_id), outcome).await
 }
 
 /// Mean squared error of the forecast probabilities against their outcomes.
@@ -169,10 +174,17 @@ pub async fn resolve_directional_prediction(
 /// asks for ≥30, and a Brier over four closes is noise wearing a decimal
 /// point.
 pub async fn brier_score(pool: &SqlitePool, minimum: usize) -> Result<Option<(Decimal, usize)>> {
+    // Directional forecasts only. The table is shared with the legacy
+    // prediction-market path, and an agent.db that has ever run that loop
+    // carries resolved rows from a different strategy on a different asset
+    // class — which would satisfy the ≥30 sample gate on day one and report
+    // a score the promotion table says to read as the venue path's.
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT fair_value, actual_outcome FROM confidence_calibration
-         WHERE resolved = 1 AND actual_outcome IS NOT NULL",
+         WHERE resolved = 1 AND actual_outcome IS NOT NULL
+           AND market_id LIKE ?",
     )
+    .bind(format!("{DIRECTIONAL_PREFIX}%"))
     .fetch_all(pool)
     .await
     .context("Failed to read resolved forecasts")?;
@@ -189,12 +201,22 @@ pub async fn brier_score(pool: &SqlitePool, minimum: usize) -> Result<Option<(De
         n += 1;
     }
 
-    if n < minimum {
+    // `n == 0` is checked independently of `minimum`: a caller passing 0
+    // would otherwise divide zero by zero and panic, and the guard reads as
+    // though it already covers the empty table.
+    if n == 0 || n < minimum {
         return Ok(None);
     }
     Ok(Some((total / Decimal::from(n), n)))
 }
 
+/// Compute the confidence discount factor based on historical calibration data.
+///
+/// Returns a value between `MIN_DISCOUNT` and `1.0` that should multiply
+/// Claude's self-reported confidence before it's used in Kelly sizing.
+///
+/// If fewer than `MIN_CALIBRATION_SAMPLES` resolved trades exist,
+/// returns `DEFAULT_DISCOUNT` (0.85).
 pub async fn compute_discount(pool: &SqlitePool, lookback: usize) -> Result<Decimal> {
     let rows: Vec<(String, bool)> = sqlx::query_as(
         "SELECT claude_confidence, forecast_correct FROM confidence_calibration
@@ -268,7 +290,7 @@ mod tests {
     async fn a_coin_flip_forecast_scores_a_quarter() {
         let pool = pool().await;
         for i in 0..30 {
-            let key = format!("alpaca:SYM{i}");
+            let key = directional_key(i);
             record_prediction(&pool, &key, dec!(0.5), dec!(0.5), dec!(100))
                 .await
                 .unwrap();
@@ -291,7 +313,7 @@ mod tests {
     async fn a_perfect_forecast_scores_zero() {
         let pool = pool().await;
         for i in 0..30 {
-            let key = format!("alpaca:SYM{i}");
+            let key = directional_key(i);
             record_prediction(&pool, &key, dec!(0.9), Decimal::ONE, dec!(100))
                 .await
                 .unwrap();
@@ -306,10 +328,16 @@ mod tests {
     #[tokio::test]
     async fn too_small_a_sample_reports_nothing_rather_than_a_flattering_number() {
         let pool = pool().await;
-        record_prediction(&pool, "alpaca:BTC/USD", dec!(0.9), Decimal::ONE, dec!(100))
-            .await
-            .unwrap();
-        record_resolution(&pool, "alpaca:BTC/USD", Decimal::ONE)
+        record_prediction(
+            &pool,
+            &directional_key(1),
+            dec!(0.9),
+            Decimal::ONE,
+            dec!(100),
+        )
+        .await
+        .unwrap();
+        record_resolution(&pool, &directional_key(1), Decimal::ONE)
             .await
             .unwrap();
         assert!(brier_score(&pool, 30).await.unwrap().is_none());
@@ -320,7 +348,7 @@ mod tests {
     #[tokio::test]
     async fn unresolved_forecasts_are_not_scored() {
         let pool = pool().await;
-        record_prediction(&pool, "alpaca:BTC/USD", dec!(0.9), dec!(0.8), dec!(100))
+        record_prediction(&pool, &directional_key(1), dec!(0.9), dec!(0.8), dec!(100))
             .await
             .unwrap();
         assert!(
@@ -335,17 +363,17 @@ mod tests {
     async fn a_directional_forecast_is_scored_against_the_price_move() {
         let pool = pool().await;
 
-        record_directional_prediction(&pool, "alpaca", "BTC/USD", dec!(0.8), dec!(0.7), dec!(100))
+        record_directional_prediction(&pool, 1, dec!(0.8), dec!(0.7), dec!(100))
             .await
             .unwrap();
-        resolve_directional_prediction(&pool, "alpaca", "BTC/USD", dec!(100), dec!(110))
+        resolve_directional_prediction(&pool, 1, dec!(100), dec!(110))
             .await
             .unwrap();
 
-        record_directional_prediction(&pool, "alpaca", "ETH/USD", dec!(0.8), dec!(0.7), dec!(100))
+        record_directional_prediction(&pool, 2, dec!(0.8), dec!(0.7), dec!(100))
             .await
             .unwrap();
-        resolve_directional_prediction(&pool, "alpaca", "ETH/USD", dec!(100), dec!(100))
+        resolve_directional_prediction(&pool, 2, dec!(100), dec!(100))
             .await
             .unwrap();
 
@@ -355,12 +383,76 @@ mod tests {
         assert_eq!(score, dec!(0.29));
     }
 
+    /// One row per position. Symbol keying collided whenever two positions
+    /// were open on one symbol, and resolved them in the wrong order.
     #[tokio::test]
-    async fn two_venues_quoting_the_same_symbol_are_separate_forecasts() {
-        assert_ne!(
-            directional_key("alpaca", "BTC/USD"),
-            directional_key("coinbase", "BTC/USD")
+    async fn two_positions_on_one_symbol_keep_separate_forecasts() {
+        assert_ne!(directional_key(1), directional_key(2));
+    }
+
+    /// The failure symbol keying produced: two forecasts outstanding on the
+    /// same symbol, and the first exit resolving the *later* forecast.
+    #[tokio::test]
+    async fn each_position_is_scored_against_its_own_forecast() {
+        let pool = pool().await;
+
+        // Trade 1 forecast 0.60, trade 2 forecast 0.90, both on BTC/USD.
+        record_directional_prediction(&pool, 1, dec!(0.8), dec!(0.60), dec!(100))
+            .await
+            .unwrap();
+        record_directional_prediction(&pool, 2, dec!(0.8), dec!(0.90), dec!(100))
+            .await
+            .unwrap();
+
+        // Trade 1 exits at a loss; trade 2 exits at a profit.
+        resolve_directional_prediction(&pool, 1, dec!(100), dec!(90))
+            .await
+            .unwrap();
+        resolve_directional_prediction(&pool, 2, dec!(100), dec!(120))
+            .await
+            .unwrap();
+
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT fair_value, actual_outcome FROM confidence_calibration
+             WHERE market_id = ? OR market_id = ? ORDER BY market_id",
+        )
+        .bind(directional_key(1))
+        .bind(directional_key(2))
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "0.60");
+        assert_eq!(rows[0].1, "0", "the 0.60 forecast lost");
+        assert_eq!(rows[1].0, "0.90");
+        assert_eq!(rows[1].1, "1", "the 0.90 forecast won");
+    }
+
+    /// The table is shared with the legacy prediction-market path. An
+    /// agent.db that ever ran that loop carries resolved rows from a
+    /// different strategy on a different asset class, and counting them
+    /// satisfies the ≥30 gate on day one with a number from somewhere else.
+    #[tokio::test]
+    async fn legacy_prediction_market_rows_are_not_scored() {
+        let pool = pool().await;
+        for i in 0..40 {
+            let key = format!("0xcondition{i}");
+            record_prediction(&pool, &key, dec!(0.9), Decimal::ONE, dec!(0.5))
+                .await
+                .unwrap();
+            record_resolution(&pool, &key, Decimal::ONE).await.unwrap();
+        }
+        assert!(
+            brier_score(&pool, 30).await.unwrap().is_none(),
+            "40 legacy rows must not satisfy the venue path's sample gate"
         );
+    }
+
+    #[tokio::test]
+    async fn a_zero_minimum_on_an_empty_table_does_not_divide_by_zero() {
+        let pool = pool().await;
+        assert!(brier_score(&pool, 0).await.unwrap().is_none());
     }
 
     #[tokio::test]

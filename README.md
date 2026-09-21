@@ -328,9 +328,20 @@ echo 'CONFIG_PATH=config/local.toml' >> .env
 # endpoint, or the reverse; the failure is a 403 at startup.
 echo 'ALPACA_API_KEY_ID=...'     >> .env
 echo 'ALPACA_API_SECRET_KEY=...' >> .env
-cargo run --release -- --dry-run            # auth, balance, instruments, quote
 cargo run --release -- --mode paper
 ```
+
+`--dry-run` is **not** a venue check. It validates config, the database, the
+model endpoint and *Polymarket* connectivity — it never builds the venue
+registry, so it does not authenticate to Alpaca, list an instrument or fetch
+a quote. For a US operator it also fails outright on the Polymarket step
+before reaching anything useful. Extending it to cover venues is worth doing;
+until then, the first paper cycle is the first real check, and the startup
+log lines (`Valuation LLM configured`, the venue's instrument count) are what
+tell you the keys work.
+
+Paper keys and live keys are not interchangeable; a mismatched pair fails on
+the first Alpaca call of the first cycle, not at startup.
 
 `config/paper.toml` raises `max_daily_loss_usd` above the shipped default,
 deliberately and with the reason in the file: $5 is the right number for a

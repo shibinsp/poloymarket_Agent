@@ -884,6 +884,35 @@ mod tests {
             "the template must not ship a relative database path"
         );
 
+        // `max_markets` is not Polymarket-only: the venue cycle passes it as
+        // `ScanFilter.max_results` and the Alpaca adapter truncates to it. A
+        // template that sets it below the symbol universe discovers nothing
+        // and trades nothing — silently, for as long as it is left running.
+        assert!(
+            config.scanning.max_markets >= config.venue_symbols().len(),
+            "max_markets ({}) must cover the {} configured symbols, or the \
+             venue scan truncates them away",
+            config.scanning.max_markets,
+            config.venue_symbols().len()
+        );
+
+        // Likewise the budget: the venue path is skipped entirely once the
+        // day's ledger is spent, so a budget that runs out mid-morning
+        // produces the same empty window as a wrong max_markets.
+        //
+        // One valuation per symbol per cycle, at roughly $0.009 a call.
+        let cycles_per_day =
+            rust_decimal_macros::dec!(86400) / Decimal::from(config.agent.cycle_interval_seconds);
+        let daily_cost = cycles_per_day
+            * Decimal::from(config.venue_symbols().len())
+            * rust_decimal_macros::dec!(0.009);
+        assert!(
+            config.agent.daily_api_budget >= daily_cost,
+            "daily_api_budget ({}) is below the ~{daily_cost} a full day of \
+             valuations costs for this universe and cadence",
+            config.agent.daily_api_budget
+        );
+
         // The live caps stay at their live values even in the paper file, so
         // going live changes the mode and not the risk numbers.
         assert_eq!(

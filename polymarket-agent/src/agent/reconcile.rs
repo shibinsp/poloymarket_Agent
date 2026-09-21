@@ -255,39 +255,11 @@ impl Reconciler<'_> {
             return;
         };
 
-        // The venue reports *cumulative* filled quantity and a *cumulative*
-        // average price, and a resting partial is re-queried every cycle. So
-        // what arrives here is the whole fill so far, over and over.
-        //
-        // Record the increment since the last pass instead. Writing the
-        // cumulative figure each time produces one row per cycle — a single
-        // 1.0 order that filled in two steps would sum to more than 1.0, and
-        // the Orders page would report executions that never happened.
-        //
-        // `order` was read before `update_order_state` overwrote the row, so
-        // it still holds the previous totals.
         let prev_qty = Decimal::from_str_exact(&order.filled_qty).unwrap_or(Decimal::ZERO);
-        let delta_qty = filled_qty - prev_qty;
-        if delta_qty <= Decimal::ZERO {
-            // Nothing new filled. Not an error — most cycles look like this.
-            return;
-        }
-
-        // The increment's own VWAP, backed out of the two running averages.
-        // Using the cumulative average would attribute the whole order's
-        // price to a tranche that traded somewhere else, which is precisely
-        // the measurement slippage is supposed to make.
         let prev_avg = order
             .avg_fill_price
             .as_deref()
             .and_then(|p| Decimal::from_str_exact(p).ok());
-        let price = match prev_avg {
-            Some(prev) if prev_qty > Decimal::ZERO => {
-                (price * filled_qty - prev * prev_qty) / delta_qty
-            }
-            _ => price,
-        };
-        let filled_qty = delta_qty;
         let mid = order
             .mid_at_submit
             .as_deref()
@@ -295,11 +267,13 @@ impl Reconciler<'_> {
 
         if let Err(e) = self
             .store
-            .record_fill(
+            .record_fill_increment(
                 order_id,
                 order.venue_order_id.as_deref(),
                 filled_qty,
                 price,
+                prev_qty,
+                prev_avg,
                 Some(fees),
                 mid,
                 &order.side,
@@ -423,6 +397,25 @@ impl Reconciler<'_> {
                 &order.client_order_id,
             )
             .await?;
+
+        // Score the forecast here too, not only on the inline-fill path.
+        //
+        // With limit exits and a TTL — the shipped configuration — most exits
+        // rest and are discovered filled by *this* pass. Scoring only the
+        // inline case left the common path unresolved forever, so the
+        // calibration sample never grew and the Brier criterion stayed
+        // unevaluable no matter how long the window ran.
+        if let Err(e) = crate::valuation::calibration::resolve_directional_prediction(
+            self.store.pool(),
+            trade_id,
+            entry,
+            price,
+        )
+        .await
+        {
+            warn!(trade_id, error = %e, "Could not score the forecast");
+        }
+
         info!(
             trade_id,
             symbol = %order.symbol,

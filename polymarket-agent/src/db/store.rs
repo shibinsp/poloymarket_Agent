@@ -913,6 +913,81 @@ impl Store {
         .context("Failed to fetch reconciliation runs")
     }
 
+    /// Row id for a client order id, for callers holding only the latter.
+    pub async fn order_id(&self, client_order_id: &str) -> Result<Option<i64>> {
+        sqlx::query_scalar("SELECT id FROM orders WHERE client_order_id = ?")
+            .bind(client_order_id)
+            .fetch_optional(&self.pool)
+            .await
+            .context("Failed to look up order id")
+    }
+
+    /// Record the *new* part of a fill, given what was already recorded.
+    ///
+    /// The venue reports cumulative filled quantity and a cumulative average
+    /// price. Every path that learns about a fill — the submit
+    /// acknowledgement and the reconciliation pass alike — sees the running
+    /// total, so recording it verbatim writes one row per observation rather
+    /// than one per execution.
+    ///
+    /// Returns whether anything was written.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_fill_increment(
+        &self,
+        order_id: i64,
+        venue_trade_id: Option<&str>,
+        cumulative_qty: Decimal,
+        cumulative_avg: Decimal,
+        prev_qty: Decimal,
+        prev_avg: Option<Decimal>,
+        fee: Option<Decimal>,
+        mid_at_submit: Option<Decimal>,
+        side: &str,
+        submitted_at: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let delta_qty = cumulative_qty - prev_qty;
+        if delta_qty <= Decimal::ZERO {
+            return Ok(false);
+        }
+
+        // Back the increment's own VWAP out of the two running averages.
+        //
+        // Guarded, because the back-out amplifies the venue's rounding of its
+        // cumulative average by `cumulative_qty / delta_qty`: a 0.99-filled
+        // order finishing its last 0.01 multiplies any wobble a hundredfold,
+        // and can produce zero or a negative price. A fill recorded at zero
+        // would enter the slippage series as -10000 bps — a spectacular price
+        // improvement that never happened, dragging the median with it.
+        let price = match prev_avg {
+            Some(prev) if prev_qty > Decimal::ZERO => {
+                let implied = (cumulative_avg * cumulative_qty - prev * prev_qty) / delta_qty;
+                if implied > Decimal::ZERO {
+                    implied
+                } else {
+                    // Implausible. The cumulative average is the honest
+                    // fallback: less precise, but never a fiction.
+                    cumulative_avg
+                }
+            }
+            _ => cumulative_avg,
+        };
+
+        self.record_fill(
+            order_id,
+            venue_trade_id,
+            delta_qty,
+            price,
+            fee,
+            mid_at_submit,
+            side,
+            submitted_at,
+            at,
+        )
+        .await?;
+        Ok(true)
+    }
+
     /// Record one execution.
     ///
     /// Slippage is signed so that **positive always means it cost us**: a buy
@@ -950,6 +1025,15 @@ impl Store {
             })
         });
 
+        // Measured from submission to *this observation*, not to the moment
+        // the venue filled. `OrderAck` carries no fill timestamp, so for a
+        // fill discovered by reconciliation this is quantised to the cycle
+        // interval — an order filled two seconds after submission and seen
+        // ten minutes later reads as ten minutes. It is an upper bound on
+        // latency and a useful one for spotting orders that rest, but it is
+        // not the venue's fill latency, and the ≤ thresholds in the promotion
+        // criteria should be read with that in mind. Plumbing Alpaca's
+        // `filled_at` through `OrderAck` is what would make it exact.
         let time_to_fill_ms = submitted_at
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .or_else(|| {
@@ -1920,13 +2004,18 @@ mod tests {
             .unwrap();
 
         let fills = store.get_fills(10).await.unwrap();
-        let bps: Vec<&str> = fills
+        let mut bps: Vec<&str> = fills
             .iter()
             .map(|f| f.slippage_bps.as_deref().unwrap())
             .collect();
-        assert!(
-            bps.iter().all(|b| b.starts_with("100")),
-            "both sides must read +100 bps, got {bps:?}"
+        bps.sort();
+        // Exact, not a prefix. `starts_with("100")` is also true of "10000",
+        // so a 100x error in the bps scale — the unit the ≤10/≤30 criteria
+        // are stated in — would have passed unnoticed.
+        assert_eq!(
+            bps,
+            vec!["100.00", "100.00"],
+            "both sides must read exactly +100 bps"
         );
     }
 

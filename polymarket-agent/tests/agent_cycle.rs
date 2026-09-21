@@ -569,7 +569,9 @@ async fn a_venue_entry_records_a_forecast_for_calibration() {
     .unwrap();
 
     assert_eq!(rows.len(), 1, "one forecast per entry, got {rows:?}");
-    assert_eq!(rows[0].0, "alpaca:BTC/USD", "namespaced by venue");
+    // Keyed by trade id: one row per position, so two positions on one
+    // symbol cannot resolve each other's forecast.
+    assert_eq!(rows[0].0, "trade:1");
     assert_eq!(
         Decimal::from_str(&rows[0].1).unwrap(),
         dec!(0.72),

@@ -85,7 +85,19 @@ cargo clippy         # Lint check
 
 ### 5. Start Paper Trading
 
+> **This section is superseded.** A bare `cargo run` uses
+> `config/default.toml`, which has no `[[venues]]` — so the agent runs the
+> legacy Polymarket-only loop, which the safety gate does not cover and which
+> US persons may not trade on at all. Follow **Starting the paper window** in
+> the README instead; it uses `config/paper.toml` and the Alpaca venue path.
+>
+> The rest of this guide's *monitoring* and *promotion* material still
+> applies. Its configuration snippets do not: `daily_api_budget` now defaults
+> to $0.50, and `claude_model` was replaced by `valuation.model` when the LLM
+> client became provider-agnostic.
+
 ```bash
+# Superseded — see the README.
 cargo run
 ```
 

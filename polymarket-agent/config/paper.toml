@@ -27,16 +27,32 @@ api_reserve = 2.0
 # Informational in this configuration: sizing comes from the Alpaca account,
 # not this number. It still seeds the dashboard's ROI baseline.
 initial_paper_balance = 100.0
-daily_api_budget = 0.50
+# One valuation per symbol per cycle: 4 symbols on a 600 s cadence is ~4
+# calls per cycle, ~144 cycles a day. At roughly $0.009 a call that is ~$5 a
+# day, and the $0.50 default buys about 90 minutes before the venue path is
+# gated off for the rest of the UTC day — which produces the same empty
+# window as a wrong `max_markets`, just more slowly.
+#
+# Sized here for the universe below. Shrink the universe or lengthen the
+# cycle to spend less; $0.50 is the right number for live micro-capital, not
+# for a window that has to gather 40 orders.
+daily_api_budget = 6.00
 max_sleep_seconds = 3600
 
 [scanning]
-# The legacy Polymarket loop. Left configured but inert — with `[[venues]]`
-# set, continuous assets go through the venue path. Polymarket's
-# international CLOB prohibits US persons, so do not enable it.
-max_markets = 0
+# `max_markets` is NOT Polymarket-only. The venue cycle passes it as
+# `ScanFilter.max_results`, and the Alpaca adapter truncates its instrument
+# list to it — so setting it to 0 to quieten the legacy loop silently
+# discovers zero instruments and the agent places nothing, for as long as you
+# leave it running.
+#
+# It must be at least as large as the symbol universe below.
+max_markets = 50
 min_volume_24h = 5000.0
 max_resolution_days = 14
+# The legacy Polymarket loop is disabled by leaving `categories` empty — it
+# scans nothing without them. Polymarket's international CLOB prohibits US
+# persons, so do not add any.
 max_spread_pct = 0.05
 categories = []
 
