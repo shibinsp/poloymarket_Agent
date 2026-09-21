@@ -40,7 +40,12 @@ const ALPACA_CASH: &str = "4000.00";
 /// A mock Alpaca with every endpoint one cycle touches.
 async fn alpaca_server() -> MockServer {
     let server = MockServer::start().await;
+    mount_common(&server).await;
+    server
+}
 
+/// Every endpoint a cycle touches, plus a POST that merely acknowledges.
+async fn mount_common(server: &MockServer) {
     Mock::given(method("GET"))
         .and(path("/v2/account"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -49,7 +54,7 @@ async fn alpaca_server() -> MockServer {
             "buying_power": "8000.00",
             "non_marginable_buying_power": ALPACA_CASH
         })))
-        .mount(&server)
+        .mount(server)
         .await;
 
     Mock::given(method("GET"))
@@ -62,7 +67,7 @@ async fn alpaca_server() -> MockServer {
             "min_trade_increment": "0.000000001",
             "price_increment": "1"
         }])))
-        .mount(&server)
+        .mount(server)
         .await;
 
     Mock::given(method("GET"))
@@ -76,7 +81,7 @@ async fn alpaca_server() -> MockServer {
                 }
             }
         })))
-        .mount(&server)
+        .mount(server)
         .await;
 
     // Enough bars for the ATR window, trending gently so volatility is real
@@ -93,19 +98,19 @@ async fn alpaca_server() -> MockServer {
     Mock::given(method("GET"))
         .and(path("/v1beta3/crypto/us/bars"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"bars": {"BTC/USD": bars}})))
-        .mount(&server)
+        .mount(server)
         .await;
 
     Mock::given(method("GET"))
         .and(path("/v2/positions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
-        .mount(&server)
+        .mount(server)
         .await;
 
     Mock::given(method("GET"))
         .and(path("/v2/orders"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
-        .mount(&server)
+        .mount(server)
         .await;
 
     Mock::given(method("POST"))
@@ -121,9 +126,36 @@ async fn alpaca_server() -> MockServer {
             "type": "limit",
             "time_in_force": "gtc"
         })))
+        .mount(server)
+        .await;
+}
+
+/// A venue that fills on the spot: the submit acknowledgement itself reports
+/// the order filled, so the reconciler never sees it.
+///
+/// Built by layering a higher-priority POST over the standard mock rather
+/// than re-registering the endpoints in a different order — wiremock resolves
+/// ties by registration order, and rebuilding the set by hand produced a
+/// server whose asset listing stopped matching on the second cycle.
+async fn instant_fill_alpaca_server() -> MockServer {
+    let server = alpaca_server().await;
+    Mock::given(method("POST"))
+        .and(path("/v2/orders"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "venue-order-1",
+            "client_order_id": "ignored",
+            "symbol": "BTC/USD",
+            "status": "filled",
+            "qty": "0.001",
+            "filled_qty": "0.001",
+            "filled_avg_price": "60065.005",
+            "side": "buy",
+            "type": "limit",
+            "time_in_force": "gtc"
+        })))
+        .with_priority(1)
         .mount(&server)
         .await;
-
     server
 }
 
@@ -576,5 +608,61 @@ async fn a_venue_entry_records_a_forecast_for_calibration() {
         Decimal::from_str(&rows[0].1).unwrap(),
         dec!(0.72),
         "the forecast recorded is p_up, which is what a Brier score is over"
+    );
+}
+
+/// A marketable order comes back filled in its own acknowledgement. Terminal
+/// states are excluded from `get_unresolved_orders`, so the reconciler never
+/// sees it — and before this was handled, nothing recorded the execution at
+/// all. Slippage was then measured over only the fills slow enough to need
+/// reconciling, which is the biased tail of the distribution being measured.
+#[tokio::test]
+async fn an_order_filled_at_submission_is_still_recorded_as_an_execution() {
+    let mut h = harness_with(instant_fill_alpaca_server().await, |_| {}).await;
+    h.agent.run_cycle().await.expect("cycle runs");
+
+    let fills = h.store.get_fills(10).await.unwrap();
+    assert_eq!(
+        fills.len(),
+        1,
+        "an inline fill must be recorded, got {fills:#?}"
+    );
+    assert_eq!(fills[0].slippage_bps.as_deref(), Some("10.00"));
+}
+
+/// The other half: an inline fill must not *also* be recorded by the next
+/// reconciliation pass. The increment guard is what prevents it, and it works
+/// because the order row already carries the filled quantity by then.
+#[tokio::test]
+async fn an_inline_fill_is_not_recorded_twice_on_the_next_cycle() {
+    let mut h = harness_with(instant_fill_alpaca_server().await, |_| {}).await;
+    h.agent.run_cycle().await.expect("cycle one");
+    assert_eq!(h.store.get_fills(10).await.unwrap().len(), 1);
+
+    h.agent.run_cycle().await.expect("cycle two");
+
+    // NOTE, unresolved: against this fixture the second cycle scans zero
+    // instruments and opens nothing, where the accepted-then-reconciled
+    // fixture opens a second position. The two servers differ only in the
+    // status the POST returns, and the state it produces (FILLED) should be
+    // *less* restrictive than ACCEPTED, which is held in the `busy` set. I
+    // could not account for it and have not assumed it is only a fixture
+    // artifact. It does not affect what this test asserts — the execution is
+    // recorded once either way — but it is worth running down before the
+    // paper window is read for "orders per day".
+    let fills = h.store.get_fills(10).await.unwrap();
+    assert_eq!(
+        fills.len(),
+        1,
+        "the second cycle must not restate an execution it already recorded, got {fills:#?}"
+    );
+    let total: Decimal = fills
+        .iter()
+        .map(|f| Decimal::from_str(&f.qty).unwrap())
+        .sum();
+    assert_eq!(
+        total,
+        dec!(0.001),
+        "the recorded quantity must equal what actually filled"
     );
 }
