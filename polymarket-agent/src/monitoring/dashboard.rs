@@ -23,9 +23,9 @@ use tracing::{info, warn};
 use crate::agent::kill_switch::{Halt, HaltSource, KillSwitch};
 use crate::config::AgentMode;
 use crate::db::store::Store;
-use crate::risk::circuit_breaker::HaltScope;
 use crate::monitoring::health::HealthState;
 use crate::monitoring::metrics::compute_metrics;
+use crate::risk::circuit_breaker::HaltScope;
 
 const LOOPBACK: &str = "127.0.0.1";
 
@@ -256,11 +256,7 @@ async fn resume_handler(State(state): State<DashboardState>) -> impl IntoRespons
         }
     };
 
-    if let Err(e) = state
-        .store
-        .clear_halts("api", chrono::Utc::now())
-        .await
-    {
+    if let Err(e) = state.store.clear_halts("api", chrono::Utc::now()).await {
         // Worth a 500: the flag is down, so the agent resumes now, but the
         // uncleared row would halt it again on the next restart. An operator
         // who thinks they have resumed and has not is the failure here.
@@ -378,10 +374,7 @@ mod tests {
         if let Some(a) = auth {
             req = req.header(header::AUTHORIZATION, a);
         }
-        let resp = app
-            .oneshot(req.body(Body::empty()).unwrap())
-            .await
-            .unwrap();
+        let resp = app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
         let code = resp.status();
         let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
             .await
@@ -422,7 +415,10 @@ mod tests {
         assert_eq!(code, StatusCode::OK);
         assert_eq!(body["halted"], serde_json::json!(true));
         assert_eq!(body["newly_halted"], serde_json::json!(true));
-        assert!(switch.is_tripped(), "the flag the agent loop reads must be set");
+        assert!(
+            switch.is_tripped(),
+            "the flag the agent loop reads must be set"
+        );
         assert_eq!(switch.current().unwrap().source, HaltSource::Api);
 
         let (code, body) = post(app.clone(), "/api/resume", None).await;
@@ -491,10 +487,7 @@ mod tests {
         assert_eq!(body["halted"], serde_json::json!(true));
         assert_eq!(body["halt"]["source"], serde_json::json!("circuit_breaker"));
         assert_eq!(body["halt"]["scope"], serde_json::json!("rest_of_day"));
-        assert!(body["halt"]["detail"]
-            .as_str()
-            .unwrap()
-            .contains("6.20%"));
+        assert!(body["halt"]["detail"].as_str().unwrap().contains("6.20%"));
     }
 
     #[tokio::test]

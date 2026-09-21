@@ -90,12 +90,8 @@ pub async fn compute_metrics(
         // performance numbers quietly optimistic in exactly the place
         // somebody would be deciding whether to go live.
         let pnl = match trade.pnl.as_deref() {
-            Some(raw) => Decimal::from_str(raw).with_context(|| {
-                format!(
-                    "trade {:?} has an unparseable pnl: {raw:?}",
-                    trade.id
-                )
-            })?,
+            Some(raw) => Decimal::from_str(raw)
+                .with_context(|| format!("trade {:?} has an unparseable pnl: {raw:?}", trade.id))?,
             None => Decimal::ZERO,
         };
 

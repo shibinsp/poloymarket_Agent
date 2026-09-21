@@ -363,10 +363,13 @@ mod tests {
         );
         let trip = evaluate(dec!(100), &day(dec!(100), dec!(100)), 10, 0, &c)
             .expect("the eleventh must be refused");
-        assert_eq!(trip, BreakerTrip::TradeCount {
-            today: 10,
-            limit: 10
-        });
+        assert_eq!(
+            trip,
+            BreakerTrip::TradeCount {
+                today: 10,
+                limit: 10
+            }
+        );
     }
 
     #[test]

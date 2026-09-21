@@ -25,9 +25,9 @@ use crate::data::{DataAggregator, DataPoint, MarketQuery};
 use crate::db::store::{CycleRecord, Store};
 use crate::execution::fills;
 use crate::execution::order::{self, OrderStatus};
+use crate::execution::reconcile::{StateReconciler, Verdict};
 use crate::execution::resolution;
 use crate::execution::wallet;
-use crate::execution::reconcile::{StateReconciler, Verdict};
 use crate::market::models::{apply_halt, AgentState, MarketCandidate};
 use crate::market::polymarket::PolymarketClient;
 use crate::market::scanner::MarketScanner;
@@ -139,9 +139,13 @@ impl Agent {
             let llm_store = store.clone_for_parallel();
             let valuation_store = store.clone_for_parallel();
             let client = Arc::new(
-                LlmClient::new(api_key.expose_secret().to_string(), &config.valuation, llm_store)?
-                    .with_content_export(config.telemetry.exports_content())
-                    .with_budget(budget.clone()),
+                LlmClient::new(
+                    api_key.expose_secret().to_string(),
+                    &config.valuation,
+                    llm_store,
+                )?
+                .with_content_export(config.telemetry.exports_content())
+                .with_budget(budget.clone()),
             );
             llm_client = Some(client.clone());
             Some(ValuationEngine::new(
@@ -374,13 +378,9 @@ impl Agent {
             0
         });
 
-        if let Some(trip) = circuit_breaker::evaluate(
-            equity,
-            &marks,
-            trades_today,
-            losses,
-            &self.config.risk,
-        ) {
+        if let Some(trip) =
+            circuit_breaker::evaluate(equity, &marks, trades_today, losses, &self.config.risk)
+        {
             self.raise_halt(Halt::new(
                 HaltSource::CircuitBreaker,
                 trip.scope(),

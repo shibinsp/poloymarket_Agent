@@ -1,10 +1,11 @@
 /** One function per route. The only place API paths are written down. */
-import { get, type ApiResult } from "./client";
+import { get, post, type ApiResult } from "./client";
 import { asArray, asObject, asObjectOrNull } from "./narrow";
 import type {
   ApiCostRecord,
   CycleRecord,
   Health,
+  HaltResponse,
   Metrics,
   TradeRecord,
 } from "./types";
@@ -59,6 +60,22 @@ export const DATASET_INTERVAL_MULTIPLIER: Record<DatasetKey, number> = {
 
 export function fetchHealth(signal?: AbortSignal): Promise<ApiResult<Health>> {
   return get({ path: DATASET_PATHS.health, narrow: asObject<Health>, signal });
+}
+
+/**
+ * Stop the agent opening positions. Exits, order polling and reconciliation
+ * keep running — this is not a shutdown.
+ *
+ * The 200 means the flag is set, not that resting orders are already
+ * cancelled: the agent does that on its next wake. The response says so.
+ */
+export function halt(): Promise<ApiResult<HaltResponse>> {
+  return post<HaltResponse>("/api/halt");
+}
+
+/** Lift the halt, and remove the HALT file so it does not come straight back. */
+export function resume(): Promise<ApiResult<HaltResponse>> {
+  return post<HaltResponse>("/api/resume");
 }
 
 export function fetchMetrics(

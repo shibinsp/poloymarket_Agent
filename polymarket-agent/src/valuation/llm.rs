@@ -251,10 +251,9 @@ impl LlmClient {
         // outage would consume the whole day's budget on calls that returned
         // nothing at all.
         let reservation = match &self.budget {
-            Some(ledger) => Some(
-                ledger
-                    .reserve(chrono::Utc::now().date_naive(), self.estimated_call_cost())?,
-            ),
+            Some(ledger) => {
+                Some(ledger.reserve(chrono::Utc::now().date_naive(), self.estimated_call_cost())?)
+            }
             None => None,
         };
 

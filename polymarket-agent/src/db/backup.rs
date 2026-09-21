@@ -255,7 +255,11 @@ mod tests {
 
         // Read the halt back out of the *snapshot*, not the live database.
         let restored = Store::new(path.to_str().unwrap()).await.unwrap();
-        let halt = restored.active_halt().await.unwrap().expect("halt survives");
+        let halt = restored
+            .active_halt()
+            .await
+            .unwrap()
+            .expect("halt survives");
         assert_eq!(halt.detail.as_deref(), Some("before the backup"));
     }
 
@@ -300,7 +304,10 @@ mod tests {
         // was off for a month must not come back to an empty backup
         // directory the first time it prunes.
         let dir = tempfile::tempdir().unwrap();
-        let old = touch(dir.path(), Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap());
+        let old = touch(
+            dir.path(),
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+        );
         assert_eq!(prune(dir.path(), 48, 30).unwrap(), 0);
         assert!(old.exists());
     }

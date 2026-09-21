@@ -28,6 +28,34 @@ export interface Health {
   uptime_seconds: number;
   next_cycle_due?: string | null;
   alerts_delivering?: boolean;
+  /**
+   * Occurrences per anomaly kind since the agent started, non-zero only.
+   * Absent on builds before the circuit breakers.
+   */
+  anomalies?: Record<string, number>;
+  /** Whether new positions are stopped, and why. */
+  halted?: boolean;
+  halt?: Halt | null;
+}
+
+/** A halt in force, as `/api/halt` and `/api/health` report it. */
+export interface Halt {
+  source: "halt_file" | "api" | "signal" | "circuit_breaker" | "reconciliation";
+  /** `rest_of_day` lifts at the UTC rollover; `until_resume` does not. */
+  scope: "rest_of_day" | "until_resume";
+  detail: string;
+  at: string;
+  day: string;
+}
+
+/** `POST /api/halt` and `POST /api/resume`. */
+export interface HaltResponse {
+  halted: boolean;
+  newly_halted?: boolean;
+  note?: string;
+  halt?: Halt | null;
+  cleared?: Halt | null;
+  error?: string;
 }
 
 /** `/api/metrics`. */

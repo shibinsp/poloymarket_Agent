@@ -319,6 +319,47 @@ mod tests {
     }
 
     #[test]
+    fn a_halted_agent_is_sized_out_of_every_asset_class() {
+        // The innermost of the three gates. `Agent::opens_positions` stops
+        // the cycle being run at all and `apply_halt` settles the state, but
+        // both of those are in the caller. This is the one that holds if a
+        // future caller forgets — and it covers the prediction path too,
+        // which goes through Kelly rather than through volatility targeting.
+        let bars = candles();
+        for inst in [equity(None), prediction()] {
+            let result = size_position(
+                &inputs(&inst, &bars, dec!(10_000), AgentState::Halted),
+                &uncapped_risk_config(),
+                &continuous_config(),
+            );
+            assert!(
+                !result.should_trade(),
+                "{:?} must not be sized while halted, got {result:?}",
+                inst.asset_class
+            );
+            assert!(
+                result.position_usd.is_zero(),
+                "a halted size must be zero, got {}",
+                result.position_usd
+            );
+        }
+    }
+
+    /// The control: the same inputs, not halted, do produce a position. Without
+    /// this the test above would pass if sizing were broken for every state.
+    #[test]
+    fn the_same_inputs_are_sized_normally_when_not_halted() {
+        let bars = candles();
+        let result = size_position(
+            &inputs(&equity(None), &bars, dec!(10_000), AgentState::Alive),
+            &uncapped_risk_config(),
+            &continuous_config(),
+        );
+        assert!(result.should_trade(), "the control case must trade");
+        assert!(result.position_usd > Decimal::ZERO);
+    }
+
+    #[test]
     fn continuous_size_makes_the_stop_loss_equal_the_risk_budget() {
         let inst = equity(None);
         let bars = candles();

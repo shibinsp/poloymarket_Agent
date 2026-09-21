@@ -115,7 +115,12 @@ impl Halt {
         })
     }
 
-    pub fn new(source: HaltSource, scope: HaltScope, detail: impl Into<String>, at: DateTime<Utc>) -> Self {
+    pub fn new(
+        source: HaltSource,
+        scope: HaltScope,
+        detail: impl Into<String>,
+        at: DateTime<Utc>,
+    ) -> Self {
         Self {
             source,
             scope,
@@ -315,7 +320,12 @@ mod tests {
     fn clearing_lifts_the_halt() {
         let dir = tempfile::tempdir().unwrap();
         let s = switch(&dir);
-        s.trip(Halt::new(HaltSource::Api, HaltScope::UntilResume, "x", at(21)));
+        s.trip(Halt::new(
+            HaltSource::Api,
+            HaltScope::UntilResume,
+            "x",
+            at(21),
+        ));
         let cleared = s.clear().unwrap();
         assert_eq!(cleared.unwrap().source, HaltSource::Api);
         assert!(!s.is_tripped());
@@ -429,9 +439,15 @@ mod tests {
             "daily loss",
             at(21),
         ));
-        assert!(!s.expire_if_day_rolled(at(21).date_naive()), "same day: held");
+        assert!(
+            !s.expire_if_day_rolled(at(21).date_naive()),
+            "same day: held"
+        );
         assert!(s.is_tripped());
-        assert!(s.expire_if_day_rolled(at(22).date_naive()), "next day: lifted");
+        assert!(
+            s.expire_if_day_rolled(at(22).date_naive()),
+            "next day: lifted"
+        );
         assert!(!s.is_tripped());
     }
 

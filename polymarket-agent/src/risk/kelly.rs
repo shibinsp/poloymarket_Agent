@@ -153,6 +153,36 @@ mod tests {
     }
 
     #[test]
+    fn a_halted_agent_gets_no_kelly_position() {
+        let config = default_config();
+        let halted = kelly_size(
+            dec!(0.70),
+            dec!(0.50),
+            dec!(0.80),
+            dec!(1000),
+            AgentState::Halted,
+            &config,
+        );
+        assert_eq!(
+            halted.position_usd,
+            Decimal::ZERO,
+            "a halted agent must be sized out of prediction markets too"
+        );
+
+        // The control: identical inputs while alive do produce a position, so
+        // this cannot pass by the sizing being broken for everything.
+        let alive = kelly_size(
+            dec!(0.70),
+            dec!(0.50),
+            dec!(0.80),
+            dec!(1000),
+            AgentState::Alive,
+            &config,
+        );
+        assert!(alive.position_usd > Decimal::ZERO);
+    }
+
+    #[test]
     fn test_kelly_basic() {
         let config = default_config();
         // Fair prob 70%, market price 50% → good edge

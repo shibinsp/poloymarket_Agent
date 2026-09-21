@@ -220,3 +220,48 @@ td.truncate { max-width: 340px; overflow: hidden; text-overflow: ellipsis; }
   .topbar { padding: 10px 16px; }
   td.truncate { max-width: 180px; }
 }
+
+/* --- Halt control -------------------------------------------------------- */
+
+/* The one control on the dashboard that changes what the agent does, so it is
+   visually separated from the read-only tiles around it rather than sitting
+   inline with them. */
+.halt {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  background: var(--surface-2);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-start;
+}
+.halt__state { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.halt__why { font-size: 12px; color: var(--text-muted); }
+.halt__detail {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  /* A breaker's detail is a sentence of numbers; let it wrap rather than
+     truncating the limit that was breached. */
+  overflow-wrap: anywhere;
+}
+.halt__confirm { margin: 0; font-size: 13px; max-width: 62ch; }
+.halt__actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.halt__error {
+  margin: 0;
+  font-size: 12px;
+  color: var(--status-critical);
+  overflow-wrap: anywhere;
+}
+
+/* Destructive only in the sense that it stops trading; the colour is a
+   deliberate speed bump, and the label always says what will happen. */
+.btn--danger {
+  border-color: color-mix(in srgb, var(--status-critical) 55%, transparent);
+  color: var(--status-critical);
+}
+.btn--danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--status-critical) 12%, transparent);
+}
+.btn--quiet { border-color: transparent; color: var(--text-muted); }

@@ -287,9 +287,9 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
     // One flag, shared by the dashboard's `/api/halt`, the `HALT` file poll,
     // the SIGUSR1 handler and the agent's own breakers. Built here because
     // the dashboard comes up before the agent does.
-    let kill_switch = std::sync::Arc::new(
-        polymarket_agent::agent::kill_switch::KillSwitch::new(config.database.halt_file()),
-    );
+    let kill_switch = std::sync::Arc::new(polymarket_agent::agent::kill_switch::KillSwitch::new(
+        config.database.halt_file(),
+    ));
 
     let dashboard_state = DashboardState::new(
         dashboard_store,

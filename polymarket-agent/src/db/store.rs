@@ -714,13 +714,12 @@ impl Store {
     /// willing to take a new view in a day, and an entry that filled in three
     /// parts is still one decision.
     pub async fn count_trades_opened_on(&self, day: chrono::NaiveDate) -> Result<u32> {
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM trades WHERE date(created_at) = ?",
-        )
-        .bind(day.to_string())
-        .fetch_one(&self.pool)
-        .await
-        .context("Failed to count today's trades")?;
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM trades WHERE date(created_at) = ?")
+                .bind(day.to_string())
+                .fetch_one(&self.pool)
+                .await
+                .context("Failed to count today's trades")?;
         Ok(count.max(0) as u32)
     }
 
@@ -826,14 +825,12 @@ impl Store {
 
     /// Mark every in-force halt as cleared.
     pub async fn clear_halts(&self, by: &str, at: DateTime<Utc>) -> Result<()> {
-        sqlx::query(
-            "UPDATE halts SET cleared_at = ?, cleared_by = ? WHERE cleared_at IS NULL",
-        )
-        .bind(at.to_rfc3339())
-        .bind(by)
-        .execute(&self.pool)
-        .await
-        .context("Failed to clear halts")?;
+        sqlx::query("UPDATE halts SET cleared_at = ?, cleared_by = ? WHERE cleared_at IS NULL")
+            .bind(at.to_rfc3339())
+            .bind(by)
+            .execute(&self.pool)
+            .await
+            .context("Failed to clear halts")?;
         Ok(())
     }
 
@@ -863,10 +860,9 @@ impl Store {
 /// dropped cost makes the day's spend read low, which is the direction that
 /// keeps spending.
 fn sum_money(rows: &[(String,)], field: &str) -> Result<Decimal> {
-    rows.iter()
-        .try_fold(Decimal::ZERO, |acc, (value,)| {
-            Ok(acc + parse_money(value, field)?)
-        })
+    rows.iter().try_fold(Decimal::ZERO, |acc, (value,)| {
+        Ok(acc + parse_money(value, field)?)
+    })
 }
 
 /// Parse a money column, loudly.

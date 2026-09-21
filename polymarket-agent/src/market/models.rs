@@ -161,6 +161,49 @@ mod tests {
     use super::*;
     use rust_decimal_macros::dec;
 
+    #[test]
+    fn a_halt_overrides_the_survival_ladder() {
+        for survival in [
+            AgentState::Alive,
+            AgentState::LowFuel,
+            AgentState::CriticalSurvival,
+        ] {
+            assert_eq!(
+                apply_halt(survival, true),
+                AgentState::Halted,
+                "{survival} must yield to a halt"
+            );
+        }
+    }
+
+    #[test]
+    fn death_outranks_a_halt() {
+        // An account at zero is not something a human resume can fix, and a
+        // halted agent that never reaches Dead never shuts down or settles —
+        // it cycles forever against an empty account waiting for someone.
+        assert_eq!(apply_halt(AgentState::Dead, true), AgentState::Dead);
+        assert_eq!(apply_halt(AgentState::Dead, false), AgentState::Dead);
+    }
+
+    #[test]
+    fn without_a_halt_the_survival_state_passes_through_unchanged() {
+        for survival in [
+            AgentState::Alive,
+            AgentState::LowFuel,
+            AgentState::CriticalSurvival,
+            AgentState::Dead,
+        ] {
+            assert_eq!(apply_halt(survival, false), survival);
+        }
+    }
+
+    #[test]
+    fn halted_renders_as_a_stable_identifier() {
+        // Written to `cycles.agent_state` and served on /api/health; the
+        // dashboard keys off it.
+        assert_eq!(AgentState::Halted.to_string(), "HALTED");
+    }
+
     fn book_with(bid_size: Decimal, ask_size: Decimal) -> OrderBookSnapshot {
         OrderBookSnapshot {
             token_id: "tok".to_string(),

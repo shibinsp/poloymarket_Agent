@@ -45,7 +45,12 @@ pub struct AgentConfig {
     pub api_reserve: Decimal,
     pub initial_paper_balance: Decimal,
     /// Maximum API spend per calendar day (UTC). Stops new evaluations once hit.
-    /// Default: $5.00 — sufficient for ~550 Claude calls at ~$0.009 each.
+    ///
+    /// Default: $0.50, roughly 55 Claude calls at ~$0.009 each. Deliberately
+    /// low. The first live capital here is $50–100, and a research budget
+    /// that can exceed the day's realistic P&L is not a research budget, it
+    /// is the largest position the agent takes. Raise it once the paper
+    /// window shows what a day actually costs.
     #[serde(default = "default_daily_api_budget")]
     pub daily_api_budget: Decimal,
     /// Longest the agent will sleep when every venue is closed. Bounds only
@@ -57,7 +62,7 @@ pub struct AgentConfig {
 }
 
 fn default_daily_api_budget() -> Decimal {
-    rust_decimal_macros::dec!(5.0)
+    rust_decimal_macros::dec!(0.50)
 }
 
 fn default_max_sleep_seconds() -> u64 {

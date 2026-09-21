@@ -5,7 +5,7 @@ death_balance_threshold = 0.0
 low_fuel_threshold = 10.0
 api_reserve = 2.0
 initial_paper_balance = 100.0
-daily_api_budget = 5.0               # max API spend per UTC day ($)
+daily_api_budget = 0.50           # max API spend per UTC day ($); see [risk] below
 max_sleep_seconds = 3600          # longest sleep while every venue is closed
 
 [scanning]
@@ -43,6 +43,41 @@ max_total_exposure_pct = 0.30
 max_positions_per_category = 3
 min_position_usd = 1.0
 
+# --- Circuit breakers -------------------------------------------------------
+#
+# Every limit below bounds a *sequence*, which nothing else here does: Kelly
+# sizes one position, the exposure cap bounds the book, the stop bounds one
+# loss. Twenty trades each losing their stop is twenty correctly-sized losses
+# and a ruined account.
+#
+# Tripping stops new entries only. Exits, order polling, reconciliation and
+# settlement all keep running — refusing to close a position because the day
+# went badly is how a bounded loss becomes an unbounded one.
+#
+# Losses trip on a strict `>` and counts on a `>=`, so 0 means "none
+# tolerated" rather than "disabled". To switch a check off, set it high.
+#
+# Clear a halt with `POST /api/halt` ... `/api/resume`, or by deleting the
+# HALT file in the data directory.
+
+# Lost more than this fraction of the day's opening equity -> stop entries for
+# the rest of the UTC day. Lifts by itself at midnight.
+max_daily_loss_pct = 0.05
+# The same limit in cash. At micro capital a percentage is a rounding error
+# and this is the number actually agreed to; whichever binds first wins.
+max_daily_loss_usd = 5.0
+# Below the all-time equity high by more than this -> stop until a human
+# resumes. Does not lift at midnight: sleeping on a drawdown changes nothing.
+max_drawdown_pct = 0.15
+# Positions opened per UTC day, and losing closes in a row. Both rest-of-day.
+max_trades_per_day = 10
+max_consecutive_losses = 4
+# Absolute ceilings, applied only in live mode. A percentage of a paper
+# balance is a number nobody agreed to, and the first live run must not
+# inherit it: 6% of a $100,000 paper account is a $6,000 position.
+max_live_notional_per_position_usd = 10.0
+max_live_total_notional_usd = 60.0
+
 [execution]
 order_type = "limit"
 order_ttl_seconds = 300
@@ -69,6 +104,9 @@ backoff_max_ms = 30000
 
 [database]
 path = "polymarket-agent.db"
+# Where the HALT file and the hourly snapshots live. Defaults to the database
+# file's own directory. Snapshots are kept 48-hourly and 30-daily.
+# data_dir = "/var/lib/polymarket-agent"
 
 # Trading venues. Leave empty to keep the legacy Polymarket-only loop.
 # Continuous assets (crypto, equities) need an explicit symbol universe —
