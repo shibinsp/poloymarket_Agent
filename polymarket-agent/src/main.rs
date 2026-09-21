@@ -3,7 +3,7 @@ use chrono::Utc;
 use clap::Parser;
 
 use polymarket_agent::agent::lifecycle::Agent;
-use polymarket_agent::config::{self, AgentMode, AppConfig};
+use polymarket_agent::config::{self, AgentMode, AppConfig, ExposeSecret};
 use polymarket_agent::db::store::Store;
 use polymarket_agent::monitoring;
 use polymarket_agent::monitoring::alerts::{AlertLevel, AnomalyKind};
@@ -167,7 +167,7 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
             // record this call in api_costs and eat into the daily budget.
             let probe_store = Store::new(":memory:").await?;
             match polymarket_agent::valuation::llm::LlmClient::new(
-                key.clone(),
+                key.expose_secret().to_string(),
                 &config.valuation,
                 probe_store,
             )
@@ -277,6 +277,9 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
 async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
     // Create shared database store
     let store = Store::new(&config.database.path).await?;
+    // Shared pool, not a second connection: opening the same file twice means
+    // two WAL writers and two migration runs.
+    let agent_pool = store.pool().clone();
 
     // Create health state and dashboard
     let health_state = monitoring::health::HealthState::new();
@@ -292,7 +295,10 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
         dashboard_store,
         health_state.clone(),
         config.agent.initial_paper_balance,
-        secrets.dashboard_token.clone(),
+        secrets
+            .dashboard_token
+            .as_ref()
+            .map(|t| t.expose_secret().to_string()),
         kill_switch.clone(),
     );
     let dashboard_handle = spawn_dashboard(
@@ -304,6 +310,19 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
 
     let mut agent = Agent::new(config.clone(), secrets, store, kill_switch.clone()).await?;
     let signal_halt = spawn_signal_halt(kill_switch.clone());
+
+    // Hourly snapshots. Skipped for an in-memory database, which has no file
+    // to vacuum and no reason to want one.
+    let backups = if config.database.path == ":memory:" {
+        None
+    } else {
+        let dir = config.database.backup_dir();
+        tracing::info!(dir = %dir.display(), "Hourly database snapshots enabled");
+        Some(polymarket_agent::db::backup::spawn(
+            Store::from_pool(agent_pool),
+            dir,
+        ))
+    };
     let alerts = agent.alerts();
     let watchdog = spawn_cycle_watchdog(
         health_state.clone(),
@@ -336,6 +355,9 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
                 health_state
                     .record_cycle(agent.cycle_number(), agent.current_state())
                     .await;
+                health_state
+                    .record_diagnostics(alerts.anomaly_counts(), kill_switch.current().as_ref())
+                    .await;
 
                 if agent.is_dead() {
                     tracing::error!("Agent has died. Shutting down.");
@@ -345,6 +367,9 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
             Err(e) => {
                 consecutive_failures += 1;
                 health_state.record_failure().await;
+                health_state
+                    .record_diagnostics(alerts.anomaly_counts(), kill_switch.current().as_ref())
+                    .await;
                 tracing::error!(
                     error = %e,
                     consecutive_failures,
@@ -402,6 +427,9 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
     watchdog.abort();
     dashboard_handle.abort();
     signal_halt.abort();
+    if let Some(backups) = backups {
+        backups.abort();
+    }
     // Spans are flushed by `main`, on the one path every mode returns
     // through — including the `?` returns above this line.
     tracing::info!("Agent shutdown complete");

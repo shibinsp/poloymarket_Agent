@@ -16,7 +16,7 @@ use crate::agent::self_funding::{
 };
 use crate::agent::venue_cycle::{CycleOutcome, VenueCycle};
 use crate::agent::venue_exits::VenueExits;
-use crate::config::{AppConfig, Secrets};
+use crate::config::{AppConfig, ExposeSecret, Secrets};
 use crate::data::crypto::CryptoSource;
 use crate::data::news::NewsSource;
 use crate::data::sports::SportsSource;
@@ -139,7 +139,7 @@ impl Agent {
             let llm_store = store.clone_for_parallel();
             let valuation_store = store.clone_for_parallel();
             let client = Arc::new(
-                LlmClient::new(api_key.clone(), &config.valuation, llm_store)?
+                LlmClient::new(api_key.expose_secret().to_string(), &config.valuation, llm_store)?
                     .with_content_export(config.telemetry.exports_content())
                     .with_budget(budget.clone()),
             );
@@ -164,7 +164,10 @@ impl Agent {
 
         // Phase 8: Initialize alert client
         let alert_client = Arc::new(AlertClient::new(
-            secrets.discord_webhook_url.clone(),
+            secrets
+                .discord_webhook_url
+                .as_ref()
+                .map(|u| u.expose_secret().to_string()),
             config.monitoring.discord_enabled,
         ));
 

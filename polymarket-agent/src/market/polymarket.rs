@@ -32,7 +32,7 @@ use std::str::FromStr;
 use tokio::sync::Mutex;
 use tracing::{info, instrument, warn};
 
-use crate::config::{AgentMode, AppConfig, RateLimitConfig, Secrets};
+use crate::config::{AgentMode, AppConfig, ExposeSecret, RateLimitConfig, Secrets};
 use crate::market::models::{
     Market, OrderBookSnapshot, PriceHistoryPoint, PriceLevel, Side, TokenInfo,
 };
@@ -148,7 +148,7 @@ impl PolymarketClient {
                     anyhow::anyhow!("POLYMARKET_PRIVATE_KEY required for live trading")
                 })?;
 
-                let signer = LocalSigner::from_str(private_key)
+                let signer = LocalSigner::from_str(private_key.expose_secret())
                     .context("Failed to parse private key")?
                     .with_chain_id(Some(137)); // Polygon chain ID
 

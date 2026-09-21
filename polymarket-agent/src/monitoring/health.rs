@@ -31,6 +31,19 @@ struct HealthData {
     /// Whether alert delivery itself is failing, so an operator can tell the
     /// difference between nothing going wrong and nothing getting through.
     alerts_delivering: bool,
+    /// Occurrences per anomaly kind since start, non-zero kinds only.
+    ///
+    /// The counterpart to `alerts_delivering`: that says whether alerts are
+    /// getting out, this says what there was to send. Without it a deduped
+    /// webhook makes "once" and "four hundred times" look identical.
+    anomalies: std::collections::BTreeMap<String, u64>,
+    /// Whether new positions are stopped, and why.
+    ///
+    /// Reported separately from `agent_state` rather than only folded into
+    /// it, because the reason is the part an operator needs and a state name
+    /// cannot carry it.
+    halted: bool,
+    halt: Option<serde_json::Value>,
 }
 
 impl HealthState {
@@ -45,6 +58,9 @@ impl HealthState {
                 uptime_seconds: 0,
                 next_cycle_due: None,
                 alerts_delivering: true,
+                anomalies: std::collections::BTreeMap::new(),
+                halted: false,
+                halt: None,
             })),
         }
     }
@@ -88,6 +104,21 @@ impl HealthState {
             AgentState::Halted => "halted".to_string(),
             _ => "ok".to_string(),
         };
+    }
+
+    /// Publish the anomaly tally and the current halt, if any.
+    pub async fn record_diagnostics(
+        &self,
+        anomalies: std::collections::BTreeMap<&'static str, u64>,
+        halt: Option<&crate::agent::kill_switch::Halt>,
+    ) {
+        let mut data = self.inner.write().await;
+        data.anomalies = anomalies
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        data.halted = halt.is_some();
+        data.halt = halt.and_then(|h| serde_json::to_value(h).ok());
     }
 
     /// Record when the next cycle should have completed by.

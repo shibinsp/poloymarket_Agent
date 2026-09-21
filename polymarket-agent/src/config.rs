@@ -2,6 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use rust_decimal::Decimal;
+pub use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -599,21 +600,32 @@ impl DatabaseConfig {
 ///
 /// `Default` is "no credentials at all", which is a legitimate configuration:
 /// paper mode needs none.
+///
+/// Every field is a `SecretString`, which is what stops these ending up in a
+/// log line. The previous `String` fields relied on nobody ever deriving
+/// `Debug` on this struct or on anything holding one of its values — true
+/// today, and a property no reviewer can check by reading the diff in front
+/// of them. `SecretString` has no `Debug` or `Display` that reveals anything,
+/// so the mistake stops compiling rather than stops being noticed, and it
+/// zeroes its buffer on drop.
+///
+/// Read one with `.expose_secret()`, which is deliberately conspicuous.
 #[derive(Default)]
 pub struct Secrets {
-    pub polymarket_private_key: Option<String>,
+    pub polymarket_private_key: Option<SecretString>,
     /// API key for the configured valuation provider. Read from `LLM_API_KEY`,
     /// falling back to `ANTHROPIC_API_KEY`.
-    pub llm_api_key: Option<String>,
-    pub discord_webhook_url: Option<String>,
-    pub noaa_api_token: Option<String>,
-    pub espn_api_key: Option<String>,
+    pub llm_api_key: Option<SecretString>,
+    /// A capability URL: anyone holding it can post to the channel.
+    pub discord_webhook_url: Option<SecretString>,
+    pub noaa_api_token: Option<SecretString>,
+    pub espn_api_key: Option<SecretString>,
     /// Bearer token protecting the dashboard's `/api/*` routes. Required when
     /// the dashboard is bound to a non-loopback address.
-    pub dashboard_token: Option<String>,
+    pub dashboard_token: Option<SecretString>,
     /// Alpaca trading credentials. Paper and live use different keys.
-    pub alpaca_key_id: Option<String>,
-    pub alpaca_secret_key: Option<String>,
+    pub alpaca_key_id: Option<SecretString>,
+    pub alpaca_secret_key: Option<SecretString>,
 }
 
 /// Read an env var, treating blank/whitespace-only as unset.
@@ -624,21 +636,25 @@ fn non_empty_env(key: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// `non_empty_env` for a value that must not be logged.
+fn secret_env(key: &str) -> Option<SecretString> {
+    non_empty_env(key).map(SecretString::from)
+}
+
 impl Secrets {
     pub fn from_env() -> Self {
         Self {
-            polymarket_private_key: non_empty_env("POLYMARKET_PRIVATE_KEY"),
+            polymarket_private_key: secret_env("POLYMARKET_PRIVATE_KEY"),
             // An unset var and one set to "" must behave the same, or the
             // blank `LLM_API_KEY=` line in .env.example would shadow the
             // ANTHROPIC_API_KEY fallback with Some("").
-            llm_api_key: non_empty_env("LLM_API_KEY")
-                .or_else(|| non_empty_env("ANTHROPIC_API_KEY")),
-            discord_webhook_url: non_empty_env("DISCORD_WEBHOOK_URL"),
-            noaa_api_token: non_empty_env("NOAA_API_TOKEN"),
-            espn_api_key: non_empty_env("ESPN_API_KEY"),
-            dashboard_token: non_empty_env("DASHBOARD_TOKEN"),
-            alpaca_key_id: non_empty_env("ALPACA_API_KEY_ID"),
-            alpaca_secret_key: non_empty_env("ALPACA_API_SECRET_KEY"),
+            llm_api_key: secret_env("LLM_API_KEY").or_else(|| secret_env("ANTHROPIC_API_KEY")),
+            discord_webhook_url: secret_env("DISCORD_WEBHOOK_URL"),
+            noaa_api_token: secret_env("NOAA_API_TOKEN"),
+            espn_api_key: secret_env("ESPN_API_KEY"),
+            dashboard_token: secret_env("DASHBOARD_TOKEN"),
+            alpaca_key_id: secret_env("ALPACA_API_KEY_ID"),
+            alpaca_secret_key: secret_env("ALPACA_API_SECRET_KEY"),
         }
     }
 }

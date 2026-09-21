@@ -286,31 +286,21 @@ impl Store {
     }
 
     pub async fn get_total_api_cost(&self) -> Result<Decimal> {
-        let row: (Option<String>,) =
-            sqlx::query_as("SELECT CAST(SUM(CAST(cost AS REAL)) AS TEXT) FROM api_costs")
-                .fetch_one(&self.pool)
-                .await
-                .context("Failed to get total API cost")?;
-
-        match row.0 {
-            Some(s) => Ok(Decimal::from_str(&s).unwrap_or(Decimal::ZERO)),
-            None => Ok(Decimal::ZERO),
-        }
+        let rows: Vec<(String,)> = sqlx::query_as("SELECT cost FROM api_costs")
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to get total API cost")?;
+        sum_money(&rows, "api_costs.cost")
     }
 
     /// Get total API spend for the current UTC day.
     pub async fn get_today_api_cost(&self) -> Result<Decimal> {
-        let row: (Option<String>,) = sqlx::query_as(
-            "SELECT CAST(SUM(CAST(cost AS REAL)) AS TEXT) FROM api_costs WHERE created_at >= date('now')",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .context("Failed to get today's API cost")?;
-
-        match row.0 {
-            Some(s) => Ok(Decimal::from_str(&s).unwrap_or(Decimal::ZERO)),
-            None => Ok(Decimal::ZERO),
-        }
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT cost FROM api_costs WHERE created_at >= date('now')")
+                .fetch_all(&self.pool)
+                .await
+                .context("Failed to get today's API cost")?;
+        sum_money(&rows, "api_costs.cost")
     }
 
     /// Get all cycles ordered by cycle number.
@@ -343,18 +333,15 @@ impl Store {
     }
 
     pub async fn get_api_cost_for_cycle(&self, cycle: i64) -> Result<Decimal> {
-        let row: (Option<String>,) = sqlx::query_as(
-            "SELECT CAST(SUM(CAST(cost AS REAL)) AS TEXT) FROM api_costs WHERE cycle = ?",
-        )
-        .bind(cycle)
-        .fetch_one(&self.pool)
-        .await
-        .context("Failed to get API cost for cycle")?;
-
-        match row.0 {
-            Some(s) => Ok(Decimal::from_str(&s).unwrap_or(Decimal::ZERO)),
-            None => Ok(Decimal::ZERO),
-        }
+        // Previously `fetch_one` against a SUM, which returns exactly one row
+        // even when nothing matches. Now that the rows are summed in Rust,
+        // `fetch_all` is both correct and what a cycle with no calls needs.
+        let rows: Vec<(String,)> = sqlx::query_as("SELECT cost FROM api_costs WHERE cycle = ?")
+            .bind(cycle)
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to get API cost for cycle")?;
+        sum_money(&rows, "api_costs.cost")
     }
 
     // === Orders (multi-venue) ===
@@ -862,6 +849,24 @@ impl Store {
         .context("Failed to read the active halt")?;
         Ok(row)
     }
+}
+
+/// Add up a money column in `Decimal`, not in `f64`.
+///
+/// These used to be `SUM(CAST(cost AS REAL))`: SQLite stores these values as
+/// TEXT, so the sum went out through a binary float and back. That is exactly
+/// the round-trip `rust_decimal` is in this project to avoid, and the result
+/// was being compared against a budget — a number whose whole job is to be
+/// exact.
+///
+/// A row that will not parse is an error rather than a zero. A silently
+/// dropped cost makes the day's spend read low, which is the direction that
+/// keeps spending.
+fn sum_money(rows: &[(String,)], field: &str) -> Result<Decimal> {
+    rows.iter()
+        .try_fold(Decimal::ZERO, |acc, (value,)| {
+            Ok(acc + parse_money(value, field)?)
+        })
 }
 
 /// Parse a money column, loudly.

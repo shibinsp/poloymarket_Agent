@@ -10,7 +10,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
-use crate::config::{AgentMode, AppConfig, Secrets, VenueConfig};
+use crate::config::{AgentMode, AppConfig, ExposeSecret, Secrets, VenueConfig};
 use crate::market::polymarket::PolymarketClient;
 use crate::venue::alpaca::{AlpacaConfig, AlpacaVenue};
 use crate::venue::polymarket::PolymarketVenue;
@@ -84,8 +84,10 @@ fn build_alpaca(
     // Paper and backtest both point at the paper host: backtest must never
     // reach the live trading API even by accident.
     let mut alpaca_config = match mode {
-        AgentMode::Live => AlpacaConfig::live(key_id, secret_key),
-        AgentMode::Paper | AgentMode::Backtest => AlpacaConfig::paper(key_id, secret_key),
+        AgentMode::Live => AlpacaConfig::live(key_id.expose_secret(), secret_key.expose_secret()),
+        AgentMode::Paper | AgentMode::Backtest => {
+            AlpacaConfig::paper(key_id.expose_secret(), secret_key.expose_secret())
+        }
     }
     .with_symbols(venue_config.symbols.clone());
 
@@ -142,8 +144,8 @@ mod tests {
             noaa_api_token: None,
             espn_api_key: None,
             dashboard_token: None,
-            alpaca_key_id: present.then(|| "key".to_string()),
-            alpaca_secret_key: present.then(|| "secret".to_string()),
+            alpaca_key_id: present.then(|| crate::config::SecretString::from("key")),
+            alpaca_secret_key: present.then(|| crate::config::SecretString::from("secret")),
         }
     }
 
