@@ -161,8 +161,15 @@ impl Reconciler<'_> {
         // filled entry is a live position and must be visible as one.
         if ack.filled_qty > Decimal::ZERO {
             report.filled += 1;
-            self.apply_fill(order, ack.filled_qty, ack.avg_fill_price, &ack.state)
-                .await?;
+            self.apply_fill(
+                order,
+                ack.filled_qty,
+                ack.avg_fill_price,
+                ack.fees,
+                &ack.state,
+                now,
+            )
+            .await?;
         }
 
         if is_terminal(&ack.state) {
@@ -225,13 +232,73 @@ impl Reconciler<'_> {
             .map(|status| (trade_id, status)))
     }
 
+    /// Write the execution itself to `fills`.
+    ///
+    /// Separate from the position bookkeeping below because they answer
+    /// different questions. `trades` says what the agent holds; `fills` says
+    /// what the venue actually did — at what price against the mid, and how
+    /// long it took. Two of the paper-window promotion criteria are median
+    /// and p95 slippage, and neither is answerable from an averaged
+    /// `avg_fill_price` on the order.
+    ///
+    /// Best-effort: losing a measurement must never block recording the
+    /// position it came from.
+    async fn record_execution(
+        &self,
+        order: &OrderRecord,
+        filled_qty: Decimal,
+        price: Decimal,
+        fees: Decimal,
+        now: DateTime<Utc>,
+    ) {
+        let Some(order_id) = order.id else {
+            return;
+        };
+
+        let prev_qty = Decimal::from_str_exact(&order.filled_qty).unwrap_or(Decimal::ZERO);
+        let prev_avg = order
+            .avg_fill_price
+            .as_deref()
+            .and_then(|p| Decimal::from_str_exact(p).ok());
+        let mid = order
+            .mid_at_submit
+            .as_deref()
+            .and_then(|m| Decimal::from_str_exact(m).ok());
+
+        if let Err(e) = self
+            .store
+            .record_fill_increment(
+                order_id,
+                order.venue_order_id.as_deref(),
+                filled_qty,
+                price,
+                prev_qty,
+                prev_avg,
+                Some(fees),
+                mid,
+                &order.side,
+                order.submitted_at.as_deref(),
+                now,
+            )
+            .await
+        {
+            warn!(
+                client_order_id = %order.client_order_id,
+                error = %e,
+                "Could not record the execution — slippage for this fill is lost"
+            );
+        }
+    }
+
     /// Record a fill against the trade the order was placed for.
     async fn apply_fill(
         &self,
         order: &OrderRecord,
         filled_qty: Decimal,
         avg_fill_price: Option<Decimal>,
+        fees: Decimal,
         state: &OrderState,
+        now: DateTime<Utc>,
     ) -> Result<()> {
         let Some((trade_id, status)) = self.linked_trade(order).await? else {
             // An order with no trade row is a bug elsewhere, not something to
@@ -253,6 +320,9 @@ impl Reconciler<'_> {
                 return Ok(());
             }
         };
+
+        self.record_execution(order, filled_qty, price, fees, now)
+            .await;
 
         match order.intent.as_str() {
             "EXIT" => {
@@ -327,6 +397,25 @@ impl Reconciler<'_> {
                 &order.client_order_id,
             )
             .await?;
+
+        // Score the forecast here too, not only on the inline-fill path.
+        //
+        // With limit exits and a TTL — the shipped configuration — most exits
+        // rest and are discovered filled by *this* pass. Scoring only the
+        // inline case left the common path unresolved forever, so the
+        // calibration sample never grew and the Brier criterion stayed
+        // unevaluable no matter how long the window ran.
+        if let Err(e) = crate::valuation::calibration::resolve_directional_prediction(
+            self.store.pool(),
+            trade_id,
+            entry,
+            price,
+        )
+        .await
+        {
+            warn!(trade_id, error = %e, "Could not score the forecast");
+        }
+
         info!(
             trade_id,
             symbol = %order.symbol,
@@ -682,6 +771,77 @@ mod tests {
         assert_eq!(open[0].quantity, dec!(0.4), "only the filled part is held");
     }
 
+    /// A resting partial is re-queried every cycle, and the venue reports
+    /// its *cumulative* filled quantity each time. Recording that as a fill
+    /// on every pass writes one row per cycle, each restating the whole
+    /// filled amount — so a single 1.0 order that filled in two steps sums
+    /// to more than 1.0, and the Orders page reports executions that never
+    /// happened.
+    #[tokio::test]
+    async fn a_resting_partial_records_one_execution_per_increment_not_per_cycle() {
+        let store = Store::new(":memory:").await.unwrap();
+        pending_entry(&store, None).await;
+
+        // Cycle one: 0.4 of 1.0 filled at 100.
+        let registry = VenueRegistry::new(vec![Box::new(ScriptedVenue::answering(ack(
+            OrderState::PartiallyFilled,
+            dec!(0.4),
+            Some(dec!(100)),
+        )))]);
+        reconciler(&registry, &store).run(Utc::now()).await.unwrap();
+        assert_eq!(store.get_fills(10).await.unwrap().len(), 1);
+
+        // Cycle two: nothing more filled. The venue repeats 0.4.
+        let registry = VenueRegistry::new(vec![Box::new(ScriptedVenue::answering(ack(
+            OrderState::PartiallyFilled,
+            dec!(0.4),
+            Some(dec!(100)),
+        )))]);
+        reconciler(&registry, &store).run(Utc::now()).await.unwrap();
+        assert_eq!(
+            store.get_fills(10).await.unwrap().len(),
+            1,
+            "an unchanged partial is not a new execution"
+        );
+
+        // Cycle three: the rest fills, taking the cumulative average to 101.
+        let registry = VenueRegistry::new(vec![Box::new(ScriptedVenue::answering(ack(
+            OrderState::Filled,
+            dec!(1.0),
+            Some(dec!(101)),
+        )))]);
+        reconciler(&registry, &store).run(Utc::now()).await.unwrap();
+
+        let fills = store.get_fills(10).await.unwrap();
+        assert_eq!(fills.len(), 2, "two increments, two executions");
+
+        let total: Decimal = fills
+            .iter()
+            .map(|f| Decimal::from_str_exact(&f.qty).unwrap())
+            .sum();
+        assert_eq!(
+            total,
+            dec!(1.0),
+            "the executions must sum to what actually filled, got {fills:#?}"
+        );
+
+        // The second execution is the *increment*, not the running average:
+        // 0.6 at the price that takes 0.4@100 to 1.0@101.
+        let newest = &fills[0];
+        assert_eq!(Decimal::from_str_exact(&newest.qty).unwrap(), dec!(0.6));
+        // The increment's own VWAP: what takes 0.4 @ 100 up to 1.0 @ 101.
+        let expected = (dec!(101) * dec!(1.0) - dec!(100) * dec!(0.4)) / dec!(0.6);
+        assert_eq!(
+            Decimal::from_str_exact(&newest.price).unwrap(),
+            expected,
+            "the increment's own VWAP, not the order's cumulative average"
+        );
+        assert!(
+            expected > dec!(101),
+            "sanity: the second tranche filled worse than the first"
+        );
+    }
+
     #[tokio::test]
     async fn an_order_past_its_ttl_is_cancelled_at_the_venue() {
         let store = Store::new(":memory:").await.unwrap();
@@ -836,6 +996,7 @@ mod tests {
             state: "ACCEPTED".to_string(),
             reject_reason: None,
             cycle: Some(1),
+            mid_at_submit: None,
             submitted_at: None,
             updated_at: None,
             expires_at: expires_at.map(|s| s.to_string()),

@@ -1,0 +1,11 @@
+-- The mid price at the moment an order was submitted.
+--
+-- Slippage is the difference between what a fill cost and what the market was
+-- showing when the decision was made, so measuring it needs both numbers — and
+-- the second one is only knowable at submission time, by which point the fill
+-- price does not exist yet. The `fills` table has a column for it; nothing
+-- carried it from placement to fill, so nothing could populate it.
+--
+-- Without this, "median slippage vs mid ≤10 bps, p95 ≤30 bps" — two of the
+-- paper-window promotion criteria — cannot be evaluated at all.
+ALTER TABLE orders ADD COLUMN mid_at_submit TEXT;

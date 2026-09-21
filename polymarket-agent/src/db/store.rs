@@ -367,8 +367,8 @@ impl Store {
     /// alternative is an order live at the venue that we have no record of.
     pub async fn insert_order(&self, order: &OrderRecord) -> Result<i64> {
         let result = sqlx::query(
-            "INSERT INTO orders (client_order_id, venue_order_id, venue_id, symbol, side, intent, trade_id, limit_price, qty, filled_qty, avg_fill_price, state, reject_reason, cycle, expires_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO orders (client_order_id, venue_order_id, venue_id, symbol, side, intent, trade_id, limit_price, qty, filled_qty, avg_fill_price, state, reject_reason, cycle, mid_at_submit, expires_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&order.client_order_id)
         .bind(&order.venue_order_id)
@@ -384,6 +384,7 @@ impl Store {
         .bind(&order.state)
         .bind(&order.reject_reason)
         .bind(order.cycle)
+        .bind(&order.mid_at_submit)
         .bind(&order.expires_at)
         .execute(&self.pool)
         .await
@@ -855,7 +856,7 @@ impl Store {
         sqlx::query_as::<_, OrderRecord>(
             "SELECT id, client_order_id, venue_order_id, venue_id, symbol, side, intent,
                     trade_id, limit_price, qty, filled_qty, avg_fill_price, state,
-                    reject_reason, cycle, submitted_at, updated_at, expires_at
+                    reject_reason, cycle, mid_at_submit, submitted_at, updated_at, expires_at
              FROM orders ORDER BY id DESC LIMIT ?",
         )
         .bind(limit)
@@ -910,6 +911,160 @@ impl Store {
         .fetch_all(&self.pool)
         .await
         .context("Failed to fetch reconciliation runs")
+    }
+
+    /// Row id for a client order id, for callers holding only the latter.
+    pub async fn order_id(&self, client_order_id: &str) -> Result<Option<i64>> {
+        sqlx::query_scalar("SELECT id FROM orders WHERE client_order_id = ?")
+            .bind(client_order_id)
+            .fetch_optional(&self.pool)
+            .await
+            .context("Failed to look up order id")
+    }
+
+    /// Record the *new* part of a fill, given what was already recorded.
+    ///
+    /// The venue reports cumulative filled quantity and a cumulative average
+    /// price. Every path that learns about a fill — the submit
+    /// acknowledgement and the reconciliation pass alike — sees the running
+    /// total, so recording it verbatim writes one row per observation rather
+    /// than one per execution.
+    ///
+    /// Returns whether anything was written.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_fill_increment(
+        &self,
+        order_id: i64,
+        venue_trade_id: Option<&str>,
+        cumulative_qty: Decimal,
+        cumulative_avg: Decimal,
+        prev_qty: Decimal,
+        prev_avg: Option<Decimal>,
+        fee: Option<Decimal>,
+        mid_at_submit: Option<Decimal>,
+        side: &str,
+        submitted_at: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let delta_qty = cumulative_qty - prev_qty;
+        if delta_qty <= Decimal::ZERO {
+            return Ok(false);
+        }
+
+        // Back the increment's own VWAP out of the two running averages.
+        //
+        // Guarded, because the back-out amplifies the venue's rounding of its
+        // cumulative average by `cumulative_qty / delta_qty`: a 0.99-filled
+        // order finishing its last 0.01 multiplies any wobble a hundredfold,
+        // and can produce zero or a negative price. A fill recorded at zero
+        // would enter the slippage series as -10000 bps — a spectacular price
+        // improvement that never happened, dragging the median with it.
+        let price = match prev_avg {
+            Some(prev) if prev_qty > Decimal::ZERO => {
+                let implied = (cumulative_avg * cumulative_qty - prev * prev_qty) / delta_qty;
+                if implied > Decimal::ZERO {
+                    implied
+                } else {
+                    // Implausible. The cumulative average is the honest
+                    // fallback: less precise, but never a fiction.
+                    cumulative_avg
+                }
+            }
+            _ => cumulative_avg,
+        };
+
+        self.record_fill(
+            order_id,
+            venue_trade_id,
+            delta_qty,
+            price,
+            fee,
+            mid_at_submit,
+            side,
+            submitted_at,
+            at,
+        )
+        .await?;
+        Ok(true)
+    }
+
+    /// Record one execution.
+    ///
+    /// Slippage is signed so that **positive always means it cost us**: a buy
+    /// above the mid and a sell below it both read positive, and price
+    /// improvement reads negative. Without that convention a median over
+    /// mixed sides cancels itself out and reports excellent execution on a
+    /// book that is bleeding on both.
+    ///
+    /// `mid_at_submit` is `None` for orders placed before it was recorded,
+    /// and those fills simply carry no slippage — which the dashboard shows
+    /// as unmeasured rather than as zero.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_fill(
+        &self,
+        order_id: i64,
+        venue_trade_id: Option<&str>,
+        qty: Decimal,
+        price: Decimal,
+        fee: Option<Decimal>,
+        mid_at_submit: Option<Decimal>,
+        side: &str,
+        submitted_at: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> Result<()> {
+        let slippage_bps = mid_at_submit.and_then(|mid| {
+            if mid <= Decimal::ZERO {
+                return None;
+            }
+            let raw = (price - mid) / mid * Decimal::from(10_000);
+            // A sell fills *below* the mid to our cost, so flip the sign.
+            Some(if side.eq_ignore_ascii_case("SELL") {
+                -raw
+            } else {
+                raw
+            })
+        });
+
+        // Measured from submission to *this observation*, not to the moment
+        // the venue filled. `OrderAck` carries no fill timestamp, so for a
+        // fill discovered by reconciliation this is quantised to the cycle
+        // interval — an order filled two seconds after submission and seen
+        // ten minutes later reads as ten minutes. It is an upper bound on
+        // latency and a useful one for spotting orders that rest, but it is
+        // not the venue's fill latency, and the ≤ thresholds in the promotion
+        // criteria should be read with that in mind. Plumbing Alpaca's
+        // `filled_at` through `OrderAck` is what would make it exact.
+        let time_to_fill_ms = submitted_at
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .or_else(|| {
+                // SQLite's `datetime('now')` default is zone-less UTC.
+                submitted_at.and_then(|s| {
+                    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+                        .ok()
+                        .map(|n| n.and_utc().into())
+                })
+            })
+            .map(|t| (at - t.with_timezone(&Utc)).num_milliseconds())
+            .filter(|ms| *ms >= 0);
+
+        sqlx::query(
+            "INSERT INTO fills (order_id, venue_trade_id, qty, price, fee, mid_at_submit,
+                                slippage_bps, time_to_fill_ms, filled_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(order_id)
+        .bind(venue_trade_id)
+        .bind(qty.to_string())
+        .bind(price.to_string())
+        .bind(fee.map(|f| f.to_string()))
+        .bind(mid_at_submit.map(|m| m.to_string()))
+        .bind(slippage_bps.map(|s| s.round_dp(2).to_string()))
+        .bind(time_to_fill_ms)
+        .bind(at.to_rfc3339())
+        .execute(&self.pool)
+        .await
+        .context("Failed to record fill")?;
+        Ok(())
     }
 
     /// Marked profit and loss across every open position.
@@ -1053,6 +1208,9 @@ pub struct OrderRecord {
     pub state: String,
     pub reject_reason: Option<String>,
     pub cycle: Option<i64>,
+    /// Mid price when this order was submitted, for measuring slippage once
+    /// it fills. Only knowable here — by fill time the market has moved.
+    pub mid_at_submit: Option<String>,
     pub submitted_at: Option<String>,
     pub updated_at: Option<String>,
     pub expires_at: Option<String>,
@@ -1803,5 +1961,212 @@ mod tests {
     async fn no_open_positions_is_zero_not_an_error() {
         let store = Store::new(":memory:").await.unwrap();
         assert_eq!(store.total_unrealized_pnl().await.unwrap(), Decimal::ZERO);
+    }
+
+    /// Slippage is signed so positive always means it cost us, whichever side
+    /// the order was. Averaging raw price-minus-mid across mixed sides makes
+    /// a book bleeding on both look like excellent execution.
+    #[tokio::test]
+    async fn a_buy_above_the_mid_and_a_sell_below_it_both_read_as_cost() {
+        let store = Store::new(":memory:").await.unwrap();
+        let at = Utc::now();
+        let oid = seed_order(&store, "BUY", Some("100")).await;
+
+        // Bought at 101 against a mid of 100: paid 100 bps up.
+        store
+            .record_fill(
+                oid,
+                None,
+                dec!(1),
+                dec!(101),
+                None,
+                Some(dec!(100)),
+                "BUY",
+                None,
+                at,
+            )
+            .await
+            .unwrap();
+        // Sold at 99 against a mid of 100: gave up 100 bps.
+        store
+            .record_fill(
+                oid,
+                None,
+                dec!(1),
+                dec!(99),
+                None,
+                Some(dec!(100)),
+                "SELL",
+                None,
+                at,
+            )
+            .await
+            .unwrap();
+
+        let fills = store.get_fills(10).await.unwrap();
+        let mut bps: Vec<&str> = fills
+            .iter()
+            .map(|f| f.slippage_bps.as_deref().unwrap())
+            .collect();
+        bps.sort();
+        // Exact, not a prefix. `starts_with("100")` is also true of "10000",
+        // so a 100x error in the bps scale — the unit the ≤10/≤30 criteria
+        // are stated in — would have passed unnoticed.
+        assert_eq!(
+            bps,
+            vec!["100.00", "100.00"],
+            "both sides must read exactly +100 bps"
+        );
+    }
+
+    #[tokio::test]
+    async fn price_improvement_reads_negative() {
+        let store = Store::new(":memory:").await.unwrap();
+        let oid = seed_order(&store, "BUY", Some("100")).await;
+        store
+            .record_fill(
+                oid,
+                None,
+                dec!(1),
+                dec!(99.5),
+                None,
+                Some(dec!(100)),
+                "BUY",
+                None,
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        let fills = store.get_fills(10).await.unwrap();
+        assert_eq!(fills[0].slippage_bps.as_deref(), Some("-50.00"));
+    }
+
+    /// An order placed before `mid_at_submit` existed carries no slippage.
+    /// Recording zero would claim perfect execution on every historical fill.
+    #[tokio::test]
+    async fn a_fill_without_a_mid_carries_no_slippage_rather_than_zero() {
+        let store = Store::new(":memory:").await.unwrap();
+        let oid = seed_order(&store, "BUY", None).await;
+        store
+            .record_fill(
+                oid,
+                None,
+                dec!(1),
+                dec!(101),
+                None,
+                None,
+                "BUY",
+                None,
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        let fills = store.get_fills(10).await.unwrap();
+        assert_eq!(fills[0].slippage_bps, None);
+        assert_eq!(fills[0].mid_at_submit, None);
+    }
+
+    #[tokio::test]
+    async fn a_zero_mid_does_not_divide_by_zero() {
+        let store = Store::new(":memory:").await.unwrap();
+        let oid = seed_order(&store, "BUY", Some("0")).await;
+        store
+            .record_fill(
+                oid,
+                None,
+                dec!(1),
+                dec!(101),
+                None,
+                Some(Decimal::ZERO),
+                "BUY",
+                None,
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.get_fills(10).await.unwrap()[0].slippage_bps, None);
+    }
+
+    #[tokio::test]
+    async fn time_to_fill_is_measured_from_submission() {
+        let store = Store::new(":memory:").await.unwrap();
+        let oid = seed_order(&store, "BUY", Some("100")).await;
+        let submitted = "2026-09-21T10:00:00+00:00";
+        let filled = DateTime::parse_from_rfc3339("2026-09-21T10:00:03+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        store
+            .record_fill(
+                oid,
+                None,
+                dec!(1),
+                dec!(100),
+                None,
+                Some(dec!(100)),
+                "BUY",
+                Some(submitted),
+                filled,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_fills(10).await.unwrap()[0].time_to_fill_ms,
+            Some(3000)
+        );
+    }
+
+    /// Clock skew between this host and the venue can put a fill "before" its
+    /// own submission. A negative duration is not a fast fill.
+    #[tokio::test]
+    async fn a_negative_time_to_fill_is_discarded() {
+        let store = Store::new(":memory:").await.unwrap();
+        let oid = seed_order(&store, "BUY", Some("100")).await;
+        let submitted = "2026-09-21T10:00:05+00:00";
+        let filled = DateTime::parse_from_rfc3339("2026-09-21T10:00:00+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        store
+            .record_fill(
+                oid,
+                None,
+                dec!(1),
+                dec!(100),
+                None,
+                Some(dec!(100)),
+                "BUY",
+                Some(submitted),
+                filled,
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.get_fills(10).await.unwrap()[0].time_to_fill_ms, None);
+    }
+
+    #[cfg(test)]
+    async fn seed_order(store: &Store, side: &str, mid: Option<&str>) -> i64 {
+        store
+            .insert_order(&OrderRecord {
+                id: None,
+                client_order_id: format!("c-{side}-{:?}-{}", mid, uuid::Uuid::new_v4()),
+                venue_order_id: Some("v1".to_string()),
+                venue_id: "alpaca".to_string(),
+                symbol: "BTC/USD".to_string(),
+                side: side.to_string(),
+                intent: "ENTRY".to_string(),
+                trade_id: None,
+                limit_price: Some("100".to_string()),
+                qty: "1".to_string(),
+                filled_qty: "0".to_string(),
+                avg_fill_price: None,
+                state: "PENDING".to_string(),
+                reject_reason: None,
+                cycle: Some(1),
+                mid_at_submit: mid.map(str::to_string),
+                submitted_at: None,
+                updated_at: None,
+                expires_at: None,
+            })
+            .await
+            .unwrap()
     }
 }

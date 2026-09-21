@@ -345,6 +345,14 @@ async fn risk_handler(State(state): State<DashboardState>) -> impl IntoResponse 
     let trades_today = state.store.count_trades_opened_on(today).await.unwrap_or(0);
     let losses = state.store.consecutive_losses().await.unwrap_or(0);
 
+    // The promotion criterion asks for Brier ≤0.24 over ≥30 closed
+    // positions. Below that count it is reported as `null` rather than as a
+    // number, because a Brier over four closes is noise with a decimal point
+    // and would be read as a pass.
+    let brier = crate::valuation::calibration::brier_score(state.store.pool(), 30)
+        .await
+        .unwrap_or(None);
+
     Json(serde_json::json!({
         "mode": format!("{:?}", state.mode).to_lowercase(),
         "day": today.to_string(),
@@ -353,6 +361,10 @@ async fn risk_handler(State(state): State<DashboardState>) -> impl IntoResponse 
         "high_water_mark": peak.map(|p| p.to_string()),
         "trades_today": trades_today,
         "consecutive_losses": losses,
+        // 0.25 is what always guessing 50% scores — the number to beat before
+        // believing any of this has edge.
+        "brier_score": brier.map(|(score, _)| score.round_dp(4).to_string()),
+        "brier_sample": brier.map(|(_, n)| n),
         "limits": {
             "max_daily_loss_pct": cfg.max_daily_loss_pct.to_string(),
             "max_daily_loss_usd": cfg.max_daily_loss_usd.to_string(),

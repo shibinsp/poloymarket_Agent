@@ -222,6 +222,7 @@ impl VenueExits<'_> {
             trade,
             &instrument_id,
             mark,
+            Some(quote.mid),
             qty,
             reason,
             cycle,
@@ -238,6 +239,10 @@ impl VenueExits<'_> {
         trade: &VenueOpenTrade,
         instrument_id: &InstrumentId,
         mark: Decimal,
+        // The book's midpoint, as distinct from `mark` (the bid). Slippage is
+        // measured against the mid on both sides or the two are not
+        // comparable.
+        mid: Option<Decimal>,
         qty: Decimal,
         reason: ExitReason,
         cycle: i64,
@@ -266,6 +271,14 @@ impl VenueExits<'_> {
                 state: "PENDING".to_string(),
                 reject_reason: Some(reason.as_str().to_string()),
                 cycle: Some(cycle),
+                // The *mid*, not the mark. `mark` is `taker_price(Sell)`,
+                // i.e. the bid — recording it here would compare a sell
+                // filling at the bid against the bid and call it zero
+                // slippage, when against the mid it cost half the spread.
+                // Entries record the true mid, so using the bid for exits
+                // measures the two sides against different references and
+                // understates sell-side cost systematically.
+                mid_at_submit: mid.map(|m| m.to_string()),
                 submitted_at: None,
                 updated_at: None,
                 expires_at: Some(
@@ -345,6 +358,19 @@ impl VenueExits<'_> {
                     &client_order_id,
                 )
                 .await?;
+            // Score the forecast that opened this position: it said the
+            // price would be higher at the horizon, and now we know.
+            if let Err(e) = crate::valuation::calibration::resolve_directional_prediction(
+                self.store.pool(),
+                trade.id,
+                entry,
+                exit_price,
+            )
+            .await
+            {
+                warn!(trade_id = trade.id, error = %e, "Could not score the forecast");
+            }
+
             info!(
                 trade_id = trade.id,
                 realized_pnl = %realized,
@@ -532,6 +558,7 @@ mod tests {
                 state: "PENDING".to_string(),
                 reject_reason: Some("STOP_LOSS".to_string()),
                 cycle: Some(1),
+                mid_at_submit: None,
                 submitted_at: None,
                 updated_at: None,
                 expires_at: None,

@@ -387,6 +387,10 @@ impl VenueCycle<'_> {
                 state: "PENDING".to_string(),
                 reject_reason: None,
                 cycle: Some(ctx.cycle),
+                // The market as it stood when this was decided. Only
+                // knowable now — by fill time it has moved, and slippage is
+                // the difference between the two.
+                mid_at_submit: Some(quote.mid.to_string()),
                 submitted_at: None,
                 updated_at: None,
                 expires_at: Some(
@@ -452,6 +456,40 @@ impl VenueCycle<'_> {
                     },
                 )
                 .await?;
+
+            // A marketable order can come back already filled. Terminal
+            // states are excluded from `get_unresolved_orders`, so the
+            // reconciler never sees it and would never record the execution —
+            // leaving slippage measured over only the *slow* fills, which is
+            // the biased tail of exactly the distribution being measured.
+            if let (Some(order_id), Some(avg)) = (
+                self.store.order_id(&client_order_id).await.ok().flatten(),
+                ack.avg_fill_price,
+            ) {
+                if let Err(e) = self
+                    .store
+                    .record_fill_increment(
+                        order_id,
+                        Some(&ack.venue_order_id),
+                        ack.filled_qty,
+                        avg,
+                        Decimal::ZERO,
+                        None,
+                        Some(ack.fees),
+                        Some(quote.mid),
+                        &Side::Buy.to_string(),
+                        None,
+                        ctx.now,
+                    )
+                    .await
+                {
+                    warn!(
+                        instrument = %instrument.id,
+                        error = %e,
+                        "Could not record an execution filled at submission"
+                    );
+                }
+            }
         }
 
         // Record the thesis now, whatever the order did.
@@ -521,6 +559,33 @@ impl VenueCycle<'_> {
                 venue_order_id: ack.map(|a| a.venue_order_id.clone()),
             })
             .await?;
+
+        // Write the forecast down so it can be scored when the position
+        // closes. Nothing on the venue path did this, which left the paper
+        // window's Brier criterion unevaluable — the only path that will
+        // actually be running during that window.
+        //
+        // Best-effort: losing a calibration row must never cost a trade.
+        //
+        // Only for an order the venue actually took. A rejected or timed-out
+        // submission has no position behind it, and a forecast with no trade
+        // can never be resolved — it would sit in the table forever, and
+        // under the old symbol keying it would also have intercepted the
+        // outcome meant for a real one.
+        let accepted = ack.is_some_and(|a| !matches!(a.state, OrderState::Rejected(_)));
+        if accepted {
+            if let Err(e) = crate::valuation::calibration::record_directional_prediction(
+                self.store.pool(),
+                trade_id,
+                view.confidence,
+                view.p_up,
+                fill_price,
+            )
+            .await
+            {
+                warn!(instrument = %instrument.id, error = %e, "Could not record the forecast for calibration");
+            }
+        }
 
         self.store
             .link_order_to_trade(&client_order_id, trade_id)
@@ -886,6 +951,7 @@ mod tests {
                 state: "UNKNOWN".to_string(),
                 reject_reason: None,
                 cycle: Some(0),
+                mid_at_submit: None,
                 submitted_at: None,
                 updated_at: None,
                 expires_at: None,
@@ -1076,6 +1142,7 @@ mod tests {
                     state: state.to_string(),
                     reject_reason: None,
                     cycle: Some(0),
+                    mid_at_submit: None,
                     submitted_at: None,
                     updated_at: None,
                     expires_at: None,

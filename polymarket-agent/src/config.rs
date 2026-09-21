@@ -856,6 +856,75 @@ mod tests {
         assert_eq!(LlmProvider::OpenAiCompatible.semconv_name(), "openai");
     }
 
+    /// The paper-window template has to deserialize, not merely be valid
+    /// TOML. It is the file an operator copies to start the ≥14-day window,
+    /// and a typo in it surfaces as the agent refusing to boot at the exact
+    /// moment they are trying to begin.
+    #[test]
+    fn the_paper_template_parses_and_enables_a_venue() {
+        let contents =
+            std::fs::read_to_string("config/paper.toml").expect("config/paper.toml should exist");
+        let config: AppConfig = toml::from_str(&contents).expect("should parse");
+
+        assert_eq!(config.agent.mode, AgentMode::Paper);
+        // The whole point of the template: without this the agent falls back
+        // to the legacy Polymarket-only loop and exercises none of the venue
+        // path — which is how the paper window failed to start at all.
+        assert_eq!(config.venues.len(), 1);
+        assert!(config.venues[0].enabled);
+        assert!(
+            config.venues[0].symbols.iter().any(|s| s.contains('/')),
+            "needs a 24/7 crypto symbol to cover weekends"
+        );
+        assert!(config.venue_symbols().len() >= 2);
+
+        // Absolute, or the ledger depends on the working directory.
+        assert!(
+            Path::new(&config.database.path).is_absolute(),
+            "the template must not ship a relative database path"
+        );
+
+        // `max_markets` is not Polymarket-only: the venue cycle passes it as
+        // `ScanFilter.max_results` and the Alpaca adapter truncates to it. A
+        // template that sets it below the symbol universe discovers nothing
+        // and trades nothing — silently, for as long as it is left running.
+        assert!(
+            config.scanning.max_markets >= config.venue_symbols().len(),
+            "max_markets ({}) must cover the {} configured symbols, or the \
+             venue scan truncates them away",
+            config.scanning.max_markets,
+            config.venue_symbols().len()
+        );
+
+        // Likewise the budget: the venue path is skipped entirely once the
+        // day's ledger is spent, so a budget that runs out mid-morning
+        // produces the same empty window as a wrong max_markets.
+        //
+        // One valuation per symbol per cycle, at roughly $0.009 a call.
+        let cycles_per_day =
+            rust_decimal_macros::dec!(86400) / Decimal::from(config.agent.cycle_interval_seconds);
+        let daily_cost = cycles_per_day
+            * Decimal::from(config.venue_symbols().len())
+            * rust_decimal_macros::dec!(0.009);
+        assert!(
+            config.agent.daily_api_budget >= daily_cost,
+            "daily_api_budget ({}) is below the ~{daily_cost} a full day of \
+             valuations costs for this universe and cadence",
+            config.agent.daily_api_budget
+        );
+
+        // The live caps stay at their live values even in the paper file, so
+        // going live changes the mode and not the risk numbers.
+        assert_eq!(
+            config.risk.max_live_notional_per_position_usd,
+            rust_decimal_macros::dec!(10.0)
+        );
+        assert_eq!(
+            config.risk.max_live_total_notional_usd,
+            rust_decimal_macros::dec!(60.0)
+        );
+    }
+
     #[test]
     fn test_parse_default_config() {
         let contents = std::fs::read_to_string("config/default.toml")
