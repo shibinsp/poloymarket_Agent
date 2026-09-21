@@ -83,6 +83,15 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// The clock only changes at session boundaries; one fetch per cycle is
 /// plenty and keeps `/v2/clock` off the per-call path.
 const DEFAULT_CLOCK_TTL: Duration = Duration::from_secs(60);
+/// How long an account snapshot is reused.
+///
+/// Cash and equity come from one payload, and several callers read one or the
+/// other within a single cycle — the bankroll, the survival ladder, `shutdown`,
+/// the reconciler. Without this the split turned one read per cycle into five,
+/// and worse, let `available` and equity come from *different* snapshots: a
+/// fill between the two reads makes free cash exceed the cash inside the
+/// equity figure, which one response made structurally impossible.
+const DEFAULT_ACCOUNT_TTL: Duration = Duration::from_secs(2);
 /// The asset universe changes on the order of days.
 const DEFAULT_ASSETS_TTL: Duration = Duration::from_secs(3600);
 
@@ -105,6 +114,7 @@ pub struct AlpacaConfig {
     pub request_timeout: Duration,
     pub clock_ttl: Duration,
     pub assets_ttl: Duration,
+    pub account_ttl: Duration,
 }
 
 /// Hand-written so credentials can never reach a log line or panic message.
@@ -139,6 +149,7 @@ impl AlpacaConfig {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             clock_ttl: DEFAULT_CLOCK_TTL,
             assets_ttl: DEFAULT_ASSETS_TTL,
+            account_ttl: DEFAULT_ACCOUNT_TTL,
         }
     }
 
@@ -225,6 +236,8 @@ pub struct AlpacaVenue {
     assets_ttl: Duration,
     clock: RwLock<Option<Cached<AlpacaClock>>>,
     assets: RwLock<HashMap<&'static str, Cached<AssetListing>>>,
+    account_ttl: Duration,
+    account: RwLock<Option<Cached<AlpacaAccount>>>,
 }
 
 impl std::fmt::Debug for AlpacaVenue {
@@ -279,6 +292,8 @@ impl AlpacaVenue {
             clock_ttl: config.clock_ttl,
             assets_ttl: config.assets_ttl,
             clock: RwLock::new(None),
+            account_ttl: config.account_ttl,
+            account: RwLock::new(None),
             assets: RwLock::new(HashMap::new()),
         })
     }
@@ -291,11 +306,29 @@ impl AlpacaVenue {
     // === Account ==========================================================
 
     /// Raw `/v2/account`.
+    /// The account, reused for a moment.
+    ///
+    /// Cash and equity are two projections of one payload, so a shared
+    /// snapshot keeps them consistent as well as cheap — see
+    /// `DEFAULT_ACCOUNT_TTL`.
     pub async fn account(&self) -> Result<AlpacaAccount> {
-        self.rest
+        if let Some(cached) = self
+            .account
+            .read()
+            .await
+            .as_ref()
+            .and_then(|c| c.get(self.account_ttl))
+        {
+            return Ok(cached);
+        }
+
+        let fresh: AlpacaAccount = self
+            .rest
             .get(Api::Trading, "/v2/account", &[])
             .await
-            .context("Failed to fetch the Alpaca account")
+            .context("Failed to fetch the Alpaca account")?;
+        *self.account.write().await = Some(Cached::new(fresh.clone()));
+        Ok(fresh)
     }
 
     /// Pre-flight guard: fail loudly if the account cannot place orders.
@@ -1149,7 +1182,8 @@ impl Venue for AlpacaVenue {
             .collect())
     }
 
-    /// Cash available to deploy, and total account value.
+    /// Cash available to deploy. Account value is `equity`, which reads the
+    /// same cached snapshot.
     ///
     /// `available` deliberately uses `non_marginable_buying_power` (cash that
     /// can buy crypto and fractional shares) rather than `buying_power`, which
@@ -1178,7 +1212,8 @@ impl Venue for AlpacaVenue {
     }
 
     /// Alpaca reports account equity directly, positions included — no
-    /// per-holding quote, so this is one ordinary account call.
+    /// per-holding quote, and off the same cached snapshot as `balance`.
+    #[instrument(skip(self), fields(venue = %self.id))]
     async fn equity(&self) -> Result<Option<Decimal>> {
         Ok(Some(self.account().await?.equity))
     }

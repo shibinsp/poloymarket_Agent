@@ -56,6 +56,10 @@ pub struct StubVenue {
     /// gives quantities without prices, which is the shape the crypto
     /// adapters have when a book call fails.
     no_equity: bool,
+    /// `equity` errors while `balance` answers — an outage or a parse bug,
+    /// which sends an operator somewhere different from a venue that
+    /// structurally cannot value its book.
+    failing_equity: bool,
 }
 
 impl StubVenue {
@@ -105,6 +109,7 @@ impl StubVenue {
         Self {
             no_positions: false,
             no_equity: false,
+            failing_equity: false,
             id: venue_id,
             caps: VenueCapabilities {
                 asset_classes: classes,
@@ -130,6 +135,12 @@ impl StubVenue {
     /// A venue whose position listing fails but whose balance does not.
     pub fn without_positions(mut self) -> Self {
         self.no_positions = true;
+        self
+    }
+
+    /// Reports cash, but the equity call fails outright.
+    pub fn failing_equity(mut self) -> Self {
+        self.failing_equity = true;
         self
     }
 
@@ -259,10 +270,16 @@ impl Venue for StubVenue {
         if self.no_balance {
             anyhow::bail!("{}: credentials rejected", self.id);
         }
+        if self.failing_equity {
+            anyhow::bail!("{}: account endpoint is down", self.id);
+        }
         if self.no_equity {
             return Ok(None);
         }
-        Ok(Some(dec!(100)))
+        // Deliberately *not* the cash figure: a test that cannot tell equity
+        // from `available` would pass a regression that printed one and
+        // called it the other, which is the confusion the trait doc warns of.
+        Ok(Some(dec!(275.50)))
     }
     async fn settlement(&self, _id: &InstrumentId) -> Result<Option<Settlement>> {
         Ok(None)

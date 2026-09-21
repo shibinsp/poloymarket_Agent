@@ -82,10 +82,11 @@ pub trait Venue: Send + Sync {
     /// Spendable cash. **Cheap**: no position pricing, no per-holding quotes.
     ///
     /// Split from equity deliberately. Marking a book costs a quote per
-    /// holding at a spot venue, and three of this method's four callers want
-    /// only the cash figure — the survival ladder, the per-cycle bankroll, and
-    /// `shutdown`, which was made to block on a network round trip per holding
-    /// per venue while trying to exit.
+    /// holding at a spot venue, and every caller of this method wants only the
+    /// cash figure: `venue_cycle::venue_bankroll`, `lifecycle::current_balance`
+    /// — which the survival ladder and `shutdown` both go through — and
+    /// `preflight::check`. Folding the two together made `shutdown` block on a
+    /// network round trip per holding per venue while trying to exit.
     async fn balance(&self) -> Result<Balance>;
 
     /// Account value including the marked value of open positions.

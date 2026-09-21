@@ -1038,21 +1038,10 @@ impl Venue for CoinbaseVenue {
 
     #[instrument(skip(self), fields(venue = %self.id))]
     async fn balance(&self) -> Result<Balance> {
-        // Cash only, and therefore no quotes: the survival ladder and the
-        // per-cycle bankroll ask for this several times a cycle, and
-        // `shutdown` asks while trying to exit.
-        let accounts = self.accounts().await?;
-
-        let mut available = Decimal::ZERO;
-        for account in accounts.iter().filter(|a| is_usable(a)) {
-            let Some(currency) = account.currency.as_deref() else {
-                continue;
-            };
-            if is_cash(currency) {
-                available += account.available()?;
-            }
-        }
-
+        // Cash only, and therefore no quotes: the bankroll and the survival
+        // ladder ask several times a cycle, and `shutdown` asks while trying
+        // to exit.
+        let (available, _, _) = self.cash_and_holdings().await?;
         Ok(Balance {
             ccy: self.cash_ccy.clone(),
             available,
@@ -1061,8 +1050,29 @@ impl Venue for CoinbaseVenue {
 
     #[instrument(skip(self), fields(venue = %self.id))]
     async fn equity(&self) -> Result<Option<Decimal>> {
+        let (_, cash_total, holdings) = self.cash_and_holdings().await?;
+        Ok(mark_equity(self, &self.id, &self.cash_ccy, cash_total, &holdings).await)
+    }
+
+    #[instrument(skip(self), fields(venue = %self.id))]
+    async fn settlement(&self, _id: &InstrumentId) -> Result<Option<Settlement>> {
+        // Spot crypto never settles; positions are closed by trading out.
+        Ok(None)
+    }
+}
+
+impl CoinbaseVenue {
+    /// Cash and holdings, split once.
+    ///
+    /// `balance` and `equity` both have to decide which rows are usable and
+    /// which are cash, and when those two loops were written separately a
+    /// later change to either rule had to be made twice — with `available`
+    /// and the cash inside equity silently describing different account sets
+    /// if only one was updated.
+    async fn cash_and_holdings(&self) -> Result<(Decimal, Decimal, Vec<Holding>)> {
         let accounts = self.accounts().await?;
 
+        let mut available = Decimal::ZERO;
         let mut cash_total = Decimal::ZERO;
         let mut holdings: Vec<Holding> = Vec::new();
 
@@ -1071,7 +1081,8 @@ impl Venue for CoinbaseVenue {
                 continue;
             };
             if is_cash(currency) {
-                // Held cash is committed to a resting order but still equity.
+                // Spendable now funds orders; held cash is still equity.
+                available += account.available()?;
                 cash_total += account.total()?;
                 continue;
             }
@@ -1090,17 +1101,9 @@ impl Venue for CoinbaseVenue {
             });
         }
 
-        Ok(mark_equity(self, &self.id, &self.cash_ccy, cash_total, &holdings).await)
+        Ok((available, cash_total, holdings))
     }
 
-    #[instrument(skip(self), fields(venue = %self.id))]
-    async fn settlement(&self, _id: &InstrumentId) -> Result<Option<Settlement>> {
-        // Spot crypto never settles; positions are closed by trading out.
-        Ok(None)
-    }
-}
-
-impl CoinbaseVenue {
     /// Every account row, paged, reused for a moment.
     ///
     /// Coinbase creates one row per supported currency and pages by cursor, so

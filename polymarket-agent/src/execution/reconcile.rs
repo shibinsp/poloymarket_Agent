@@ -234,10 +234,10 @@ impl StateReconciler<'_> {
                     missing_on_venue: Vec::new(),
                     qty_mismatches: Vec::new(),
                     unknown_open_orders: Vec::new(),
-                    // Still asked for: `balance()` is an independent call, and
-                    // returning early without it threw away an equity figure
-                    // the venue would have given — which the caller reads as
-                    // "no venue would report", and halts on.
+                    // Still asked for: `equity()` is an independent call, and
+                    // returning early without it threw away a figure the venue
+                    // would have given — which the caller reads as "no venue
+                    // would report", and halts on.
                     equity: read_equity(venue).await,
                     detail: format!("positions unavailable: {e}"),
                 };
@@ -491,7 +491,10 @@ mod tests {
         );
         assert_eq!(
             reports[0].equity,
-            Some(dec!(100)),
+            // The stub's equity, which differs from its cash on purpose: 100
+            // here would mean the cash figure had been read and labelled
+            // equity.
+            Some(dec!(275.50)),
             "but equity is a separate call, and it answered"
         );
     }

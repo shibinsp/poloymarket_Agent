@@ -12,7 +12,6 @@
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
-use tracing::warn;
 
 use crate::venue::types::ScanFilter;
 use crate::venue::{venue_has_work_at, Venue};
@@ -103,12 +102,12 @@ pub async fn check(
     // Asked for separately, because it is a separate call now: at a spot venue
     // it costs a quote per holding, and the dry run is the one place that
     // cost is worth paying to find out whether the breakers can run at all.
-    let equity = venue.equity().await.unwrap_or_else(|e| {
-        warn!(venue = %venue_id, error = %format!("{e:#}"), "Equity check failed");
-        None
-    });
+    let equity = venue.equity().await;
 
-    let equity_note = equity.map(|t| format!(", {t} equity")).unwrap_or_default();
+    let equity_note = match &equity {
+        Ok(Some(value)) => format!(", {value} equity"),
+        _ => String::new(),
+    };
     checks.push((
         "auth + balance",
         Check::Ok(format!(
@@ -117,15 +116,35 @@ pub async fn check(
         )),
     ));
 
-    if equity.is_none() {
-        checks.push((
+    match equity {
+        Ok(Some(_)) => {}
+        // Failed, not warned, and in both cases.
+        //
+        // The consequence is the same either way and it is not advisory: no
+        // equity means `combined_equity` is `None` for the *whole* registry,
+        // the grace cycle is spent, and cycle two raises an `UntilResume`
+        // halt that needs a human. A dry run that exits 0 on that sends an
+        // operator to fund an account the agent will refuse to trade.
+        //
+        // The two are still told apart, because they send you to different
+        // places: a structural gap is a venue or configuration problem, an
+        // error is an outage or a parse bug — and folding the error into the
+        // same sentence hid it entirely, since the log line this module
+        // writes is one an operator reading the console never sees.
+        Ok(None) => checks.push((
             "equity",
-            // Not fatal here, but the agent halts rather than trade with no
-            // loss limits — which is not something to discover after funding.
-            Check::Warn(
-                "venue reports no equity figure — the circuit breakers cannot run".to_string(),
+            Check::Failed(
+                "venue reports no equity figure — the circuit breakers cannot run, so the \
+                 agent will halt rather than trade"
+                    .to_string(),
             ),
-        ));
+        )),
+        Err(e) => checks.push((
+            "equity",
+            Check::Failed(format!(
+                "could not read account equity, so the circuit breakers cannot run: {e:#}"
+            )),
+        )),
     }
     if balance.available <= Decimal::ZERO {
         checks.push((
@@ -329,42 +348,69 @@ mod tests {
         assert_eq!(report.checks[0].0, "auth + balance");
     }
 
-    /// A venue that authenticates fine but cannot value its own book. Not
-    /// fatal here, but the agent halts rather than trade with no loss limits,
-    /// and that is not something to discover after funding the account.
+    fn named<'a>(report: &'a Preflight, name: &str) -> &'a Check {
+        report
+            .checks
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, c)| c)
+            .unwrap_or_else(|| panic!("no {name:?} check in {report:#?}"))
+    }
+
+    /// A venue that authenticates fine but cannot value its own book. The
+    /// consequence is not advisory: no equity means the whole registry's sum
+    /// is unknowable, and cycle two raises an `UntilResume` halt. A dry run
+    /// that exits 0 on that sends an operator to fund an account the agent
+    /// will refuse to trade.
     #[tokio::test]
-    async fn a_venue_with_no_equity_figure_is_warned_about_not_passed_over() {
+    async fn a_venue_with_no_equity_figure_fails_the_dry_run() {
         let venue = StubVenue::new("coinbase", TradingSession::Always, &["BTC/USD"], false)
             .quoting(dec!(100))
             .without_equity();
         let report = check(&venue, &syms(&["BTC/USD"]), 50, at()).await;
 
-        let (_, equity) = report
-            .checks
-            .iter()
-            .find(|(name, _)| *name == "equity")
-            .expect("the equity gap must be reported: {report:#?}");
+        assert!(!report.passed(), "it must not exit 0: {report:#?}");
+        let equity = named(&report, "equity");
         assert!(
-            matches!(equity, Check::Warn(m) if m.contains("circuit breakers")),
+            matches!(equity, Check::Failed(m) if m.contains("circuit breakers")),
             "and must say what it costs: {equity:?}"
+        );
+    }
+
+    /// An error is a different problem from a structural gap — an outage or a
+    /// parse bug rather than a venue that cannot value its book — and folding
+    /// it into the same sentence hid it, because the log line this module
+    /// writes is one an operator reading the console never sees.
+    #[tokio::test]
+    async fn an_equity_call_that_errors_reports_the_error_itself() {
+        let venue = StubVenue::new("coinbase", TradingSession::Always, &["BTC/USD"], false)
+            .quoting(dec!(100))
+            .failing_equity();
+        let report = check(&venue, &syms(&["BTC/USD"]), 50, at()).await;
+
+        assert!(!report.passed());
+        let equity = named(&report, "equity");
+        assert!(
+            matches!(equity, Check::Failed(m) if m.contains("account endpoint is down")),
+            "the operator needs the cause, not a generic gap: {equity:?}"
         );
     }
 
     /// The happy path reports the figure rather than staying silent about it.
     #[tokio::test]
-    async fn a_venue_that_reports_equity_shows_it_beside_the_cash() {
+    async fn a_venue_that_reports_equity_shows_the_figure_beside_the_cash() {
         let venue = StubVenue::new("alpaca", TradingSession::Always, &["BTC/USD"], false)
             .quoting(dec!(100));
         let report = check(&venue, &syms(&["BTC/USD"]), 50, at()).await;
 
-        let (_, auth) = report
-            .checks
-            .iter()
-            .find(|(name, _)| *name == "auth + balance")
-            .expect("balance is always checked");
+        let auth = named(&report, "auth + balance");
         assert!(
-            matches!(auth, Check::Ok(m) if m.contains("equity")),
-            "the operator should see the number the breakers will use: {auth:?}"
+            // The stub's equity (275.50) differs from its cash (100) on
+            // purpose: asserting only that the word "equity" appears would
+            // pass a regression that printed the cash figure and labelled it
+            // equity, which is exactly the confusion the trait doc warns of.
+            matches!(auth, Check::Ok(m) if m.contains("275.50 equity") && m.contains("100")),
+            "both numbers, and the right one against each label: {auth:?}"
         );
     }
 

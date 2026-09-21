@@ -844,16 +844,17 @@ async fn a_recovered_equity_figure_clears_the_streak() {
     );
 }
 
-/// The point of splitting cash from equity: three of `balance()`'s four
-/// callers want only the cash figure, and at a spot venue marking a book
-/// costs a quote per holding. `shutdown` is one of those callers, so the old
-/// shape made the agent block on a network round trip per holding per venue
-/// while trying to exit.
+/// The split made cash and equity two calls where there had been one, and
+/// several callers ask for cash each cycle — the bankroll, the survival
+/// ladder, `shutdown`. An account snapshot shared across the cycle is what
+/// keeps that from multiplying.
 ///
-/// Alpaca prices nothing, so this measures the other half — that exactly one
-/// equity call is made per cycle rather than one per balance check.
+/// The exact number is the contract here, not a bound: an earlier version of
+/// this test asserted `<= 8`, which passed identically on the code before the
+/// change and therefore guarded nothing. Five is what both the pre-split code
+/// and the uncached split produce; one is what this is for.
 #[tokio::test]
-async fn a_cycle_asks_for_equity_once_not_once_per_balance_check() {
+async fn a_cycle_reads_the_account_once() {
     let alpaca = alpaca_server().await;
     let mut h = harness_with(alpaca, |_| {}).await;
     h.agent.run_cycle().await.unwrap();
@@ -864,11 +865,9 @@ async fn a_cycle_asks_for_equity_once_not_once_per_balance_check() {
         .filter(|r| r.url.path() == "/v2/account")
         .count();
 
-    // Five cash checks plus one equity check. The number itself is not the
-    // contract; what matters is that it is bounded and does not grow with the
-    // number of holdings, which is what the crypto venues would have done.
-    assert!(
-        account_calls <= 8,
-        "account calls per cycle should stay bounded, got {account_calls}"
+    assert_eq!(
+        account_calls, 1,
+        "cash and equity are projections of one payload and must share a snapshot — \
+         five here means the cache stopped working, and they can also disagree"
     );
 }

@@ -364,7 +364,7 @@ impl Venue for PolymarketVenue {
     }
 
     /// `positions` is unimplemented here, so there is no way to value what is
-    /// held and `balance().total` is always `None`. Saying so lets the
+    /// held and `equity()` is always `None`. Saying so lets the
     /// registry refuse this venue instead of halting every cycle over an
     /// equity figure it was never going to get.
     fn reports_equity(&self) -> bool {

@@ -17,7 +17,8 @@
 //!   average is that divided by the filled quantity.
 
 use std::collections::HashSet;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
@@ -55,6 +56,16 @@ const ORDER_PATH: &str = "/api/v3/order";
 const OPEN_ORDERS_PATH: &str = "/api/v3/openOrders";
 const ACCOUNT_PATH: &str = "/api/v3/account";
 const MY_TRADES_PATH: &str = "/api/v3/myTrades";
+
+/// How long an account snapshot is reused.
+///
+/// `balance`, `equity` and `positions` are three projections of one payload,
+/// and a cycle reads them within moments of each other. Without this each one
+/// mints a fresh signed request at weight 20 — and, worse, lets cash and
+/// equity come from *different* snapshots: a fill landing between the two
+/// makes free cash exceed the cash inside the equity figure, which a single
+/// response made structurally impossible.
+const ACCOUNT_CACHE_TTL: Duration = Duration::from_secs(2);
 
 /// A Binance order reference: the symbol and the numeric id, together.
 ///
@@ -111,6 +122,7 @@ pub struct BinanceUsConfig {
     secret_key: String,
     pub symbols: Vec<String>,
     pub request_timeout: Duration,
+    pub account_cache_ttl: Duration,
 }
 
 /// Hand-written so the secret can never reach a log line or panic message.
@@ -135,6 +147,7 @@ impl BinanceUsConfig {
             secret_key: secret_key.into(),
             symbols: Vec::new(),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            account_cache_ttl: ACCOUNT_CACHE_TTL,
         }
     }
 
@@ -152,6 +165,12 @@ impl BinanceUsConfig {
         self.symbols = symbols;
         self
     }
+
+    /// Reuse window for the account snapshot. Zero disables reuse.
+    pub fn with_account_cache_ttl(mut self, ttl: Duration) -> Self {
+        self.account_cache_ttl = ttl;
+        self
+    }
 }
 
 pub struct BinanceUsVenue {
@@ -161,6 +180,8 @@ pub struct BinanceUsVenue {
     symbols: Vec<String>,
     quote_ccy: String,
     rest: BinanceRest,
+    account_cache_ttl: Duration,
+    account_cache: tokio::sync::Mutex<Option<(Instant, Arc<AccountInfo>)>>,
 }
 
 impl std::fmt::Debug for BinanceUsVenue {
@@ -209,6 +230,8 @@ impl BinanceUsVenue {
             symbols: config.symbols,
             quote_ccy: quote_ccy.unwrap_or_else(|| "USD".to_string()),
             rest,
+            account_cache_ttl: config.account_cache_ttl,
+            account_cache: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -318,11 +341,70 @@ impl BinanceUsVenue {
         })
     }
 
-    async fn account(&self) -> Result<AccountInfo> {
-        self.rest
+    /// Cash and holdings, split once, from one snapshot.
+    ///
+    /// `balance` and `equity` both have to find the cash row and decide what
+    /// counts as a holding; writing those twice let a later change to either
+    /// rule land in only one of them, with `available` and the cash inside
+    /// equity describing different account sets.
+    async fn cash_and_holdings(&self) -> Result<(Decimal, Decimal, Vec<Holding>)> {
+        let account = self.account().await?;
+        let ccy = self.cash_ccy().to_string();
+
+        let cash = account
+            .balances
+            .iter()
+            .find(|b| b.asset.eq_ignore_ascii_case(&ccy));
+        // `free` only funds an order; what is locked is committed to a resting
+        // one — but it is still equity.
+        let available = cash
+            .map(|b| b.free_amount())
+            .transpose()?
+            .unwrap_or(Decimal::ZERO);
+        let cash_total = cash
+            .map(|b| b.total_amount())
+            .transpose()?
+            .unwrap_or(Decimal::ZERO);
+
+        let mut holdings: Vec<Holding> = Vec::new();
+        for balance in &account.balances {
+            let asset = balance.asset.to_uppercase();
+            if asset == ccy {
+                continue;
+            }
+            let qty = balance.total_amount()?;
+            if qty <= Decimal::ZERO {
+                continue;
+            }
+            holdings.push(Holding {
+                asset: asset.clone(),
+                qty,
+                // Cash in another currency included: leaving it out
+                // understates the account rather than reporting that it could
+                // not be valued.
+                symbol: self.symbol_for_base(&asset),
+            });
+        }
+
+        Ok((available, cash_total, holdings))
+    }
+
+    async fn account(&self) -> Result<Arc<AccountInfo>> {
+        let mut cache = self.account_cache.lock().await;
+        if let Some((fetched, account)) = cache.as_ref() {
+            if fetched.elapsed() < self.account_cache_ttl {
+                return Ok(account.clone());
+            }
+        }
+
+        let fresh: AccountInfo = self
+            .rest
             .signed(Method::GET, ACCOUNT_PATH, &[], Self::now_ms()?)
             .await
-            .context("Failed to fetch the Binance.US account")
+            .context("Failed to fetch the Binance.US account")?;
+        let fresh = Arc::new(fresh);
+        *cache = Some((Instant::now(), fresh.clone()));
+        Ok(fresh)
     }
 
     async fn fetch_order(&self, key: &OrderKey, params: Vec<(&str, String)>) -> Result<OrderAck> {
@@ -1135,59 +1217,20 @@ impl Venue for BinanceUsVenue {
 
     #[instrument(skip(self), fields(venue = %self.id))]
     async fn balance(&self) -> Result<Balance> {
-        // Cash only, and therefore no quotes: the survival ladder and the
-        // per-cycle bankroll ask for this several times a cycle, and
-        // `shutdown` asks while trying to exit.
-        let account = self.account().await?;
-        let ccy = self.cash_ccy().to_string();
-
-        let available = account
-            .balances
-            .iter()
-            .find(|b| b.asset.eq_ignore_ascii_case(&ccy))
-            // `free` only: what is locked is committed to a resting order and
-            // cannot fund a new one.
-            .map(|b| b.free_amount())
-            .transpose()?
-            .unwrap_or(Decimal::ZERO);
-
-        Ok(Balance { ccy, available })
+        // Cash only, and therefore no quotes: the bankroll and the survival
+        // ladder ask several times a cycle, and `shutdown` asks while trying
+        // to exit.
+        let (available, _, _) = self.cash_and_holdings().await?;
+        Ok(Balance {
+            ccy: self.cash_ccy().to_string(),
+            available,
+        })
     }
 
     #[instrument(skip(self), fields(venue = %self.id))]
     async fn equity(&self) -> Result<Option<Decimal>> {
-        let account = self.account().await?;
+        let (_, cash_total, holdings) = self.cash_and_holdings().await?;
         let ccy = self.cash_ccy().to_string();
-
-        let cash_total = account
-            .balances
-            .iter()
-            .find(|b| b.asset.eq_ignore_ascii_case(&ccy))
-            // Locked cash is committed to a resting order but still equity.
-            .map(|b| b.total_amount())
-            .transpose()?
-            .unwrap_or(Decimal::ZERO);
-
-        let mut holdings: Vec<Holding> = Vec::new();
-        for balance in &account.balances {
-            let asset = balance.asset.to_uppercase();
-            if asset == ccy {
-                continue;
-            }
-            let qty = balance.total_amount()?;
-            if qty <= Decimal::ZERO {
-                continue;
-            }
-            holdings.push(Holding {
-                asset: asset.clone(),
-                qty,
-                // Cash in another currency included: leaving it out
-                // understates the account rather than reporting that it could
-                // not be valued.
-                symbol: self.symbol_for_base(&asset),
-            });
-        }
-
         Ok(mark_equity(self, &self.id, &ccy, cash_total, &holdings).await)
     }
 
@@ -2328,6 +2371,53 @@ mod tests {
             None,
             "reporting 100 here would book the whole position as an instant loss"
         );
+    }
+
+    /// Cash and equity are projections of one payload, so they must come from
+    /// one snapshot. Two fetches let a fill land between them — free cash from
+    /// before it, the equity figure from after — so `available` can exceed the
+    /// cash inside equity, which a single response made impossible.
+    #[tokio::test]
+    async fn balance_and_equity_share_one_account_snapshot() {
+        let server = MockServer::start().await;
+        Mock::given(http_method("GET"))
+            .and(path(ACCOUNT_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "canTrade": true,
+                "balances": [{"asset": "USD", "free": "250.00", "locked": "0"}]
+            })))
+            // Asserted on drop.
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["BTC/USD"]);
+        assert_eq!(venue.balance().await.unwrap().available, dec!(250.00));
+        assert_eq!(venue.equity().await.unwrap(), Some(dec!(250.00)));
+    }
+
+    #[tokio::test]
+    async fn the_account_snapshot_is_refetched_once_it_expires() {
+        let server = MockServer::start().await;
+        Mock::given(http_method("GET"))
+            .and(path(ACCOUNT_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "canTrade": true,
+                "balances": [{"asset": "USD", "free": "250.00"}]
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let venue = BinanceUsVenue::new(
+            BinanceUsConfig::new("api-key", "secret-key")
+                .with_base_url(server.uri())
+                .with_symbols(vec!["BTC/USD".to_string()])
+                .with_account_cache_ttl(Duration::ZERO),
+        )
+        .unwrap();
+        venue.balance().await.unwrap();
+        venue.equity().await.unwrap();
     }
 
     /// The whole point of the split: `balance()` must price nothing.
