@@ -120,6 +120,33 @@ impl VenueRegistry {
             .map(|v| v.as_ref())
     }
 
+    /// Pull every resting order off every venue.
+    ///
+    /// Used on three paths that share one requirement: after this returns,
+    /// nothing the agent placed may still be working at a venue nobody is
+    /// watching. Halting, dying, and being stopped all qualify — an order
+    /// left resting through a `systemctl stop` can fill during a deploy, and
+    /// the position it opens belongs to nobody until the process comes back.
+    ///
+    /// Best-effort by necessity: a venue that will not answer cannot be made
+    /// to cancel. Failures are logged rather than propagated, and every venue
+    /// is asked even after one fails — otherwise a single unreachable venue
+    /// would leave every other venue's book untouched, which is the opposite
+    /// of what this is for.
+    pub async fn cancel_all_resting(&self, why: &str) {
+        for venue in self.all() {
+            match venue.cancel_all().await {
+                Ok(()) => tracing::info!(venue = %venue.id(), why, "Cancelled resting orders"),
+                Err(e) => tracing::warn!(
+                    venue = %venue.id(),
+                    why,
+                    error = %e,
+                    "Could not cancel resting orders — they may still fill"
+                ),
+            }
+        }
+    }
+
     /// Venues currently accepting orders — what the scanner should look at.
     pub fn open_at(&self, at: DateTime<Utc>) -> Vec<&dyn Venue> {
         self.all().filter(|v| v.is_open_at(at)).collect()
@@ -333,6 +360,50 @@ mod tests {
         // Crypto ignores the venue's session entirely.
         assert!(instrument_tradeable(&crypto, true));
         assert!(instrument_tradeable(&crypto, false));
+    }
+
+    /// Gate item 1: no orphaned live orders on stop or crash. The shutdown
+    /// path, the death path and the halt path all come through here.
+    #[tokio::test]
+    async fn every_venue_is_asked_to_clear_its_book() {
+        use std::sync::atomic::Ordering;
+
+        let a = StubVenue::new("a", TradingSession::Always, &["BTC/USD"], false);
+        let b = StubVenue::new("b", TradingSession::Always, &["ETH/USD"], false);
+        let (ca, cb) = (a.cancel_all_counter(), b.cancel_all_counter());
+        let reg = VenueRegistry::new(vec![Box::new(a), Box::new(b)]);
+
+        reg.cancel_all_resting("shutdown").await;
+
+        assert_eq!(ca.load(Ordering::SeqCst), 1, "venue a was not asked");
+        assert_eq!(cb.load(Ordering::SeqCst), 1, "venue b was not asked");
+    }
+
+    /// The ordering that matters: a venue that cannot be reached must not
+    /// stop the others being cleared. Otherwise one unreachable venue leaves
+    /// every other venue's book working through a deploy.
+    #[tokio::test]
+    async fn a_venue_that_cannot_be_reached_does_not_strand_the_others() {
+        use std::sync::atomic::Ordering;
+
+        let broken = StubVenue::new("broken", TradingSession::Always, &["X"], true);
+        let working = StubVenue::new("working", TradingSession::Always, &["BTC/USD"], false);
+        let (broken_calls, working_calls) =
+            (broken.cancel_all_counter(), working.cancel_all_counter());
+        let reg = VenueRegistry::new(vec![Box::new(broken), Box::new(working)]);
+
+        reg.cancel_all_resting("shutdown").await;
+
+        assert_eq!(
+            broken_calls.load(Ordering::SeqCst),
+            1,
+            "the unreachable venue is still asked"
+        );
+        assert_eq!(
+            working_calls.load(Ordering::SeqCst),
+            1,
+            "and the reachable one is still cleared despite the failure"
+        );
     }
 
     #[tokio::test]

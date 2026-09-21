@@ -589,6 +589,32 @@ impl DatabaseConfig {
         }
     }
 
+    /// Warn if the database will land somewhere that depends on where the
+    /// process happened to be started.
+    ///
+    /// A relative `path` resolves against the working directory, which is the
+    /// repo when run by hand and `WorkingDirectory=` — or `/` — under
+    /// systemd. The two are different files, and the symptom is not an error:
+    /// the agent starts cleanly against an empty database and reports no open
+    /// positions, while the real ledger sits untouched somewhere else. That
+    /// is indistinguishable from "nothing has happened yet" right up until it
+    /// places a duplicate of every position it already holds.
+    pub fn warn_if_relative(&self) {
+        if self.path == ":memory:" || Path::new(&self.path).is_absolute() {
+            return;
+        }
+        let resolved = std::env::current_dir()
+            .map(|cwd| cwd.join(&self.path))
+            .unwrap_or_else(|_| std::path::PathBuf::from(&self.path));
+        tracing::warn!(
+            configured = %self.path,
+            resolved = %resolved.display(),
+            "database.path is relative — it resolves against the working \
+             directory, so starting the agent from elsewhere silently opens a \
+             different ledger. Set an absolute path."
+        );
+    }
+
     /// The file whose existence halts the agent.
     pub fn halt_file(&self) -> std::path::PathBuf {
         self.data_dir().join("HALT")
@@ -966,6 +992,49 @@ mod tests {
 
         let cfg: ValuationConfig = toml::from_str(&format!("max_tokens = 8192\n{base}")).unwrap();
         assert_eq!(cfg.max_tokens, 8192);
+    }
+
+    #[test]
+    fn the_data_directory_defaults_to_the_database_files_own_directory() {
+        let db = DatabaseConfig {
+            path: "/var/lib/agent/agent.db".to_string(),
+            data_dir: None,
+        };
+        assert_eq!(db.data_dir(), Path::new("/var/lib/agent"));
+        assert_eq!(db.halt_file(), Path::new("/var/lib/agent/HALT"));
+        assert_eq!(db.backup_dir(), Path::new("/var/lib/agent/backups"));
+    }
+
+    #[test]
+    fn a_bare_database_filename_still_yields_a_usable_directory() {
+        // `Path::parent` on "agent.db" returns an *empty* path rather than
+        // None, and `PathBuf::from("")` is not somewhere a file can be
+        // created — so the HALT file and the backup directory would both have
+        // been unusable with the default config.
+        let db = DatabaseConfig {
+            path: "polymarket-agent.db".to_string(),
+            data_dir: None,
+        };
+        assert_eq!(db.data_dir(), Path::new("."));
+        assert_eq!(db.halt_file(), Path::new("./HALT"));
+    }
+
+    #[test]
+    fn an_explicit_data_dir_wins_over_the_database_location() {
+        let db = DatabaseConfig {
+            path: "/var/lib/agent/agent.db".to_string(),
+            data_dir: Some("/run/agent".to_string()),
+        };
+        assert_eq!(db.halt_file(), Path::new("/run/agent/HALT"));
+    }
+
+    #[test]
+    fn a_blank_data_dir_is_treated_as_unset() {
+        let db = DatabaseConfig {
+            path: "/var/lib/agent/agent.db".to_string(),
+            data_dir: Some(String::new()),
+        };
+        assert_eq!(db.data_dir(), Path::new("/var/lib/agent"));
     }
 
     #[test]

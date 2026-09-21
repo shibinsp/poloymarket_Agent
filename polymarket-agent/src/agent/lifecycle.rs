@@ -245,15 +245,7 @@ impl Agent {
         // Resting orders first. A halt that leaves working orders on the book
         // has not stopped anything: they can still fill, and the agent has
         // just stopped watching them closely.
-        for venue in self.venues.all() {
-            if let Err(e) = venue.cancel_all().await {
-                warn!(
-                    venue = %venue.id(),
-                    error = %e,
-                    "Could not cancel resting orders while halting — they may still fill"
-                );
-            }
-        }
+        self.cancel_resting_orders("halting").await;
 
         if let Err(e) = self
             .store
@@ -280,6 +272,21 @@ impl Agent {
                 &halt.detail,
             )
             .await;
+    }
+
+    /// Pull every resting order off every venue.
+    ///
+    /// Used on three paths that share one requirement: after this returns,
+    /// nothing the agent placed may still be working at a venue that nobody
+    /// is watching. Halting, dying, and being stopped all qualify — an order
+    /// left resting through a `systemctl stop` can fill during a deploy, and
+    /// the position it opens belongs to nobody until the process comes back.
+    ///
+    /// Best-effort by necessity: a venue that will not answer cannot be made
+    /// to cancel. Failures are logged loudly rather than propagated, because
+    /// one unreachable venue must not stop the others being cleared.
+    pub async fn cancel_resting_orders(&self, why: &str) {
+        self.venues.cancel_all_resting(why).await;
     }
 
     /// Reconcile the halt flag with the `HALT` file and the calendar.
@@ -1371,6 +1378,10 @@ impl Agent {
             balance = %balance,
             "AGENT DEATH — balance depleted, shutting down"
         );
+
+        // A dead agent with orders still on the book is the same problem as a
+        // halted one, minus anybody left to notice.
+        self.cancel_resting_orders("agent death").await;
 
         // Phase 8: Send death alert
         if let Err(e) = self

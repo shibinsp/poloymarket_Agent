@@ -276,6 +276,7 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
 /// Run the agent in paper or live trading mode.
 async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
     // Create shared database store
+    config.database.warn_if_relative();
     let store = Store::new(&config.database.path).await?;
     // Shared pool, not a second connection: opening the same file twice means
     // two WAL writers and two migration runs.
@@ -432,6 +433,19 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
             }
         }
     }
+
+    // Pull everything off the book before the process goes away.
+    //
+    // Gate item 1: no orphaned live orders on stop or crash. Without this a
+    // `systemctl stop` — a deploy, a reboot, an operator tidying up — left
+    // resting orders working at the venue with nothing polling them. They can
+    // still fill, and the position they open belongs to nobody until the
+    // agent comes back and reconciles it.
+    //
+    // Runs on every exit path, including the fatal one: a run that ended in
+    // five consecutive cycle failures is exactly when the book should not be
+    // left unattended.
+    agent.cancel_resting_orders("shutdown").await;
 
     // Clean up background tasks
     watchdog.abort();

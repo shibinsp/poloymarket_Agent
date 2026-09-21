@@ -36,6 +36,16 @@ pub struct StubVenue {
     /// Every order this venue was asked to place, so a test can assert that a
     /// second one was never sent.
     pub placed: Mutex<Vec<OrderRequest>>,
+    /// How many times `cancel_all` was called. Shutdown, death and halting
+    /// all have to clear the book, and "was every venue asked" is the only
+    /// thing worth asserting about that.
+    ///
+    /// An `Arc` so a test can keep a handle on the counter after the venue
+    /// has been boxed into a `VenueRegistry` and is no longer reachable as a
+    /// concrete type. The alternative — casting the trait object back — is a
+    /// pointer cast that compiles happily after the registry's contents
+    /// change and then reads whatever is there.
+    cancel_all_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl StubVenue {
@@ -96,6 +106,7 @@ impl StubVenue {
             mark: None,
             ack: None,
             placed: Mutex::new(Vec::new()),
+            cancel_all_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -113,6 +124,10 @@ impl StubVenue {
 
     pub fn orders_placed(&self) -> usize {
         self.placed.lock().expect("stub mutex").len()
+    }
+    /// A handle on the cancel counter that outlives boxing into a registry.
+    pub fn cancel_all_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        self.cancel_all_calls.clone()
     }
 }
 
@@ -169,6 +184,11 @@ impl Venue for StubVenue {
         Ok(())
     }
     async fn cancel_all(&self) -> Result<()> {
+        self.cancel_all_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail {
+            anyhow::bail!("{} cannot be reached", self.id);
+        }
         Ok(())
     }
     async fn open_orders(&self) -> Result<Vec<OrderAck>> {
