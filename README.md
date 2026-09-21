@@ -413,6 +413,15 @@ line in the shipped config made a comment the only thing between a paper window
 and real money — and the file operators are told to edit is `config/local.toml`,
 which that comment is not in.
 
+Spot balances are positions: Coinbase has no position endpoint, so a non-zero
+balance in a base currency *is* the position. Only currencies in the configured
+symbol list are reported as such — a personal Coinbase account's staked ETH or
+dust from a manual trade is real money but not ledger drift, and reporting it
+would halt the agent `UntilResume` on the first reconciliation. Those holdings
+are logged instead. A pre-existing balance in a currency you **do** configure
+still halts, deliberately: the agent would otherwise size against a position it
+does not know it has, and exit by selling coins it never bought.
+
 `fee_pct` in the template is the **taker** rate at the lowest volume tier
 (~1.2%), not the maker rate: orders go out as limit GTC without `post_only`, so
 they can take, and `round_trip_cost` doubles the number. Quoting the maker rate
