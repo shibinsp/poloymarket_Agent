@@ -843,3 +843,31 @@ async fn a_recovered_equity_figure_clears_the_streak() {
         "equity came back, so the next failure is a first failure again"
     );
 }
+
+/// The split made cash and equity two calls where there had been one, and
+/// several callers ask for cash each cycle — the bankroll, the survival
+/// ladder, `shutdown`. An account snapshot shared across the cycle is what
+/// keeps that from multiplying.
+///
+/// The exact number is the contract here, not a bound: an earlier version of
+/// this test asserted `<= 8`, which passed identically on the code before the
+/// change and therefore guarded nothing. Five is what both the pre-split code
+/// and the uncached split produce; one is what this is for.
+#[tokio::test]
+async fn a_cycle_reads_the_account_once() {
+    let alpaca = alpaca_server().await;
+    let mut h = harness_with(alpaca, |_| {}).await;
+    h.agent.run_cycle().await.unwrap();
+
+    let reqs = h._alpaca.received_requests().await.unwrap();
+    let account_calls = reqs
+        .iter()
+        .filter(|r| r.url.path() == "/v2/account")
+        .count();
+
+    assert_eq!(
+        account_calls, 1,
+        "cash and equity are projections of one payload and must share a snapshot — \
+         five here means the cache stopped working, and they can also disagree"
+    );
+}

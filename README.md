@@ -427,13 +427,20 @@ still halts, deliberately: the agent would otherwise size against a position it
 does not know it has, and exit by selling coins it never bought.
 
 Equity is computed, not skipped: the accounts endpoint gives quantities
-without prices, so `balance().total` is cash plus each configured holding
-marked at the current mid. Without it every loss limit is unevaluable and the
-agent halts — a crypto-only deployment could not trade live at all. A holding
-that cannot be priced makes equity `None` rather than partial, because a
-partial equity is a wrong one and no breaker can tell it from a real loss.
-Cash and coins committed to a resting order count toward equity but not toward
-spendable cash.
+without prices, so `Venue::equity()` marks each holding at the current mid and
+adds the cash. Without it every loss limit is unevaluable and the agent halts —
+a crypto-only deployment could not trade live at all. A holding that cannot be
+priced makes equity `None` rather than partial, because a partial equity is a
+wrong one and no breaker can tell it from a real loss. Cash and coins committed
+to a resting order count toward equity but not toward spendable cash.
+
+`equity()` is deliberately **separate from `balance()`**, which reports
+spendable cash and prices nothing. Marking a book costs a quote per holding,
+and most callers — the survival ladder, the per-cycle bankroll, and `shutdown`
+— want only the cash figure; folding the two together made the agent block on
+a network round trip per holding per venue on its way out. The reconciler asks
+for equity once a cycle, and `--dry-run` asks once, which is where the cost is
+worth paying.
 
 `fee_pct` in the template is the **taker** rate at the lowest volume tier
 (~1.2%), not the maker rate: orders go out as limit GTC without `post_only`, so

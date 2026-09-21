@@ -121,7 +121,7 @@ pub fn build_registry_reporting(
                     // Refused, not merely warned about. Every loss limit is
                     // measured against equity summed across the registry, and
                     // this venue cannot report one — its position listing is
-                    // unimplemented, so `balance().total` is always `None`.
+                    // unimplemented, so `equity()` is always `None`.
                     // Enabling it therefore made the sum unknowable and halted
                     // the agent `UntilResume` on every cycle, whatever the
                     // other venues said. The legacy Polymarket loop, which has

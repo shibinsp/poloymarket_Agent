@@ -1038,6 +1038,38 @@ impl Venue for CoinbaseVenue {
 
     #[instrument(skip(self), fields(venue = %self.id))]
     async fn balance(&self) -> Result<Balance> {
+        // Cash only, and therefore no quotes: the bankroll and the survival
+        // ladder ask several times a cycle, and `shutdown` asks while trying
+        // to exit.
+        let (available, _, _) = self.cash_and_holdings().await?;
+        Ok(Balance {
+            ccy: self.cash_ccy.clone(),
+            available,
+        })
+    }
+
+    #[instrument(skip(self), fields(venue = %self.id))]
+    async fn equity(&self) -> Result<Option<Decimal>> {
+        let (_, cash_total, holdings) = self.cash_and_holdings().await?;
+        Ok(mark_equity(self, &self.id, &self.cash_ccy, cash_total, &holdings).await)
+    }
+
+    #[instrument(skip(self), fields(venue = %self.id))]
+    async fn settlement(&self, _id: &InstrumentId) -> Result<Option<Settlement>> {
+        // Spot crypto never settles; positions are closed by trading out.
+        Ok(None)
+    }
+}
+
+impl CoinbaseVenue {
+    /// Cash and holdings, split once.
+    ///
+    /// `balance` and `equity` both have to decide which rows are usable and
+    /// which are cash, and when those two loops were written separately a
+    /// later change to either rule had to be made twice — with `available`
+    /// and the cash inside equity silently describing different account sets
+    /// if only one was updated.
+    async fn cash_and_holdings(&self) -> Result<(Decimal, Decimal, Vec<Holding>)> {
         let accounts = self.accounts().await?;
 
         let mut available = Decimal::ZERO;
@@ -1064,29 +1096,14 @@ impl Venue for CoinbaseVenue {
                 // The configured pair when there is one, else the shared
                 // helper prices it against this venue's currency. *Every*
                 // holding is priced, configured or not: leaving one out
-                // reports a partial equity as authoritative, which is the
-                // failure this is here to prevent.
+                // reports a partial equity as authoritative.
                 symbol: self.symbol_for_base(currency),
             });
         }
 
-        let total = mark_equity(self, &self.id, &self.cash_ccy, cash_total, &holdings).await;
-
-        Ok(Balance {
-            ccy: self.cash_ccy.clone(),
-            available,
-            total,
-        })
+        Ok((available, cash_total, holdings))
     }
 
-    #[instrument(skip(self), fields(venue = %self.id))]
-    async fn settlement(&self, _id: &InstrumentId) -> Result<Option<Settlement>> {
-        // Spot crypto never settles; positions are closed by trading out.
-        Ok(None)
-    }
-}
-
-impl CoinbaseVenue {
     /// Every account row, paged, reused for a moment.
     ///
     /// Coinbase creates one row per supported currency and pages by cursor, so
@@ -1602,7 +1619,7 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
             "USD + USDC, not the BTC, and not the cash held against a resting order"
         );
         assert_eq!(
-            balance.total,
+            venue.equity().await.unwrap(),
             Some(dec!(220.505)),
             "held cash counts, and the BTC is marked: 160.50 + 0.001 x 60005"
         );
@@ -1641,7 +1658,7 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
         assert_eq!(balance.available, dec!(100.00));
         // 0.002 BTC (available + hold) at a 60005 mid = 120.01.
         assert_eq!(
-            balance.total,
+            venue.equity().await.unwrap(),
             Some(dec!(220.01)),
             "cash plus the marked value of the holding, held coins included"
         );
@@ -1694,6 +1711,41 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
         assert_eq!(positions[0].qty, dec!(0.01));
     }
 
+    /// The whole point of the split: `balance()` must price nothing.
+    ///
+    /// The survival ladder and the per-cycle bankroll ask for it several times
+    /// a cycle, and `shutdown` asks while trying to exit — so a quote per
+    /// holding here made the agent block on the network on its way out.
+    #[tokio::test]
+    async fn balance_makes_no_quote_calls_even_with_holdings() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/brokerage/accounts"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "accounts": [
+                    {"currency": "USD", "available_balance": {"value": "100.00"}},
+                    {"currency": "BTC", "available_balance": {"value": "0.5"}},
+                    {"currency": "ETH", "available_balance": {"value": "3"}}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/brokerage/product_book"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "pricebook": {"product_id": "BTC-USD",
+                              "bids": [{"price": "1", "size": "1"}],
+                              "asks": [{"price": "1", "size": "1"}]}
+            })))
+            // Asserted on drop: not one book call belongs in a cash check.
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["BTC/USD"]);
+        assert_eq!(venue.balance().await.unwrap().available, dec!(100.00));
+    }
+
     /// A holding the agent does not trade is still the account's money.
     /// Leaving it out reports a partial equity *as authoritative*, which is
     /// the failure the whole change exists to prevent — and a pre-existing
@@ -1724,9 +1776,8 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
 
         // ETH is not configured; it is still $15,000.
         let venue = venue(&server, &["BTC/USD"]);
-        let balance = venue.balance().await.unwrap();
         assert_eq!(
-            balance.total,
+            venue.equity().await.unwrap(),
             Some(dec!(16000)),
             "1000 cash + 5 ETH at a 3000 mid — reporting 1000 would be a partial equity"
         );
@@ -1755,7 +1806,7 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
         // No product_book mock at all: asking for one would fail the call.
 
         let venue = venue(&server, &["BTC/USD"]);
-        assert_eq!(venue.balance().await.unwrap().total, Some(dec!(1000.00)));
+        assert_eq!(venue.equity().await.unwrap(), Some(dec!(1000.00)));
     }
 
     /// A partial equity is a wrong equity, and the drawdown breaker cannot
@@ -1783,7 +1834,8 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
         let balance = venue.balance().await.unwrap();
         assert_eq!(balance.available, dec!(100.00), "cash is still readable");
         assert_eq!(
-            balance.total, None,
+            venue.equity().await.unwrap(),
+            None,
             "reporting 100 here would book the whole position as an instant loss"
         );
     }
