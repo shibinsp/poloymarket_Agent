@@ -568,6 +568,16 @@ pub struct DatabaseConfig {
     pub data_dir: Option<String>,
 }
 
+/// The `DATABASE_URL` value worth warning about, if any.
+///
+/// Separated from the logging so the rule is testable: a blank value is how
+/// the variable appears in a shell that exported it once and is not worth a
+/// warning, while any real value means the operator believes it does
+/// something.
+fn misleading_database_url(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|v| !v.is_empty())
+}
+
 impl DatabaseConfig {
     pub fn url(&self) -> String {
         format!("sqlite:{}", self.path)
@@ -613,6 +623,26 @@ impl DatabaseConfig {
              directory, so starting the agent from elsewhere silently opens a \
              different ledger. Set an absolute path."
         );
+    }
+
+    /// `DATABASE_URL` looks like it configures the database and does not.
+    ///
+    /// Nothing reads it: every query here is built at runtime, there are no
+    /// compile-time `sqlx::query!` macros and no offline metadata, so the only
+    /// knob is `[database] path`. It shipped in `.env.example` regardless,
+    /// which is worse than absent — an operator sets it to a production path,
+    /// sees no error, and runs against a different ledger than they believe.
+    /// Removing it from the example fixes the next operator; this catches the
+    /// one who already has it set.
+    pub fn warn_if_database_url_set(&self) {
+        if let Some(url) = misleading_database_url(std::env::var("DATABASE_URL").ok().as_deref()) {
+            tracing::warn!(
+                database_url = %url,
+                using = %self.path,
+                "DATABASE_URL is set but nothing reads it — the ledger comes from \
+                 [database] path. Point CONFIG_PATH at a config file to change it."
+            );
+        }
     }
 
     /// The file whose existence halts the agent.
@@ -784,6 +814,43 @@ fn apply_telemetry_endpoint(telemetry: &mut TelemetryConfig, endpoint: Option<St
 
 #[cfg(test)]
 mod tests {
+    /// `DATABASE_URL` shipped in `.env.example` and nothing reads it, so an
+    /// operator could set it to a production path, see no error, and run
+    /// against a different ledger than they believed.
+    #[test]
+    fn a_real_database_url_is_worth_warning_about() {
+        assert_eq!(
+            misleading_database_url(Some("sqlite:/var/lib/agent/prod.db")),
+            Some("sqlite:/var/lib/agent/prod.db")
+        );
+        assert_eq!(
+            misleading_database_url(Some("  sqlite:x.db  ")),
+            Some("sqlite:x.db"),
+            "trimmed, so surrounding whitespace does not hide it"
+        );
+    }
+
+    /// Unset, or exported blank — which is how it looks in a shell that set it
+    /// once — is not something to nag about every startup.
+    #[test]
+    fn an_absent_or_blank_database_url_is_silent() {
+        assert_eq!(misleading_database_url(None), None);
+        assert_eq!(misleading_database_url(Some("")), None);
+        assert_eq!(misleading_database_url(Some("   ")), None);
+    }
+
+    /// The example file must not advertise a variable that does nothing.
+    #[test]
+    fn the_env_example_does_not_ship_a_database_url() {
+        let example = std::fs::read_to_string(".env.example").unwrap();
+        assert!(
+            !example
+                .lines()
+                .any(|l| l.trim_start().starts_with("DATABASE_URL=")),
+            "DATABASE_URL is read by nothing — shipping it is worse than absent"
+        );
+    }
+
     /// A US operator may not legally trade Polymarket. Demanding its key in
     /// live mode stopped `--dry-run` before it reached the venue preflight —
     /// so the one check that matters before going live never ran.

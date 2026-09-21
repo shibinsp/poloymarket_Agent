@@ -374,6 +374,7 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
 async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
     // Create shared database store
     config.database.warn_if_relative();
+    config.database.warn_if_database_url_set();
     let store = Store::new(&config.database.path).await?;
     // Shared pool, not a second connection: opening the same file twice means
     // two WAL writers and two migration runs.
