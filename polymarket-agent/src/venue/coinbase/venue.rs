@@ -13,7 +13,9 @@
 //!   Sending a number loses scale on small crypto quantities, which is the
 //!   whole point of `Decimal` here.
 
-use std::time::Duration;
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
@@ -23,8 +25,8 @@ use tracing::{info, instrument, warn};
 
 use super::auth::CdpSigner;
 use super::models::{
-    money, Account, AccountsResponse, CandlesResponse, CreateOrderResponse, Order, OrderResponse,
-    OrdersResponse, Product, ProductBookResponse, ProductsResponse,
+    money, Account, AccountsResponse, BatchCancelResponse, CandlesResponse, CreateOrderResponse,
+    Order, OrderResponse, OrdersResponse, Product, ProductBookResponse, ProductsResponse,
 };
 use super::rest::CoinbaseRest;
 use crate::market::models::{OrderBookSnapshot, PriceLevel};
@@ -32,16 +34,51 @@ use crate::venue::session::TradingSession;
 use crate::venue::types::{
     AssetClass, Balance, Candle, CandleInterval, Instrument, InstrumentId, InstrumentMeta,
     OrderAck, OrderKind, OrderRef, OrderRequest, OrderState, Position, Quote, ScanFilter,
-    Settlement, Side, VenueCapabilities, VenueId,
+    Settlement, Side, TimeInForce, VenueCapabilities, VenueId,
 };
 use crate::venue::Venue;
 
 pub const DEFAULT_VENUE_ID: &str = "coinbase";
 pub const BASE_URL: &str = "https://api.coinbase.com";
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
-/// Coinbase's page cap for `/products`. Well above any universe this agent
-/// trades, but named rather than assumed.
+/// Coinbase's page cap for `/products`.
 const PRODUCT_PAGE_LIMIT: usize = 1000;
+/// Pages of `/products` to walk before giving up and saying so. Coinbase pages
+/// this endpoint by offset, and a configured symbol past the first page was
+/// dropped with only a "does not list this product" warning — which reads as a
+/// delisting rather than as truncation.
+const MAX_PRODUCT_PAGES: usize = 20;
+/// Coinbase's page cap for the order endpoints.
+const ORDER_PAGE_LIMIT: usize = 250;
+/// Pages of orders to walk. The live set is small; this exists so a stuck
+/// cursor cannot spin forever.
+const MAX_ORDER_PAGES: usize = 20;
+/// Coinbase's page cap for `/accounts`. It creates one row per supported
+/// currency, so real accounts run past a single page.
+const ACCOUNT_PAGE_LIMIT: usize = 250;
+const MAX_ACCOUNT_PAGES: usize = 20;
+/// Most candles Coinbase returns for one request.
+const MAX_CANDLES_PER_REQUEST: i64 = 350;
+/// How long a fetched account snapshot is reused.
+///
+/// `balance()` and `positions()` are separate trait methods that the reconciler
+/// calls back to back, and each one otherwise pages the same rate-limited
+/// endpoint, minting a JWT per request. A window this short cannot outlive one
+/// pass, and it makes the cash and the holdings two projections of a *single*
+/// snapshot rather than two that can disagree with each other.
+const ACCOUNTS_CACHE_TTL: Duration = Duration::from_secs(2);
+
+const ORDERS_PATH: &str = "/api/v3/brokerage/orders";
+const ORDER_HISTORY_PATH: &str = "/api/v3/brokerage/orders/historical/batch";
+const BATCH_CANCEL_PATH: &str = "/api/v3/brokerage/orders/batch_cancel";
+const ACCOUNTS_PATH: &str = "/api/v3/brokerage/accounts";
+
+/// Coinbase refuses `OPEN` combined with any other status, so the live set
+/// takes two queries rather than one.
+const OPEN_STATUS: [&str; 1] = ["OPEN"];
+/// `to_order_state` treats these as accepted — the order exists at the venue
+/// and can fill — so the kill switch has to be able to see them.
+const PENDING_STATUSES: [&str; 2] = ["PENDING", "QUEUED"];
 
 pub struct CoinbaseConfig {
     pub venue_id: VenueId,
@@ -50,6 +87,7 @@ pub struct CoinbaseConfig {
     private_key_pem: String,
     pub symbols: Vec<String>,
     pub request_timeout: Duration,
+    pub accounts_cache_ttl: Duration,
 }
 
 /// Hand-written so the key can never reach a log line or panic message.
@@ -74,6 +112,7 @@ impl CoinbaseConfig {
             private_key_pem: private_key_pem.into(),
             symbols: Vec::new(),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            accounts_cache_ttl: ACCOUNTS_CACHE_TTL,
         }
     }
 
@@ -91,6 +130,12 @@ impl CoinbaseConfig {
         self.symbols = symbols;
         self
     }
+
+    /// Reuse window for the `/accounts` snapshot. Zero disables reuse.
+    pub fn with_accounts_cache_ttl(mut self, ttl: Duration) -> Self {
+        self.accounts_cache_ttl = ttl;
+        self
+    }
 }
 
 pub struct CoinbaseVenue {
@@ -99,6 +144,8 @@ pub struct CoinbaseVenue {
     session: TradingSession,
     symbols: Vec<String>,
     rest: CoinbaseRest,
+    accounts_cache_ttl: Duration,
+    accounts_cache: tokio::sync::Mutex<Option<(Instant, Arc<Vec<Account>>)>>,
 }
 
 impl std::fmt::Debug for CoinbaseVenue {
@@ -136,6 +183,8 @@ impl CoinbaseVenue {
             session: TradingSession::Always,
             symbols: config.symbols,
             rest,
+            accounts_cache_ttl: config.accounts_cache_ttl,
+            accounts_cache: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -194,27 +243,40 @@ impl CoinbaseVenue {
         })
     }
 
-    /// The configured symbol whose base is `base`, or a `/USD` fallback.
+    /// The configured symbol whose base is `base`, if the agent trades one.
     ///
-    /// Spot balances name only the currency — `BTC` — and the pair it
-    /// belongs to is a choice: a universe of `BTC/USDC` and a position
-    /// reported as `BTC/USD` reconciles against nothing, which reads as two
-    /// mismatches at once and halts a healthy agent `UntilResume`.
+    /// A spot balance names only the currency — `BTC` — and the pair it
+    /// belongs to is a *choice*. Guessing `/USD` against a `BTC/USDC`
+    /// universe reconciles against nothing, which reads as two mismatches at
+    /// once and halts a healthy agent `UntilResume`.
     ///
-    /// The fallback matters too: a holding outside the configured universe —
-    /// dust from a manual trade, or a symbol since removed — is still real
-    /// exposure, and dropping it would hide it from the very check that
-    /// exists to find it.
-    fn symbol_for_base(&self, base: &str) -> String {
-        self.symbols
+    /// `None` means the agent does not trade this currency at all. The caller
+    /// reports it rather than inventing a symbol for it.
+    fn symbol_for_base(&self, base: &str) -> Option<String> {
+        let mut matches = self
+            .symbols
             .iter()
             .map(|s| s.trim().to_uppercase())
-            .find(|s| {
+            .filter(|s| {
                 s.split('/')
                     .next()
                     .is_some_and(|b| b.eq_ignore_ascii_case(base))
-            })
-            .unwrap_or_else(|| format!("{}/USD", base.to_uppercase()))
+            });
+
+        let first = matches.next()?;
+        if matches.next().is_some() {
+            // One balance cannot be split across two ledgers: Coinbase does
+            // not say which pair bought the coin. Attributing it to the first
+            // is a choice worth making loudly.
+            warn!(
+                venue = %self.id,
+                base = base,
+                symbol = %first,
+                "Several configured symbols share this base — a spot balance names only \
+                 the currency, so the whole holding is attributed to the first"
+            );
+        }
+        Some(first)
     }
 
     async fn fetch_order(&self, venue_order_id: &str) -> Result<Order> {
@@ -238,6 +300,71 @@ impl CoinbaseVenue {
 /// have reconciliation hunt for a matching trade that does not exist.
 fn is_cash(currency: &str) -> bool {
     currency.eq_ignore_ascii_case("USD") || currency.eq_ignore_ascii_case("USDC")
+}
+
+/// Whether an account's balance is actually spendable.
+///
+/// Coinbase omits `active` on some account types, and absence is not a signal.
+/// An explicit `false` is: a suspended or restricted sub-account's cash cannot
+/// be spent, and counting it sizes positions against money the agent will
+/// discover it does not have one rejected order at a time.
+fn is_usable(account: &Account) -> bool {
+    account.active != Some(false)
+}
+
+/// `to_ack`, but a malformed number costs that field rather than the whole
+/// list.
+///
+/// `open_orders` feeds `cancel_all`, so one unparseable `total_fees` anywhere
+/// in the book would make the kill switch return before posting a single
+/// cancel and leave every resting order live. The order id and status are what
+/// cancelling and the orphan audit need, and both survive. Nothing books a
+/// fill from this path — `get_order` stays strict for that.
+fn to_ack_lossy(order: &Order) -> OrderAck {
+    to_ack(order).unwrap_or_else(|e| {
+        warn!(
+            order_id = %order.order_id,
+            error = %format!("{e:#}"),
+            "Coinbase sent an unparseable order field — keeping the order so it can \
+             still be cancelled, with its numeric fields zeroed"
+        );
+        OrderAck {
+            venue_order_id: order.order_id.clone(),
+            client_order_id: order.client_order_id.clone().unwrap_or_default(),
+            state: to_order_state(order),
+            filled_qty: Decimal::ZERO,
+            avg_fill_price: None,
+            fees: Decimal::ZERO,
+        }
+    })
+}
+
+/// Fold a series into wider buckets, aligned to the epoch.
+///
+/// Coinbase has no four-hour granularity, so an H4 series is built from pairs
+/// of two-hour bars. The alternative — labelling `SIX_HOUR` data as four-hour,
+/// which is what this adapter did first — produces a plausible number from the
+/// wrong bars rather than an error.
+fn fold_candles(source: Vec<Candle>, bucket_seconds: i64) -> Vec<Candle> {
+    let mut out: Vec<Candle> = Vec::new();
+    for candle in source {
+        let offset = candle.ts.timestamp().rem_euclid(bucket_seconds);
+        let bucket_start = candle.ts - chrono::Duration::seconds(offset);
+        match out.last_mut() {
+            Some(last) if last.ts == bucket_start => {
+                last.high = last.high.max(candle.high);
+                last.low = last.low.min(candle.low);
+                // Oldest first, so the last bar seen closes the bucket.
+                last.close = candle.close;
+                last.volume += candle.volume;
+            }
+            _ => out.push(Candle {
+                ts: bucket_start,
+                ..candle
+            }),
+        }
+    }
+    out
 }
 
 /// Coinbase's order status vocabulary, mapped to ours.
@@ -361,45 +488,73 @@ impl Venue for CoinbaseVenue {
             return Ok(Vec::new());
         }
 
-        let wanted: std::collections::HashSet<String> =
-            requested.iter().map(|s| Self::to_product_id(s)).collect();
-
-        let response: ProductsResponse = self
-            .rest
-            .get(
-                "/api/v3/brokerage/products",
-                &[
-                    ("product_type", "SPOT".to_string()),
-                    ("limit", PRODUCT_PAGE_LIMIT.to_string()),
-                ],
-            )
-            .await
-            .context("Failed to list Coinbase products")?;
+        let wanted: HashSet<String> = requested.iter().map(|s| Self::to_product_id(s)).collect();
 
         let mut out = Vec::new();
-        for product in &response.products {
-            if !wanted.contains(&product.product_id.to_uppercase()) {
-                continue;
+        // Every wanted id Coinbase named, tradeable or not. Built once, so the
+        // "not listed" pass below is a lookup per configured symbol rather
+        // than a scan of the whole product list per configured symbol.
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut offset = 0usize;
+        let mut truncated = true;
+
+        for _ in 0..MAX_PRODUCT_PAGES {
+            let mut params = vec![
+                ("product_type", "SPOT".to_string()),
+                ("limit", PRODUCT_PAGE_LIMIT.to_string()),
+                ("offset", offset.to_string()),
+            ];
+            // Ask for exactly the products wanted. When Coinbase honours this
+            // the answer is one short page; when it does not, the local
+            // `wanted` check and the offset walk below reach the same result,
+            // so neither behaviour can truncate the universe silently.
+            for id in &wanted {
+                params.push(("product_ids", id.clone()));
             }
-            if !product.tradeable() {
-                warn!(
-                    product = %product.product_id,
-                    "Coinbase lists this product as not tradeable — skipping"
-                );
-                continue;
+
+            let response: ProductsResponse = self
+                .rest
+                .get("/api/v3/brokerage/products", &params)
+                .await
+                .context("Failed to list Coinbase products")?;
+
+            let page_len = response.products.len();
+            for product in &response.products {
+                let id = product.product_id.to_uppercase();
+                if !wanted.contains(&id) || !seen.insert(id) {
+                    continue;
+                }
+                if !product.tradeable() {
+                    warn!(
+                        product = %product.product_id,
+                        "Coinbase lists this product as not tradeable — skipping"
+                    );
+                    continue;
+                }
+                out.push(self.instrument_from(product)?);
             }
-            out.push(self.instrument_from(product)?);
+
+            if seen.len() == wanted.len() || page_len < PRODUCT_PAGE_LIMIT {
+                truncated = false;
+                break;
+            }
+            offset += page_len;
+        }
+
+        if truncated {
+            // Not the same as a delisting, and saying so matters: the operator
+            // would otherwise go looking for a symbol Coinbase still trades.
+            warn!(
+                venue = %self.id,
+                pages = MAX_PRODUCT_PAGES,
+                "Stopped paging Coinbase products before finding every configured symbol"
+            );
         }
 
         // Configured symbols Coinbase did not return at all. Silently trading
         // a smaller universe than configured is a quiet way to under-trade.
         for symbol in requested {
-            let product_id = Self::to_product_id(symbol);
-            if !response
-                .products
-                .iter()
-                .any(|p| p.product_id.eq_ignore_ascii_case(&product_id))
-            {
+            if !seen.contains(&Self::to_product_id(symbol)) {
                 warn!(symbol = %symbol, "Coinbase does not list this product — skipping");
             }
         }
@@ -494,18 +649,26 @@ impl Venue for CoinbaseVenue {
         limit: usize,
     ) -> Result<Vec<Candle>> {
         let product_id = Self::to_product_id(&id.symbol);
-        let granularity = match interval {
-            CandleInterval::H1 => "ONE_HOUR",
-            CandleInterval::H4 => "SIX_HOUR",
-            CandleInterval::D1 => "ONE_DAY",
+        // Coinbase has no FOUR_HOUR granularity. `TWO_HOUR` is the widest that
+        // divides four cleanly, so H4 is folded from pairs below rather than
+        // served by the nearest-looking name — `SIX_HOUR` bars labelled
+        // four-hour are wrong data that still charts.
+        let (granularity, source_seconds, fold) = match interval {
+            CandleInterval::H1 => ("ONE_HOUR", 3600i64, 1i64),
+            CandleInterval::H4 => ("TWO_HOUR", 7200, 2),
+            CandleInterval::D1 => ("ONE_DAY", 86400, 1),
         };
 
         // Coinbase requires an explicit window; it does not accept a bare
         // count. Asking for exactly `limit` periods back leaves no slack for
-        // a missing bar, so this asks for a little more and truncates.
-        let seconds = interval.hours() * 3600;
+        // a missing bar, so this asks for a little more and truncates. Capped
+        // at what one request can answer: asking for a wider window than that
+        // returns a *truncated* series, and Coinbase returns the newest end of
+        // it, so the count is short rather than the bars being wrong.
+        let source_bars =
+            ((limit as i64).saturating_add(2).saturating_mul(fold)).min(MAX_CANDLES_PER_REQUEST);
         let end = Utc::now();
-        let start = end - chrono::Duration::seconds(seconds * (limit as i64 + 2));
+        let start = end - chrono::Duration::seconds(source_seconds * source_bars);
 
         let path = format!(
             "/api/v3/brokerage/products/{}/candles",
@@ -548,6 +711,11 @@ impl Venue for CoinbaseVenue {
         // expects oldest first, and a reversed series produces a plausible
         // number from the wrong data rather than an error.
         candles.sort_by_key(|c| c.ts);
+
+        if fold > 1 {
+            candles = fold_candles(candles, interval.hours() * 3600);
+        }
+
         if candles.len() > limit {
             candles.drain(..candles.len() - limit);
         }
@@ -568,18 +736,54 @@ impl Venue for CoinbaseVenue {
         // Sizes and prices as strings. A JSON number loses scale on small
         // crypto quantities, which is the entire reason this codebase is
         // Decimal end to end.
-        let configuration = match request.kind {
-            OrderKind::Limit { price } => serde_json::json!({
-                "limit_limit_gtc": {
-                    "base_size": request.qty.normalize().to_string(),
-                    "limit_price": price.normalize().to_string(),
-                    "post_only": false,
+        let base_size = request.qty.normalize().to_string();
+        let configuration = match (request.kind, request.side) {
+            (OrderKind::Limit { price }, _) => {
+                let limit_price = price.normalize().to_string();
+                match request.tif {
+                    TimeInForce::Gtc => serde_json::json!({
+                        "limit_limit_gtc": {
+                            "base_size": base_size,
+                            "limit_price": limit_price,
+                            "post_only": false,
+                        }
+                    }),
+                    TimeInForce::Gtd(end) => serde_json::json!({
+                        "limit_limit_gtd": {
+                            "base_size": base_size,
+                            "limit_price": limit_price,
+                            "end_time": end.to_rfc3339(),
+                            "post_only": false,
+                        }
+                    }),
+                    // Coinbase's only immediate limit configuration is
+                    // fill-or-kill, which is not IOC — it refuses a partial
+                    // fill rather than taking it — and spot crypto has no
+                    // trading day for `Day` to end at. Rewriting either into
+                    // GTC, which is what this adapter did first, turns "fill
+                    // now or be gone" into a resting order that can fill
+                    // minutes later at a price the decision no longer
+                    // supports. Refused instead, as Alpaca refuses its own
+                    // unsupported set.
+                    other => bail!(
+                        "Coinbase Advanced Trade cannot express {other:?} for a limit order; \
+                         use Gtc or Gtd"
+                    ),
                 }
-            }),
-            OrderKind::Market => serde_json::json!({
-                "market_market_ioc": {
-                    "base_size": request.qty.normalize().to_string(),
-                }
+            }
+            // Coinbase sizes a market BUY in the *quote* currency and a market
+            // SELL in the base. Sending base_size on a buy comes back as an
+            // HTTP 200 with `success: false`. Converting would need a price,
+            // and a market buy sized from a quote fetched a moment earlier
+            // fills a quantity the risk sizing never approved — so the caller
+            // is told to price it instead.
+            (OrderKind::Market, Side::Buy) => bail!(
+                "Coinbase sizes market buys in the quote currency, not the base; \
+                 submit {} as a limit order",
+                request.instrument.symbol()
+            ),
+            (OrderKind::Market, Side::Sell) => serde_json::json!({
+                "market_market_ioc": { "base_size": base_size }
             }),
         };
 
@@ -592,7 +796,7 @@ impl Venue for CoinbaseVenue {
 
         let response: CreateOrderResponse = self
             .rest
-            .post("/api/v3/brokerage/orders", &payload)
+            .post(ORDERS_PATH, &payload)
             .await
             .context("Failed to submit the Coinbase order")?;
 
@@ -642,41 +846,50 @@ impl Venue for CoinbaseVenue {
             OrderRef::Venue(id) => to_ack(&self.fetch_order(id).await?),
             OrderRef::Client(client_order_id) => {
                 // Coinbase has no lookup by client id, so this lists and
-                // filters. Bounded by the open set plus recent history, which
-                // at a ten-minute cadence is small.
-                // Bounded. Coinbase pages this endpoint and an unbounded
-                // request can return a great deal of history to find one id;
-                // the reconciler only reaches here before a venue id has been
-                // recorded, so recent orders are the only ones that can match.
-                let response: OrdersResponse = self
-                    .rest
-                    .get(
-                        "/api/v3/brokerage/orders/historical/batch",
-                        &[("limit", "250".to_string())],
-                    )
-                    .await
-                    .context("Failed to list Coinbase orders")?;
-                let found = response
-                    .orders
-                    .iter()
-                    .find(|o| o.client_order_id.as_deref() == Some(client_order_id.as_str()))
-                    .with_context(|| {
-                        format!("Coinbase has no order with client id {client_order_id}")
-                    })?;
-                to_ack(found)
+                // filters. It has to page: a miss here is not "no such order",
+                // it is what the reconciler turns, once the TTL elapses, into
+                // "never acknowledged by the venue" — writing off a row for an
+                // order that may be live or already filled.
+                let mut cursor: Option<String> = None;
+                for _ in 0..MAX_ORDER_PAGES {
+                    let mut params = vec![("limit", ORDER_PAGE_LIMIT.to_string())];
+                    if let Some(c) = &cursor {
+                        params.push(("cursor", c.clone()));
+                    }
+                    let response: OrdersResponse = self
+                        .rest
+                        .get(ORDER_HISTORY_PATH, &params)
+                        .await
+                        .context("Failed to list Coinbase orders")?;
+
+                    if let Some(found) = response
+                        .orders
+                        .iter()
+                        .find(|o| o.client_order_id.as_deref() == Some(client_order_id.as_str()))
+                    {
+                        return to_ack(found);
+                    }
+
+                    if !response.has_next {
+                        break;
+                    }
+                    match response.cursor {
+                        // A cursor that does not advance would page forever.
+                        Some(next) if Some(&next) != cursor.as_ref() => cursor = Some(next),
+                        _ => break,
+                    }
+                }
+                bail!("Coinbase has no order with client id {client_order_id}")
             }
         }
     }
 
     #[instrument(skip(self), fields(venue = %self.id))]
     async fn cancel_order(&self, venue_order_id: &str) -> Result<()> {
-        let payload = serde_json::json!({ "order_ids": [venue_order_id] });
-        let _: serde_json::Value = self
-            .rest
-            .post("/api/v3/brokerage/orders/batch_cancel", &payload)
+        let ids = [venue_order_id.to_string()];
+        self.batch_cancel(&ids)
             .await
-            .with_context(|| format!("Failed to cancel Coinbase order {venue_order_id}"))?;
-        Ok(())
+            .with_context(|| format!("Failed to cancel Coinbase order {venue_order_id}"))
     }
 
     #[instrument(skip(self), fields(venue = %self.id))]
@@ -686,26 +899,38 @@ impl Venue for CoinbaseVenue {
             return Ok(());
         }
         let ids: Vec<String> = open.iter().map(|o| o.venue_order_id.clone()).collect();
-        let payload = serde_json::json!({ "order_ids": ids });
-        let _: serde_json::Value = self
-            .rest
-            .post("/api/v3/brokerage/orders/batch_cancel", &payload)
+        let count = ids.len();
+        self.batch_cancel(&ids)
             .await
             .context("Failed to cancel all Coinbase orders")?;
+        info!(orders = count, "Cancelled resting Coinbase orders");
         Ok(())
     }
 
     #[instrument(skip(self), fields(venue = %self.id))]
     async fn open_orders(&self) -> Result<Vec<OrderAck>> {
-        let response: OrdersResponse = self
-            .rest
-            .get(
-                "/api/v3/brokerage/orders/historical/batch",
-                &[("order_status", "OPEN".to_string())],
-            )
+        let mut acks = self
+            .list_orders(&OPEN_STATUS)
             .await
             .context("Failed to list open Coinbase orders")?;
-        response.orders.iter().map(to_ack).collect()
+
+        // Best-effort, deliberately. `cancel_all` starts here, and returning
+        // an error would have it stop before posting a single cancel — which
+        // leaves every resting order live. Cancelling what was found beats
+        // cancelling nothing.
+        match self.list_orders(&PENDING_STATUSES).await {
+            Ok(pending) => acks.extend(pending),
+            Err(e) => warn!(
+                venue = %self.id,
+                error = %format!("{e:#}"),
+                "Could not list pending Coinbase orders — the live set may be incomplete"
+            ),
+        }
+
+        // An order can move from PENDING to OPEN between the two queries.
+        let mut seen = HashSet::new();
+        acks.retain(|a| seen.insert(a.venue_order_id.clone()));
+        Ok(acks)
     }
 
     #[instrument(skip(self), fields(venue = %self.id))]
@@ -715,7 +940,9 @@ impl Venue for CoinbaseVenue {
         // the agent trades, so it lines up with the symbols in the ledger.
         let accounts = self.accounts().await?;
         let mut out = Vec::new();
-        for account in &accounts {
+        let mut outside = Vec::new();
+
+        for account in accounts.iter().filter(|a| is_usable(a)) {
             let Some(currency) = account.currency.as_deref() else {
                 continue;
             };
@@ -730,16 +957,39 @@ impl Venue for CoinbaseVenue {
             if qty <= Decimal::ZERO {
                 continue;
             }
-            out.push(Position {
-                instrument: InstrumentId::new(self.id.clone(), self.symbol_for_base(currency)),
-                qty,
-                // Coinbase does not report a cost basis on the accounts
-                // endpoint. Zero would claim the position was free and make
-                // every P&L calculation wrong; the reconciler compares
-                // quantities, which is what this is for.
-                avg_entry: Decimal::ZERO,
-            });
+
+            // Only what the agent actually trades. A Coinbase account is a
+            // personal wallet as well as an agent account: staked ETH, an old
+            // SOL bag, dust from a manual trade. Reporting those as positions
+            // makes the reconciler see a holding it has no record of, which is
+            // an `UntilResume` halt needing a human — so anyone enabling this
+            // venue on an existing account would halt on the first cycle.
+            match self.symbol_for_base(currency) {
+                Some(symbol) => out.push(Position {
+                    instrument: InstrumentId::new(self.id.clone(), symbol),
+                    qty,
+                    // Coinbase does not report a cost basis on the accounts
+                    // endpoint. Zero would claim the position was free and make
+                    // every P&L calculation wrong; the reconciler compares
+                    // quantities, which is what this is for.
+                    avg_entry: Decimal::ZERO,
+                }),
+                None => outside.push(format!("{currency} {}", qty.normalize())),
+            }
         }
+
+        if !outside.is_empty() {
+            // Visible without being actionable by the reconciler: it is real
+            // money, but it is not drift, and halting on it would train an
+            // operator to resume without reading.
+            warn!(
+                venue = %self.id,
+                holdings = %outside.join(", "),
+                "Coinbase holds balances outside the configured universe — reported here \
+                 only, since the reconciler would otherwise read them as drift and halt"
+            );
+        }
+
         Ok(out)
     }
 
@@ -748,7 +998,7 @@ impl Venue for CoinbaseVenue {
         let accounts = self.accounts().await?;
 
         let mut cash = Decimal::ZERO;
-        for account in &accounts {
+        for account in accounts.iter().filter(|a| is_usable(a)) {
             let Some(currency) = account.currency.as_deref() else {
                 continue;
             };
@@ -784,16 +1034,153 @@ impl Venue for CoinbaseVenue {
 }
 
 impl CoinbaseVenue {
-    async fn accounts(&self) -> Result<Vec<Account>> {
-        let response: AccountsResponse = self
-            .rest
-            .get(
-                "/api/v3/brokerage/accounts",
-                &[("limit", "250".to_string())],
-            )
-            .await
-            .context("Failed to fetch Coinbase accounts")?;
-        Ok(response.accounts)
+    /// Every account row, paged, reused for a moment.
+    ///
+    /// Coinbase creates one row per supported currency and pages by cursor, so
+    /// reading the first page alone drops both cash and holdings — and a
+    /// dropped holding is a `missing_on_venue` orphan, which halts the agent
+    /// for a human with a perfectly correct book.
+    async fn accounts(&self) -> Result<Arc<Vec<Account>>> {
+        let mut cache = self.accounts_cache.lock().await;
+        if let Some((fetched, accounts)) = cache.as_ref() {
+            if fetched.elapsed() < self.accounts_cache_ttl {
+                return Ok(accounts.clone());
+            }
+        }
+
+        let mut accounts = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut truncated = true;
+
+        for _ in 0..MAX_ACCOUNT_PAGES {
+            let mut params = vec![("limit", ACCOUNT_PAGE_LIMIT.to_string())];
+            if let Some(c) = &cursor {
+                params.push(("cursor", c.clone()));
+            }
+            let response: AccountsResponse = self
+                .rest
+                .get(ACCOUNTS_PATH, &params)
+                .await
+                .context("Failed to fetch Coinbase accounts")?;
+            accounts.extend(response.accounts);
+
+            if !response.has_next {
+                truncated = false;
+                break;
+            }
+            match response.cursor {
+                // A cursor that does not advance — or a `has_next` with no
+                // cursor at all — cannot finish the list. Breaking out of the
+                // loop without saying so would report the partial answer as
+                // the whole one, which is the bug this paging exists to fix.
+                Some(next) if Some(&next) != cursor.as_ref() => cursor = Some(next),
+                _ => break,
+            }
+        }
+
+        if truncated {
+            // A short account list is a wrong balance and a missing position,
+            // both of which read as something else entirely downstream.
+            bail!(
+                "Coinbase account listing did not finish within {MAX_ACCOUNT_PAGES} pages — \
+                 refusing to report a partial balance"
+            );
+        }
+
+        let accounts = Arc::new(accounts);
+        *cache = Some((Instant::now(), accounts.clone()));
+        Ok(accounts)
+    }
+
+    /// Cancel, and check what Coinbase actually did.
+    ///
+    /// `batch_cancel` answers HTTP 200 with a per-order result: the envelope
+    /// says nothing about whether anything was cancelled. Reading only the
+    /// status code has the reconciler write a still-resting order off as
+    /// EXPIRED and abandon it, leaving it live to fill into a position the
+    /// ledger no longer carries.
+    async fn batch_cancel(&self, ids: &[String]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let payload = serde_json::json!({ "order_ids": ids });
+        let response: BatchCancelResponse = self.rest.post(BATCH_CANCEL_PATH, &payload).await?;
+
+        if response.results.is_empty() {
+            bail!(
+                "Coinbase returned no cancel result for {} order(s) — whether they are \
+                 still resting is unknown",
+                ids.len()
+            );
+        }
+
+        let mut failed = Vec::new();
+        for result in &response.results {
+            if result.success {
+                continue;
+            }
+            let id = result.order_id.as_deref().unwrap_or("<unknown>");
+            if result.is_already_resolved() {
+                warn!(
+                    order_id = id,
+                    reason = result.reason(),
+                    "Coinbase would not cancel an order that is already gone — \
+                     nothing is left resting under that id"
+                );
+                continue;
+            }
+            failed.push(format!("{id} ({})", result.reason()));
+        }
+
+        if !failed.is_empty() {
+            bail!(
+                "Coinbase could not cancel {} order(s): {}",
+                failed.len(),
+                failed.join(", ")
+            );
+        }
+        Ok(())
+    }
+
+    /// Orders in the given statuses, paged.
+    ///
+    /// The first page is not the whole answer: `cancel_all` builds its id list
+    /// from this, and the orphan audit concludes that an order it cannot see
+    /// does not exist.
+    async fn list_orders(&self, statuses: &[&str]) -> Result<Vec<OrderAck>> {
+        let mut acks = Vec::new();
+        let mut cursor: Option<String> = None;
+
+        for _ in 0..MAX_ORDER_PAGES {
+            let mut params: Vec<(&str, String)> = statuses
+                .iter()
+                .map(|s| ("order_status", (*s).to_string()))
+                .collect();
+            params.push(("limit", ORDER_PAGE_LIMIT.to_string()));
+            if let Some(c) = &cursor {
+                params.push(("cursor", c.clone()));
+            }
+
+            let response: OrdersResponse = self.rest.get(ORDER_HISTORY_PATH, &params).await?;
+            acks.extend(response.orders.iter().map(to_ack_lossy));
+
+            if !response.has_next {
+                return Ok(acks);
+            }
+            match response.cursor {
+                Some(next) if Some(&next) != cursor.as_ref() => cursor = Some(next),
+                _ => break,
+            }
+        }
+
+        // Reported rather than raised: `cancel_all` starts here, and an error
+        // would have it cancel nothing at all.
+        warn!(
+            venue = %self.id,
+            orders = acks.len(),
+            "Could not page Coinbase orders to the end — the live set may be incomplete"
+        );
+        Ok(acks)
     }
 }
 
@@ -802,7 +1189,9 @@ mod tests {
     use super::*;
     use rust_decimal_macros::dec;
     use serde_json::{json, Value};
-    use wiremock::matchers::{body_partial_json, header_exists, method, path, query_param};
+    use wiremock::matchers::{
+        body_partial_json, header_exists, method, path, query_param, query_param_is_missing,
+    };
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// A throwaway P-256 key. Generated for these tests and used nowhere else.
@@ -1287,25 +1676,587 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
         );
     }
 
+    /// A Coinbase account is a personal wallet as well as an agent account.
+    /// Staked ETH or an old SOL bag is real money, but it is not *drift*: the
+    /// reconciler reads a holding it has no record of as `missing_locally`,
+    /// which is an `UntilResume` halt needing a human. Reporting these would
+    /// halt anyone who enables this venue on an account they already use.
     #[tokio::test]
-    async fn a_holding_outside_the_configured_universe_still_reports() {
-        // Dust from a manual trade, or a symbol removed from the config. It
-        // is real exposure and reconciliation must be able to see it.
+    async fn a_holding_outside_the_configured_universe_is_not_a_position() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v3/brokerage/accounts"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "accounts": [{"currency": "SOL", "available_balance": {"value": "2"}}]
+                "accounts": [
+                    {"currency": "SOL", "available_balance": {"value": "2"}},
+                    {"currency": "BTC", "available_balance": {"value": "0.01"}}
+                ]
             })))
             .mount(&server)
             .await;
 
         let venue = venue(&server, &["BTC/USD"]);
         let positions = venue.positions().await.unwrap();
-        assert_eq!(positions.len(), 1);
+
+        assert_eq!(positions.len(), 1, "only what the agent trades");
+        assert_eq!(positions[0].instrument.symbol, "BTC/USD");
+    }
+
+    /// An explicit `active: false` is a suspended sub-account. Counting its
+    /// cash sizes positions against money the agent will find out it cannot
+    /// spend one rejected order at a time.
+    #[tokio::test]
+    async fn a_deactivated_account_counts_for_neither_cash_nor_positions() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/brokerage/accounts"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "accounts": [
+                    {"currency": "USD", "available_balance": {"value": "100"}, "active": true},
+                    {"currency": "USD", "available_balance": {"value": "900"}, "active": false},
+                    {"currency": "BTC", "available_balance": {"value": "0.5"}, "active": false}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["BTC/USD"]);
+        assert_eq!(venue.balance().await.unwrap().available, dec!(100));
+        assert!(venue.positions().await.unwrap().is_empty());
+    }
+
+    /// Coinbase creates a row per supported currency and pages by cursor. The
+    /// first page is not the answer: cash on page two reads as a zero bankroll,
+    /// and a holding on page two reads as an orphan and halts the agent.
+    #[tokio::test]
+    async fn accounts_are_paged_to_the_end() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/brokerage/accounts"))
+            .and(query_param_is_missing("cursor"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "accounts": [{"currency": "ETH", "available_balance": {"value": "1"}}],
+                "has_next": true,
+                "cursor": "page2"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/brokerage/accounts"))
+            .and(query_param("cursor", "page2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "accounts": [
+                    {"currency": "USD", "available_balance": {"value": "250"}},
+                    {"currency": "BTC", "available_balance": {"value": "0.02"}}
+                ],
+                "has_next": false
+            })))
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["BTC/USD"]);
         assert_eq!(
-            positions[0].instrument.symbol, "SOL/USD",
-            "falls back to USD"
+            venue.balance().await.unwrap().available,
+            dec!(250),
+            "cash on the second page is still cash"
         );
+        let positions = venue.positions().await.unwrap();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].instrument.symbol, "BTC/USD");
+    }
+
+    /// A truncated account list is a wrong balance and a missing position,
+    /// both of which read as something else entirely downstream — so it is an
+    /// error rather than a short answer.
+    #[tokio::test]
+    async fn an_account_listing_that_never_ends_is_an_error_not_a_partial_balance() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/brokerage/accounts"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "accounts": [{"currency": "USD", "available_balance": {"value": "1"}}],
+                "has_next": true,
+                "cursor": "always-more"
+            })))
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["BTC/USD"]);
+        let err = venue.balance().await.unwrap_err();
+        assert!(format!("{err:#}").contains("partial balance"), "{err:#}");
+    }
+
+    /// `balance()` and `positions()` are two projections of one snapshot. Each
+    /// paging the same rate-limited endpoint, and minting a JWT per request,
+    /// also lets the two disagree with each other within a single pass.
+    #[tokio::test]
+    async fn balance_and_positions_share_one_account_fetch() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/brokerage/accounts"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "accounts": [{"currency": "USD", "available_balance": {"value": "10"}}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["BTC/USD"]);
+        venue.balance().await.unwrap();
+        venue.positions().await.unwrap();
+        // `expect(1)` is asserted on drop.
+    }
+
+    #[tokio::test]
+    async fn the_account_snapshot_is_refetched_once_it_expires() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/brokerage/accounts"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "accounts": [{"currency": "USD", "available_balance": {"value": "10"}}]
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let venue = CoinbaseVenue::new(
+            CoinbaseConfig::new("organizations/o/apiKeys/k", PEM)
+                .with_base_url(server.uri())
+                .with_symbols(vec!["BTC/USD".to_string()])
+                .with_accounts_cache_ttl(Duration::ZERO),
+        )
+        .unwrap();
+        venue.balance().await.unwrap();
+        venue.positions().await.unwrap();
+    }
+
+    // ---- orders ---------------------------------------------------------
+
+    fn open_order(id: &str) -> Value {
+        json!({
+            "order_id": id,
+            "client_order_id": format!("cid-{id}"),
+            "product_id": "BTC-USD",
+            "status": "OPEN",
+            "filled_size": "0",
+            "total_fees": "0"
+        })
+    }
+
+    async fn mount_no_pending(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/api/v3/brokerage/orders/historical/batch"))
+            .and(query_param("order_status", "PENDING"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"orders": []})))
+            .mount(server)
+            .await;
+    }
+
+    /// `batch_cancel` answers HTTP 200 with a per-order result. Reading only
+    /// the status code has the reconciler write a still-resting order off as
+    /// EXPIRED and abandon it — leaving it live to fill into a position the
+    /// ledger no longer carries.
+    #[tokio::test]
+    async fn a_refused_cancel_is_an_error_not_a_silent_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v3/brokerage/orders/batch_cancel"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{
+                    "order_id": "cb-1",
+                    "success": false,
+                    "failure_reason": "UNKNOWN_CANCEL_FAILURE_REASON"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["BTC/USD"]);
+        let err = venue.cancel_order("cb-1").await.unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("cb-1"), "{rendered}");
+        assert!(
+            rendered.contains("UNKNOWN_CANCEL_FAILURE_REASON"),
+            "{rendered}"
+        );
+    }
+
+    /// An order that is already gone cannot be cancelled and does not need to
+    /// be. Treating that as a failure would have the reconciler retry forever.
+    #[tokio::test]
+    async fn a_cancel_for_an_order_that_is_already_gone_succeeds() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v3/brokerage/orders/batch_cancel"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{
+                    "order_id": "cb-1",
+                    "success": false,
+                    "failure_reason": "DUPLICATE_CANCEL_REQUEST"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["BTC/USD"]);
+        venue
+            .cancel_order("cb-1")
+            .await
+            .expect("nothing is resting");
+    }
+
+    #[tokio::test]
+    async fn a_cancel_coinbase_answers_with_nothing_is_not_a_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v3/brokerage/orders/batch_cancel"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"results": []})))
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["BTC/USD"]);
+        let err = venue.cancel_order("cb-1").await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("still resting is unknown"),
+            "{err:#}"
+        );
+    }
+
+    /// The kill switch builds its id list from `open_orders`. An order past
+    /// the first page is one it never cancels.
+    #[tokio::test]
+    async fn open_orders_pages_past_the_first_page() {
+        let server = MockServer::start().await;
+        mount_no_pending(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/brokerage/orders/historical/batch"))
+            .and(query_param("order_status", "OPEN"))
+            .and(query_param_is_missing("cursor"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "orders": [open_order("cb-1")], "has_next": true, "cursor": "next"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/brokerage/orders/historical/batch"))
+            .and(query_param("order_status", "OPEN"))
+            .and(query_param("cursor", "next"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "orders": [open_order("cb-2")], "has_next": false
+            })))
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["BTC/USD"]);
+        let open = venue.open_orders().await.unwrap();
+        let ids: Vec<&str> = open.iter().map(|o| o.venue_order_id.as_str()).collect();
+        assert_eq!(ids, vec!["cb-1", "cb-2"], "page two is not optional");
+    }
+
+    /// `to_order_state` calls PENDING and QUEUED accepted — the order exists
+    /// at the venue and can fill — so a kill switch that only asks for OPEN
+    /// leaves a just-submitted order resting through a halt.
+    #[tokio::test]
+    async fn open_orders_includes_pending_and_queued() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/brokerage/orders/historical/batch"))
+            .and(query_param("order_status", "OPEN"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"orders": []})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/brokerage/orders/historical/batch"))
+            .and(query_param("order_status", "PENDING"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "orders": [{
+                    "order_id": "cb-9", "status": "PENDING",
+                    "filled_size": "0", "total_fees": "0"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["BTC/USD"]);
+        let open = venue.open_orders().await.unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].venue_order_id, "cb-9");
+        assert_eq!(open[0].state, OrderState::Accepted);
+    }
+
+    /// One unparseable number must not cost the whole list: `cancel_all`
+    /// starts with `open_orders()?`, so an error there means the kill switch
+    /// posts no cancel at all and every resting order survives it.
+    #[tokio::test]
+    async fn one_malformed_order_does_not_stop_the_kill_switch() {
+        let server = MockServer::start().await;
+        mount_no_pending(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/brokerage/orders/historical/batch"))
+            .and(query_param("order_status", "OPEN"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "orders": [
+                    {"order_id": "cb-bad", "status": "OPEN", "total_fees": ""},
+                    open_order("cb-ok")
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v3/brokerage/orders/batch_cancel"))
+            .and(body_partial_json(json!({"order_ids": ["cb-bad", "cb-ok"]})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [
+                    {"order_id": "cb-bad", "success": true},
+                    {"order_id": "cb-ok", "success": true}
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["BTC/USD"]);
+        venue.cancel_all().await.expect("both orders are cancelled");
+    }
+
+    /// A miss here is not "no such order": the reconciler turns it, once the
+    /// TTL elapses, into "never acknowledged by the venue" and writes off a
+    /// row for an order that may be live or already filled.
+    #[tokio::test]
+    async fn a_client_id_lookup_pages_before_giving_up() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/brokerage/orders/historical/batch"))
+            .and(query_param_is_missing("cursor"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "orders": [open_order("cb-1")], "has_next": true, "cursor": "next"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/brokerage/orders/historical/batch"))
+            .and(query_param("cursor", "next"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "orders": [open_order("cb-2")], "has_next": false
+            })))
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["BTC/USD"]);
+        let ack = venue
+            .get_order(&OrderRef::Client("cid-cb-2".to_string()))
+            .await
+            .expect("the order is on page two, not absent");
+        assert_eq!(ack.venue_order_id, "cb-2");
+    }
+
+    // ---- order configuration --------------------------------------------
+
+    fn request(kind: OrderKind, side: Side, tif: TimeInForce) -> OrderRequest {
+        OrderRequest {
+            instrument: instrument(),
+            side,
+            kind,
+            qty: dec!(0.001),
+            tif,
+            extended_hours: false,
+            client_order_id: "cid-1".to_string(),
+        }
+    }
+
+    async fn accepting_server() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v3/brokerage/orders"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "success_response": {"order_id": "cb-1", "client_order_id": "cid-1"}
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// An IOC order's whole contract is "fill now or be gone". Sending it as
+    /// `limit_limit_gtc` — which is what this adapter did first — leaves a
+    /// resting order that can fill minutes later at a price the decision no
+    /// longer supports.
+    #[tokio::test]
+    async fn an_unsupported_time_in_force_is_refused_not_rewritten() {
+        let server = accepting_server().await;
+        let venue = venue(&server, &["BTC/USD"]);
+
+        for tif in [TimeInForce::Ioc, TimeInForce::Day] {
+            let err = venue
+                .place_order(&request(
+                    OrderKind::Limit { price: dec!(60000) },
+                    Side::Buy,
+                    tif,
+                ))
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("cannot express"),
+                "{err:#} for {tif:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_good_till_date_order_carries_its_expiry() {
+        let server = MockServer::start().await;
+        let expiry = Utc.with_ymd_and_hms(2026, 9, 21, 12, 0, 0).unwrap();
+        Mock::given(method("POST"))
+            .and(path("/api/v3/brokerage/orders"))
+            .and(body_partial_json(json!({
+                "order_configuration": {
+                    "limit_limit_gtd": {
+                        "base_size": "0.001",
+                        "limit_price": "60000",
+                        "end_time": "2026-09-21T12:00:00+00:00"
+                    }
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "success_response": {"order_id": "cb-1"}
+            })))
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["BTC/USD"]);
+        venue
+            .place_order(&request(
+                OrderKind::Limit { price: dec!(60000) },
+                Side::Buy,
+                TimeInForce::Gtd(expiry),
+            ))
+            .await
+            .expect("a GTD order is expressible");
+    }
+
+    /// Coinbase sizes a market BUY in the quote currency. Sending `base_size`
+    /// comes back as an HTTP 200 with `success: false`, and converting would
+    /// need a price — filling a quantity the risk sizing never approved.
+    #[tokio::test]
+    async fn a_market_buy_is_refused_because_coinbase_sizes_it_in_quote() {
+        let server = accepting_server().await;
+        let venue = venue(&server, &["BTC/USD"]);
+        let err = venue
+            .place_order(&request(OrderKind::Market, Side::Buy, TimeInForce::Ioc))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("quote currency"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn a_market_sell_is_sized_in_the_base_currency() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v3/brokerage/orders"))
+            .and(body_partial_json(json!({
+                "side": "SELL",
+                "order_configuration": {"market_market_ioc": {"base_size": "0.001"}}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "success_response": {"order_id": "cb-1"}
+            })))
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["BTC/USD"]);
+        venue
+            .place_order(&request(OrderKind::Market, Side::Sell, TimeInForce::Ioc))
+            .await
+            .expect("a market sell is sized in base");
+    }
+
+    // ---- candles and products -------------------------------------------
+
+    /// Coinbase has no FOUR_HOUR granularity. Sending `SIX_HOUR` and computing
+    /// the window from four hours — which is what this adapter did first —
+    /// returns six-hour bars labelled four-hour, and about two thirds of the
+    /// count asked for. Both halves produce a plausible number from the wrong
+    /// data rather than an error.
+    #[tokio::test]
+    async fn four_hour_candles_are_folded_from_two_hour_bars() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/brokerage/products/BTC-USD/candles"))
+            .and(query_param("granularity", "TWO_HOUR"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                // 08:00 and 10:00 fold into one 08:00 bucket; 12:00 opens the next.
+                // 1758441600 is 4h-aligned. It and 1758448800 fold into one
+                // bucket; 1758456000 opens the next.
+                "candles": [
+                    {"start": "1758456000", "low": "5", "high": "9", "open": "6", "close": "7", "volume": "3"},
+                    {"start": "1758448800", "low": "2", "high": "8", "open": "3", "close": "4", "volume": "2"},
+                    {"start": "1758441600", "low": "1", "high": "6", "open": "2", "close": "3", "volume": "1"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["BTC/USD"]);
+        let candles = venue
+            .candles(&instrument().id, CandleInterval::H4, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            candles.len(),
+            2,
+            "three two-hour bars make two four-hour ones"
+        );
+        let first = &candles[0];
+        assert_eq!(
+            first.ts.timestamp() % 14400,
+            0,
+            "buckets align to the interval"
+        );
+        assert_eq!(first.open, dec!(2), "the oldest bar in the bucket opens it");
+        assert_eq!(first.close, dec!(4), "the newest closes it");
+        assert_eq!(first.high, dec!(8), "the highest high across both");
+        assert_eq!(first.low, dec!(1), "the lowest low across both");
+        assert_eq!(first.volume, dec!(3), "volume sums");
+        assert_eq!(candles[1].open, dec!(6), "the next bucket starts fresh");
+    }
+
+    /// `/products` pages by offset. A configured symbol past the first page
+    /// was dropped with a "does not list this product" warning — which reads
+    /// as a delisting rather than as truncation.
+    #[tokio::test]
+    async fn products_are_paged_until_every_configured_symbol_is_found() {
+        let server = MockServer::start().await;
+        let filler: Vec<Value> = (0..PRODUCT_PAGE_LIMIT)
+            .map(|i| {
+                let mut p = btc_product();
+                p["product_id"] = json!(format!("FILL{i}-USD"));
+                p
+            })
+            .collect();
+        Mock::given(method("GET"))
+            .and(path("/api/v3/brokerage/products"))
+            .and(query_param("offset", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"products": filler})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/brokerage/products"))
+            .and(query_param("offset", PRODUCT_PAGE_LIMIT.to_string()))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"products": [btc_product()]})),
+            )
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["BTC/USD"]);
+        let found = venue
+            .list_instruments(&ScanFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].symbol(), "BTC/USD");
     }
 }

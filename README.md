@@ -397,16 +397,26 @@ all; that is the point of the threshold.
 | Venue | Assets | Paper mode | Status |
 |---|---|---|---|
 | Alpaca | US equities + crypto | yes, separate keys and host | the paper-window target |
-| Coinbase Advanced Trade | spot crypto, 24/7 | **no** | implemented, disabled by default |
+| Coinbase Advanced Trade | spot crypto, 24/7 | **no** | implemented, live mode only |
 | Polymarket | prediction markets | in-process | legacy path; US persons may not trade it |
 
 **Coinbase has no paper endpoint.** Its sandbox serves authentication and
 serialization only — there is no matching engine — so an enabled Coinbase
-venue reaches the *live* exchange whatever `agent.mode` says. That is
-different from Alpaca, where paper and live are different hosts and different
-keys, and it is why Coinbase ships disabled: the config is the safety
-mechanism, not the mode flag. A test pins that the paper template does not
-enable it.
+venue reaches the *live* exchange. That is different from Alpaca, where paper
+and live are different hosts and different keys, and there is no paper
+simulator on the `Venue` path either: the cycle calls `place_order` on every
+venue in the registry whatever the mode.
+
+So the agent **refuses to build a Coinbase venue unless `agent.mode = "live"`**
+and names it in the startup log and in `--dry-run`. Leaving this to a disabled
+line in the shipped config made a comment the only thing between a paper window
+and real money — and the file operators are told to edit is `config/local.toml`,
+which that comment is not in.
+
+`fee_pct` in the template is the **taker** rate at the lowest volume tier
+(~1.2%), not the maker rate: orders go out as limit GTC without `post_only`, so
+they can take, and `round_trip_cost` doubles the number. Quoting the maker rate
+would let trades that are negative after fees clear the edge threshold.
 
 Credentials are `COINBASE_API_KEY_NAME` (`organizations/{org}/apiKeys/{key}`)
 and `COINBASE_API_PRIVATE_KEY`, the EC PEM issued with it. Escaped newlines

@@ -80,11 +80,12 @@ pub fn build_registry_reporting(
                 ),
                 Err(e) => skip(&venue_config.id, format!("{e:#}")),
             },
-            "coinbase" => match build_coinbase(venue_config, secrets) {
+            "coinbase" => match build_coinbase(venue_config, secrets, config.agent.mode) {
                 Ok(Some(venue)) => {
                     info!(
                         venue = %venue_config.id,
                         symbols = venue_config.symbols.len(),
+                        mode = ?config.agent.mode,
                         "Venue enabled"
                     );
                     venues.push(Box::new(venue));
@@ -120,13 +121,30 @@ pub fn build_registry_reporting(
 /// `Ok(None)` means "configured but no credentials", which is a skip, not an
 /// error.
 ///
-/// Coinbase has no paper endpoint — its sandbox serves auth and
-/// serialization only, not a matching engine — so unlike Alpaca there is no
-/// mode-derived host here. In paper mode the agent must not reach it at all;
-/// that is enforced by the venue being disabled in the shipped config rather
-/// than by a URL swap, because a URL swap that silently fails open would
-/// point paper trading at the live exchange.
-fn build_coinbase(venue_config: &VenueConfig, secrets: &Secrets) -> Result<Option<CoinbaseVenue>> {
+/// Coinbase has no paper endpoint — its sandbox serves auth and serialization
+/// only, not a matching engine — so unlike Alpaca there is no mode-derived
+/// host to swap: an enabled Coinbase venue reaches the live exchange, and
+/// `venue_cycle` calls `place_order` on every venue in the registry without
+/// asking which mode the agent is in. There is no paper simulator on the
+/// `Venue` path.
+///
+/// So the mode check lives here, where the venue is built. Leaving it to a
+/// disabled line in the shipped config made a comment the only thing standing
+/// between `mode = "paper"` and real money, and the file operators are told to
+/// edit is `config/local.toml`, which that comment is not in.
+fn build_coinbase(
+    venue_config: &VenueConfig,
+    secrets: &Secrets,
+    mode: AgentMode,
+) -> Result<Option<CoinbaseVenue>> {
+    if mode != AgentMode::Live {
+        anyhow::bail!(
+            "Coinbase has no paper endpoint, so an enabled Coinbase venue trades real \
+             money — refusing to build it while agent.mode is {mode:?}. Set \
+             agent.mode = \"live\" if that is what you intend."
+        );
+    }
+
     let (Some(key_name), Some(private_key)) =
         (&secrets.coinbase_key_name, &secrets.coinbase_private_key)
     else {
@@ -205,6 +223,13 @@ mod tests {
         config
     }
 
+    /// Coinbase is live-only, so its tests have to say so.
+    fn live_config_with(venues: Vec<VenueConfig>) -> AppConfig {
+        let mut config = config_with(venues);
+        config.agent.mode = AgentMode::Live;
+        config
+    }
+
     fn alpaca_config(enabled: bool) -> VenueConfig {
         VenueConfig {
             id: "alpaca".to_string(),
@@ -246,7 +271,7 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
             base_url: None,
             data_url: None,
             symbols: vec!["BTC/USD".to_string()],
-            fee_pct: rust_decimal_macros::dec!(0.006),
+            fee_pct: rust_decimal_macros::dec!(0.012),
         }
     }
 
@@ -262,7 +287,7 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
     #[test]
     fn a_coinbase_venue_with_credentials_is_built() {
         let registry = build_registry(
-            &config_with(vec![coinbase_config(true)]),
+            &live_config_with(vec![coinbase_config(true)]),
             &secrets_with_coinbase(true),
             None,
         )
@@ -272,12 +297,43 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
     }
 
     /// Coinbase has **no paper endpoint** — its sandbox serves auth and
-    /// serialization only, with no matching engine. So there is no
-    /// mode-derived host to swap, and an enabled Coinbase venue reaches the
-    /// live exchange whatever `agent.mode` says.
-    ///
-    /// That makes "disabled in the shipped config" the actual safety
-    /// mechanism, and this pins it: the template must not enable it.
+    /// serialization only, with no matching engine — and there is no paper
+    /// simulator on the `Venue` path: `venue_cycle` calls `place_order` on
+    /// every registry venue whatever the mode. So an enabled Coinbase venue in
+    /// a "paper window" spends real money, and the only thing that can stop it
+    /// is refusing to build it.
+    #[test]
+    fn coinbase_is_refused_outright_in_paper_mode() {
+        let mut config = config_with(vec![coinbase_config(true)]);
+        config.agent.mode = AgentMode::Paper;
+        let (registry, skipped) =
+            build_registry_reporting(&config, &secrets_with_coinbase(true), None);
+
+        assert!(
+            registry.is_empty(),
+            "a paper window must not be able to place a real Coinbase order"
+        );
+        assert_eq!(skipped.len(), 1);
+        assert!(
+            skipped[0].reason.contains("real money") && skipped[0].reason.contains("Paper"),
+            "the reason must say why, and name the mode: {}",
+            skipped[0].reason
+        );
+    }
+
+    #[test]
+    fn coinbase_is_refused_in_backtest_mode_too() {
+        let mut config = config_with(vec![coinbase_config(true)]);
+        config.agent.mode = AgentMode::Backtest;
+        let (registry, _) = build_registry_reporting(&config, &secrets_with_coinbase(true), None);
+        assert!(
+            registry.is_empty(),
+            "a backtest reaching the live exchange is worse than a paper one"
+        );
+    }
+
+    /// The guard is in the builder, not in a comment in a file operators are
+    /// told to copy — but the shipped template should still not enable it.
     #[test]
     fn the_shipped_paper_template_does_not_enable_coinbase() {
         let toml = std::fs::read_to_string("config/paper.toml").unwrap();
@@ -287,15 +343,14 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
                 .venues
                 .iter()
                 .any(|v| v.enabled && v.kind.eq_ignore_ascii_case("coinbase")),
-            "Coinbase has no paper mode — enabling it in the paper template \
-             would point a paper window at the live exchange"
+            "Coinbase has no paper mode"
         );
     }
 
     #[test]
     fn coinbase_without_credentials_is_skipped_with_a_reason_naming_them() {
         let (registry, skipped) = build_registry_reporting(
-            &config_with(vec![coinbase_config(true)]),
+            &live_config_with(vec![coinbase_config(true)]),
             &secrets_with_coinbase(false),
             None,
         );
@@ -320,8 +375,11 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
             coinbase_private_key: Some(crate::config::SecretString::from("not a pem")),
             ..secrets_with_alpaca(false)
         };
-        let (registry, skipped) =
-            build_registry_reporting(&config_with(vec![coinbase_config(true)]), &secrets, None);
+        let (registry, skipped) = build_registry_reporting(
+            &live_config_with(vec![coinbase_config(true)]),
+            &secrets,
+            None,
+        );
         assert!(registry.is_empty());
         assert!(
             skipped[0].reason.contains("P-256"),
@@ -341,8 +399,12 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
     fn a_coinbase_venue_reports_its_configured_id() {
         let mut cfg = coinbase_config(true);
         cfg.id = "coinbase-main".to_string();
-        let registry =
-            build_registry(&config_with(vec![cfg]), &secrets_with_coinbase(true), None).unwrap();
+        let registry = build_registry(
+            &live_config_with(vec![cfg]),
+            &secrets_with_coinbase(true),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             registry.all().next().unwrap().id().as_str(),
             "coinbase-main"

@@ -105,7 +105,16 @@ impl CoinbaseRest {
             .with_context(|| format!("Coinbase {method} {url} request failed"))?;
 
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        // A read that fails mid-body is not an empty body. Collapsing the two
+        // turns a connection reset on a 200 into "returned an unexpected body:"
+        // with nothing after the colon, and erases the reason from an HTTP
+        // error — the opposite of why this function carries the body at all.
+        let body = response.text().await.with_context(|| {
+            format!(
+                "Coinbase {method} {url} answered HTTP {} but the body could not be read",
+                status.as_u16()
+            )
+        })?;
 
         if !status.is_success() {
             bail!(

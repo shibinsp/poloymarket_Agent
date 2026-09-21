@@ -23,6 +23,10 @@ pub fn money(value: &str, field: &str) -> Result<Decimal> {
 pub struct ProductsResponse {
     #[serde(default)]
     pub products: Vec<Product>,
+    /// Total products matching the query, which is larger than `products.len()`
+    /// whenever the answer was paged. Coinbase pages `/products` by `offset`.
+    #[serde(default)]
+    pub num_products: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -123,6 +127,13 @@ pub struct CandleRow {
 pub struct AccountsResponse {
     #[serde(default)]
     pub accounts: Vec<Account>,
+    /// Coinbase creates one account row per supported currency, so real
+    /// accounts run well past a single page. Reading only the first page
+    /// silently drops both cash and holdings.
+    #[serde(default)]
+    pub has_next: bool,
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -202,6 +213,49 @@ impl CreateOrderError {
     }
 }
 
+/// `POST /orders/batch_cancel` answers HTTP 200 with a per-order result.
+///
+/// The envelope succeeding says nothing about whether anything was cancelled,
+/// so an adapter that reads only the status code reports a still-resting order
+/// as cancelled — and the kill switch then reports a book it never closed.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BatchCancelResponse {
+    #[serde(default)]
+    pub results: Vec<CancelResult>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CancelResult {
+    #[serde(default)]
+    pub order_id: Option<String>,
+    #[serde(default)]
+    pub success: bool,
+    #[serde(default)]
+    pub failure_reason: Option<String>,
+}
+
+impl CancelResult {
+    /// Whether a refusal still means nothing is left resting.
+    ///
+    /// Coinbase refuses a cancel for an order that is already gone — filled,
+    /// already cancelled, or never existed. That is the outcome the caller
+    /// wanted, so treating it as a failure would have the reconciler retry
+    /// forever against an order that cannot be cancelled because it is done.
+    pub fn is_already_resolved(&self) -> bool {
+        self.failure_reason.as_deref().is_some_and(|r| {
+            let r = r.to_uppercase();
+            r.contains("DUPLICATE_CANCEL_REQUEST") || r.contains("INVALID_CANCEL_REQUEST")
+        })
+    }
+
+    pub fn reason(&self) -> &str {
+        self.failure_reason
+            .as_deref()
+            .filter(|r| !r.trim().is_empty())
+            .unwrap_or("Coinbase refused the cancel without a reason")
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct OrderResponse {
     pub order: Order,
@@ -211,6 +265,10 @@ pub struct OrderResponse {
 pub struct OrdersResponse {
     #[serde(default)]
     pub orders: Vec<Order>,
+    #[serde(default)]
+    pub has_next: bool,
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -330,6 +388,36 @@ mod tests {
             preview_failure_reason: None,
         };
         assert_eq!(prefers_message.reason(), "size too small");
+    }
+
+    fn cancel(success: bool, reason: Option<&str>) -> CancelResult {
+        CancelResult {
+            order_id: Some("cb-1".to_string()),
+            success,
+            failure_reason: reason.map(str::to_string),
+        }
+    }
+
+    /// An order that is already gone cannot be cancelled and does not need to
+    /// be — that is the outcome the caller wanted. Treating it as a failure
+    /// would have the reconciler retry forever against a finished order.
+    #[test]
+    fn a_refusal_for_an_order_that_is_already_gone_is_not_a_failure() {
+        assert!(cancel(false, Some("DUPLICATE_CANCEL_REQUEST")).is_already_resolved());
+        assert!(cancel(false, Some("INVALID_CANCEL_REQUEST")).is_already_resolved());
+    }
+
+    /// Everything else leaves an order resting. Reading it as resolved is how
+    /// the kill switch reports a book it never closed.
+    #[test]
+    fn any_other_refusal_leaves_an_order_resting() {
+        assert!(!cancel(false, Some("UNKNOWN_CANCEL_FAILURE_REASON")).is_already_resolved());
+        assert!(!cancel(false, Some("COMMANDER_REJECTED_CANCEL_ORDER")).is_already_resolved());
+        assert!(!cancel(false, None).is_already_resolved());
+        assert_eq!(
+            cancel(false, None).reason(),
+            "Coinbase refused the cancel without a reason"
+        );
     }
 
     #[test]

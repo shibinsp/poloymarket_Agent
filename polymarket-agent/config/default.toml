@@ -128,16 +128,21 @@ path = "polymarket-agent.db"
 #
 # WARNING: Coinbase has no paper endpoint. Its sandbox serves auth and
 # serialization only — there is no matching engine — so an enabled Coinbase
-# venue reaches the LIVE exchange whatever `agent.mode` says. Unlike Alpaca,
-# `mode = "paper"` does not protect you here. Leave it disabled until you
-# intend to trade real money on it.
+# venue reaches the LIVE exchange and trades real money. The agent therefore
+# refuses to build it unless agent.mode = "live", and says so at startup.
+#
+# fee_pct is the TAKER rate at the lowest volume tier (<$1K/30d), which is
+# where micro capital starts. Orders go out as limit GTC without post_only, so
+# they can take — and round_trip_cost doubles this number, so quoting the maker
+# rate here would clear the edge threshold on trades that are really negative
+# after fees. Lower it when your volume tier earns it.
 #
 # [[venues]]
 # id = "coinbase"
 # kind = "coinbase"
 # enabled = false
 # symbols = ["BTC/USD", "ETH/USD"]
-# fee_pct = 0.006
+# fee_pct = 0.012
 
 [sizing_continuous]
 risk_per_trade_pct = 0.0075     # fraction of bankroll risked if the stop hits
