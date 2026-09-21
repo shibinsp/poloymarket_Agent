@@ -254,6 +254,40 @@ impl Reconciler<'_> {
         let Some(order_id) = order.id else {
             return;
         };
+
+        // The venue reports *cumulative* filled quantity and a *cumulative*
+        // average price, and a resting partial is re-queried every cycle. So
+        // what arrives here is the whole fill so far, over and over.
+        //
+        // Record the increment since the last pass instead. Writing the
+        // cumulative figure each time produces one row per cycle — a single
+        // 1.0 order that filled in two steps would sum to more than 1.0, and
+        // the Orders page would report executions that never happened.
+        //
+        // `order` was read before `update_order_state` overwrote the row, so
+        // it still holds the previous totals.
+        let prev_qty = Decimal::from_str_exact(&order.filled_qty).unwrap_or(Decimal::ZERO);
+        let delta_qty = filled_qty - prev_qty;
+        if delta_qty <= Decimal::ZERO {
+            // Nothing new filled. Not an error — most cycles look like this.
+            return;
+        }
+
+        // The increment's own VWAP, backed out of the two running averages.
+        // Using the cumulative average would attribute the whole order's
+        // price to a tranche that traded somewhere else, which is precisely
+        // the measurement slippage is supposed to make.
+        let prev_avg = order
+            .avg_fill_price
+            .as_deref()
+            .and_then(|p| Decimal::from_str_exact(p).ok());
+        let price = match prev_avg {
+            Some(prev) if prev_qty > Decimal::ZERO => {
+                (price * filled_qty - prev * prev_qty) / delta_qty
+            }
+            _ => price,
+        };
+        let filled_qty = delta_qty;
         let mid = order
             .mid_at_submit
             .as_deref()
@@ -742,6 +776,77 @@ mod tests {
         let open = store.get_open_venue_trades().await.unwrap();
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].quantity, dec!(0.4), "only the filled part is held");
+    }
+
+    /// A resting partial is re-queried every cycle, and the venue reports
+    /// its *cumulative* filled quantity each time. Recording that as a fill
+    /// on every pass writes one row per cycle, each restating the whole
+    /// filled amount — so a single 1.0 order that filled in two steps sums
+    /// to more than 1.0, and the Orders page reports executions that never
+    /// happened.
+    #[tokio::test]
+    async fn a_resting_partial_records_one_execution_per_increment_not_per_cycle() {
+        let store = Store::new(":memory:").await.unwrap();
+        pending_entry(&store, None).await;
+
+        // Cycle one: 0.4 of 1.0 filled at 100.
+        let registry = VenueRegistry::new(vec![Box::new(ScriptedVenue::answering(ack(
+            OrderState::PartiallyFilled,
+            dec!(0.4),
+            Some(dec!(100)),
+        )))]);
+        reconciler(&registry, &store).run(Utc::now()).await.unwrap();
+        assert_eq!(store.get_fills(10).await.unwrap().len(), 1);
+
+        // Cycle two: nothing more filled. The venue repeats 0.4.
+        let registry = VenueRegistry::new(vec![Box::new(ScriptedVenue::answering(ack(
+            OrderState::PartiallyFilled,
+            dec!(0.4),
+            Some(dec!(100)),
+        )))]);
+        reconciler(&registry, &store).run(Utc::now()).await.unwrap();
+        assert_eq!(
+            store.get_fills(10).await.unwrap().len(),
+            1,
+            "an unchanged partial is not a new execution"
+        );
+
+        // Cycle three: the rest fills, taking the cumulative average to 101.
+        let registry = VenueRegistry::new(vec![Box::new(ScriptedVenue::answering(ack(
+            OrderState::Filled,
+            dec!(1.0),
+            Some(dec!(101)),
+        )))]);
+        reconciler(&registry, &store).run(Utc::now()).await.unwrap();
+
+        let fills = store.get_fills(10).await.unwrap();
+        assert_eq!(fills.len(), 2, "two increments, two executions");
+
+        let total: Decimal = fills
+            .iter()
+            .map(|f| Decimal::from_str_exact(&f.qty).unwrap())
+            .sum();
+        assert_eq!(
+            total,
+            dec!(1.0),
+            "the executions must sum to what actually filled, got {fills:#?}"
+        );
+
+        // The second execution is the *increment*, not the running average:
+        // 0.6 at the price that takes 0.4@100 to 1.0@101.
+        let newest = &fills[0];
+        assert_eq!(Decimal::from_str_exact(&newest.qty).unwrap(), dec!(0.6));
+        // The increment's own VWAP: what takes 0.4 @ 100 up to 1.0 @ 101.
+        let expected = (dec!(101) * dec!(1.0) - dec!(100) * dec!(0.4)) / dec!(0.6);
+        assert_eq!(
+            Decimal::from_str_exact(&newest.price).unwrap(),
+            expected,
+            "the increment's own VWAP, not the order's cumulative average"
+        );
+        assert!(
+            expected > dec!(101),
+            "sanity: the second tranche filled worse than the first"
+        );
     }
 
     #[tokio::test]
