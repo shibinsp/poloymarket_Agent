@@ -156,6 +156,32 @@ async fn instant_fill_alpaca_server() -> MockServer {
         .with_priority(1)
         .mount(&server)
         .await;
+    // Positions have to be staged, not static: flat before the fill and
+    // holding after it.
+    //
+    // A venue that reports the position from the first call disagrees with an
+    // empty ledger; one that never reports it disagrees with a full ledger.
+    // Either way reconciliation halts the agent — correctly, and that is how
+    // this fixture's missing positions were found. The first reconciliation
+    // runs before the entry, so the empty answer is consumed once.
+    Mock::given(method("GET"))
+        .and(path("/v2/positions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/positions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "symbol": "BTCUSD",
+            "asset_class": "crypto",
+            "qty": "0.001",
+            "avg_entry_price": "60065.005"
+        }])))
+        .with_priority(2)
+        .mount(&server)
+        .await;
     server
 }
 
@@ -641,28 +667,63 @@ async fn an_inline_fill_is_not_recorded_twice_on_the_next_cycle() {
 
     h.agent.run_cycle().await.expect("cycle two");
 
-    // NOTE, unresolved: against this fixture the second cycle scans zero
-    // instruments and opens nothing, where the accepted-then-reconciled
-    // fixture opens a second position. The two servers differ only in the
-    // status the POST returns, and the state it produces (FILLED) should be
-    // *less* restrictive than ACCEPTED, which is held in the `busy` set. I
-    // could not account for it and have not assumed it is only a fixture
-    // artifact. It does not affect what this test asserts — the execution is
-    // recorded once either way — but it is worth running down before the
-    // paper window is read for "orders per day".
+    // Cycle two opens a second position, which also fills inline — so two
+    // orders and two executions. What must not happen is a *restatement*:
+    // the venue reports cumulative quantities, and recording those verbatim
+    // would give the first order a second row for the same 0.001.
+    let orders = h.store.get_orders(10).await.unwrap();
     let fills = h.store.get_fills(10).await.unwrap();
     assert_eq!(
         fills.len(),
-        1,
-        "the second cycle must not restate an execution it already recorded, got {fills:#?}"
+        orders.len(),
+        "one execution per filled order, got {} orders and {fills:#?}",
+        orders.len()
     );
-    let total: Decimal = fills
-        .iter()
-        .map(|f| Decimal::from_str(&f.qty).unwrap())
-        .sum();
+    assert!(
+        fills
+            .iter()
+            .all(|f| Decimal::from_str(&f.qty).unwrap() == dec!(0.001)),
+        "each execution records its own increment, not a running total: {fills:#?}"
+    );
+}
+
+/// A position the venue does not report halts the agent.
+///
+/// The base fixture's `/v2/positions` is always empty, so once an entry
+/// fills, the ledger holds something the venue denies. That is the single
+/// most expensive disagreement there is — it means the agent is sizing,
+/// marking and stopping against a position picture that is wrong — and it
+/// must stop trading rather than carry on.
+///
+/// Found by accident: a test that expected a second position got none, and
+/// the reason was this halt firing exactly as designed.
+#[tokio::test]
+async fn a_position_the_venue_does_not_report_halts_the_agent() {
+    let mut h = harness_with(filling_alpaca_server().await, |_| {}).await;
+
+    h.agent
+        .run_cycle()
+        .await
+        .expect("cycle one places an order");
+    h.agent.run_cycle().await.expect("cycle two fills it");
+    // Cycle three: the ledger now holds a position the venue denies.
+    h.agent.run_cycle().await.expect("cycle three reconciles");
+
+    assert!(
+        h.kill_switch.is_tripped(),
+        "a ledger the venue contradicts must stop trading"
+    );
+    let halt = h.store.active_halt().await.unwrap().expect("persisted");
+    assert_eq!(halt.source, "reconciliation");
     assert_eq!(
-        total,
-        dec!(0.001),
-        "the recorded quantity must equal what actually filled"
+        halt.scope, "until_resume",
+        "tomorrow will not make the books agree"
+    );
+    assert!(
+        halt.detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("BTC/USD"),
+        "the halt must name what disagreed: {halt:?}"
     );
 }
