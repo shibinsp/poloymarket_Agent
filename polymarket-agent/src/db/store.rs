@@ -298,11 +298,20 @@ impl Store {
     /// this is used for display only — the budget ledger and the daily cap
     /// read `get_today_api_cost`, which is bounded by the day and summed
     /// exactly in `Decimal`.
+    ///
+    /// The `CAST` is load-bearing, not tidiness. Without it SQLite types the
+    /// result from the values it summed: every cost a whole number — which is
+    /// what a free-tier or self-hosted model gives, every row `"0"` — makes
+    /// `SUM` return an **INTEGER**, which does not decode as `f64`. The whole
+    /// call then fails, `/api/metrics` answers `{"error": ...}`, and every
+    /// tile on the dashboard's portfolio panel reads as missing. `CAST`
+    /// pins the type to REAL regardless of the data.
     pub async fn get_total_api_cost(&self) -> Result<Decimal> {
-        let total: Option<f64> = sqlx::query_scalar("SELECT SUM(cost) FROM api_costs")
-            .fetch_one(&self.pool)
-            .await
-            .context("Failed to get total API cost")?;
+        let total: Option<f64> =
+            sqlx::query_scalar("SELECT SUM(CAST(cost AS REAL)) FROM api_costs")
+                .fetch_one(&self.pool)
+                .await
+                .context("Failed to get total API cost")?;
         Ok(total
             .and_then(Decimal::from_f64_retain)
             .unwrap_or(Decimal::ZERO)
@@ -1319,6 +1328,68 @@ pub struct VenueTradeRecord {
 
 #[cfg(test)]
 mod tests {
+    fn api_cost(cost: &str) -> ApiCostRecord {
+        ApiCostRecord {
+            id: None,
+            provider: "test".to_string(),
+            endpoint: None,
+            input_tokens: Some(100),
+            output_tokens: Some(50),
+            cost: cost.to_string(),
+            cycle: Some(1),
+            created_at: None,
+        }
+    }
+
+    /// A free-tier or self-hosted model records every call at `"0"`.
+    ///
+    /// `cost` is a TEXT column, so SQLite types `SUM` from the values it
+    /// summed: all-integral input makes it return an INTEGER, which does not
+    /// decode as `f64`. The whole call then failed, `/api/metrics` answered
+    /// `{"error": ...}`, and every tile on the dashboard's portfolio panel
+    /// read as missing — permanently, for anyone not billed per call.
+    #[tokio::test]
+    async fn total_api_cost_survives_costs_that_are_whole_numbers() {
+        let store = Store::new(":memory:").await.expect("store");
+        for _ in 0..3 {
+            store.insert_api_cost(&api_cost("0")).await.expect("insert");
+        }
+
+        assert_eq!(
+            store
+                .get_total_api_cost()
+                .await
+                .expect("a free model is not an error"),
+            Decimal::ZERO
+        );
+    }
+
+    /// Whole numbers that are not zero take the same path.
+    #[tokio::test]
+    async fn total_api_cost_survives_integral_costs_above_zero() {
+        let store = Store::new(":memory:").await.expect("store");
+        store.insert_api_cost(&api_cost("2")).await.expect("insert");
+        store.insert_api_cost(&api_cost("3")).await.expect("insert");
+
+        assert_eq!(store.get_total_api_cost().await.unwrap(), dec!(5));
+    }
+
+    #[tokio::test]
+    async fn total_api_cost_still_adds_fractional_costs() {
+        let store = Store::new(":memory:").await.expect("store");
+        store.insert_api_cost(&api_cost("0.0091")).await.unwrap();
+        store.insert_api_cost(&api_cost("0.0109")).await.unwrap();
+
+        assert_eq!(store.get_total_api_cost().await.unwrap(), dec!(0.02));
+    }
+
+    /// No calls yet is zero, not an error and not a missing panel.
+    #[tokio::test]
+    async fn total_api_cost_is_zero_before_any_call() {
+        let store = Store::new(":memory:").await.expect("store");
+        assert_eq!(store.get_total_api_cost().await.unwrap(), Decimal::ZERO);
+    }
+
     use super::*;
     use rust_decimal_macros::dec;
 
