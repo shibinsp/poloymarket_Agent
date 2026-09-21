@@ -34,6 +34,10 @@ const LOOPBACK: &str = "127.0.0.1";
 pub struct DashboardState {
     store: Arc<Store>,
     health: HealthState,
+    /// The limits the breakers enforce, so the risk page can show headroom
+    /// rather than only reporting a trip after the fact.
+    risk: Arc<crate::config::RiskConfig>,
+    mode: AgentMode,
     initial_bankroll: Decimal,
     api_token: Option<Arc<str>>,
     /// Shared with the agent loop. The dashboard only ever sets or clears
@@ -51,12 +55,16 @@ impl DashboardState {
         initial_bankroll: Decimal,
         api_token: Option<String>,
         kill_switch: Arc<KillSwitch>,
+        risk: crate::config::RiskConfig,
+        mode: AgentMode,
     ) -> Self {
         Self {
             store: Arc::new(store),
             health,
             initial_bankroll,
             kill_switch,
+            risk: Arc::new(risk),
+            mode,
             // Trim before storing: the page sends a trimmed token, so keeping
             // stray whitespace here would 401 every request with an
             // apparently-correct token.
@@ -132,6 +140,11 @@ fn build_router(state: DashboardState) -> Router {
         .route("/api/cycles", get(cycles_latest_handler))
         .route("/api/cycles/all", get(cycles_all_handler))
         .route("/api/costs", get(costs_handler))
+        .route("/api/orders", get(orders_handler))
+        .route("/api/fills", get(fills_handler))
+        .route("/api/equity", get(equity_handler))
+        .route("/api/reconciliation", get(reconciliation_handler))
+        .route("/api/risk", get(risk_handler))
         .route("/api/halt", post(halt_handler))
         .route("/api/halt", get(halt_status_handler))
         .route("/api/resume", post(resume_handler))
@@ -179,6 +192,83 @@ async fn require_token(State(state): State<DashboardState>, req: Request, next: 
 async fn index_handler() -> impl IntoResponse {
     let html = include_str!("../../static/index.html");
     ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html)
+}
+
+/// The execution record: what was asked for, and what came back.
+async fn orders_handler(State(state): State<DashboardState>) -> impl IntoResponse {
+    match state.store.get_orders(500).await {
+        Ok(rows) => Json(serde_json::to_value(&rows).unwrap_or_default()),
+        Err(e) => Json(serde_json::json!({"error": e.to_string()})),
+    }
+}
+
+/// Individual executions — where slippage and time-to-fill live.
+async fn fills_handler(State(state): State<DashboardState>) -> impl IntoResponse {
+    match state.store.get_fills(500).await {
+        Ok(rows) => Json(serde_json::to_value(&rows).unwrap_or_default()),
+        Err(e) => Json(serde_json::json!({"error": e.to_string()})),
+    }
+}
+
+/// Start-of-day equity and the running peak — the drawdown series.
+async fn equity_handler(State(state): State<DashboardState>) -> impl IntoResponse {
+    match state.store.get_daily_equity().await {
+        Ok(rows) => Json(serde_json::to_value(&rows).unwrap_or_default()),
+        Err(e) => Json(serde_json::json!({"error": e.to_string()})),
+    }
+}
+
+async fn reconciliation_handler(State(state): State<DashboardState>) -> impl IntoResponse {
+    match state.store.get_reconciliation_runs(200).await {
+        Ok(rows) => Json(serde_json::to_value(&rows).unwrap_or_default()),
+        Err(e) => Json(serde_json::json!({"error": e.to_string()})),
+    }
+}
+
+/// How much headroom is left under each circuit breaker.
+///
+/// The limits live in a config file and the trips land in the logs; neither
+/// answers the question an operator actually has, which is *how close am I*.
+/// Reported as raw numbers rather than a single percentage so the page can
+/// show both the limit and the distance to it.
+async fn risk_handler(State(state): State<DashboardState>) -> impl IntoResponse {
+    let today = chrono::Utc::now().date_naive();
+    let cfg = &state.risk;
+
+    // Read the marks; never write them. Recording equity from a GET would let
+    // a page refresh move the day's opening figure, which is the number every
+    // daily-loss calculation is measured against.
+    let equity = state.store.get_daily_equity().await.unwrap_or_default();
+    let today_row = equity.iter().find(|r| r.day == today.to_string());
+    let peak = equity
+        .iter()
+        .filter_map(|r| Decimal::from_str_exact(&r.high_water_mark).ok())
+        .max();
+
+    let trades_today = state.store.count_trades_opened_on(today).await.unwrap_or(0);
+    let losses = state.store.consecutive_losses().await.unwrap_or(0);
+
+    Json(serde_json::json!({
+        "mode": format!("{:?}", state.mode).to_lowercase(),
+        "day": today.to_string(),
+        "starting_equity": today_row.map(|r| r.starting_equity.clone()),
+        "current_equity": today_row.and_then(|r| r.closing_equity.clone()),
+        "high_water_mark": peak.map(|p| p.to_string()),
+        "trades_today": trades_today,
+        "consecutive_losses": losses,
+        "limits": {
+            "max_daily_loss_pct": cfg.max_daily_loss_pct.to_string(),
+            "max_daily_loss_usd": cfg.max_daily_loss_usd.to_string(),
+            "max_drawdown_pct": cfg.max_drawdown_pct.to_string(),
+            "max_trades_per_day": cfg.max_trades_per_day,
+            "max_consecutive_losses": cfg.max_consecutive_losses,
+            "max_live_notional_per_position_usd":
+                cfg.max_live_notional_per_position_usd.to_string(),
+            "max_live_total_notional_usd": cfg.max_live_total_notional_usd.to_string(),
+            // The absolute caps only bind with real money on the line.
+            "live_caps_apply": state.mode == AgentMode::Live,
+        },
+    }))
 }
 
 /// Stop opening positions.
@@ -370,6 +460,8 @@ mod tests {
             dec!(100),
             token.map(str::to_string),
             switch,
+            crate::config::RiskConfig::default(),
+            AgentMode::Paper,
         )
     }
 
@@ -489,6 +581,83 @@ mod tests {
     /// stopped. They did: `/api/health` served a snapshot written at the end
     /// of each cycle, so a halt raised during a long cycle showed as `false`
     /// there and `true` on `/api/halt` — and the dashboard reads health.
+    /// Every new route must be behind the token and must actually exist.
+    /// The pages that call them were written before the handlers were, and
+    /// the only symptom of a missing route is an empty card.
+    #[tokio::test]
+    async fn the_new_read_routes_exist_and_are_authenticated() {
+        let authed = build_router(state_with_token(Some("s3cret")).await);
+        let open = build_router(state_with_token(None).await);
+
+        for route in [
+            "/api/orders",
+            "/api/fills",
+            "/api/equity",
+            "/api/reconciliation",
+            "/api/risk",
+        ] {
+            assert_eq!(
+                status(authed.clone(), route, None).await,
+                StatusCode::UNAUTHORIZED,
+                "{route} must sit behind the token"
+            );
+            assert_eq!(
+                status(open.clone(), route, None).await,
+                StatusCode::OK,
+                "{route} must be routed at all"
+            );
+        }
+    }
+
+    /// An empty database must produce empty arrays, not an error object. The
+    /// UI narrows on shape, and a `{"error": ...}` body renders as a failed
+    /// card — which on a fresh install would say something is broken when
+    /// nothing has happened yet.
+    #[tokio::test]
+    async fn the_new_collections_are_empty_arrays_before_anything_happens() {
+        let app = build_router(state_with_token(None).await);
+        for route in [
+            "/api/orders",
+            "/api/fills",
+            "/api/equity",
+            "/api/reconciliation",
+        ] {
+            let body = get_json(app.clone(), route).await;
+            assert!(
+                body.is_array(),
+                "{route} returned {body} rather than an array"
+            );
+            assert_eq!(body.as_array().unwrap().len(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_risk_route_reports_the_configured_limits() {
+        let app = build_router(state_with_token(None).await);
+        let body = get_json(app, "/api/risk").await;
+
+        // Defaults from RiskConfig::default(), which the test state uses.
+        assert_eq!(body["limits"]["max_trades_per_day"], serde_json::json!(10));
+        assert_eq!(
+            body["limits"]["max_consecutive_losses"],
+            serde_json::json!(4)
+        );
+        assert_eq!(
+            body["limits"]["max_drawdown_pct"],
+            serde_json::json!("0.15")
+        );
+        // Paper mode: the absolute cash caps are reported but do not bind.
+        assert_eq!(
+            body["limits"]["live_caps_apply"],
+            serde_json::json!(false),
+            "paper mode must not claim the live caps apply"
+        );
+        assert_eq!(body["mode"], serde_json::json!("paper"));
+        // Nothing recorded yet, and that must read as absent rather than zero.
+        assert_eq!(body["starting_equity"], serde_json::Value::Null);
+        assert_eq!(body["trades_today"], serde_json::json!(0));
+    }
+
     #[tokio::test]
     async fn health_reports_a_halt_raised_since_the_last_cycle_completed() {
         let state = state_with_token(None).await;

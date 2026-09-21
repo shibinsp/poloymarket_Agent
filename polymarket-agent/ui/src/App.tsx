@@ -3,6 +3,8 @@ import { AppShell } from "./components/shell/AppShell";
 import { useHashRoute } from "./router/useHashRoute";
 import { Overview } from "./pages/Overview";
 import { Trades } from "./pages/Trades";
+import { Orders } from "./pages/Orders";
+import { Risk } from "./pages/Risk";
 import { Cycles } from "./pages/Cycles";
 import { Costs } from "./pages/Costs";
 import { Health } from "./pages/Health";
@@ -24,6 +26,10 @@ export function App() {
         <NotFound attempted={attempted} />
       ) : path === "/trades" ? (
         <Trades />
+      ) : path === "/orders" ? (
+        <Orders />
+      ) : path === "/risk" ? (
+        <Risk />
       ) : path === "/cycles" ? (
         <Cycles />
       ) : path === "/costs" ? (

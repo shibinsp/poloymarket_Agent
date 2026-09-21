@@ -292,6 +292,29 @@ npm run build:embed   # vite build, then cargo build
 compile time, so a rebuilt bundle does not reach the binary — or a running
 agent — until Rust recompiles and the agent restarts.
 
+### Pages
+
+| Page | What it answers |
+|---|---|
+| Overview | Is it alive, and is it making or losing money |
+| Trades | What positions were taken, and how they resolved |
+| **Orders** | **Did execution work — fill rate, slippage, time to fill, stuck orders** |
+| **Risk** | **How close each breaker is, the drawdown curve, reconciliation history** |
+| Cycles | What each pass did, and how long it took |
+| Costs | What the valuations cost |
+| Health | Liveness, anomaly counts, and the halt control |
+| Settings | Poll interval, theme, token |
+
+Orders and Risk are the two the paper window is read from. The promotion
+criteria are a fill rate, a median and p95 slippage, zero unresolved
+reconciliation mismatches and a bounded drawdown — none of which the other
+pages show, because they are about what happened *after* execution worked.
+
+Execution statistics are computed in the browser from the most recent 500
+orders and fills, and the page says so. Fill rate is measured over orders that
+reached a terminal state, so submitting an order does not make the venue look
+worse until it finishes.
+
 ### Tracing (OpenTelemetry / Langfuse)
 
 The agent exports spans over OTLP when an endpoint is configured, and stays

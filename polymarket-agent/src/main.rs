@@ -301,6 +301,8 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
             .as_ref()
             .map(|t| t.expose_secret().to_string()),
         kill_switch.clone(),
+        config.risk.clone(),
+        config.agent.mode,
     );
     let dashboard_handle = spawn_dashboard(
         dashboard_state,

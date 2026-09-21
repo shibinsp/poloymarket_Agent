@@ -836,6 +836,69 @@ impl Store {
         Ok(())
     }
 
+    /// Orders, newest first. The execution record: what was asked for, what
+    /// came back, and what it actually filled at.
+    pub async fn get_orders(&self, limit: i64) -> Result<Vec<OrderRecord>> {
+        sqlx::query_as::<_, OrderRecord>(
+            "SELECT id, client_order_id, venue_order_id, venue_id, symbol, side, intent,
+                    trade_id, limit_price, qty, filled_qty, avg_fill_price, state,
+                    reject_reason, cycle, submitted_at, updated_at, expires_at
+             FROM orders ORDER BY id DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to fetch orders")
+    }
+
+    /// Individual executions, newest first, with the order they belong to.
+    ///
+    /// Slippage and time-to-fill live here rather than on `orders` because an
+    /// order can fill in several pieces at several prices, and averaging them
+    /// away is how "median slippage 10bps" stops meaning anything.
+    pub async fn get_fills(&self, limit: i64) -> Result<Vec<FillRecord>> {
+        sqlx::query_as::<_, FillRecord>(
+            "SELECT f.id, f.order_id, o.client_order_id, o.venue_id, o.symbol, o.side,
+                    o.intent, f.qty, f.price, f.fee, f.mid_at_submit, f.slippage_bps,
+                    f.time_to_fill_ms, f.filled_at
+             FROM fills f JOIN orders o ON o.id = f.order_id
+             ORDER BY f.id DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to fetch fills")
+    }
+
+    /// One row per UTC day: where equity opened, its running peak, where it
+    /// closed. The series the drawdown breaker reads.
+    pub async fn get_daily_equity(&self) -> Result<Vec<DailyEquityRecord>> {
+        sqlx::query_as::<_, DailyEquityRecord>(
+            "SELECT day, starting_equity, high_water_mark, closing_equity, realized_pnl, updated_at
+             FROM daily_equity ORDER BY day ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to fetch daily equity")
+    }
+
+    /// Reconciliation history, newest first.
+    pub async fn get_reconciliation_runs(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<ReconciliationRunRecord>> {
+        sqlx::query_as::<_, ReconciliationRunRecord>(
+            "SELECT id, venue_id, cycle, balance_delta, positions_missing_locally,
+                    positions_missing_on_venue, qty_mismatches, unknown_open_orders,
+                    passed, detail, created_at
+             FROM reconciliation_runs ORDER BY id DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to fetch reconciliation runs")
+    }
+
     /// Record one halt however many times it is offered.
     #[cfg(test)]
     pub async fn halt_count(&self) -> Result<i64> {
@@ -882,6 +945,52 @@ fn sum_money(rows: &[(String,)], field: &str) -> Result<Decimal> {
 /// anyone would notice in time.
 fn parse_money(value: &str, field: &str) -> Result<Decimal> {
     Decimal::from_str(value).with_context(|| format!("Invalid decimal in {field}: {value:?}"))
+}
+
+/// One execution, with the order it belongs to. All decimals stay as strings
+/// on the way to the dashboard — the UI parses them, and re-encoding through
+/// f64 here is the round-trip the rest of this file exists to avoid.
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct FillRecord {
+    pub id: i64,
+    pub order_id: i64,
+    pub client_order_id: String,
+    pub venue_id: String,
+    pub symbol: String,
+    pub side: String,
+    pub intent: String,
+    pub qty: String,
+    pub price: String,
+    pub fee: Option<String>,
+    pub mid_at_submit: Option<String>,
+    pub slippage_bps: Option<String>,
+    pub time_to_fill_ms: Option<i64>,
+    pub filled_at: Option<String>,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct DailyEquityRecord {
+    pub day: String,
+    pub starting_equity: String,
+    pub high_water_mark: String,
+    pub closing_equity: Option<String>,
+    pub realized_pnl: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct ReconciliationRunRecord {
+    pub id: i64,
+    pub venue_id: String,
+    pub cycle: Option<i64>,
+    pub balance_delta: Option<String>,
+    pub positions_missing_locally: i64,
+    pub positions_missing_on_venue: i64,
+    pub qty_mismatches: i64,
+    pub unknown_open_orders: i64,
+    pub passed: bool,
+    pub detail: Option<String>,
+    pub created_at: Option<String>,
 }
 
 /// A halt as persisted. Decimal-free, so it needs no parsing pass.
