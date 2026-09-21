@@ -568,17 +568,24 @@ pub struct DatabaseConfig {
     pub data_dir: Option<String>,
 }
 
-/// The `DATABASE_URL` value worth warning about, if any.
+/// The file a SQLite DSN names, for comparison.
 ///
-/// Separated from the logging so the rule is testable: a blank value is how
-/// the variable appears in a shell that exported it once and is not worth a
-/// warning, while any real value means the operator believes it does
-/// something.
-fn misleading_database_url(value: Option<&str>) -> Option<&str> {
-    value.map(str::trim).filter(|v| !v.is_empty())
+/// `sqlite:x.db` and `sqlite://x.db` are the same target spelled two ways, and
+/// warning about that difference would be noise. Anything that is not SQLite
+/// is returned whole, so it can never compare equal to a SQLite path.
+fn sqlite_target(dsn: &str) -> &str {
+    let dsn = dsn.trim();
+    dsn.strip_prefix("sqlite://")
+        .or_else(|| dsn.strip_prefix("sqlite:"))
+        .unwrap_or(dsn)
 }
 
 impl DatabaseConfig {
+    /// The DSN for the configured path.
+    ///
+    /// Not what opens the database — `Store::new` takes the path directly —
+    /// but the canonical spelling of it, which is what a stray `DATABASE_URL`
+    /// is compared against.
     pub fn url(&self) -> String {
         format!("sqlite:{}", self.path)
     }
@@ -625,22 +632,42 @@ impl DatabaseConfig {
         );
     }
 
-    /// `DATABASE_URL` looks like it configures the database and does not.
+    /// Whether a set `DATABASE_URL` points somewhere other than the ledger
+    /// actually in use.
     ///
-    /// Nothing reads it: every query here is built at runtime, there are no
-    /// compile-time `sqlx::query!` macros and no offline metadata, so the only
-    /// knob is `[database] path`. It shipped in `.env.example` regardless,
-    /// which is worse than absent — an operator sets it to a production path,
-    /// sees no error, and runs against a different ledger than they believe.
-    /// Removing it from the example fixes the next operator; this catches the
-    /// one who already has it set.
-    pub fn warn_if_database_url_set(&self) {
-        if let Some(url) = misleading_database_url(std::env::var("DATABASE_URL").ok().as_deref()) {
+    /// Nothing reads that variable: every query here is built at runtime and
+    /// the only knob is `[database] path`. But warning merely because it is
+    /// *set* would fire for everyone who copied the old `.env.example`, whose
+    /// value matches the shipped default — and a warning that is usually
+    /// noise is one an operator learns to scroll past, so it is not there on
+    /// the day it means something.
+    ///
+    /// Returns the **scheme** only, never the value: a DSN routinely carries
+    /// `scheme://user:password@host/db`, and the log file is neither opt-in
+    /// nor access-controlled. Every other credential-shaped field in this file
+    /// is a `SecretString` for the same reason.
+    pub fn disagreeing_database_url(&self) -> Option<String> {
+        let set = non_empty_env("DATABASE_URL")?;
+        if sqlite_target(&set) == sqlite_target(&self.url()) {
+            return None;
+        }
+        Some(
+            set.split_once("://")
+                .or_else(|| set.split_once(':'))
+                .map(|(scheme, _)| scheme.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+        )
+    }
+
+    /// Say so, once, where an operator will see it.
+    pub fn warn_if_database_url_disagrees(&self) {
+        if let Some(scheme) = self.disagreeing_database_url() {
             tracing::warn!(
-                database_url = %url,
+                database_url_scheme = %scheme,
                 using = %self.path,
-                "DATABASE_URL is set but nothing reads it — the ledger comes from \
-                 [database] path. Point CONFIG_PATH at a config file to change it."
+                "DATABASE_URL is set and points somewhere else, but nothing reads it — \
+                 the ledger comes from [database] path. Point CONFIG_PATH at a config \
+                 file to change it. (The value is not logged; it can carry a password.)"
             );
         }
     }
@@ -814,40 +841,193 @@ fn apply_telemetry_endpoint(telemetry: &mut TelemetryConfig, endpoint: Option<St
 
 #[cfg(test)]
 mod tests {
+    /// Environment variables are process-global and cargo runs tests in
+    /// threads, so anything touching one takes this first.
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    fn db(path: &str) -> DatabaseConfig {
+        DatabaseConfig {
+            path: path.to_string(),
+            data_dir: None,
+        }
+    }
+
     /// `DATABASE_URL` shipped in `.env.example` and nothing reads it, so an
     /// operator could set it to a production path, see no error, and run
     /// against a different ledger than they believed.
+    ///
+    /// Env vars are process-global, so these run under one lock rather than as
+    /// separate `#[test]`s — cargo runs tests in threads and two of them
+    /// setting the same variable interleave.
     #[test]
-    fn a_real_database_url_is_worth_warning_about() {
-        assert_eq!(
-            misleading_database_url(Some("sqlite:/var/lib/agent/prod.db")),
-            Some("sqlite:/var/lib/agent/prod.db")
-        );
-        assert_eq!(
-            misleading_database_url(Some("  sqlite:x.db  ")),
-            Some("sqlite:x.db"),
-            "trimmed, so surrounding whitespace does not hide it"
-        );
+    fn a_database_url_is_only_worth_warning_about_when_it_disagrees() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let config = db("polymarket-agent.db");
+
+        // The overwhelmingly common case: copied from the old example, and
+        // agreeing with the shipped default. Warning here every startup is how
+        // an operator learns to scroll past the message.
+        std::env::set_var("DATABASE_URL", "sqlite:polymarket-agent.db");
+        assert_eq!(config.disagreeing_database_url(), None);
+
+        // The same target spelled the other way is still the same target.
+        std::env::set_var("DATABASE_URL", "sqlite://polymarket-agent.db");
+        assert_eq!(config.disagreeing_database_url(), None);
+
+        // This is the one the warning exists for.
+        std::env::set_var("DATABASE_URL", "sqlite:/var/lib/agent/prod.db");
+        assert_eq!(config.disagreeing_database_url().as_deref(), Some("sqlite"));
+
+        // Unset, or exported blank — how it looks in a shell that set it once.
+        std::env::set_var("DATABASE_URL", "");
+        assert_eq!(config.disagreeing_database_url(), None);
+        std::env::remove_var("DATABASE_URL");
+        assert_eq!(config.disagreeing_database_url(), None);
     }
 
-    /// Unset, or exported blank — which is how it looks in a shell that set it
-    /// once — is not something to nag about every startup.
+    /// A DSN routinely carries `scheme://user:password@host/db`, and the log
+    /// file is neither opt-in nor access-controlled. Only the scheme escapes.
     #[test]
-    fn an_absent_or_blank_database_url_is_silent() {
-        assert_eq!(misleading_database_url(None), None);
-        assert_eq!(misleading_database_url(Some("")), None);
-        assert_eq!(misleading_database_url(Some("   ")), None);
-    }
+    fn a_disagreeing_url_yields_its_scheme_and_never_its_value() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(
+            "DATABASE_URL",
+            "postgres://agent:hunter2@db.prod:5432/ledger",
+        );
+        let scheme = db("local.db").disagreeing_database_url();
+        std::env::remove_var("DATABASE_URL");
 
-    /// The example file must not advertise a variable that does nothing.
-    #[test]
-    fn the_env_example_does_not_ship_a_database_url() {
-        let example = std::fs::read_to_string(".env.example").unwrap();
+        assert_eq!(scheme.as_deref(), Some("postgres"));
+        let rendered = format!("{scheme:?}");
         assert!(
-            !example
-                .lines()
-                .any(|l| l.trim_start().starts_with("DATABASE_URL=")),
-            "DATABASE_URL is read by nothing — shipping it is worse than absent"
+            !rendered.contains("hunter2"),
+            "password must not survive: {rendered}"
+        );
+        assert!(!rendered.contains("db.prod"), "nor the host: {rendered}");
+    }
+
+    /// The wiring, not the helper: an earlier version of these tests exercised
+    /// only a two-combinator trim, so misspelling the variable name or
+    /// deleting the call site left the feature dead with a green suite.
+    #[test]
+    fn the_warning_reaches_the_log_with_the_scheme_and_without_the_value() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for Captured {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(captured.clone()),
+        );
+
+        std::env::set_var("DATABASE_URL", "postgres://agent:hunter2@db.prod/ledger");
+        {
+            let _sub = tracing::subscriber::set_default(subscriber);
+            db("local.db").warn_if_database_url_disagrees();
+        }
+        std::env::remove_var("DATABASE_URL");
+
+        let text = String::from_utf8_lossy(&captured.0.lock().unwrap()).into_owned();
+        assert!(
+            text.contains("nothing reads it"),
+            "the warning must fire: {text}"
+        );
+        assert!(text.contains("postgres"), "and name the scheme: {text}");
+        assert!(!text.contains("hunter2"), "but never the password: {text}");
+    }
+
+    /// Files that tell an operator what to put in `.env` must not advertise a
+    /// variable that does nothing.
+    ///
+    /// `.env.example` is copied straight to `.env` by the start scripts, and
+    /// the paper guide gives the file's contents to paste — so removing the
+    /// line from one and leaving it in the other fixes nobody.
+    #[test]
+    fn nothing_tells_an_operator_to_set_a_database_url() {
+        for file in [".env.example", "../PAPER_TRADING_GUIDE.md"] {
+            let Ok(text) = std::fs::read_to_string(file) else {
+                panic!("{file} is missing — this guard is only as good as its file list");
+            };
+            for (n, line) in text.lines().enumerate() {
+                // `export FOO=` and `FOO = ` are both valid in a file dotenvy
+                // parses, and neither starts with "DATABASE_URL=".
+                let bare = line.trim_start().trim_start_matches("export ").trim_start();
+                assert!(
+                    !bare.starts_with("DATABASE_URL")
+                        || !bare
+                            .trim_start_matches("DATABASE_URL")
+                            .trim_start()
+                            .starts_with('='),
+                    "{file}:{} still hands out DATABASE_URL, which nothing reads",
+                    n + 1
+                );
+            }
+        }
+    }
+
+    /// The claim the warning rests on, enforced rather than asserted in prose.
+    ///
+    /// `DATABASE_URL` is dead *because* every query is built at runtime. Add
+    /// one of sqlx's compile-time query macros and it becomes load-bearing at
+    /// build time, the docs have to advertise it again, and the warning above
+    /// turns into a lie. This fails first, pointing at why.
+    ///
+    /// The needle is assembled at runtime so this guard does not match its own
+    /// source — which it did on the first attempt.
+    #[test]
+    fn no_compile_time_sqlx_macros_exist_to_make_database_url_load_bearing() {
+        fn scan(dir: &std::path::Path, found: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    scan(&path, found);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let Ok(text) = std::fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    for macro_name in ["query!", "query_as!", "query_scalar!"] {
+                        let needle = ["sqlx", "::", macro_name].concat();
+                        if text.contains(&needle) {
+                            found.push(format!("{}: {needle}", path.display()));
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut found = Vec::new();
+        scan(std::path::Path::new("src"), &mut found);
+        assert!(
+            found.is_empty(),
+            "compile-time sqlx macros make DATABASE_URL load-bearing at build time, so \
+             the docs and the startup warning both need revisiting: {found:?}"
         );
     }
 
