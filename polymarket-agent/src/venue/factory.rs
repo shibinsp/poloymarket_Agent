@@ -13,6 +13,7 @@ use tracing::{info, warn};
 use crate::config::{AgentMode, AppConfig, ExposeSecret, Secrets, VenueConfig};
 use crate::market::polymarket::PolymarketClient;
 use crate::venue::alpaca::{AlpacaConfig, AlpacaVenue};
+use crate::venue::binance_us::{BinanceUsConfig, BinanceUsVenue};
 use crate::venue::coinbase::{CoinbaseConfig, CoinbaseVenue};
 use crate::venue::polymarket::PolymarketVenue;
 use crate::venue::{Venue, VenueRegistry};
@@ -96,6 +97,24 @@ pub fn build_registry_reporting(
                 ),
                 Err(e) => skip(&venue_config.id, format!("{e:#}")),
             },
+            "binance_us" | "binanceus" | "binance.us" => {
+                match build_binance_us(venue_config, secrets, config.agent.mode) {
+                    Ok(Some(venue)) => {
+                        info!(
+                            venue = %venue_config.id,
+                            symbols = venue_config.symbols.len(),
+                            mode = ?config.agent.mode,
+                            "Venue enabled"
+                        );
+                        venues.push(Box::new(venue));
+                    }
+                    Ok(None) => skip(
+                        &venue_config.id,
+                        "BINANCE_US_API_KEY/BINANCE_US_SECRET_KEY are unset".to_string(),
+                    ),
+                    Err(e) => skip(&venue_config.id, format!("{e:#}")),
+                }
+            }
             "polymarket" => match &polymarket_client {
                 Some(client) => {
                     info!(venue = %venue_config.id, "Venue enabled");
@@ -109,7 +128,7 @@ pub fn build_registry_reporting(
             other => skip(
                 &venue_config.id,
                 format!(
-                    "unknown venue kind {other:?} — expected \"alpaca\", \"coinbase\" or \"polymarket\""
+                    "unknown venue kind {other:?} — expected \"alpaca\", \"coinbase\", \"binance_us\" or \"polymarket\""
                 ),
             ),
         }
@@ -160,6 +179,43 @@ fn build_coinbase(
     }
 
     Ok(Some(CoinbaseVenue::new(config)?))
+}
+
+/// `Ok(None)` means "configured but no credentials", which is a skip, not an
+/// error.
+///
+/// Binance.US has **no testnet**. `testnet.binance.vision` belongs to global
+/// Binance, which is a different exchange with a different symbol list and one
+/// that blocks US persons — so there is no host to swap and no simulator on
+/// the `Venue` path. Same reasoning, and the same guard, as Coinbase.
+fn build_binance_us(
+    venue_config: &VenueConfig,
+    secrets: &Secrets,
+    mode: AgentMode,
+) -> Result<Option<BinanceUsVenue>> {
+    if mode != AgentMode::Live {
+        anyhow::bail!(
+            "Binance.US has no testnet, so an enabled Binance.US venue trades real money \
+             — refusing to build it while agent.mode is {mode:?}. Set \
+             agent.mode = \"live\" if that is what you intend."
+        );
+    }
+
+    let (Some(api_key), Some(secret_key)) =
+        (&secrets.binance_us_api_key, &secrets.binance_us_secret_key)
+    else {
+        return Ok(None);
+    };
+
+    let mut config = BinanceUsConfig::new(api_key.expose_secret(), secret_key.expose_secret())
+        .with_venue_id(venue_config.id.clone())
+        .with_symbols(venue_config.symbols.clone());
+
+    if let Some(base) = &venue_config.base_url {
+        config = config.with_base_url(base.clone());
+    }
+
+    Ok(Some(BinanceUsVenue::new(config)?))
 }
 
 /// `Ok(None)` means "configured but no credentials", which is a skip, not an
@@ -253,6 +309,8 @@ mod tests {
             alpaca_key_id: present.then(|| crate::config::SecretString::from("key")),
             coinbase_key_name: None,
             coinbase_private_key: None,
+            binance_us_api_key: None,
+            binance_us_secret_key: None,
             alpaca_secret_key: present.then(|| crate::config::SecretString::from("secret")),
         }
     }
@@ -409,6 +467,113 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
             registry.all().next().unwrap().id().as_str(),
             "coinbase-main"
         );
+    }
+
+    fn binance_config(enabled: bool) -> VenueConfig {
+        VenueConfig {
+            id: "binance_us".to_string(),
+            kind: "binance_us".to_string(),
+            enabled,
+            base_url: None,
+            data_url: None,
+            symbols: vec!["BTC/USD".to_string()],
+            fee_pct: rust_decimal_macros::dec!(0.006),
+        }
+    }
+
+    fn secrets_with_binance(present: bool) -> Secrets {
+        Secrets {
+            binance_us_api_key: present.then(|| crate::config::SecretString::from("key")),
+            binance_us_secret_key: present.then(|| crate::config::SecretString::from("secret")),
+            ..secrets_with_alpaca(false)
+        }
+    }
+
+    #[test]
+    fn a_binance_us_venue_with_credentials_is_built() {
+        let registry = build_registry(
+            &live_config_with(vec![binance_config(true)]),
+            &secrets_with_binance(true),
+            None,
+        )
+        .unwrap();
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.all().next().unwrap().id().as_str(), "binance_us");
+    }
+
+    /// Binance.US has **no testnet** — `testnet.binance.vision` belongs to
+    /// global Binance, a different exchange that blocks US persons. So there
+    /// is no host to swap and, as with Coinbase, refusing to build it is the
+    /// only thing between a paper window and real money.
+    #[test]
+    fn binance_us_is_refused_outright_in_paper_mode() {
+        let mut config = config_with(vec![binance_config(true)]);
+        config.agent.mode = AgentMode::Paper;
+        let (registry, skipped) =
+            build_registry_reporting(&config, &secrets_with_binance(true), None);
+
+        assert!(registry.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert!(
+            skipped[0].reason.contains("real money") && skipped[0].reason.contains("Paper"),
+            "the reason must say why, and name the mode: {}",
+            skipped[0].reason
+        );
+    }
+
+    #[test]
+    fn binance_us_is_refused_in_backtest_mode_too() {
+        let mut config = config_with(vec![binance_config(true)]);
+        config.agent.mode = AgentMode::Backtest;
+        let (registry, _) = build_registry_reporting(&config, &secrets_with_binance(true), None);
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn binance_us_without_credentials_is_skipped_with_a_reason_naming_them() {
+        let (registry, skipped) = build_registry_reporting(
+            &live_config_with(vec![binance_config(true)]),
+            &secrets_with_binance(false),
+            None,
+        );
+        assert!(registry.is_empty());
+        assert!(
+            skipped[0].reason.contains("BINANCE_US_API_KEY"),
+            "the reason must name the variables to set: {}",
+            skipped[0].reason
+        );
+    }
+
+    /// Every per-venue lookup keys on the id the venue reports, so a venue
+    /// configured as anything else silently trades no symbols and pays the
+    /// default fee.
+    #[test]
+    fn a_binance_us_venue_reports_its_configured_id() {
+        let mut cfg = binance_config(true);
+        cfg.id = "binance-main".to_string();
+        let registry = build_registry(
+            &live_config_with(vec![cfg]),
+            &secrets_with_binance(true),
+            None,
+        )
+        .unwrap();
+        assert_eq!(registry.all().next().unwrap().id().as_str(), "binance-main");
+    }
+
+    /// A `kind` is a one-character mistake away from taking the venue with it.
+    #[test]
+    fn the_binance_us_kind_is_matched_in_the_spellings_operators_write() {
+        for kind in ["binance_us", "BINANCE_US", "binanceus", "binance.us"] {
+            let mut cfg = binance_config(true);
+            cfg.kind = kind.to_string();
+            let registry = build_registry(
+                &live_config_with(vec![cfg]),
+                &secrets_with_binance(true),
+                None,
+            )
+            .unwrap();
+            assert_eq!(registry.len(), 1, "kind {kind:?} should build");
+        }
     }
 
     #[test]

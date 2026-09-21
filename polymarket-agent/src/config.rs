@@ -664,6 +664,28 @@ pub struct Secrets {
     /// escaped, which is how it arrives when pasted out of the downloaded
     /// JSON into an env var.
     pub coinbase_private_key: Option<SecretString>,
+    /// Binance.US HMAC credentials. Binance.US has no testnet — these are
+    /// live-exchange keys whatever `agent.mode` says.
+    pub binance_us_api_key: Option<SecretString>,
+    pub binance_us_secret_key: Option<SecretString>,
+}
+
+impl AppConfig {
+    /// Whether this deployment can reach Polymarket at all.
+    ///
+    /// The legacy Polymarket loop runs only when no venue is configured, so a
+    /// venue-based deployment never touches it — and a US operator may not
+    /// legally trade it. Demanding its key regardless stopped the live dry run
+    /// before it reached the venue preflight, which is the check that actually
+    /// matters before the first real dollar.
+    pub fn uses_polymarket(&self) -> bool {
+        let mut enabled = self.venues.iter().filter(|v| v.enabled).peekable();
+        // No venues at all means the legacy Polymarket-only loop.
+        if enabled.peek().is_none() {
+            return true;
+        }
+        enabled.any(|v| v.kind.eq_ignore_ascii_case("polymarket"))
+    }
 }
 
 /// Read an env var, treating blank/whitespace-only as unset.
@@ -695,6 +717,8 @@ impl Secrets {
             alpaca_secret_key: secret_env("ALPACA_API_SECRET_KEY"),
             coinbase_key_name: secret_env("COINBASE_API_KEY_NAME"),
             coinbase_private_key: secret_env("COINBASE_API_PRIVATE_KEY"),
+            binance_us_api_key: secret_env("BINANCE_US_API_KEY"),
+            binance_us_secret_key: secret_env("BINANCE_US_SECRET_KEY"),
         }
     }
 }
@@ -760,6 +784,60 @@ fn apply_telemetry_endpoint(telemetry: &mut TelemetryConfig, endpoint: Option<St
 
 #[cfg(test)]
 mod tests {
+    /// A US operator may not legally trade Polymarket. Demanding its key in
+    /// live mode stopped `--dry-run` before it reached the venue preflight —
+    /// so the one check that matters before going live never ran.
+    #[test]
+    fn a_venue_deployment_does_not_need_polymarket() {
+        let mut config = test_config();
+        config.venues = vec![venue_config("alpaca", "alpaca", true)];
+        assert!(!config.uses_polymarket());
+    }
+
+    #[test]
+    fn a_polymarket_venue_still_needs_its_key() {
+        let mut config = test_config();
+        config.venues = vec![
+            venue_config("alpaca", "alpaca", true),
+            venue_config("polymarket", "Polymarket", true),
+        ];
+        assert!(config.uses_polymarket(), "matched case-insensitively");
+    }
+
+    /// No venues configured means the legacy Polymarket-only loop, which does
+    /// need the key.
+    #[test]
+    fn no_venues_means_the_legacy_polymarket_loop() {
+        let mut config = test_config();
+        config.venues = Vec::new();
+        assert!(config.uses_polymarket());
+    }
+
+    /// A venue section that exists but is all disabled is the legacy loop too.
+    #[test]
+    fn every_venue_disabled_falls_back_to_polymarket() {
+        let mut config = test_config();
+        config.venues = vec![venue_config("alpaca", "alpaca", false)];
+        assert!(config.uses_polymarket());
+    }
+
+    fn venue_config(id: &str, kind: &str, enabled: bool) -> VenueConfig {
+        VenueConfig {
+            id: id.to_string(),
+            kind: kind.to_string(),
+            enabled,
+            base_url: None,
+            data_url: None,
+            symbols: vec!["BTC/USD".to_string()],
+            fee_pct: rust_decimal_macros::dec!(0.0025),
+        }
+    }
+
+    fn test_config() -> AppConfig {
+        let toml = std::fs::read_to_string("config/default.toml").unwrap();
+        toml::from_str(&toml).unwrap()
+    }
+
     use super::*;
 
     // --- Telemetry gating -------------------------------------------------

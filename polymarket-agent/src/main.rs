@@ -161,15 +161,20 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
         config.valuation.model,
         if llm_ok { "✅ Set" } else { "❌ Missing" }
     );
+    // Only demanded when this deployment can actually reach Polymarket. A
+    // venue-based agent never touches it — and returning early here skipped
+    // the venue preflight entirely, which is the check that matters most
+    // before the first real dollar.
+    let poly_needed = config.uses_polymarket();
     println!(
         "   Polymarket Private Key: {}",
-        if poly_ok {
-            "✅ Set"
-        } else {
-            "⚠️  Missing (required for live mode)"
+        match (poly_ok, poly_needed) {
+            (true, _) => "✅ Set",
+            (false, true) => "⚠️  Missing (required for live mode)",
+            (false, false) => "— not needed (no Polymarket venue is enabled)",
         }
     );
-    if config.agent.mode == AgentMode::Live && !poly_ok {
+    if config.agent.mode == AgentMode::Live && !poly_ok && poly_needed {
         println!("   ❌ ERROR: POLYMARKET_PRIVATE_KEY required for live mode");
         return Err(anyhow::anyhow!("Missing required API key for live mode"));
     }
