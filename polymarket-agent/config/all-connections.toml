@@ -1,3 +1,61 @@
+# Every connection this agent supports, in one file.
+#
+# Copy it, fill in the credentials you have, and flip `enabled` on the venues
+# you actually want.
+#
+# Only Alpaca starts enabled, because it is the only one with a paper endpoint
+# — and even that needs `base_url` pointed at paper-api.alpaca.markets plus
+# paper keys, which `agent.mode = "paper"` does for you. Coinbase and
+# Binance.US start disabled and trade REAL MONEY the moment they are enabled,
+# because neither has a paper endpoint at all; the agent refuses to build them
+# outside live mode, which is the only thing standing between a paper window
+# and a live one.
+#
+#   CONFIG_PATH=config/all-connections.toml ./polymarket-agent --dry-run
+#
+# `--dry-run` is the right first command: it reports, per venue, whether the
+# credentials authenticate, whether the account can trade, how many configured
+# symbols the venue actually lists, a live quote, and whether it can report
+# the equity the circuit breakers need.
+#
+# ---------------------------------------------------------------------------
+# WHAT CAN BE CONNECTED
+# ---------------------------------------------------------------------------
+#
+# Trading venues (below, [[venues]]):
+#   alpaca       US equities + crypto spot   PAPER AVAILABLE   ALPACA_API_KEY_ID / ALPACA_API_SECRET_KEY
+#   coinbase     crypto spot                 LIVE ONLY         COINBASE_API_KEY_NAME / COINBASE_API_PRIVATE_KEY
+#   binance_us   crypto spot                 LIVE ONLY         BINANCE_US_API_KEY / BINANCE_US_SECRET_KEY
+#   polymarket   prediction markets          refused in the registry — see the note by its block
+#
+# Valuation model ([valuation]):
+#   provider = "anthropic"           Anthropic Messages API
+#   provider = "openai_compatible"   any /v1/chat/completions endpoint —
+#                                    NVIDIA NIM, OpenRouter, Together, vLLM,
+#                                    Ollama, LM Studio, OpenAI itself
+#   Key in LLM_API_KEY (ANTHROPIC_API_KEY is read as a fallback).
+#
+# Alerts ([monitoring]):
+#   Discord webhook, in DISCORD_WEBHOOK_URL. Optional; the agent runs without it.
+#
+# Data sources (no config, all on by default):
+#   CoinGecko        crypto prices        public, no key
+#   Google News RSS  headlines            public, no key
+#   ESPN             scores and fixtures  ESPN_API_KEY optional
+#   NOAA weather.gov weather              NOAA_API_TOKEN optional
+#
+# Telemetry ([telemetry]):
+#   Any OTLP/HTTP collector, or Langfuse. Set OTEL_EXPORTER_OTLP_ENDPOINT, or
+#   LANGFUSE_HOST plus LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY. Valuation
+#   spans carry GenAI semantic-convention attributes, so Langfuse renders them
+#   as generations with model, token counts and cost.
+#
+# Dashboard ([monitoring]):
+#   Its own HTTP server. DASHBOARD_TOKEN is optional on loopback and REQUIRED
+#   if you bind it anywhere else.
+#
+# ---------------------------------------------------------------------------
+
 [agent]
 mode = "paper"                    # paper | live | backtest
 cycle_interval_seconds = 600      # 10 minutes
@@ -112,14 +170,14 @@ path = "polymarket-agent.db"
 # Continuous assets (crypto, equities) need an explicit symbol universe —
 # unlike prediction markets they are not discovered.
 #
-# [[venues]]
-# id = "alpaca"
-# kind = "alpaca"
-# enabled = true
-# base_url = "https://paper-api.alpaca.markets"
-# data_url = "https://data.alpaca.markets"
-# symbols = ["BTC/USD", "ETH/USD", "SPY", "AAPL"]
-# fee_pct = 0.0025
+[[venues]]
+id = "alpaca"
+kind = "alpaca"
+enabled = true
+base_url = "https://paper-api.alpaca.markets"
+data_url = "https://data.alpaca.markets"
+symbols = ["BTC/USD", "ETH/USD", "SPY", "AAPL"]
+fee_pct = 0.0025
 #
 # Coinbase Advanced Trade — spot crypto, 24/7.
 #
@@ -137,12 +195,12 @@ path = "polymarket-agent.db"
 # rate here would clear the edge threshold on trades that are really negative
 # after fees. Lower it when your volume tier earns it.
 #
-# [[venues]]
-# id = "coinbase"
-# kind = "coinbase"
-# enabled = false
-# symbols = ["BTC/USD", "ETH/USD"]
-# fee_pct = 0.012
+[[venues]]
+id = "coinbase"
+kind = "coinbase"
+enabled = false
+symbols = ["BTC/USD", "ETH/USD"]
+fee_pct = 0.012
 #
 # Binance.US — spot crypto, 24/7.
 #
@@ -162,12 +220,12 @@ path = "polymarket-agent.db"
 # round_trip_cost doubles this number, so understating it clears the edge
 # threshold on trades that are negative after fees.
 #
-# [[venues]]
-# id = "binance_us"
-# kind = "binance_us"
-# enabled = false
-# symbols = ["BTC/USD", "ETH/USD"]
-# fee_pct = 0.006
+[[venues]]
+id = "binance_us"
+kind = "binance_us"
+enabled = false
+symbols = ["BTC/USD", "ETH/USD"]
+fee_pct = 0.006
 #
 # Polymarket — prediction markets.
 #
@@ -181,12 +239,12 @@ path = "polymarket-agent.db"
 # no [[venues]] are configured at all. Note that Polymarket's CLOB prohibits
 # US persons.
 #
-# [[venues]]
-# id = "polymarket"
-# kind = "polymarket"
-# enabled = false
-# symbols = []
-# fee_pct = 0.02
+[[venues]]
+id = "polymarket"
+kind = "polymarket"
+enabled = false
+symbols = []
+fee_pct = 0.02
 
 [sizing_continuous]
 risk_per_trade_pct = 0.0075     # fraction of bankroll risked if the stop hits
