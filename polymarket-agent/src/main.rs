@@ -230,11 +230,36 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
         Some(std::sync::Arc::clone(&polymarket)),
     )?;
 
-    if registry.is_empty() {
+    // A venue whose credentials are missing is *skipped* by the factory — it
+    // logs a warning and returns no venue. So "enabled in the config" and
+    // "present in the registry" are different sets, and reporting only the
+    // second would tell an operator who forgot an env var that they had
+    // configured no venues at all: the wrong problem, pointing at the wrong
+    // file.
+    let enabled: Vec<&str> = config
+        .venues
+        .iter()
+        .filter(|v| v.enabled)
+        .map(|v| v.id.as_str())
+        .collect();
+    let built: std::collections::HashSet<String> =
+        registry.all().map(|v| v.id().to_string()).collect();
+
+    if enabled.is_empty() {
         println!("   ⚠️  No [[venues]] configured — the agent falls back to the");
         println!("      legacy Polymarket-only loop, which the safety gate does");
         println!("      not cover. See 'Starting the paper window' in the README.");
     }
+    for id in &enabled {
+        if !built.contains(*id) {
+            println!("   {id}:");
+            println!("      ❌ enabled in the config but not built — its credentials");
+            println!("         are missing from the environment (ALPACA_API_KEY_ID /");
+            println!("         ALPACA_API_SECRET_KEY, or the equivalent for its kind)");
+            failures.push(format!("{id}: enabled but no credentials"));
+        }
+    }
+
     for venue in registry.all() {
         check_venue(venue, config, &mut failures).await;
     }
