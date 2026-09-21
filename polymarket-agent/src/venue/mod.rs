@@ -9,6 +9,7 @@
 pub mod alpaca;
 pub mod factory;
 pub mod polymarket;
+pub mod preflight;
 pub mod session;
 #[cfg(test)]
 pub mod test_support;
@@ -75,6 +76,20 @@ pub trait Venue: Send + Sync {
     async fn positions(&self) -> Result<Vec<Position>>;
 
     async fn balance(&self) -> Result<Balance>;
+
+    /// Whether the account is *permitted* to trade.
+    ///
+    /// Distinct from `balance`, which a blocked account answers perfectly
+    /// well: Alpaca returns cash and equity on a `trading_blocked` or
+    /// `account_blocked` account and then rejects every order. A PDT
+    /// violation or a compliance hold would otherwise pass every startup
+    /// check and be discovered one rejected order at a time.
+    ///
+    /// Defaults to permitted, so a venue with no such concept need not
+    /// implement it.
+    async fn trading_readiness(&self) -> Result<()> {
+        Ok(())
+    }
 
     /// Settlement result for a resolved instrument. `None` while unresolved;
     /// venues whose assets never settle always return `None`.

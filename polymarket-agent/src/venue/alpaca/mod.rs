@@ -1155,6 +1155,15 @@ impl Venue for AlpacaVenue {
     /// can buy crypto and fractional shares) rather than `buying_power`, which
     /// on a margin account is a multiple of cash. An agent sizing against
     /// leverage it did not ask for is a solvency bug, not a feature.
+    /// `assert_tradable` reached through the trait.
+    ///
+    /// It was written, tested and never called by anything — so a
+    /// `trading_blocked` account passed every startup check and then had
+    /// every order rejected.
+    async fn trading_readiness(&self) -> Result<()> {
+        self.assert_tradable().await
+    }
+
     #[instrument(skip(self), fields(venue = %self.id))]
     async fn balance(&self) -> Result<Balance> {
         let account = self.account().await?;

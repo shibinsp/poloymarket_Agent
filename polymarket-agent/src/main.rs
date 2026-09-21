@@ -231,90 +231,110 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
 
     // 5. The venues the agent will actually trade
     //
-    // This is the check the dry run existed to provide and did not: it used
-    // to validate Polymarket and nothing else, so an Alpaca deployment —
-    // which is what the safety gate is for — learned nothing here, and a
-    // US operator (for whom Polymarket is off the table) had the whole run
-    // aborted by the `?` on a Gamma call before anything useful ran.
-    let config_arc = std::sync::Arc::new(config.clone());
-    let polymarket = std::sync::Arc::new(
-        polymarket_agent::market::polymarket::PolymarketClient::new(config_arc.clone(), secrets)
-            .await?,
-    );
-
+    // The check the dry run existed to provide and did not: it validated
+    // Polymarket and nothing else, so an Alpaca deployment — which is what
+    // the safety gate is for — learned nothing here.
     println!("5. Venues:");
-    let registry = polymarket_agent::venue::factory::build_registry(
-        config,
-        secrets,
-        Some(std::sync::Arc::clone(&polymarket)),
-    )?;
-
-    // A venue whose credentials are missing is *skipped* by the factory — it
-    // logs a warning and returns no venue. So "enabled in the config" and
-    // "present in the registry" are different sets, and reporting only the
-    // second would tell an operator who forgot an env var that they had
-    // configured no venues at all: the wrong problem, pointing at the wrong
-    // file.
-    let enabled: Vec<&str> = config
+    let polymarket_configured = config
         .venues
         .iter()
-        .filter(|v| v.enabled)
-        .map(|v| v.id.as_str())
-        .collect();
-    let built: std::collections::HashSet<String> =
-        registry.all().map(|v| v.id().to_string()).collect();
+        .any(|v| v.enabled && v.kind.eq_ignore_ascii_case("polymarket"));
 
-    if enabled.is_empty() {
+    // Built only when something needs it. Constructing it unconditionally put
+    // a fatal `?` — an authenticating network call in live mode — ahead of
+    // the venue section, so for a US operator with an unreachable CLOB the
+    // run still died before reporting anything about Alpaca. That was the
+    // bug, moved one call earlier rather than fixed.
+    let legacy_only = config.venues.iter().all(|v| !v.enabled);
+    let polymarket = if polymarket_configured || legacy_only {
+        match polymarket_agent::market::polymarket::PolymarketClient::new(
+            std::sync::Arc::new(config.clone()),
+            secrets,
+        )
+        .await
+        {
+            Ok(c) => Some(std::sync::Arc::new(c)),
+            Err(e) => {
+                println!("   Polymarket client: ❌ {e:#}");
+                failures.push(format!("Polymarket client: {e:#}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let (registry, skipped) = polymarket_agent::venue::factory::build_registry_reporting(
+        config,
+        secrets,
+        polymarket.clone(),
+    );
+
+    if legacy_only {
         println!("   ⚠️  No [[venues]] configured — the agent falls back to the");
         println!("      legacy Polymarket-only loop, which the safety gate does");
         println!("      not cover. See 'Starting the paper window' in the README.");
     }
-    for id in &enabled {
-        if !built.contains(*id) {
-            println!("   {id}:");
-            println!("      ❌ enabled in the config but not built — its credentials");
-            println!("         are missing from the environment (ALPACA_API_KEY_ID /");
-            println!("         ALPACA_API_SECRET_KEY, or the equivalent for its kind)");
-            failures.push(format!("{id}: enabled but no credentials"));
-        }
+
+    // A skipped venue is enabled in the config but absent from the registry,
+    // for one of three unrelated reasons. Reporting "missing credentials" for
+    // all of them sends an operator who mistyped a `kind` to the wrong file.
+    for s in &skipped {
+        println!("   {}:", s.id);
+        println!("      ❌ enabled but not built — {}", s.reason);
+        failures.push(format!("{}: {}", s.id, s.reason));
     }
 
     for venue in registry.all() {
-        check_venue(venue, config, &mut failures).await;
+        let id = venue.id().to_string();
+        let report = polymarket_agent::venue::preflight::check(
+            venue,
+            &config.venue_symbols_for(&id),
+            // The real scan limit, not a sample size — this is what makes a
+            // `max_markets` below the universe visible here rather than as a
+            // fortnight of empty cycles.
+            config.scanning.max_markets,
+            Utc::now(),
+        )
+        .await;
+
+        println!("   {}:", report.venue_id);
+        for (label, check) in &report.checks {
+            println!("      {label}: {} {}", check.mark(), check.message());
+        }
+        for failure in report.failures() {
+            failures.push(format!("{}: {}", report.venue_id, failure.message()));
+        }
     }
     println!();
 
-    // 6. Polymarket, only if it is actually in use
+    // 6. Polymarket, only when it is not already covered above
     //
-    // Reported rather than enforced. Its international CLOB prohibits US
-    // persons, so for many operators an unreachable Gamma is the expected
-    // state and must not fail a dry run about an Alpaca deployment.
-    let polymarket_in_use = registry.is_empty()
-        || config
-            .venues
-            .iter()
-            .any(|v| v.enabled && v.kind.eq_ignore_ascii_case("polymarket"));
+    // Reported, never enforced: its international CLOB prohibits US persons,
+    // so for many operators an unreachable Gamma is the expected state and
+    // must not fail a dry run about an Alpaca deployment.
     println!("6. Polymarket:");
-    if !polymarket_in_use {
-        println!("   Skipped — not an enabled venue.");
-    } else {
-        let filters = polymarket_agent::market::polymarket::MarketFilters {
-            min_volume_24h: config.scanning.min_volume_24h,
-            max_resolution_days: config.scanning.max_resolution_days,
-            max_markets: 10,
-            max_spread_pct: config.scanning.max_spread_pct,
-        };
-        match polymarket.get_markets(&filters).await {
-            Ok(markets) => println!("   Gamma API: ✅ {} markets", markets.len()),
-            Err(e) => {
-                println!("   Gamma API: ❌ {e}");
-                failures.push(format!("Polymarket market data unavailable: {e}"));
+    match (&polymarket, polymarket_configured) {
+        // Already checked as a venue; asking again is two more round trips
+        // against a rate-limited API and a second failure line for one cause.
+        (Some(_), true) => println!("   Checked above as a venue."),
+        (Some(client), false) => {
+            let filters = polymarket_agent::market::polymarket::MarketFilters {
+                min_volume_24h: config.scanning.min_volume_24h,
+                max_resolution_days: config.scanning.max_resolution_days,
+                max_markets: 10,
+                max_spread_pct: config.scanning.max_spread_pct,
+            };
+            match client.get_markets(&filters).await {
+                Ok(markets) => println!("   Gamma API: ✅ {} markets", markets.len()),
+                Err(e) => println!("   Gamma API: ⚠️  {e:#}"),
+            }
+            match client.get_balance().await {
+                Ok(balance) => println!("   Balance: ${balance}"),
+                Err(e) => println!("   Balance: ⚠️  {e:#}"),
             }
         }
-        match polymarket.get_balance().await {
-            Ok(balance) => println!("   Balance: ${balance}"),
-            Err(e) => println!("   Balance: ⚠️  {e}"),
-        }
+        (None, _) => println!("   Skipped — not an enabled venue."),
     }
     println!();
 
@@ -337,129 +357,6 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
     println!("⚠️  Run paper trading for at least two weeks before going live.");
 
     Ok(())
-}
-
-/// Auth, balance, instruments, one quote, session — per the plan's dry-run
-/// contract, and in that order, because each step is only meaningful if the
-/// previous one worked.
-///
-/// Failures are collected rather than returned: one misconfigured venue
-/// should not hide whether the others are fine, which is the whole reason to
-/// run this before a fourteen-day window rather than discover it on cycle one.
-async fn check_venue(
-    venue: &dyn polymarket_agent::venue::Venue,
-    config: &AppConfig,
-    failures: &mut Vec<String>,
-) {
-    use polymarket_agent::venue::types::ScanFilter;
-
-    let id = venue.id().to_string();
-    println!("   {id}:");
-
-    // Errors print with `{:#}` — the whole anyhow chain. The outermost
-    // context is "Failed to fetch the Alpaca account", which does not say
-    // whether that was a 403 from a paper/live key mix-up, a DNS failure or
-    // a timeout. Those need different fixes.
-
-    // Balance is also the auth check: every venue needs a credentialed call
-    // to answer it, so a 401 or a wrong paper/live key pairing surfaces here
-    // rather than on the first order of the first cycle.
-    let bankroll = match venue.balance().await {
-        Ok(b) => {
-            println!(
-                "      auth + balance: ✅ {} {} available{}",
-                b.available,
-                b.ccy,
-                b.total.map(|t| format!(", {t} equity")).unwrap_or_default()
-            );
-            if b.total.is_none() {
-                println!(
-                    "      ⚠️  no equity figure — the circuit breakers cannot run \
-                     against this venue"
-                );
-            }
-            Some(b.available)
-        }
-        Err(e) => {
-            println!("      auth + balance: ❌ {e:#}");
-            failures.push(format!("{id}: {e:#}"));
-            // Everything below needs credentials too; stop here rather than
-            // print four more copies of the same failure.
-            return;
-        }
-    };
-
-    if bankroll == Some(rust_decimal::Decimal::ZERO) {
-        println!("      ⚠️  zero available balance — nothing can be sized");
-    }
-
-    let filter = ScanFilter {
-        asset_classes: vec![],
-        symbols: config.venue_symbols_for(&id),
-        min_volume_24h: None,
-        max_days_to_resolution: None,
-        max_results: Some(5),
-    };
-    let instruments = match venue.list_instruments(&filter).await {
-        Ok(i) if i.is_empty() => {
-            // The exact shape of the `max_markets = 0` trap: the agent runs,
-            // logs healthy cycles and trades nothing, for as long as it is
-            // left running. A tick next to a zero would be the one place this
-            // check could mislead.
-            println!("      instruments: ❌ none discovered");
-            println!(
-                "         check [[venues]].symbols and scanning.max_markets — \
-                 the latter caps the venue scan too"
-            );
-            failures.push(format!("{id}: no tradeable instruments"));
-            i
-        }
-        Ok(i) => {
-            println!(
-                "      instruments: ✅ {} of the configured universe",
-                i.len()
-            );
-            i
-        }
-        Err(e) => {
-            println!("      instruments: ❌ {e:#}");
-            failures.push(format!("{id} instruments: {e:#}"));
-            Vec::new()
-        }
-    };
-
-    if let Some(first) = instruments.first() {
-        match venue.quote(&first.id).await {
-            Ok(q) => println!(
-                "      quote: ✅ {} {}/{} (mid {})",
-                first.symbol(),
-                q.bid,
-                q.ask,
-                q.mid
-            ),
-            Err(e) => {
-                println!("      quote: ❌ {} {e:#}", first.symbol());
-                failures.push(format!("{id} quote: {e:#}"));
-            }
-        }
-    }
-
-    let now = Utc::now();
-    println!(
-        "      session: {} ({})",
-        if venue.is_open_at(now) {
-            "open"
-        } else {
-            "closed"
-        },
-        // A closed equity session is normal out of hours; a closed 24/7
-        // crypto venue is not, and the two look identical without this.
-        if polymarket_agent::venue::venue_has_work_at(venue, now) {
-            "has tradeable assets now"
-        } else {
-            "nothing tradeable until it reopens"
-        }
-    );
 }
 
 /// Run the agent in paper or live trading mode.
