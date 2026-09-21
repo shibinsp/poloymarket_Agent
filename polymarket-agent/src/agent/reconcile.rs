@@ -161,8 +161,15 @@ impl Reconciler<'_> {
         // filled entry is a live position and must be visible as one.
         if ack.filled_qty > Decimal::ZERO {
             report.filled += 1;
-            self.apply_fill(order, ack.filled_qty, ack.avg_fill_price, &ack.state)
-                .await?;
+            self.apply_fill(
+                order,
+                ack.filled_qty,
+                ack.avg_fill_price,
+                ack.fees,
+                &ack.state,
+                now,
+            )
+            .await?;
         }
 
         if is_terminal(&ack.state) {
@@ -225,13 +232,65 @@ impl Reconciler<'_> {
             .map(|status| (trade_id, status)))
     }
 
+    /// Write the execution itself to `fills`.
+    ///
+    /// Separate from the position bookkeeping below because they answer
+    /// different questions. `trades` says what the agent holds; `fills` says
+    /// what the venue actually did — at what price against the mid, and how
+    /// long it took. Two of the paper-window promotion criteria are median
+    /// and p95 slippage, and neither is answerable from an averaged
+    /// `avg_fill_price` on the order.
+    ///
+    /// Best-effort: losing a measurement must never block recording the
+    /// position it came from.
+    async fn record_execution(
+        &self,
+        order: &OrderRecord,
+        filled_qty: Decimal,
+        price: Decimal,
+        fees: Decimal,
+        now: DateTime<Utc>,
+    ) {
+        let Some(order_id) = order.id else {
+            return;
+        };
+        let mid = order
+            .mid_at_submit
+            .as_deref()
+            .and_then(|m| Decimal::from_str_exact(m).ok());
+
+        if let Err(e) = self
+            .store
+            .record_fill(
+                order_id,
+                order.venue_order_id.as_deref(),
+                filled_qty,
+                price,
+                Some(fees),
+                mid,
+                &order.side,
+                order.submitted_at.as_deref(),
+                now,
+            )
+            .await
+        {
+            warn!(
+                client_order_id = %order.client_order_id,
+                error = %e,
+                "Could not record the execution — slippage for this fill is lost"
+            );
+        }
+    }
+
     /// Record a fill against the trade the order was placed for.
     async fn apply_fill(
         &self,
         order: &OrderRecord,
         filled_qty: Decimal,
         avg_fill_price: Option<Decimal>,
+        fees: Decimal,
         state: &OrderState,
+        now: DateTime<Utc>,
     ) -> Result<()> {
         let Some((trade_id, status)) = self.linked_trade(order).await? else {
             // An order with no trade row is a bug elsewhere, not something to
@@ -253,6 +312,9 @@ impl Reconciler<'_> {
                 return Ok(());
             }
         };
+
+        self.record_execution(order, filled_qty, price, fees, now)
+            .await;
 
         match order.intent.as_str() {
             "EXIT" => {
@@ -836,6 +898,7 @@ mod tests {
             state: "ACCEPTED".to_string(),
             reject_reason: None,
             cycle: Some(1),
+            mid_at_submit: None,
             submitted_at: None,
             updated_at: None,
             expires_at: expires_at.map(|s| s.to_string()),

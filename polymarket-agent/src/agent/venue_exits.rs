@@ -266,6 +266,8 @@ impl VenueExits<'_> {
                 state: "PENDING".to_string(),
                 reject_reason: Some(reason.as_str().to_string()),
                 cycle: Some(cycle),
+                // Exits are priced off the mark, which is the mid.
+                mid_at_submit: Some(mark.to_string()),
                 submitted_at: None,
                 updated_at: None,
                 expires_at: Some(
@@ -532,6 +534,7 @@ mod tests {
                 state: "PENDING".to_string(),
                 reject_reason: Some("STOP_LOSS".to_string()),
                 cycle: Some(1),
+                mid_at_submit: None,
                 submitted_at: None,
                 updated_at: None,
                 expires_at: None,

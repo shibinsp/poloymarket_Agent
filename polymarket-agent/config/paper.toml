@@ -1,0 +1,143 @@
+# Paper-window configuration: Alpaca only.
+#
+# Copy, adjust, and point CONFIG_PATH at it:
+#
+#   cp config/paper.toml config/local.toml
+#   echo 'CONFIG_PATH=config/local.toml' >> .env
+#
+# config/local.toml is gitignored. Never commit a file with your own paths or
+# balances in it — see the note in .gitignore.
+#
+# Required in .env, from https://app.alpaca.markets (Paper account → API keys):
+#
+#   ALPACA_API_KEY_ID=...
+#   ALPACA_API_SECRET_KEY=...
+#   LLM_API_KEY=...
+#
+# Paper keys only work against paper-api.alpaca.markets, and live keys only
+# against api.alpaca.markets. They are not interchangeable, and the failure is
+# a 403 at startup rather than anything subtler.
+
+[agent]
+mode = "paper"
+cycle_interval_seconds = 600      # 10 minutes
+death_balance_threshold = 0.0
+low_fuel_threshold = 10.0
+api_reserve = 2.0
+# Informational in this configuration: sizing comes from the Alpaca account,
+# not this number. It still seeds the dashboard's ROI baseline.
+initial_paper_balance = 100.0
+daily_api_budget = 0.50
+max_sleep_seconds = 3600
+
+[scanning]
+# The legacy Polymarket loop. Left configured but inert — with `[[venues]]`
+# set, continuous assets go through the venue path. Polymarket's
+# international CLOB prohibits US persons, so do not enable it.
+max_markets = 0
+min_volume_24h = 5000.0
+max_resolution_days = 14
+max_spread_pct = 0.05
+categories = []
+
+[valuation]
+provider = "anthropic"
+model = "claude-sonnet-4-20250514"
+min_edge_threshold = 0.08
+high_confidence_edge = 0.06
+low_confidence_edge = 0.10
+cache_ttl_seconds = 300
+
+[risk]
+kelly_fraction = 0.5
+max_position_pct = 0.06
+max_total_exposure_pct = 0.30
+max_positions_per_category = 3
+min_position_usd = 1.0
+
+# --- Circuit breakers, tuned for a paper window ------------------------------
+#
+# These differ from the shipped defaults in one place, deliberately.
+#
+# `max_daily_loss_usd` defaults to $5, which is the right number for a $50–100
+# live rollout. Against an Alpaca paper account — $100,000 by default — a $5
+# limit halts trading most days, and the promotion criteria need ≥40 orders
+# and ≥30 closed positions over ≥14 days. A window that halts every morning
+# gathers neither.
+#
+# Set this to something proportionate to the *paper* balance, and put it back
+# to the live number before funding anything.
+max_daily_loss_pct = 0.05
+max_daily_loss_usd = 2000.0       # ~2% of a $100k paper account. LIVE: 5.0
+max_drawdown_pct = 0.15
+max_trades_per_day = 10
+max_consecutive_losses = 4
+# Inert in paper; they bind only in live mode. Left at the live values so the
+# transition changes one word — mode — and not the risk numbers.
+max_live_notional_per_position_usd = 10.0
+max_live_total_notional_usd = 60.0
+
+[execution]
+order_type = "limit"
+order_ttl_seconds = 300
+max_slippage_pct = 0.02
+max_retries = 3
+
+[monitoring]
+log_level = "info"
+discord_enabled = false
+daily_summary_hour = 9
+dashboard_port = 8080
+dashboard_bind = "127.0.0.1"
+
+[polymarket]
+clob_base_url = "https://clob.polymarket.com"
+gamma_base_url = "https://gamma-api.polymarket.com"
+chain_id = 137
+
+[rate_limit]
+requests_per_second = 10
+burst_size = 20
+backoff_base_ms = 1000
+backoff_max_ms = 30000
+
+[database]
+# Absolute, so the ledger does not depend on where the process was started.
+# A relative path resolves against the working directory — the repo by hand,
+# WorkingDirectory= under systemd — and the symptom is not an error: the agent
+# opens an empty database, reports no positions, and re-opens everything it
+# already holds.
+path = "/var/lib/polymarket-agent/agent.db"
+data_dir = "/var/lib/polymarket-agent"
+
+[[venues]]
+id = "alpaca"
+kind = "alpaca"
+enabled = true
+base_url = "https://paper-api.alpaca.markets"
+data_url = "https://data.alpaca.markets"
+# Continuous assets are not discovered — they need an explicit universe, and
+# it bounds model spend directly: one valuation per symbol per cycle.
+#
+# Crypto trades 24/7, which is what makes the two weekends in the promotion
+# criteria reachable. Equities only trade in their sessions.
+symbols = ["BTC/USD", "ETH/USD", "SPY", "AAPL"]
+fee_pct = 0.0025
+
+[sizing_continuous]
+risk_per_trade_pct = 0.0075
+atr_period = 14
+atr_multiplier = 2.0
+min_stop_pct = 0.03
+max_stop_pct = 0.12
+min_p_up = 0.55
+max_orders_per_cycle = 2
+
+[exits_continuous]
+take_profit_pct = 0.06
+max_hold_hours = 72
+
+[telemetry]
+service_name = "polymarket-agent"
+export_content = true
+export_timeout_seconds = 10

@@ -387,6 +387,10 @@ impl VenueCycle<'_> {
                 state: "PENDING".to_string(),
                 reject_reason: None,
                 cycle: Some(ctx.cycle),
+                // The market as it stood when this was decided. Only
+                // knowable now — by fill time it has moved, and slippage is
+                // the difference between the two.
+                mid_at_submit: Some(quote.mid.to_string()),
                 submitted_at: None,
                 updated_at: None,
                 expires_at: Some(
@@ -886,6 +890,7 @@ mod tests {
                 state: "UNKNOWN".to_string(),
                 reject_reason: None,
                 cycle: Some(0),
+                mid_at_submit: None,
                 submitted_at: None,
                 updated_at: None,
                 expires_at: None,
@@ -1076,6 +1081,7 @@ mod tests {
                     state: state.to_string(),
                     reject_reason: None,
                     cycle: Some(0),
+                    mid_at_submit: None,
                     submitted_at: None,
                     updated_at: None,
                     expires_at: None,
