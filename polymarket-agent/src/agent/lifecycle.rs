@@ -63,6 +63,8 @@ pub struct Agent {
     last_balance: Decimal,
     /// Venues from `[[venues]]`. Empty keeps the legacy Polymarket-only path.
     venues: VenueRegistry,
+    /// Consecutive cycles in which no equity figure could be established.
+    unknown_equity_cycles: u32,
     /// Shared with the valuation engine; the venue cycle calls it directly
     /// because continuous assets use a different prompt.
     llm: Option<Arc<LlmClient>>,
@@ -217,6 +219,7 @@ impl Agent {
         );
 
         Ok(Self {
+            unknown_equity_cycles: 0,
             config,
             store,
             state: AgentState::Alive,
@@ -456,17 +459,62 @@ impl Agent {
     /// having it means none of them can be evaluated — and an agent that goes
     /// on trading while its only risk input is unavailable has no risk
     /// controls at all, however many are configured.
-    async fn check_breakers(&self, now: DateTime<Utc>, equity: Option<Decimal>) {
+    /// Cycles in a row that equity could not be established before halting.
+    ///
+    /// An `UntilResume` halt needs a human, so raising one on the first
+    /// failure turns a single 500 from a book endpoint into an indefinite
+    /// outage — and an operator who meets that weekly learns to resume without
+    /// reading, which is worse than the gap it was guarding. One cycle of
+    /// grace absorbs a transient; a second in a row is a real problem and
+    /// halts. The window is bounded and the agent says where it is in it.
+    const UNKNOWN_EQUITY_GRACE_CYCLES: u32 = 1;
+
+    /// Consecutive cycles in which no equity figure could be established.
+    ///
+    /// Zero in normal operation. Worth reading rather than inferring: it is
+    /// the difference between "one book call failed" and "the risk limits
+    /// have not been evaluated since this morning".
+    pub fn unknown_equity_cycles(&self) -> u32 {
+        self.unknown_equity_cycles
+    }
+
+    async fn check_breakers(&mut self, now: DateTime<Utc>, equity: Option<Decimal>) {
         let Some(equity) = equity else {
+            self.unknown_equity_cycles += 1;
+            if self.unknown_equity_cycles <= Self::UNKNOWN_EQUITY_GRACE_CYCLES {
+                // Deliberately not a halt *yet*, and deliberately still an
+                // alert: for this one cycle the loss limits are unevaluated,
+                // which is a real exposure and not a silent one.
+                warn!(
+                    cycles = self.unknown_equity_cycles,
+                    "No venue would report account equity — the risk limits cannot be \
+                     evaluated this cycle; halting if it happens again"
+                );
+                let _ = self
+                    .alert_client
+                    .anomaly(
+                        AlertLevel::Warning,
+                        AnomalyKind::ReconciliationMismatch,
+                        "risk",
+                        "Account equity unavailable — risk limits unevaluated for one cycle",
+                    )
+                    .await;
+                return;
+            }
             self.raise_halt(Halt::new(
                 HaltSource::CircuitBreaker,
                 HaltScope::UntilResume,
-                "No venue would report account equity, so no risk limit can be evaluated"
-                    .to_string(),
+                format!(
+                    "No venue would report account equity for {} cycles, so no risk limit \
+                     can be evaluated",
+                    self.unknown_equity_cycles
+                ),
                 now,
             ));
             return;
         };
+        // A figure again: the streak is over.
+        self.unknown_equity_cycles = 0;
 
         let today = now.date_naive();
         let marks = match self.store.record_equity(today, equity).await {

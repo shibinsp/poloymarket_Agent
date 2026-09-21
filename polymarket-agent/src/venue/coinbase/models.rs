@@ -394,8 +394,6 @@ mod tests {
         assert!(!p.tradeable());
     }
 
-    /// Coinbase populates a different field depending on where the order was
-    /// refused. Taking only the first would record most rejections blank.
     /// Money committed to a resting order is still the account's. Omitting it
     /// makes a position appear to shrink the moment an exit rests — which the
     /// reconciler reads as drift and halts on.
@@ -420,6 +418,8 @@ mod tests {
         assert_eq!(account.total().unwrap(), dec!(100));
     }
 
+    /// Coinbase populates a different field depending on where the order was
+    /// refused. Taking only the first would record most rejections blank.
     #[test]
     fn a_rejection_reason_falls_through_to_whichever_field_is_set() {
         let only_preview = CreateOrderError {

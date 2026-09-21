@@ -30,6 +30,7 @@ use super::models::{
 };
 use super::rest::CoinbaseRest;
 use crate::market::models::{OrderBookSnapshot, PriceLevel};
+use crate::venue::equity::{mark_equity, single_quote_currency, Holding};
 use crate::venue::session::TradingSession;
 use crate::venue::types::{
     AssetClass, Balance, Candle, CandleInterval, Instrument, InstrumentId, InstrumentMeta,
@@ -143,6 +144,7 @@ pub struct CoinbaseVenue {
     caps: VenueCapabilities,
     session: TradingSession,
     symbols: Vec<String>,
+    cash_ccy: String,
     rest: CoinbaseRest,
     accounts_cache_ttl: Duration,
     accounts_cache: tokio::sync::Mutex<Option<(Instant, Arc<Vec<Account>>)>>,
@@ -160,6 +162,18 @@ impl std::fmt::Debug for CoinbaseVenue {
 
 impl CoinbaseVenue {
     pub fn new(config: CoinbaseConfig) -> Result<Self> {
+        // One quote currency, or the balance cannot be reported faithfully:
+        // `Balance` carries one number and one currency, and cash in a second
+        // one is either dropped from equity or folded in at an implied 1:1.
+        let quote_ccy = single_quote_currency(&config.symbols).map_err(|found| {
+            anyhow::anyhow!(
+                "Coinbase venue {} has symbols quoting in {} — one venue reports one \
+                 currency, so configure a venue entry per quote currency",
+                config.venue_id,
+                found.join(" and ")
+            )
+        })?;
+
         let signer = CdpSigner::new(&config.key_name, &config.private_key_pem)?;
         let rest = CoinbaseRest::new(&config.base_url, signer, config.request_timeout)?;
 
@@ -182,6 +196,10 @@ impl CoinbaseVenue {
             // Spot crypto: 24/7, every day, no holidays.
             session: TradingSession::Always,
             symbols: config.symbols,
+            // Coinbase settles USD and USDC interchangeably, so `is_cash`
+            // counts both; this is the label, and the currency holdings are
+            // priced against.
+            cash_ccy: quote_ccy.unwrap_or_else(|| "USD".to_string()),
             rest,
             accounts_cache_ttl: config.accounts_cache_ttl,
             accounts_cache: tokio::sync::Mutex::new(None),
@@ -969,6 +987,21 @@ impl Venue for CoinbaseVenue {
             if is_cash(currency) {
                 continue;
             }
+            // Only what the agent actually trades. A Coinbase account is a
+            // personal wallet as well as an agent account: staked ETH, an old
+            // SOL bag, dust from a manual trade. Reporting those as positions
+            // makes the reconciler see a holding it has no record of, which is
+            // an `UntilResume` halt needing a human — so anyone enabling this
+            // venue on an existing account would halt on the first cycle.
+            //
+            // Checked *before* parsing: an account can hold dust in dozens of
+            // currencies, and letting one unparseable amount fail the whole
+            // call would blind the audit over a row it was going to discard.
+            let Some(symbol) = self.symbol_for_base(currency) else {
+                outside.push(currency.to_uppercase());
+                continue;
+            };
+
             // Available *and* held: coins committed to a resting order are
             // still the account's position, and omitting them would read as
             // drift the moment an exit order rests.
@@ -977,24 +1010,15 @@ impl Venue for CoinbaseVenue {
                 continue;
             }
 
-            // Only what the agent actually trades. A Coinbase account is a
-            // personal wallet as well as an agent account: staked ETH, an old
-            // SOL bag, dust from a manual trade. Reporting those as positions
-            // makes the reconciler see a holding it has no record of, which is
-            // an `UntilResume` halt needing a human — so anyone enabling this
-            // venue on an existing account would halt on the first cycle.
-            match self.symbol_for_base(currency) {
-                Some(symbol) => out.push(Position {
-                    instrument: InstrumentId::new(self.id.clone(), symbol),
-                    qty,
-                    // Coinbase does not report a cost basis on the accounts
-                    // endpoint. Zero would claim the position was free and make
-                    // every P&L calculation wrong; the reconciler compares
-                    // quantities, which is what this is for.
-                    avg_entry: Decimal::ZERO,
-                }),
-                None => outside.push(format!("{currency} {}", qty.normalize())),
-            }
+            out.push(Position {
+                instrument: InstrumentId::new(self.id.clone(), symbol),
+                qty,
+                // Coinbase does not report a cost basis on the accounts
+                // endpoint. Zero would claim the position was free and make
+                // every P&L calculation wrong; the reconciler compares
+                // quantities, which is what this is for.
+                avg_entry: Decimal::ZERO,
+            });
         }
 
         if !outside.is_empty() {
@@ -1018,7 +1042,7 @@ impl Venue for CoinbaseVenue {
 
         let mut available = Decimal::ZERO;
         let mut cash_total = Decimal::ZERO;
-        let mut holdings: Vec<(String, Decimal)> = Vec::new();
+        let mut holdings: Vec<Holding> = Vec::new();
 
         for account in accounts.iter().filter(|a| is_usable(a)) {
             let Some(currency) = account.currency.as_deref() else {
@@ -1034,18 +1058,24 @@ impl Venue for CoinbaseVenue {
             if qty <= Decimal::ZERO {
                 continue;
             }
-            // Only what the agent trades can be priced — the same scoping
-            // `positions()` uses. A holding outside the universe is already
-            // reported there and is left out of equity rather than guessed at.
-            if let Some(symbol) = self.symbol_for_base(currency) {
-                holdings.push((symbol, qty));
-            }
+            holdings.push(Holding {
+                asset: currency.to_uppercase(),
+                qty,
+                // The configured pair when there is one, else the shared
+                // helper prices it against this venue's currency. *Every*
+                // holding is priced, configured or not: leaving one out
+                // reports a partial equity as authoritative, which is the
+                // failure this is here to prevent.
+                symbol: self.symbol_for_base(currency),
+            });
         }
 
+        let total = mark_equity(self, &self.id, &self.cash_ccy, cash_total, &holdings).await;
+
         Ok(Balance {
-            ccy: "USD".to_string(),
+            ccy: self.cash_ccy.clone(),
             available,
-            total: self.mark_equity(cash_total, &holdings).await,
+            total,
         })
     }
 
@@ -1057,41 +1087,6 @@ impl Venue for CoinbaseVenue {
 }
 
 impl CoinbaseVenue {
-    /// Account equity: cash plus each holding marked at the current mid.
-    ///
-    /// This is the number every loss limit is measured against, and the
-    /// accounts endpoint reports quantities without prices — so without a
-    /// quote per holding there is no equity, and `check_breakers` halts
-    /// `UntilResume` rather than trade with no risk controls. Reporting cash
-    /// alone instead would read every entry as an instant loss of the full
-    /// notional and trip the drawdown breaker on a flat book.
-    ///
-    /// `None` when a holding cannot be priced: a partial equity is a wrong
-    /// equity, and the drawdown breaker cannot tell one from a real loss. A
-    /// flat book needs no quotes at all, which is the common case for a
-    /// deployment that has not traded yet.
-    async fn mark_equity(&self, cash: Decimal, holdings: &[(String, Decimal)]) -> Option<Decimal> {
-        let mut total = cash;
-        for (symbol, qty) in holdings {
-            let id = InstrumentId::new(self.id.clone(), symbol.clone());
-            match self.quote(&id).await {
-                Ok(quote) => total += *qty * quote.mid,
-                Err(e) => {
-                    warn!(
-                        venue = %self.id,
-                        symbol = %symbol,
-                        error = %format!("{e:#}"),
-                        "Could not price a holding, so account equity cannot be computed — \
-                         the risk limits will report themselves unevaluable rather than \
-                         run against a partial number"
-                    );
-                    return None;
-                }
-            }
-        }
-        Some(total)
-    }
-
     /// Every account row, paged, reused for a moment.
     ///
     /// Coinbase creates one row per supported currency and pages by cursor, so
@@ -1582,8 +1577,18 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
                 "accounts": [
                     {"currency": "USD",  "available_balance": {"value": "120.50"},
                      "hold": {"value": "10.00"}},
-                    {"currency": "USDC", "available_balance": {"value": "30.00"}}
+                    {"currency": "USDC", "available_balance": {"value": "30.00"}},
+                    {"currency": "BTC",  "available_balance": {"value": "0.001"}}
                 ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/brokerage/product_book"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "pricebook": {"product_id": "BTC-USD",
+                              "bids": [{"price": "60000.00", "size": "1"}],
+                              "asks": [{"price": "60010.00", "size": "1"}]}
             })))
             .mount(&server)
             .await;
@@ -1594,12 +1599,12 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
         assert_eq!(
             balance.available,
             dec!(150.50),
-            "USD + USDC, and not the cash held against a resting order"
+            "USD + USDC, not the BTC, and not the cash held against a resting order"
         );
         assert_eq!(
             balance.total,
-            Some(dec!(160.50)),
-            "held cash is still equity — a flat book needs no quotes at all"
+            Some(dec!(220.505)),
+            "held cash counts, and the BTC is marked: 160.50 + 0.001 x 60005"
         );
     }
 
@@ -1640,6 +1645,117 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
             Some(dec!(220.01)),
             "cash plus the marked value of the holding, held coins included"
         );
+    }
+
+    /// `Balance` carries one number and one currency, so a venue whose pairs
+    /// quote in more than one cannot be reported faithfully — the cash in the
+    /// other is either dropped or folded in at an implied 1:1. Refused at
+    /// construction, where an operator is looking.
+    #[test]
+    fn a_venue_quoting_in_two_currencies_is_refused_at_construction() {
+        let err = CoinbaseVenue::new(
+            CoinbaseConfig::new("organizations/o/apiKeys/k", PEM)
+                .with_symbols(vec!["BTC/USD".to_string(), "ETH/USDC".to_string()]),
+        )
+        .unwrap_err();
+
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("USD and USDC"), "name both: {rendered}");
+        assert!(
+            rendered.contains("venue entry per quote currency"),
+            "and say what to do instead: {rendered}"
+        );
+    }
+
+    /// An account can hold dust in dozens of currencies. One unparseable
+    /// amount on a row the agent does not trade must not fail the whole call
+    /// and blind the position audit.
+    #[tokio::test]
+    async fn a_junk_hold_outside_the_universe_does_not_blind_the_audit() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/brokerage/accounts"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "accounts": [
+                    {"currency": "SOL", "available_balance": {"value": "2"},
+                     "hold": {"value": "n/a"}},
+                    {"currency": "BTC", "available_balance": {"value": "0.01"}}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["BTC/USD"]);
+        let positions = venue
+            .positions()
+            .await
+            .expect("the BTC position is readable regardless of the SOL row");
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].qty, dec!(0.01));
+    }
+
+    /// A holding the agent does not trade is still the account's money.
+    /// Leaving it out reports a partial equity *as authoritative*, which is
+    /// the failure the whole change exists to prevent — and a pre-existing
+    /// bag is the case this adapter calls normal.
+    #[tokio::test]
+    async fn equity_prices_holdings_outside_the_configured_universe_too() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/brokerage/accounts"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "accounts": [
+                    {"currency": "USD", "available_balance": {"value": "1000.00"}},
+                    {"currency": "ETH", "available_balance": {"value": "5"}}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/brokerage/product_book"))
+            .and(query_param("product_id", "ETH-USD"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "pricebook": {"product_id": "ETH-USD",
+                              "bids": [{"price": "2999.00", "size": "10"}],
+                              "asks": [{"price": "3001.00", "size": "10"}]}
+            })))
+            .mount(&server)
+            .await;
+
+        // ETH is not configured; it is still $15,000.
+        let venue = venue(&server, &["BTC/USD"]);
+        let balance = venue.balance().await.unwrap();
+        assert_eq!(
+            balance.total,
+            Some(dec!(16000)),
+            "1000 cash + 5 ETH at a 3000 mid — reporting 1000 would be a partial equity"
+        );
+        assert!(
+            venue.positions().await.unwrap().is_empty(),
+            "and it is still not a position, because it is not drift"
+        );
+    }
+
+    /// A closed position leaves billionths of a coin behind. Demanding a quote
+    /// for that would let a failed book call over $0.0006 of dust blank the
+    /// account's equity and halt the agent.
+    #[tokio::test]
+    async fn dust_does_not_need_a_quote_and_cannot_blank_equity() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/brokerage/accounts"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "accounts": [
+                    {"currency": "USD", "available_balance": {"value": "1000.00"}},
+                    {"currency": "BTC", "available_balance": {"value": "0.00000001"}}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        // No product_book mock at all: asking for one would fail the call.
+
+        let venue = venue(&server, &["BTC/USD"]);
+        assert_eq!(venue.balance().await.unwrap().total, Some(dec!(1000.00)));
     }
 
     /// A partial equity is a wrong equity, and the drawdown breaker cannot
