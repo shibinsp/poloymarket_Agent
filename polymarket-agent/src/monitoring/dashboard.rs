@@ -145,19 +145,90 @@ fn build_router(state: DashboardState) -> Router {
         .route("/api/equity", get(equity_handler))
         .route("/api/reconciliation", get(reconciliation_handler))
         .route("/api/risk", get(risk_handler))
-        .route("/api/halt", post(halt_handler))
         .route("/api/halt", get(halt_status_handler))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
+
+    // State-changing routes get a second gate on top of the token.
+    //
+    // Every `/api/*` route was read-only until these existed, so an unset
+    // `DASHBOARD_TOKEN` — the documented default on a loopback bind — was
+    // merely an information question. It is not any more: a `POST` with no
+    // custom header is a CORS *simple request*, which any page the operator
+    // browses can issue at `localhost:8080`. The browser sends it, the
+    // response is opaque to the attacker, and the side effect lands anyway —
+    // a drive-by kill switch, and worse, a drive-by *resume* that lifts the
+    // drawdown halt the README says only a person can clear.
+    //
+    // Requiring a header the fetch spec will not send cross-origin without a
+    // preflight, and refusing a cross-site Origin outright, closes both.
+    let control = Router::new()
+        .route("/api/halt", post(halt_handler))
         .route("/api/resume", post(resume_handler))
         // The plan's name for the same action. A reconciliation mismatch is
         // cleared by acknowledging it, which is a resume.
         .route("/api/reconcile/ack", post(resume_handler))
+        .route_layer(middleware::from_fn(require_same_origin))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
 
     Router::new()
         .route("/", get(index_handler))
         .route("/api/health", get(health_handler))
         .merge(protected)
+        .merge(control)
         .with_state(state)
+}
+
+/// Header the dashboard sends on every control request.
+///
+/// Its only job is to be *custom*: a cross-origin `fetch` carrying it stops
+/// being a CORS simple request and triggers a preflight, which this server
+/// never answers. The value is irrelevant — its presence is the proof that
+/// the request came from code allowed to read this origin.
+const CONTROL_HEADER: &str = "x-agent-control";
+
+/// Refuse state-changing requests that a foreign page could have made.
+///
+/// Two independent checks, because each covers a gap in the other. `Origin`
+/// is set by browsers on every cross-site POST and is the direct signal, but
+/// is absent on same-origin requests in some browsers and on curl. The custom
+/// header cannot be set cross-origin without a preflight, but is trivially
+/// present on curl. Requiring the header and rejecting a foreign `Origin`
+/// leaves the command line working and the browser drive-by refused.
+async fn require_same_origin(req: Request, next: Next) -> Response {
+    if let Some(origin) = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+    {
+        let host = req
+            .headers()
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        let matches_host = origin
+            .rsplit("//")
+            .next()
+            .map(|o| o == host)
+            .unwrap_or(false);
+        if !matches_host {
+            warn!(origin, host, "Refused a cross-origin control request");
+            return (
+                StatusCode::FORBIDDEN,
+                "cross-origin control requests are refused",
+            )
+                .into_response();
+        }
+    }
+
+    if req.headers().get(CONTROL_HEADER).is_none() {
+        return (
+            StatusCode::FORBIDDEN,
+            format!("control requests must carry the {CONTROL_HEADER} header"),
+        )
+            .into_response();
+    }
+
+    next.run(req).await
 }
 
 async fn require_token(State(state): State<DashboardState>, req: Request, next: Next) -> Response {
@@ -194,34 +265,60 @@ async fn index_handler() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html)
 }
 
+/// A read route that could not read. Carries the agent's own message.
+fn rows_unavailable(e: anyhow::Error) -> Response {
+    warn!(error = %e, "Dashboard read failed");
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({"error": e.to_string()})),
+    )
+        .into_response()
+}
+
 /// The execution record: what was asked for, and what came back.
 async fn orders_handler(State(state): State<DashboardState>) -> impl IntoResponse {
     match state.store.get_orders(500).await {
-        Ok(rows) => Json(serde_json::to_value(&rows).unwrap_or_default()),
-        Err(e) => Json(serde_json::json!({"error": e.to_string()})),
+        Ok(rows) => Json(serde_json::to_value(&rows).unwrap_or_default()).into_response(),
+        // A real status code, unlike the older routes. Those answer 200 with
+        // an error body, which the page's array narrowing rejects as
+        // "malformed" — so the operator never sees "database is locked", only
+        // a card that failed for no stated reason.
+        Err(e) => rows_unavailable(e),
     }
 }
 
 /// Individual executions — where slippage and time-to-fill live.
 async fn fills_handler(State(state): State<DashboardState>) -> impl IntoResponse {
     match state.store.get_fills(500).await {
-        Ok(rows) => Json(serde_json::to_value(&rows).unwrap_or_default()),
-        Err(e) => Json(serde_json::json!({"error": e.to_string()})),
+        Ok(rows) => Json(serde_json::to_value(&rows).unwrap_or_default()).into_response(),
+        // A real status code, unlike the older routes. Those answer 200 with
+        // an error body, which the page's array narrowing rejects as
+        // "malformed" — so the operator never sees "database is locked", only
+        // a card that failed for no stated reason.
+        Err(e) => rows_unavailable(e),
     }
 }
 
 /// Start-of-day equity and the running peak — the drawdown series.
 async fn equity_handler(State(state): State<DashboardState>) -> impl IntoResponse {
     match state.store.get_daily_equity().await {
-        Ok(rows) => Json(serde_json::to_value(&rows).unwrap_or_default()),
-        Err(e) => Json(serde_json::json!({"error": e.to_string()})),
+        Ok(rows) => Json(serde_json::to_value(&rows).unwrap_or_default()).into_response(),
+        // A real status code, unlike the older routes. Those answer 200 with
+        // an error body, which the page's array narrowing rejects as
+        // "malformed" — so the operator never sees "database is locked", only
+        // a card that failed for no stated reason.
+        Err(e) => rows_unavailable(e),
     }
 }
 
 async fn reconciliation_handler(State(state): State<DashboardState>) -> impl IntoResponse {
     match state.store.get_reconciliation_runs(200).await {
-        Ok(rows) => Json(serde_json::to_value(&rows).unwrap_or_default()),
-        Err(e) => Json(serde_json::json!({"error": e.to_string()})),
+        Ok(rows) => Json(serde_json::to_value(&rows).unwrap_or_default()).into_response(),
+        // A real status code, unlike the older routes. Those answer 200 with
+        // an error body, which the page's array narrowing rejects as
+        // "malformed" — so the operator never sees "database is locked", only
+        // a card that failed for no stated reason.
+        Err(e) => rows_unavailable(e),
     }
 }
 
@@ -378,15 +475,26 @@ async fn health_handler(State(state): State<DashboardState>) -> impl IntoRespons
     // window is exactly the one an operator is refreshing this page to see.
     if let Some(obj) = data.as_object_mut() {
         let halt = state.kill_switch.current();
-        obj.insert(
-            "halted".to_string(),
-            serde_json::json!(state.kill_switch.is_tripped()),
-        );
+        let halted = state.kill_switch.is_tripped();
+        obj.insert("halted".to_string(), serde_json::json!(halted));
         obj.insert(
             "halt".to_string(),
             halt.and_then(|h| serde_json::to_value(h).ok())
                 .unwrap_or(serde_json::Value::Null),
         );
+
+        // `status` is what an uptime probe keys on, and it was only rewritten
+        // when a cycle completed — so halting while the loop was idle left it
+        // reporting "ok" for up to `max_sleep_seconds` beside a `halted: true`
+        // that contradicted it. Derived here from the same live flag, unless
+        // the agent is dead, which outranks everything.
+        let dead = obj.get("status").and_then(|v| v.as_str()) == Some("dead");
+        if !dead {
+            obj.insert(
+                "status".to_string(),
+                serde_json::json!(if halted { "halted" } else { "ok" }),
+            );
+        }
     }
     Json(data)
 }
@@ -446,14 +554,26 @@ mod tests {
         build_router(state_with_token(token).await)
     }
 
+    /// One temp directory for the whole test binary.
+    ///
+    /// The HALT path has to outlive every `DashboardState` built from it, and
+    /// the previous version bought that with `std::mem::forget` — which left
+    /// a directory behind per test, per run, forever. A single `OnceLock`
+    /// gives the same lifetime and is cleaned up with the process.
+    ///
+    /// Each switch gets a distinct file name so concurrent tests cannot see
+    /// each other's HALT.
+    fn halt_path() -> std::path::PathBuf {
+        static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = DIR.get_or_init(|| tempfile::tempdir().expect("tempdir"));
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        dir.path().join(format!("HALT-{n}"))
+    }
+
     async fn state_with_token(token: Option<&str>) -> DashboardState {
         let store = Store::new(":memory:").await.unwrap();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let switch = Arc::new(KillSwitch::new(dir.path().join("HALT")));
-        // The directory has to outlive the state, or the HALT path points at
-        // something already deleted and `clear` starts failing for the wrong
-        // reason.
-        std::mem::forget(dir);
+        let switch = Arc::new(KillSwitch::new(halt_path()));
         DashboardState::new(
             store,
             HealthState::new(),
@@ -488,9 +608,21 @@ mod tests {
     }
 
     async fn post(app: Router, uri: &str, auth: Option<&str>) -> (StatusCode, serde_json::Value) {
+        post_with(app, uri, auth, true).await
+    }
+
+    async fn post_with(
+        app: Router,
+        uri: &str,
+        auth: Option<&str>,
+        control_header: bool,
+    ) -> (StatusCode, serde_json::Value) {
         let mut req = HttpRequest::builder().method("POST").uri(uri);
         if let Some(a) = auth {
             req = req.header(header::AUTHORIZATION, a);
+        }
+        if control_header {
+            req = req.header(CONTROL_HEADER, "1");
         }
         let resp = app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
         let code = resp.status();
@@ -503,6 +635,80 @@ mod tests {
 
     /// The halt endpoint is the one route that changes what the agent does.
     /// Leaving it open would make the dashboard a remote stop button.
+    /// A `POST` with no custom header is a CORS *simple request*: any page
+    /// the operator browses can issue one at `localhost:8080`, the browser
+    /// sends it, and the side effect lands even though the response is
+    /// opaque. That is a drive-by kill switch — and, worse, a drive-by
+    /// *resume* lifting the drawdown halt the README says only a person can
+    /// clear. Requiring a header `fetch` will not send cross-origin without a
+    /// preflight this server never answers is what closes it.
+    #[tokio::test]
+    async fn a_control_request_without_the_custom_header_is_refused() {
+        let app = build_router(state_with_token(None).await);
+        for route in ["/api/halt", "/api/resume", "/api/reconcile/ack"] {
+            let (code, _) = post_with(app.clone(), route, None, false).await;
+            assert_eq!(
+                code,
+                StatusCode::FORBIDDEN,
+                "{route} must refuse a simple cross-site POST"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_control_routes_still_work_with_the_header() {
+        let state = state_with_token(None).await;
+        let switch = state.kill_switch.clone();
+        let app = build_router(state);
+        let (code, _) = post(app, "/api/halt", None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(switch.is_tripped());
+    }
+
+    /// A browser that announces a foreign origin is refused outright, header
+    /// or not — the header alone would not survive an attacker who can get a
+    /// preflight answered by some future CORS layer.
+    #[tokio::test]
+    async fn a_cross_origin_control_request_is_refused() {
+        let app = build_router(state_with_token(None).await);
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/api/halt")
+                    .header(header::HOST, "localhost:8080")
+                    .header(header::ORIGIN, "https://evil.example")
+                    .header(CONTROL_HEADER, "1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn a_same_origin_control_request_is_allowed() {
+        let state = state_with_token(None).await;
+        let switch = state.kill_switch.clone();
+        let app = build_router(state);
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/api/halt")
+                    .header(header::HOST, "localhost:8080")
+                    .header(header::ORIGIN, "http://localhost:8080")
+                    .header(CONTROL_HEADER, "1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(switch.is_tripped());
+    }
+
     #[tokio::test]
     async fn the_control_routes_sit_behind_the_token() {
         let app = build_router(state_with_token(Some("s3cret")).await);

@@ -225,6 +225,16 @@ impl StateReconciler<'_> {
 
         for (symbol, (lq, class)) in &local_qty {
             let vq = venue_qty.get(symbol).copied().unwrap_or(Decimal::ZERO);
+            // Both sides dust is flat on both sides. Without this, a
+            // sub-DUST local leftover against a flat venue skipped the
+            // missing-on-venue branch (its own `lq > DUST` guard fails) and
+            // fell through to the quantity comparison, which for equities has
+            // a zero tolerance — so the audit failed forever on a remainder
+            // too small to trade. That is the "trains an operator to ignore
+            // the alert" outcome DUST exists to prevent.
+            if vq.abs() <= DUST && lq.abs() <= DUST {
+                continue;
+            }
             if vq.abs() <= DUST && lq.abs() > DUST {
                 missing_on_venue.push(OrphanPosition {
                     symbol: symbol.clone(),
@@ -254,29 +264,46 @@ impl StateReconciler<'_> {
         // Resting orders the ledger has never heard of. An orphan from a
         // crash between "submitted" and "recorded" shows up here and nowhere
         // else.
-        let unknown_open_orders = match venue.open_orders().await {
+        // `None` means the comparison could not be made, which is not the
+        // same as "nothing was found" — see the verdict below.
+        let unknown_open_orders: Option<Vec<String>> = match venue.open_orders().await {
             Ok(acks) => {
-                let known = self
-                    .store
-                    .get_unresolved_orders()
-                    .await
-                    .map(|orders| {
-                        orders
-                            .into_iter()
-                            .map(|o| o.client_order_id)
-                            .collect::<std::collections::HashSet<_>>()
-                    })
-                    .unwrap_or_default();
-                acks.into_iter()
-                    .filter(|a| !known.contains(&a.client_order_id))
-                    .map(|a| a.client_order_id)
-                    .collect()
+                // A store failure here must not read as an empty known-set.
+                // It would mark every resting order unknown, and every
+                // unknown order is a Mismatch, which is an UntilResume halt
+                // needing a human — so one second of SQLite lock contention
+                // would stop the agent until somebody noticed. The positions
+                // branch above guards exactly this; this one did not.
+                match self.store.get_unresolved_orders().await {
+                    Ok(orders) => {
+                        let known: std::collections::HashSet<_> =
+                            orders.into_iter().map(|o| o.client_order_id).collect();
+                        Some(
+                            acks.into_iter()
+                                .filter(|a| !known.contains(&a.client_order_id))
+                                .map(|a| a.client_order_id)
+                                .collect(),
+                        )
+                    }
+                    Err(e) => {
+                        warn!(
+                            venue = %venue_id,
+                            error = %e,
+                            "Could not read local orders — resting orders are unverified, not unknown"
+                        );
+                        None
+                    }
+                }
             }
             Err(e) => {
+                // The venue would not say. Same reasoning: unverified, not
+                // clean, and certainly not a mismatch.
                 warn!(venue = %venue_id, error = %e, "Could not list open orders during reconciliation");
-                Vec::new()
+                None
             }
         };
+        let orders_unverified = unknown_open_orders.is_none();
+        let unknown_open_orders = unknown_open_orders.unwrap_or_default();
 
         let equity = venue.balance().await.ok().and_then(|b| b.total);
 
@@ -287,7 +314,7 @@ impl StateReconciler<'_> {
 
         let verdict = if mismatched {
             Verdict::Mismatch
-        } else if equity.is_none() {
+        } else if orders_unverified || equity.is_none() {
             // Not a mismatch — nothing disagrees — but the breakers cannot
             // run without an equity figure, so it must not read as clean.
             Verdict::Unverified
@@ -333,6 +360,8 @@ impl StateReconciler<'_> {
                 ));
             }
             parts.join("; ")
+        } else if orders_unverified {
+            "resting orders could not be compared against the ledger".to_string()
         } else if equity.is_none() {
             "venue reports no account equity — the circuit breaker cannot run".to_string()
         } else {

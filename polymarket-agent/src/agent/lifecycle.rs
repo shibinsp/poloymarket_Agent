@@ -8,7 +8,7 @@ use rust_decimal_macros::dec;
 use tracing::{error, info, instrument, warn};
 
 use crate::agent::budget::BudgetLedger;
-use crate::agent::kill_switch::{Halt, HaltSource, KillSwitch};
+use crate::agent::kill_switch::{FileSync, Halt, HaltSource, KillSwitch};
 use crate::agent::reconcile::Reconciler;
 use crate::agent::scheduler::{self, WakePlan};
 use crate::agent::self_funding::{
@@ -298,17 +298,34 @@ impl Agent {
             }
         }
         // The background poller usually gets here first; this covers the gap
-        // between process start and its first tick.
-        self.kill_switch.sync_with_file(now);
+        // between process start and its first tick — and, either way, this is
+        // where the persisted row is cleared when the file goes away. Without
+        // that, deleting the file resumed the agent in memory and left the
+        // row behind, so the next restart reinstated a lifted halt, cancelled
+        // every resting order and fired a Critical alert for it.
+        if self.kill_switch.sync_with_file(now) == FileSync::Resumed {
+            info!("HALT file removed — resuming");
+            if let Err(e) = self.store.clear_halts("halt_file_removed", now).await {
+                warn!(error = %e, "Could not clear the halt row — a restart would halt again");
+            }
+        }
         // Anything raised since the last cycle — by the poller, the
         // dashboard, or a signal — gets its side effects now.
         self.apply_pending_halt().await;
     }
 
     /// Ask every venue whether the ledger still describes reality.
-    async fn audit_venue_state(&self, now: DateTime<Utc>) {
+    ///
+    /// Returns the total account equity the venues reported, which is what
+    /// the breakers must be measured against — the reconciler already asks
+    /// each venue for it, and fetching it twice a cycle would be two calls
+    /// for one number.
+    ///
+    /// `None` means no venue would say. That is not zero, and the caller must
+    /// not treat it as a quiet day.
+    async fn audit_venue_state(&self, now: DateTime<Utc>) -> Option<Decimal> {
         if self.venues.is_empty() {
-            return;
+            return None;
         }
         let reconciler = StateReconciler {
             registry: &self.venues,
@@ -318,9 +335,11 @@ impl Agent {
             Ok(r) => r,
             Err(e) => {
                 warn!(error = %e, "State reconciliation could not run");
-                return;
+                return None;
             }
         };
+
+        let equity: Option<Decimal> = reports.iter().filter_map(|r| r.equity).reduce(|a, b| a + b);
 
         for report in reports {
             match report.verdict {
@@ -356,14 +375,72 @@ impl Agent {
                 }
             }
         }
+
+        equity
+    }
+
+    /// Account value the circuit breakers are measured against.
+    ///
+    /// Two things this gets right that the obvious version does not.
+    ///
+    /// **It is marked, not cost basis.** Buying $10 of something takes $10
+    /// out of cash and puts $10 of exposure on; if it then halves, neither
+    /// number moves. An equity built from cash plus cost basis never falls
+    /// while a position bleeds, so the daily-loss and drawdown breakers would
+    /// only ever see *realised* losses — they would watch the book go to zero
+    /// without objecting once.
+    ///
+    /// **It is the account that holds the positions.** The legacy wallet
+    /// balance is a Polygon USDC figure that does not move with Alpaca P&L,
+    /// so measuring an Alpaca deployment against it measures nothing. When
+    /// venues are configured, their own equity is authoritative.
+    ///
+    /// `None` means the number could not be established. The caller halts:
+    /// trading on when the one input to every loss limit is unavailable is
+    /// the wrong direction on the control that bounds the worst case.
+    async fn account_equity(&self, venue_equity: Option<Decimal>) -> Option<Decimal> {
+        if !self.venues.is_empty() {
+            // A venue that would not report is already flagged Unverified by
+            // the reconciler; if *none* would, there is no equity to speak of.
+            return venue_equity;
+        }
+
+        // Legacy Polymarket-only path.
+        let cash = self.current_balance().await;
+        let cost_basis = fills::unrealized_exposure(&self.store)
+            .await
+            .unwrap_or(Decimal::ZERO);
+        let marked = match self.store.total_unrealized_pnl().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "Could not read unrealized P&L — equity would be overstated");
+                return None;
+            }
+        };
+        Some(cash + cost_basis + marked)
     }
 
     /// Mark the day's equity and test it against the risk limits.
     ///
-    /// `equity` is account value including open positions, not free cash.
-    /// Free cash would read every entry as an instant loss of the full
-    /// notional and trip the daily-loss breaker on a flat book.
-    async fn check_breakers(&self, now: DateTime<Utc>, equity: Decimal) {
+    /// `equity` is account value including the *marked* value of open
+    /// positions, not free cash and not cost basis. See `account_equity`.
+    ///
+    /// `None` halts. Every loss limit is measured against this number, so not
+    /// having it means none of them can be evaluated — and an agent that goes
+    /// on trading while its only risk input is unavailable has no risk
+    /// controls at all, however many are configured.
+    async fn check_breakers(&self, now: DateTime<Utc>, equity: Option<Decimal>) {
+        let Some(equity) = equity else {
+            self.raise_halt(Halt::new(
+                HaltSource::CircuitBreaker,
+                HaltScope::UntilResume,
+                "No venue would report account equity, so no risk limit can be evaluated"
+                    .to_string(),
+                now,
+            ));
+            return;
+        };
+
         let today = now.date_naive();
         let marks = match self.store.record_equity(today, equity).await {
             Ok(m) => m,
@@ -480,8 +557,9 @@ impl Agent {
         // inside its risk limits? Both can halt, so both run before the state
         // is settled — deciding to trade and *then* discovering the books
         // disagree is the ordering this exists to prevent.
-        self.audit_venue_state(now).await;
-        self.check_breakers(now, balance + unrealized).await;
+        let venue_equity = self.audit_venue_state(now).await;
+        let equity = self.account_equity(venue_equity).await;
+        self.check_breakers(now, equity).await;
         // Whatever either of those raised gets its orders cancelled, its
         // alert sent and its row written — here, once, in one place.
         self.apply_pending_halt().await;

@@ -40,6 +40,12 @@ export function failureText(f: ApiFailure): string {
   }
 }
 
+/**
+ * Sent on every control request. Must match `CONTROL_HEADER` in
+ * `monitoring/dashboard.rs`.
+ */
+export const CONTROL_HEADER = "x-agent-control";
+
 /** A failure the operator can fix by supplying a token. */
 export function isAuthFailure(f: ApiFailure): boolean {
   return f.kind === "unauthorized";
@@ -145,7 +151,14 @@ export async function post<T>(path: string): Promise<ApiResult<T>> {
     try {
       res = await fetch(path, {
         method: "POST",
-        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+        headers: {
+          // Required by the server on every state-changing route. Its value
+          // is irrelevant; its presence is what stops the request being a
+          // CORS *simple request*, which any page the operator browses could
+          // otherwise fire at localhost:8080 to halt — or resume — trading.
+          [CONTROL_HEADER]: "1",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
         cache: "no-store",
       });
     } catch (e) {

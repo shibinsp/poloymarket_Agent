@@ -53,6 +53,16 @@ impl HaltSource {
     }
 }
 
+/// What reconciling with the `HALT` file changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileSync {
+    /// The file appeared and the switch is now tripped.
+    Raised(Halt),
+    /// The file was removed and the switch is now clear.
+    Resumed,
+    Unchanged,
+}
+
 /// A halt in force.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Halt {
@@ -184,8 +194,23 @@ impl KillSwitch {
     /// Returns a given halt exactly once, so the caller can cancel resting
     /// orders, alert and persist without repeating any of it on the cycles
     /// that follow.
+    /// Whether a halt is in force whose side effects have not run yet.
+    ///
+    /// Does not consume it — the loop uses this to decide not to go to sleep,
+    /// and `take_unhandled` still has to hand the halt over exactly once.
+    pub fn has_unhandled(&self) -> bool {
+        self.lock().is_some() && !self.handled.load(Ordering::Acquire)
+    }
+
     pub fn take_unhandled(&self) -> Option<Halt> {
-        let halt = self.lock().clone()?;
+        // The guard is held across the swap on purpose. Reading the halt and
+        // then marking it handled as two steps leaves a window in which
+        // `clear()` can empty `current` and reset `handled` — and the swap
+        // then observes `false` and hands back a halt that is no longer in
+        // force. The loop would cancel every resting order and write an audit
+        // row for a halt the operator had just explicitly lifted.
+        let current = self.lock();
+        let halt = current.clone()?;
         if self.handled.swap(true, Ordering::AcqRel) {
             return None;
         }
@@ -263,8 +288,9 @@ impl KillSwitch {
     /// halt raised by anything else — a breaker trip is not cleared by
     /// removing a file that was never there.
     ///
-    /// Returns `Some(halt)` when this call newly tripped the switch.
-    pub fn sync_with_file(&self, now: DateTime<Utc>) -> Option<Halt> {
+    /// Returns what changed, so the caller can clear the persisted row on a
+    /// resume as well as act on a new halt.
+    pub fn sync_with_file(&self, now: DateTime<Utc>) -> FileSync {
         let exists = self.halt_file.exists();
         let current_source = self.lock().as_ref().map(|h| h.source);
 
@@ -277,19 +303,22 @@ impl KillSwitch {
                     .unwrap_or_else(|| format!("{} exists", self.halt_file.display()));
                 let halt = Halt::new(HaltSource::HaltFile, HaltScope::UntilResume, detail, now);
                 if self.trip(halt.clone()) {
-                    return Some(halt);
+                    return FileSync::Raised(halt);
                 }
-                None
+                FileSync::Unchanged
             }
             (false, Some(HaltSource::HaltFile)) => {
-                // The operator removed the file. That is a resume.
+                // The operator removed the file. That is a resume — and the
+                // caller must clear the persisted row, or the next restart
+                // reinstates a halt that was lifted, cancelling orders and
+                // firing a Critical alert for something long since resolved.
                 let mut current = self.lock();
                 *current = None;
                 self.tripped.store(false, Ordering::Release);
                 self.handled.store(false, Ordering::Release);
-                None
+                FileSync::Resumed
             }
-            _ => None,
+            _ => FileSync::Unchanged,
         }
     }
 
@@ -595,7 +624,7 @@ mod tests {
         assert!(!s.halt_file().exists(), "the file must be gone");
         assert_eq!(
             s.sync_with_file(at(21)),
-            None,
+            FileSync::Unchanged,
             "and the next poll must not re-raise it"
         );
         assert!(!s.is_tripped());
@@ -619,7 +648,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = switch(&dir);
         std::fs::write(s.halt_file(), "  broker margin call  \n").unwrap();
-        let raised = s.sync_with_file(at(21)).expect("the file must trip it");
+        let FileSync::Raised(raised) = s.sync_with_file(at(21)) else {
+            panic!("the file must trip it")
+        };
         assert_eq!(raised.source, HaltSource::HaltFile);
         assert_eq!(raised.detail, "broker margin call");
         assert!(s.is_tripped());
@@ -630,7 +661,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = switch(&dir);
         std::fs::write(s.halt_file(), "").unwrap();
-        let raised = s.sync_with_file(at(21)).expect("an empty file still halts");
+        let FileSync::Raised(raised) = s.sync_with_file(at(21)) else {
+            panic!("an empty file still halts")
+        };
         assert!(
             raised.detail.contains("HALT"),
             "the reason should name the file, got {:?}",
@@ -643,9 +676,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = switch(&dir);
         std::fs::write(s.halt_file(), "stop").unwrap();
-        assert!(s.sync_with_file(at(21)).is_some());
-        assert!(
-            s.sync_with_file(at(21)).is_none(),
+        assert!(matches!(s.sync_with_file(at(21)), FileSync::Raised(_)));
+        assert_eq!(
+            s.sync_with_file(at(21)),
+            FileSync::Unchanged,
             "every wake polls the file; only the first must cancel orders"
         );
     }
@@ -745,7 +779,9 @@ mod tests {
         ));
         std::fs::write(s.halt_file(), "and also this").unwrap();
         assert!(s.expire_if_day_rolled(at(22).date_naive()));
-        let raised = s.sync_with_file(at(22)).expect("the file re-raises");
+        let FileSync::Raised(raised) = s.sync_with_file(at(22)) else {
+            panic!("the file re-raises")
+        };
         assert_eq!(raised.source, HaltSource::HaltFile);
         assert!(s.is_tripped());
     }

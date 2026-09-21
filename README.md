@@ -385,7 +385,9 @@ curl http://localhost:8080/api/health
 }
 ```
 
-`status` is `ok`, `halted`, or `dead`. `anomalies` counts *occurrences* per
+`status` is `ok`, `halted`, or `dead`, and — like `halted` — is read from the
+kill switch at request time, so an uptime probe keyed on it sees a halt
+immediately rather than at the end of the next cycle. `anomalies` counts *occurrences* per
 kind since start — alerts are deduped per `(kind, scope)` for 30 minutes, so
 one webhook message can stand for hundreds of these, and the difference
 between "once" and "four hundred times" is the interesting part.
@@ -414,8 +416,8 @@ whatever directory `database.path` lives in.
 ```bash
 touch <data_dir>/HALT                    # survives a restart; no token needed
 echo "why" > <data_dir>/HALT             # the contents become the reason
-curl -X POST localhost:8080/api/halt     # or the button on the Health page
 kill -USR1 $(pgrep polymarket-agent)     # a PID and nothing else
+curl -X POST -H 'x-agent-control: 1' localhost:8080/api/halt   # or the button
 ```
 
 The `HALT` file is polled every five seconds and wakes the idle loop, so the
@@ -424,9 +426,17 @@ wake — which across a closed weekend is an hour away. Removing the file
 resumes; it does not clear a halt raised by anything else.
 
 ```bash
-curl -X POST localhost:8080/api/resume            # also removes the HALT file
-curl -X POST localhost:8080/api/reconcile/ack     # the same thing, named for a mismatch
+curl -X POST -H 'x-agent-control: 1' localhost:8080/api/resume
+curl -X POST -H 'x-agent-control: 1' localhost:8080/api/reconcile/ack
 ```
+
+The `x-agent-control` header is required on every state-changing route, on top
+of the bearer token. Its value is irrelevant; its presence is what stops the
+request being a CORS *simple request*. Without it, any page the operator
+happened to browse could `fetch('http://localhost:8080/api/resume', {method:
+'POST'})` — the browser would send it and the side effect would land, lifting
+the very drawdown halt that is supposed to need a person. A cross-site
+`Origin` is refused outright as well.
 
 A halt is written to the `halts` table and reinstated on startup. Restarting
 the process is the first thing anyone does when something looks wrong; if

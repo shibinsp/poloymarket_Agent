@@ -285,12 +285,28 @@ impl Store {
         Ok(result.last_insert_rowid())
     }
 
+    /// Lifetime API spend.
+    ///
+    /// Summed in SQLite over the TEXT column, not in Rust. The float
+    /// round-trip this used to do (`SUM(CAST(cost AS REAL))`) is gone, but so
+    /// is the fix that replaced it: `api_costs` gains a row per model call
+    /// forever, and `/api/metrics` calls this on every dashboard poll, so
+    /// streaming the table decoded tens of thousands of rows to produce one
+    /// display number.
+    ///
+    /// `SUM` over TEXT still goes through a float internally, which is why
+    /// this is used for display only — the budget ledger and the daily cap
+    /// read `get_today_api_cost`, which is bounded by the day and summed
+    /// exactly in `Decimal`.
     pub async fn get_total_api_cost(&self) -> Result<Decimal> {
-        let rows: Vec<(String,)> = sqlx::query_as("SELECT cost FROM api_costs")
-            .fetch_all(&self.pool)
+        let total: Option<f64> = sqlx::query_scalar("SELECT SUM(cost) FROM api_costs")
+            .fetch_one(&self.pool)
             .await
             .context("Failed to get total API cost")?;
-        sum_money(&rows, "api_costs.cost")
+        Ok(total
+            .and_then(Decimal::from_f64_retain)
+            .unwrap_or(Decimal::ZERO)
+            .round_dp(6))
     }
 
     /// Get total API spend for the current UTC day.
@@ -894,6 +910,26 @@ impl Store {
         .fetch_all(&self.pool)
         .await
         .context("Failed to fetch reconciliation runs")
+    }
+
+    /// Marked profit and loss across every open position.
+    ///
+    /// Written by the mark pass each cycle. Needed because cost basis alone
+    /// does not move when a position loses: buying $10 of something takes $10
+    /// out of cash and adds $10 of exposure, and if it then halves, neither
+    /// number changes. Account equity is cash + cost basis + this.
+    ///
+    /// A position the mark pass has not reached yet contributes nothing,
+    /// which is the honest answer — not a guess at what it might be worth.
+    pub async fn total_unrealized_pnl(&self) -> Result<Decimal> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT unrealized_pnl FROM trades
+             WHERE status IN ('OPEN', 'PARTIAL') AND unrealized_pnl IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read unrealized P&L")?;
+        sum_money(&rows, "trades.unrealized_pnl")
     }
 
     /// Record one halt however many times it is offered.
@@ -1703,5 +1739,69 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[cfg(test)]
+    async fn seed_open(store: &Store, cost: &str, unrealized: Option<&str>) {
+        sqlx::query(
+            "INSERT INTO trades (cycle, venue_id, market_id, symbol, asset_class, direction,
+                                 side, entry_price, size, edge_at_entry, claude_fair_value,
+                                 confidence, kelly_raw, kelly_adjusted, status, unrealized_pnl)
+             VALUES (1,'alpaca','BTC/USD','BTC/USD','crypto_spot','LONG','BUY', ?, '1',
+                     '0.1','0.6','0.8','0','0','OPEN', ?)",
+        )
+        .bind(cost)
+        .bind(unrealized)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    }
+
+    /// Equity must move when an open position loses, or the daily-loss and
+    /// drawdown breakers only ever see *realised* P&L.
+    ///
+    /// Cash plus cost basis does not move: buying $10 of something takes $10
+    /// out of cash and puts $10 of exposure on, and if it halves, neither
+    /// number changes. This is the term that makes the difference.
+    #[tokio::test]
+    async fn unrealized_pnl_sums_across_open_positions() {
+        let store = Store::new(":memory:").await.unwrap();
+        seed_open(&store, "10", Some("-6")).await;
+        seed_open(&store, "20", Some("2.5")).await;
+        assert_eq!(store.total_unrealized_pnl().await.unwrap(), dec!(-3.5));
+    }
+
+    /// A position the mark pass has not reached yet contributes nothing —
+    /// the honest answer, rather than a guess at what it might be worth.
+    #[tokio::test]
+    async fn an_unmarked_position_contributes_nothing_to_unrealized_pnl() {
+        let store = Store::new(":memory:").await.unwrap();
+        seed_open(&store, "10", None).await;
+        seed_open(&store, "10", Some("-4")).await;
+        assert_eq!(store.total_unrealized_pnl().await.unwrap(), dec!(-4));
+    }
+
+    #[tokio::test]
+    async fn closed_positions_are_excluded_from_unrealized_pnl() {
+        let store = Store::new(":memory:").await.unwrap();
+        seed_open(&store, "10", Some("-4")).await;
+        seed_closed(
+            &store,
+            "2026-09-20T09:00:00Z",
+            "2026-09-20T10:00:00Z",
+            "-99",
+        )
+        .await;
+        assert_eq!(
+            store.total_unrealized_pnl().await.unwrap(),
+            dec!(-4),
+            "a closed position's P&L is realised, and is already in the cash balance"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_open_positions_is_zero_not_an_error() {
+        let store = Store::new(":memory:").await.unwrap();
+        assert_eq!(store.total_unrealized_pnl().await.unwrap(), Decimal::ZERO);
     }
 }

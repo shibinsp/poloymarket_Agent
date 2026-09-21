@@ -354,6 +354,10 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
         // through just because SIGTERM arrived; if a cycle genuinely hangs,
         // systemd's TimeoutStopSec (see deploy/polymarket-agent.service) is
         // the backstop that forces an exit.
+        // Consumed before the cycle, so a trip raised while it runs is still
+        // pending when the loop reaches its sleep.
+        halt_trips.borrow_and_update();
+
         match agent.run_cycle().await {
             Ok(()) => {
                 consecutive_failures = 0;
@@ -415,10 +419,23 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
             "Idling until the next wake"
         );
 
-        // Whatever halt state exists now has just been through a cycle, so
-        // mark it seen. Without this the loop would wake instantly on a halt
-        // it has already acted on, and spin.
-        halt_trips.borrow_and_update();
+        // A halt raised *during* the cycle — by the file poller, a signal or
+        // the dashboard — must not be marked seen here. The version was
+        // consumed before `run_cycle` (below, at the top of the loop), so
+        // anything that arrived since is still pending and `changed()` will
+        // resolve immediately.
+        //
+        // Belt and braces: if the switch is holding work the loop has not
+        // acted on, do not sleep at all. Marking the version seen after the
+        // cycle — which is what this used to do — silently consumed a trip
+        // raised in the window between the cycle's last halt check and the
+        // sleep, and the agent then idled for up to `max_sleep_seconds` with
+        // resting orders still working. That is exactly the latency the watch
+        // channel was added to remove.
+        if kill_switch.has_unhandled() {
+            tracing::warn!("A halt arrived during the cycle — not sleeping on it");
+            continue;
+        }
 
         tokio::select! {
             _ = tokio::time::sleep(sleep_for) => {}
@@ -544,11 +561,20 @@ fn spawn_halt_file_poller(
             // Both directions: creating the file halts, removing it resumes.
             // The agent loop does the rest — cancelling resting orders,
             // alerting, writing the row that survives a restart.
-            if let Some(halt) = kill_switch.sync_with_file(Utc::now()) {
-                tracing::warn!(
-                    detail = %halt.detail,
-                    "HALT file present — halting new positions"
-                );
+            match kill_switch.sync_with_file(Utc::now()) {
+                polymarket_agent::agent::kill_switch::FileSync::Raised(halt) => {
+                    tracing::warn!(
+                        detail = %halt.detail,
+                        "HALT file present — halting new positions"
+                    );
+                }
+                // The persisted row is cleared by the agent loop's own
+                // `sync_halts`, which has the store; this task only has the
+                // flag. Logged here so the two are not confused.
+                polymarket_agent::agent::kill_switch::FileSync::Resumed => {
+                    tracing::info!("HALT file removed — resuming on the next wake");
+                }
+                polymarket_agent::agent::kill_switch::FileSync::Unchanged => {}
             }
         }
     })
