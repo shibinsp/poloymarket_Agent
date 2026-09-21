@@ -398,6 +398,7 @@ all; that is the point of the threshold.
 |---|---|---|---|
 | Alpaca | US equities + crypto | yes, separate keys and host | the paper-window target |
 | Coinbase Advanced Trade | spot crypto, 24/7 | **no** | implemented, live mode only |
+| Binance.US | spot crypto, 24/7 | **no** | implemented, live mode only |
 | Polymarket | prediction markets | in-process | legacy path; US persons may not trade it |
 
 **Coinbase has no paper endpoint.** Its sandbox serves authentication and
@@ -435,6 +436,45 @@ downloaded JSON.
 Requests are signed with a per-request ES256 JWT whose `uri` claim names the
 method, host and path, so a token cannot be replayed against another
 endpoint. It expires in two minutes.
+
+### Binance.US
+
+Also live-only, and for the same reason: **Binance.US has no testnet.**
+`testnet.binance.vision` belongs to *global* Binance, which is a different
+exchange with a different symbol list and one that blocks US persons — so there
+is nothing to point paper mode at. The venue refuses to build unless
+`agent.mode = "live"`.
+
+Credentials are `BINANCE_US_API_KEY` and `BINANCE_US_SECRET_KEY`. Every private
+request carries an HMAC-SHA256 of the **exact query string sent**, so the
+adapter builds that string itself rather than handing a parameter list to the
+HTTP client — a reordered or re-encoded parameter is `-1022`, which names
+neither the parameter nor the byte. The signing is pinned against Binance's own
+published test vector.
+
+Three things are worth knowing before enabling it:
+
+- **Order ids carry their symbol.** Binance identifies an order by
+  `(symbol, orderId)` — `GET /order`, `DELETE /order` and `GET /myTrades` all
+  reject a bare id — but the `Venue` trait and the ledger carry one string. So
+  this adapter reports `BTCUSD:12345`, and parses it back on the way in.
+- **The quote currency is part of the pair.** `BTC/USD` and `BTC/USDT` hold
+  cash in different assets, and the adapter reads its cash currency from the
+  symbols you configure rather than assuming dollars. It reports **one**
+  currency, never a sum: adding USD to USDT asserts they are interchangeable
+  and would tell the sizing gate there are spendable dollars that can in fact
+  only fund the other pairs. Configure pairs that quote in one currency; if
+  you mix them, the most-used one is reported and the rest are warned about.
+- **Commissions are charged in whichever asset was received** — the base, the
+  quote, or BNB. Adding those together would add bitcoin to dollars, so a
+  base-asset commission is converted at the price of the trade that incurred
+  it, and anything that cannot be priced is logged rather than silently
+  dropped. `GET /order` carries no commissions at all, so a limit order that
+  rests and fills later has its fees read from `/myTrades`; without that every
+  such fill would book zero fees and understate the round trip.
+
+`fee_pct` in the template is the taker rate at the base volume tier. Check it
+against your own tier before trading real money.
 
 ### Tracing (OpenTelemetry / Langfuse)
 

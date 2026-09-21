@@ -7,6 +7,7 @@
 //! exchange can't stop the cycle.
 
 pub mod alpaca;
+pub mod binance_us;
 pub mod coinbase;
 pub mod factory;
 pub mod polymarket;

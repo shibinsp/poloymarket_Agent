@@ -143,6 +143,31 @@ path = "polymarket-agent.db"
 # enabled = false
 # symbols = ["BTC/USD", "ETH/USD"]
 # fee_pct = 0.012
+#
+# Binance.US — spot crypto, 24/7.
+#
+# Credentials are BINANCE_US_API_KEY and BINANCE_US_SECRET_KEY.
+#
+# WARNING: Binance.US has no testnet. `testnet.binance.vision` belongs to
+# GLOBAL Binance, which is a different exchange with a different symbol list
+# and one that blocks US persons — so there is nothing to point paper mode at.
+# The agent refuses to build this venue unless agent.mode = "live".
+#
+# Quote currency matters: BTC/USD and BTC/USDT are different pairs holding
+# cash in different assets, and the adapter reads its cash currency from the
+# symbols configured here.
+#
+# fee_pct is the TAKER rate at the base volume tier. Verify it against your
+# own tier and Binance.US's current schedule before trading real money —
+# round_trip_cost doubles this number, so understating it clears the edge
+# threshold on trades that are negative after fees.
+#
+# [[venues]]
+# id = "binance_us"
+# kind = "binance_us"
+# enabled = false
+# symbols = ["BTC/USD", "ETH/USD"]
+# fee_pct = 0.006
 
 [sizing_continuous]
 risk_per_trade_pct = 0.0075     # fraction of bankroll risked if the stop hits

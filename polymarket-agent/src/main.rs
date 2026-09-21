@@ -161,15 +161,20 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
         config.valuation.model,
         if llm_ok { "✅ Set" } else { "❌ Missing" }
     );
+    // Only demanded when this deployment can actually reach Polymarket. A
+    // venue-based agent never touches it — and returning early here skipped
+    // the venue preflight entirely, which is the check that matters most
+    // before the first real dollar.
+    let poly_needed = config.uses_polymarket();
     println!(
         "   Polymarket Private Key: {}",
-        if poly_ok {
-            "✅ Set"
-        } else {
-            "⚠️  Missing (required for live mode)"
+        match (poly_ok, poly_needed) {
+            (true, _) => "✅ Set",
+            (false, true) => "⚠️  Missing (required for live mode)",
+            (false, false) => "— not needed (no Polymarket venue is enabled)",
         }
     );
-    if config.agent.mode == AgentMode::Live && !poly_ok {
+    if config.agent.mode == AgentMode::Live && !poly_ok && poly_needed {
         println!("   ❌ ERROR: POLYMARKET_PRIVATE_KEY required for live mode");
         return Err(anyhow::anyhow!("Missing required API key for live mode"));
     }
@@ -235,18 +240,24 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
     // Polymarket and nothing else, so an Alpaca deployment — which is what
     // the safety gate is for — learned nothing here.
     println!("5. Venues:");
+    // These two are reported separately below — "configured but skipped" and
+    // "no venues at all" are different things to tell an operator. Whether
+    // Polymarket is *needed* is `config.uses_polymarket()`, asked once and
+    // shared with the key check above and with `Agent::new`: two copies of
+    // one predicate is two answers waiting to disagree, and the disagreement
+    // decides whether a live credential is demanded.
     let polymarket_configured = config
         .venues
         .iter()
         .any(|v| v.enabled && v.kind.eq_ignore_ascii_case("polymarket"));
+    let legacy_only = config.venues.iter().all(|v| !v.enabled);
 
     // Built only when something needs it. Constructing it unconditionally put
     // a fatal `?` — an authenticating network call in live mode — ahead of
     // the venue section, so for a US operator with an unreachable CLOB the
     // run still died before reporting anything about Alpaca. That was the
     // bug, moved one call earlier rather than fixed.
-    let legacy_only = config.venues.iter().all(|v| !v.enabled);
-    let polymarket = if polymarket_configured || legacy_only {
+    let polymarket = if poly_needed {
         match polymarket_agent::market::polymarket::PolymarketClient::new(
             std::sync::Arc::new(config.clone()),
             secrets,
