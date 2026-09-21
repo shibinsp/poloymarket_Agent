@@ -894,38 +894,57 @@ impl Venue for CoinbaseVenue {
 
     #[instrument(skip(self), fields(venue = %self.id))]
     async fn cancel_all(&self) -> Result<()> {
-        let open = self.open_orders().await?;
-        if open.is_empty() {
-            return Ok(());
+        // Deliberately not `open_orders()`. This is the kill switch: one
+        // status query failing must not cost the cancels for the other, and
+        // `open_orders` is strict on purpose for the orphan audit, which needs
+        // "could not compare" to stay distinct from "found nothing".
+        let mut ids = Vec::new();
+        let mut unlistable = Vec::new();
+        for statuses in [&OPEN_STATUS[..], &PENDING_STATUSES[..]] {
+            match self.list_orders(statuses).await {
+                Ok(acks) => ids.extend(acks.into_iter().map(|a| a.venue_order_id)),
+                Err(e) => unlistable.push(format!("{}: {e:#}", statuses.join("/"))),
+            }
         }
-        let ids: Vec<String> = open.iter().map(|o| o.venue_order_id.clone()).collect();
+
+        let mut seen = HashSet::new();
+        ids.retain(|id| seen.insert(id.clone()));
+
         let count = ids.len();
-        self.batch_cancel(&ids)
-            .await
-            .context("Failed to cancel all Coinbase orders")?;
+        let cancelled = self.batch_cancel(&ids).await;
+
+        // Reported after the attempt, not instead of it. The caller has to
+        // know the book may not be flat, but it should still be as flat as
+        // this could make it.
+        if !unlistable.is_empty() {
+            cancelled.context("Failed to cancel all Coinbase orders")?;
+            bail!(
+                "Cancelled {count} Coinbase order(s), but could not list them all, so \
+                 some may still be resting — {}",
+                unlistable.join("; ")
+            );
+        }
+
+        cancelled.context("Failed to cancel all Coinbase orders")?;
         info!(orders = count, "Cancelled resting Coinbase orders");
         Ok(())
     }
 
     #[instrument(skip(self), fields(venue = %self.id))]
     async fn open_orders(&self) -> Result<Vec<OrderAck>> {
+        // Strict, both queries. The orphan audit reads an error as "could not
+        // compare", which it handles honestly; a short list would instead be a
+        // claim that an order it never saw does not exist. `cancel_all` does
+        // its own best-effort listing rather than relying on this.
         let mut acks = self
             .list_orders(&OPEN_STATUS)
             .await
             .context("Failed to list open Coinbase orders")?;
-
-        // Best-effort, deliberately. `cancel_all` starts here, and returning
-        // an error would have it stop before posting a single cancel — which
-        // leaves every resting order live. Cancelling what was found beats
-        // cancelling nothing.
-        match self.list_orders(&PENDING_STATUSES).await {
-            Ok(pending) => acks.extend(pending),
-            Err(e) => warn!(
-                venue = %self.id,
-                error = %format!("{e:#}"),
-                "Could not list pending Coinbase orders — the live set may be incomplete"
-            ),
-        }
+        acks.extend(
+            self.list_orders(&PENDING_STATUSES)
+                .await
+                .context("Failed to list pending Coinbase orders")?,
+        );
 
         // An order can move from PENDING to OPEN between the two queries.
         let mut seen = HashSet::new();
@@ -2017,6 +2036,68 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
 
         let venue = venue(&server, &["BTC/USD"]);
         venue.cancel_all().await.expect("both orders are cancelled");
+    }
+
+    /// The orphan audit needs "could not compare" to stay distinct from "found
+    /// nothing": a short list is a claim that an order it never saw does not
+    /// exist. `cancel_all` is the one that trades completeness for reach.
+    #[tokio::test]
+    async fn open_orders_reports_a_listing_it_could_not_finish() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/brokerage/orders/historical/batch"))
+            .and(query_param("order_status", "OPEN"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"orders": []})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/brokerage/orders/historical/batch"))
+            .and(query_param("order_status", "PENDING"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("upstream is down"))
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["BTC/USD"]);
+        let err = venue.open_orders().await.unwrap_err();
+        assert!(format!("{err:#}").contains("pending"), "{err:#}");
+    }
+
+    /// The kill switch is the last line of defence: one status query failing
+    /// must not cost the cancels for the other.
+    #[tokio::test]
+    async fn cancel_all_still_cancels_what_it_could_list() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/brokerage/orders/historical/batch"))
+            .and(query_param("order_status", "OPEN"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("upstream is down"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/brokerage/orders/historical/batch"))
+            .and(query_param("order_status", "PENDING"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "orders": [open_order("cb-7")]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v3/brokerage/orders/batch_cancel"))
+            .and(body_partial_json(json!({"order_ids": ["cb-7"]})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{"order_id": "cb-7", "success": true}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["BTC/USD"]);
+        let err = venue.cancel_all().await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("may still be resting"),
+            "the caller has to know the book may not be flat: {err:#}"
+        );
+        // The `expect(1)` above is the other half: it cancelled what it found.
     }
 
     /// A miss here is not "no such order": the reconciler turns it, once the
