@@ -365,7 +365,8 @@ impl Agent {
             }
         };
 
-        let equity: Option<Decimal> = reports.iter().filter_map(|r| r.equity).reduce(|a, b| a + b);
+        // All the venues or none of them — see `combined_equity`.
+        let equity: Option<Decimal> = crate::execution::reconcile::combined_equity(&reports);
 
         for report in reports {
             match report.verdict {

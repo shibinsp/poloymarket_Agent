@@ -358,6 +358,40 @@ impl BinanceUsVenue {
         })
     }
 
+    /// Account equity: cash plus each holding marked at the current mid.
+    ///
+    /// This is the number every loss limit is measured against, and the
+    /// account endpoint reports quantities without prices — so without a quote
+    /// per holding there is no equity, and `check_breakers` halts
+    /// `UntilResume` rather than trade with no risk controls. Reporting cash
+    /// alone instead would read every entry as an instant loss of the full
+    /// notional and trip the drawdown breaker on a flat book.
+    ///
+    /// `None` when a holding cannot be priced: a partial equity is a wrong
+    /// equity, and the drawdown breaker cannot tell one from a real loss. A
+    /// flat book needs no quotes at all.
+    async fn mark_equity(&self, cash: Decimal, holdings: &[(String, Decimal)]) -> Option<Decimal> {
+        let mut total = cash;
+        for (symbol, qty) in holdings {
+            let id = InstrumentId::new(self.id.clone(), symbol.clone());
+            match self.quote(&id).await {
+                Ok(quote) => total += *qty * quote.mid,
+                Err(e) => {
+                    warn!(
+                        venue = %self.id,
+                        symbol = %symbol,
+                        error = %format!("{e:#}"),
+                        "Could not price a holding, so account equity cannot be computed — \
+                         the risk limits will report themselves unevaluable rather than \
+                         run against a partial number"
+                    );
+                    return None;
+                }
+            }
+        }
+        Some(total)
+    }
+
     async fn account(&self) -> Result<AccountInfo> {
         self.rest
             .signed(Method::GET, ACCOUNT_PATH, &[], Self::now_ms()?)
@@ -1179,28 +1213,45 @@ impl Venue for BinanceUsVenue {
         // One currency, never a sum across several: see `reporting_currency`.
         let ccy = self.reporting_currency();
 
-        let available = account
+        let cash = account
             .balances
             .iter()
-            .filter(|b| b.asset.eq_ignore_ascii_case(&ccy))
-            // `free` only: what is locked is committed to a resting order and
-            // cannot fund a new one.
+            .find(|b| b.asset.eq_ignore_ascii_case(&ccy));
+        // `free` only funds an order; what is locked is committed to a resting
+        // one — but it is still equity.
+        let available = cash
             .map(|b| b.free_amount())
-            .next()
             .transpose()?
             .unwrap_or(Decimal::ZERO);
+        let cash_total = cash
+            .map(|b| b.total_amount())
+            .transpose()?
+            .unwrap_or(Decimal::ZERO);
+
+        let mut holdings: Vec<(String, Decimal)> = Vec::new();
+        for balance in &account.balances {
+            let asset = balance.asset.to_uppercase();
+            if asset == ccy {
+                continue;
+            }
+            // Only what the agent trades can be priced — the same scoping
+            // `positions()` uses. Anything else is reported there and left out
+            // of equity rather than guessed at.
+            let Some(symbol) = self.symbol_for_base(&asset) else {
+                continue;
+            };
+            let qty = balance.total_amount()?;
+            if qty > Decimal::ZERO {
+                holdings.push((symbol, qty));
+            }
+        }
 
         Ok(Balance {
             // The quote currency this account trades in, not a hardcoded USD:
             // a USDT account's numbers are USDT.
             ccy,
             available,
-            // Deliberately `None`. Equity would be cash plus the marked value
-            // of every holding, and the account endpoint reports quantities
-            // without prices. Reporting cash here instead would read every
-            // entry as an instant loss of the full notional and trip the
-            // drawdown breaker on a flat book.
-            total: None,
+            total: self.mark_equity(cash_total, &holdings).await,
         })
     }
 
@@ -2145,8 +2196,8 @@ mod tests {
         assert_eq!(balance.ccy, "USD");
         assert_eq!(
             balance.total, None,
-            "equity needs a price per holding; reporting cash would read every entry \
-             as an instant loss of the full notional"
+            "the BTC holding has no quote mounted here, and a partial equity is a \
+             wrong equity — see the equity tests below"
         );
     }
 
@@ -2250,6 +2301,72 @@ mod tests {
             balance.available,
             dec!(100.00),
             "the USDT cannot fund a USD pair and must not be counted as if it could"
+        );
+    }
+
+    /// The number every loss limit is measured against. Without it
+    /// `check_breakers` halts `UntilResume`, so a crypto-only deployment
+    /// could not trade live at all.
+    #[tokio::test]
+    async fn equity_marks_each_holding_at_the_current_mid() {
+        let server = MockServer::start().await;
+        mount_account(
+            &server,
+            json!({
+                "balances": [
+                    {"asset": "USD", "free": "100.00", "locked": "0"},
+                    {"asset": "BTC", "free": "0.001",  "locked": "0.001"}
+                ]
+            }),
+        )
+        .await;
+        Mock::given(http_method("GET"))
+            .and(path(DEPTH_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "bids": [["60000.00", "1"]], "asks": [["60010.00", "1"]]
+            })))
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["BTC/USD"]);
+        let balance = venue.balance().await.unwrap();
+
+        assert_eq!(balance.available, dec!(100.00));
+        // 0.002 BTC (free + locked) at a 60005 mid = 120.01.
+        assert_eq!(
+            balance.total,
+            Some(dec!(220.01)),
+            "cash plus the marked holding, locked coins included"
+        );
+    }
+
+    /// A partial equity is a wrong equity, and the drawdown breaker cannot
+    /// tell one from a real loss.
+    #[tokio::test]
+    async fn equity_is_unknown_rather_than_partial_when_a_holding_cannot_be_priced() {
+        let server = MockServer::start().await;
+        mount_account(
+            &server,
+            json!({
+                "balances": [
+                    {"asset": "USD", "free": "100.00"},
+                    {"asset": "BTC", "free": "0.01"}
+                ]
+            }),
+        )
+        .await;
+        Mock::given(http_method("GET"))
+            .and(path(DEPTH_PATH))
+            .respond_with(ResponseTemplate::new(500).set_body_string("down"))
+            .mount(&server)
+            .await;
+
+        let venue = venue(&server, &["BTC/USD"]);
+        let balance = venue.balance().await.unwrap();
+        assert_eq!(balance.available, dec!(100.00), "cash is still readable");
+        assert_eq!(
+            balance.total, None,
+            "reporting 100 here would book the whole position as an instant loss"
         );
     }
 

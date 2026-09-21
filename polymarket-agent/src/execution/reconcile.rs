@@ -95,6 +95,26 @@ pub struct VenueReconcileReport {
     pub detail: String,
 }
 
+/// Total equity across every venue, or `None` if any one will not report.
+///
+/// All or nothing, deliberately. Summing only the venues that answer — which
+/// is what `filter_map` did — measured every loss limit against the venues
+/// that happen to report while the others went on trading: an Alpaca+crypto
+/// deployment watched the Alpaca account alone, so a crypto position could go
+/// to zero without moving the number the drawdown breaker reads. That is the
+/// Phase 3 finding "breakers measured the wrong account" through a different
+/// door.
+///
+/// A partial equity is a wrong equity, and no breaker can tell one from a real
+/// loss — so the honest answer is that it could not be established, which the
+/// caller turns into a halt.
+pub fn combined_equity(reports: &[VenueReconcileReport]) -> Option<Decimal> {
+    if reports.iter().any(|r| r.equity.is_none()) {
+        return None;
+    }
+    reports.iter().filter_map(|r| r.equity).reduce(|a, b| a + b)
+}
+
 impl VenueReconcileReport {
     pub fn passed(&self) -> bool {
         self.verdict == Verdict::Clean
@@ -411,4 +431,55 @@ fn describe(positions: &[OrphanPosition]) -> String {
         .map(|p| format!("{} x{}", p.symbol, p.qty))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    fn equity_report(venue_id: &str, equity: Option<Decimal>) -> VenueReconcileReport {
+        VenueReconcileReport {
+            venue_id: venue_id.to_string(),
+            verdict: Verdict::Clean,
+            missing_locally: Vec::new(),
+            missing_on_venue: Vec::new(),
+            qty_mismatches: Vec::new(),
+            unknown_open_orders: Vec::new(),
+            equity,
+            detail: String::new(),
+        }
+    }
+
+    /// An Alpaca+crypto deployment measured every loss limit against the
+    /// Alpaca account alone, because the crypto venue reported no equity and
+    /// was silently dropped from the sum — while it went on trading, since
+    /// `Verdict::Unverified` does not halt and nothing consults the verdict.
+    #[test]
+    fn equity_is_unknown_when_any_venue_will_not_report_it() {
+        let reports = vec![
+            equity_report("alpaca", Some(dec!(4200))),
+            equity_report("coinbase", None),
+        ];
+        assert_eq!(
+            combined_equity(&reports),
+            None,
+            "4200 here is the Alpaca account, and the crypto positions are not in it"
+        );
+    }
+
+    #[test]
+    fn equity_sums_the_venues_when_every_one_reports() {
+        let reports = vec![
+            equity_report("alpaca", Some(dec!(4200))),
+            equity_report("coinbase", Some(dec!(250.50))),
+        ];
+        assert_eq!(combined_equity(&reports), Some(dec!(4450.50)));
+    }
+
+    /// Zero would read as a total loss and trip every breaker at once.
+    #[test]
+    fn no_venues_at_all_is_no_equity_rather_than_zero() {
+        assert_eq!(combined_equity(&[]), None);
+    }
 }

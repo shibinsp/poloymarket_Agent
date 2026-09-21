@@ -358,7 +358,10 @@ nothing, for as long as you leave it:
 
 - **no instruments discovered** — usually `scanning.max_markets` set below
   the symbol universe, which caps the venue scan and not just the legacy one
-- **no equity figure** — the circuit breakers cannot run without one
+- **no equity figure** — the circuit breakers cannot run without one, and the
+  agent halts rather than trade with no loss limits. The crypto venues compute
+  it as cash plus each holding marked at the current mid, so this now means a
+  quote genuinely failed
 
 Polymarket is checked only when it is an enabled venue. It is not one in the
 paper template, so an unreachable Gamma no longer fails a dry run about an
@@ -422,6 +425,15 @@ would halt the agent `UntilResume` on the first reconciliation. Those holdings
 are logged instead. A pre-existing balance in a currency you **do** configure
 still halts, deliberately: the agent would otherwise size against a position it
 does not know it has, and exit by selling coins it never bought.
+
+Equity is computed, not skipped: the accounts endpoint gives quantities
+without prices, so `balance().total` is cash plus each configured holding
+marked at the current mid. Without it every loss limit is unevaluable and the
+agent halts — a crypto-only deployment could not trade live at all. A holding
+that cannot be priced makes equity `None` rather than partial, because a
+partial equity is a wrong one and no breaker can tell it from a real loss.
+Cash and coins committed to a resting order count toward equity but not toward
+spendable cash.
 
 `fee_pct` in the template is the **taker** rate at the lowest volume tier
 (~1.2%), not the maker rate: orders go out as limit GTC without `post_only`, so
