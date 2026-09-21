@@ -1,0 +1,264 @@
+# Local development against dev/mock_venue.py. No credentials, no network.
+#
+#   python3 dev/mock_venue.py &
+#   CONFIG_PATH=config/local-mock.toml LLM_API_KEY=mock \
+#     ALPACA_API_KEY_ID=key ALPACA_API_SECRET_KEY=secret cargo run
+#
+# Then open http://127.0.0.1:8080.
+#
+# Differences from default.toml, all so a run shows something in a minute
+# rather than an hour:
+#   cycle_interval_seconds  15, not 600
+#   daily_api_budget        raised, since the mock model is free and the cap
+#                           would otherwise never be the thing under test
+#   scanning.categories     empty, which disables the legacy Polymarket loop
+#                           (setting max_markets to 0 would ALSO zero the
+#                           venue scan — they share the field)
+#   valuation               pointed at the mock's OpenAI-compatible endpoint
+#
+# The numbers this produces are fabricated. It exercises the plumbing —
+# discovery, view, sizing, order, fill, reconciliation, the dashboard — and
+# says nothing about whether the strategy works.
+
+[agent]
+mode = "paper"                    # paper | live | backtest
+cycle_interval_seconds = 15      # fast, so a run shows something in a minute
+death_balance_threshold = 0.0
+low_fuel_threshold = 10.0
+api_reserve = 2.0
+initial_paper_balance = 100.0
+daily_api_budget = 50.00           # max API spend per UTC day ($); see [risk] below
+max_sleep_seconds = 3600          # longest sleep while every venue is closed
+
+[scanning]
+max_markets = 1000
+min_volume_24h = 5000.0
+max_resolution_days = 14
+max_spread_pct = 0.05
+categories = []
+
+[valuation]
+# provider = "openai_compatible" (default) | "openai_compatible"
+#
+# For any OpenAI-compatible endpoint (NVIDIA NIM, vLLM, OpenRouter, Together)
+# set provider + base_url + model, and put the key in LLM_API_KEY. Example:
+#   provider = "openai_compatible"
+#   base_url = "https://integrate.api.nvidia.com/v1"
+#   model = "meta/llama-3.3-70b-instruct"
+# Pricing defaults to $0 for openai_compatible — set input/output prices below
+# if your endpoint bills you, otherwise the daily budget cap and the
+# edge-justifies-cost gate will both treat calls as free.
+provider = "openai_compatible"
+model = "claude-sonnet-4-20250514"
+base_url = "http://127.0.0.1:18800/v1"
+# input_price_per_million = 3.00
+# output_price_per_million = 15.00
+min_edge_threshold = 0.08
+high_confidence_edge = 0.06
+low_confidence_edge = 0.10
+cache_ttl_seconds = 300
+
+[risk]
+kelly_fraction = 0.5
+max_position_pct = 0.06
+max_total_exposure_pct = 0.30
+max_positions_per_category = 3
+min_position_usd = 1.0
+
+# --- Circuit breakers -------------------------------------------------------
+#
+# Every limit below bounds a *sequence*, which nothing else here does: Kelly
+# sizes one position, the exposure cap bounds the book, the stop bounds one
+# loss. Twenty trades each losing their stop is twenty correctly-sized losses
+# and a ruined account.
+#
+# Tripping stops new entries only. Exits, order polling, reconciliation and
+# settlement all keep running — refusing to close a position because the day
+# went badly is how a bounded loss becomes an unbounded one.
+#
+# Losses trip on a strict `>` and counts on a `>=`, so 0 means "none
+# tolerated" rather than "disabled". To switch a check off, set it high.
+#
+# Clear a halt with `POST /api/halt` ... `/api/resume`, or by deleting the
+# HALT file in the data directory.
+
+# Lost more than this fraction of the day's opening equity -> stop entries for
+# the rest of the UTC day. Lifts by itself at midnight.
+max_daily_loss_pct = 0.05
+# The same limit in cash. At micro capital a percentage is a rounding error
+# and this is the number actually agreed to; whichever binds first wins.
+max_daily_loss_usd = 5.0
+# Below the all-time equity high by more than this -> stop until a human
+# resumes. Does not lift at midnight: sleeping on a drawdown changes nothing.
+max_drawdown_pct = 0.15
+# Positions opened per UTC day, and losing closes in a row. Both rest-of-day.
+max_trades_per_day = 10
+max_consecutive_losses = 4
+# Absolute ceilings, applied only in live mode. A percentage of a paper
+# balance is a number nobody agreed to, and the first live run must not
+# inherit it: 6% of a $100,000 paper account is a $6,000 position.
+max_live_notional_per_position_usd = 10.0
+max_live_total_notional_usd = 60.0
+
+[execution]
+order_type = "limit"
+order_ttl_seconds = 300
+max_slippage_pct = 0.02
+max_retries = 3
+
+[monitoring]
+log_level = "info"
+discord_enabled = false
+daily_summary_hour = 9
+dashboard_port = 8080
+dashboard_bind = "127.0.0.1"          # set DASHBOARD_TOKEN in the env before binding anywhere else
+
+[polymarket]
+clob_base_url = "https://clob.polymarket.com"
+gamma_base_url = "https://gamma-api.polymarket.com"
+chain_id = 137
+
+[rate_limit]
+requests_per_second = 10
+burst_size = 20
+backoff_base_ms = 1000
+backoff_max_ms = 30000
+
+[database]
+path = "dev/local.db"
+# Where the HALT file and the hourly snapshots live. Defaults to the database
+# file's own directory. Snapshots are kept 48-hourly and 30-daily.
+# data_dir = "/var/lib/polymarket-agent"
+
+# Trading venues. Leave empty to keep the legacy Polymarket-only loop.
+# Continuous assets (crypto, equities) need an explicit symbol universe —
+# unlike prediction markets they are not discovered.
+#
+# [[venues]]
+# id = "alpaca"
+# kind = "alpaca"
+# enabled = true
+# base_url = "https://paper-api.alpaca.markets"
+# data_url = "https://data.alpaca.markets"
+# symbols = ["BTC/USD", "ETH/USD", "SPY", "AAPL"]
+# fee_pct = 0.0025
+#
+# Coinbase Advanced Trade — spot crypto, 24/7.
+#
+# Credentials are COINBASE_API_KEY_NAME (organizations/{org}/apiKeys/{key})
+# and COINBASE_API_PRIVATE_KEY (the EC PEM issued with it).
+#
+# WARNING: Coinbase has no paper endpoint. Its sandbox serves auth and
+# serialization only — there is no matching engine — so an enabled Coinbase
+# venue reaches the LIVE exchange and trades real money. The agent therefore
+# refuses to build it unless agent.mode = "live", and says so at startup.
+#
+# fee_pct is the TAKER rate at the lowest volume tier (<$1K/30d), which is
+# where micro capital starts. Orders go out as limit GTC without post_only, so
+# they can take — and round_trip_cost doubles this number, so quoting the maker
+# rate here would clear the edge threshold on trades that are really negative
+# after fees. Lower it when your volume tier earns it.
+#
+# [[venues]]
+# id = "coinbase"
+# kind = "coinbase"
+# enabled = false
+# symbols = ["BTC/USD", "ETH/USD"]
+# fee_pct = 0.012
+#
+# Binance.US — spot crypto, 24/7.
+#
+# Credentials are BINANCE_US_API_KEY and BINANCE_US_SECRET_KEY.
+#
+# WARNING: Binance.US has no testnet. `testnet.binance.vision` belongs to
+# GLOBAL Binance, which is a different exchange with a different symbol list
+# and one that blocks US persons — so there is nothing to point paper mode at.
+# The agent refuses to build this venue unless agent.mode = "live".
+#
+# Quote currency matters: BTC/USD and BTC/USDT are different pairs holding
+# cash in different assets, and the adapter reads its cash currency from the
+# symbols configured here.
+#
+# fee_pct is the TAKER rate at the base volume tier. Verify it against your
+# own tier and Binance.US's current schedule before trading real money —
+# round_trip_cost doubles this number, so understating it clears the edge
+# threshold on trades that are negative after fees.
+#
+# [[venues]]
+# id = "binance_us"
+# kind = "binance_us"
+# enabled = false
+# symbols = ["BTC/USD", "ETH/USD"]
+# fee_pct = 0.006
+#
+# Polymarket — prediction markets.
+#
+# Listed for completeness and it will NOT build. It cannot report account
+# equity (its position listing is unimplemented), and every loss limit is
+# measured against equity summed across the registry — so one venue that
+# cannot report makes the total unknowable and halts the whole agent. The
+# registry refuses it and says so.
+#
+# The legacy Polymarket loop, which has its own equity arithmetic, runs when
+# no [[venues]] are configured at all. Note that Polymarket's CLOB prohibits
+# US persons.
+#
+# [[venues]]
+# id = "polymarket"
+# kind = "polymarket"
+# enabled = false
+# symbols = []
+# fee_pct = 0.02
+
+[sizing_continuous]
+risk_per_trade_pct = 0.0075     # fraction of bankroll risked if the stop hits
+atr_period = 14
+atr_multiplier = 2.0            # stop distance = ATR x this, then clamped
+min_stop_pct = 0.03
+max_stop_pct = 0.12
+min_p_up = 0.55                 # minimum probability-of-up before a view is tradeable
+max_orders_per_cycle = 2        # cap on new positions opened per cycle
+
+[telemetry]
+# OpenTelemetry span export. Off unless an endpoint is set here or via
+# OTEL_EXPORTER_OTLP_ENDPOINT / LANGFUSE_HOST in the environment.
+#
+# Point it at a self-hosted Langfuse or any OTLP collector; "/v1/traces" is
+# appended if absent. Langfuse renders the valuation spans as generations,
+# with model, token counts and cost, because they carry GenAI
+# semantic-convention attributes.
+#
+#   otlp_endpoint = "http://localhost:3000/api/public/otel"   # self-hosted Langfuse
+#   otlp_endpoint = "http://localhost:4318"                   # plain collector
+#
+# `enabled` is left unset on purpose, not written as `false`.
+#
+# Unset means "no opinion": setting OTEL_EXPORTER_OTLP_ENDPOINT or
+# LANGFUSE_HOST in the environment then turns export on, which is the
+# one-variable path. Writing `enabled = false` here is a different and
+# stronger statement — it means "off, whatever the environment says" — and it
+# is the right thing to write on a host where a platform injects OTLP
+# variables for every process and you do not want this one exporting.
+#
+#   enabled = true     # on, even with no env var (needs otlp_endpoint below)
+#   enabled = false    # off, even if the environment sets an endpoint
+service_name = "polymarket-agent"
+# Whether prompts and completions travel with the span. Leave on for a
+# destination you control; turn it off and the spans keep model, token
+# counts, cost and latency but carry no text.
+#
+# It only takes effect when export is actually configured: with no exporter
+# there is no span for the text to ride on, and prompts are never written to
+# the ordinary logs regardless of this setting.
+export_content = true
+export_timeout_seconds = 10
+
+
+[[venues]]
+id = "alpaca"
+kind = "alpaca"
+enabled = true
+base_url = "http://127.0.0.1:18800"
+data_url = "http://127.0.0.1:18800"
+symbols = ["BTC/USD"]
+fee_pct = 0.0025

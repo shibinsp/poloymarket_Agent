@@ -2,65 +2,82 @@
 
 ## Part 1: How to Test (Step by Step)
 
-### Prerequisites
+Four levels, cheapest first. Each one answers a different question, and the
+later ones are the only ones that have ever found the interesting bugs.
+
+### Level 1 — the test suite (no keys, no network)
 
 ```bash
-# 1. Install Rust (if not already)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source $HOME/.cargo/env
-
-# 2. Navigate to project
 cd polymarket-agent
-
-# 3. Create your .env file from the example
-cp .env.example .env
+cargo test            # ~720 tests, in-memory SQLite and wiremock throughout
+cargo clippy --all-targets -- -D warnings
+cargo fmt --all --check
 ```
 
-### Step A: Compile & Run Tests (No API Keys Needed)
+Answers: *does the logic hold*. It will not tell you whether the pieces are
+wired to each other — every serious defect found in this project so far lived
+in the assembly, not the units.
+
+### Level 2 — run it against a fake venue (no keys, no network)
 
 ```bash
-# Compile — catches type errors, missing imports, etc.
-cargo check
-
-# Run all unit + integration tests (uses in-memory SQLite, no network calls)
-cargo test
-
-# Lint for idiomatic Rust issues
-cargo clippy -- -W clippy::all
+./dev/run-local.sh
 ```
 
-**Expected**: All tests pass. If `cargo check` fails, there may be minor import issues
-to fix — the code was written without a local compiler. Fix any errors `rustc` reports.
-
-### Step B: Paper Trading (Needs Only Anthropic API Key)
-
-Paper mode simulates trades against **real market data** but uses fake money.
-No Polymarket wallet or private key needed.
+Starts `dev/mock_venue.py` (a fake Alpaca and a fake model on one port) and the
+agent against `config/local-mock.toml`, on a 15-second cycle. Open
+<http://127.0.0.1:8080>. Within a minute you should see it discover BTC/USD,
+take a view, place and fill three orders, record the fills with slippage, and
+then stop at the open-position limit saying so.
 
 ```bash
-# In your .env file, set ONLY this:
-ANTHROPIC_API_KEY=sk-ant-your-real-key-here
-
-# Everything else can stay as placeholders or be empty
-
-# Run in paper mode (this is the default)
-cargo run
+./dev/run-local.sh --dry-run    # the preflight, same stack
+sqlite3 dev/local.db "select venue_id, symbol, state, filled_qty from orders;"
 ```
 
-**What happens each cycle (every 10 minutes):**
-1. Scans Polymarket for active markets via Gamma API (public, no auth needed)
-2. Filters markets by volume, spread, category, resolution date
-3. Fetches order books from CLOB API (public, no auth needed)
-4. Asks Claude Sonnet to estimate fair probability (~$0.009 per call)
-5. Computes edge = |fair_value - market_price|
-6. Runs Kelly criterion to size the position
-7. Simulates the trade in memory (paper balance starts at $100)
-8. Logs everything to SQLite + console
-9. Checks for resolved markets and settles P&L
-10. Dashboard available at http://127.0.0.1:8080
+Answers: *is it wired together* — discovery, sizing, ordering, fills,
+reconciliation, the halt path, the dashboard. The numbers are fabricated; this
+says nothing about whether the strategy works.
 
-**Cost to run paper mode**: ~$0.009 per market evaluated. With the default
-$5/day budget cap, that's ~550 evaluations max per day.
+### Level 3 — a real venue with fake money
+
+Get **Alpaca paper** keys (free, no funding) and put them in `.env`:
+
+```bash
+ALPACA_API_KEY_ID=...
+ALPACA_API_SECRET_KEY=...
+LLM_API_KEY=...            # a real model key; see config/all-connections.toml
+```
+
+```bash
+CONFIG_PATH=config/paper.toml cargo run -- --dry-run   # do this first
+CONFIG_PATH=config/paper.toml cargo run
+```
+
+`--dry-run` checks each venue's credentials, whether the account can trade, how
+many of your configured symbols the venue actually lists, a live quote, and
+whether it can report the equity the circuit breakers need. Run it before every
+change of config.
+
+Answers: *does our understanding of the API match the API*. This is the first
+level that can find that, and it is where the surprises are — every adapter in
+this repo has had bugs that only a real response would reveal.
+
+**Nothing below level 3 has ever touched a real venue.** Levels 1 and 2 both
+test against mocks written from the same understanding as the adapter, so they
+agree with it by construction.
+
+### Level 4 — the paper window
+
+Leave level 3 running for **≥14 days**, and judge it by the promotion criteria
+in `config/paper.toml` (≥40 orders, ≥30 closed positions) rather than by
+impression. Watch for what a short run cannot show: the UTC day rollover that
+resets the daily-loss breaker, weekends, session boundaries, and slow leaks.
+
+Coinbase and Binance.US **cannot** be exercised at levels 3 or 4 — neither has
+a paper endpoint, which is why the agent refuses to build them outside live
+mode. Going live on either means going live on an adapter with no paper track
+record, so start with a hard, low `max_live_total_notional_usd`.
 
 ### Step C: Monitor Paper Performance
 
