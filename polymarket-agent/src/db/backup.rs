@@ -122,7 +122,7 @@ pub fn prune(dir: &Path, keep_hourly: usize, keep_daily: usize) -> Result<usize>
         }
     }
     // Newest first.
-    snapshots.sort_by(|a, b| b.0.cmp(&a.0));
+    snapshots.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
 
     let mut keep: BTreeSet<PathBuf> = snapshots
         .iter()
