@@ -911,13 +911,14 @@ impl Venue for CoinbaseVenue {
         ids.retain(|id| seen.insert(id.clone()));
 
         let count = ids.len();
-        let cancelled = self.batch_cancel(&ids).await;
+        self.batch_cancel(&ids)
+            .await
+            .context("Failed to cancel all Coinbase orders")?;
 
         // Reported after the attempt, not instead of it. The caller has to
         // know the book may not be flat, but it should still be as flat as
         // this could make it.
         if !unlistable.is_empty() {
-            cancelled.context("Failed to cancel all Coinbase orders")?;
             bail!(
                 "Cancelled {count} Coinbase order(s), but could not list them all, so \
                  some may still be resting — {}",
@@ -925,7 +926,6 @@ impl Venue for CoinbaseVenue {
             );
         }
 
-        cancelled.context("Failed to cancel all Coinbase orders")?;
         info!(orders = count, "Cancelled resting Coinbase orders");
         Ok(())
     }
