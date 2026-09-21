@@ -63,6 +63,14 @@ async fn main() -> Result<()> {
     // each call took, is worth having.
     let telemetry = logger::init_logging(&config.monitoring, &config.telemetry)?;
 
+    // Both here rather than in `run_agent`: `--dry-run` is the documented
+    // pre-live check, and it opens the store itself, so a preflight that
+    // certifies a setup the agent later warns about is worse than no warning.
+    // `AppConfig::load` would be earlier still, but it runs before logging is
+    // initialised and the event would go nowhere.
+    config.database.warn_if_relative();
+    config.database.warn_if_database_url_disagrees();
+
     // One flush, on the single path every mode returns through.
     //
     // Dropping the handle is not a substitute: the SDK only shuts a provider
@@ -133,6 +141,12 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
     // surface everything that is wrong, not the first thing.
     println!("2. Database:");
     println!("   Path: {}", config.database.path);
+    if let Some(scheme) = config.database.disagreeing_database_url() {
+        println!(
+            "   ⚠️  DATABASE_URL is set ({scheme}) and points elsewhere — nothing reads \
+             it; this path is the ledger"
+        );
+    }
     let mut failures: Vec<String> = Vec::new();
     match Store::new(&config.database.path).await {
         Ok(store) => {
@@ -373,7 +387,7 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
 /// Run the agent in paper or live trading mode.
 async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
     // Create shared database store
-    config.database.warn_if_relative();
+
     let store = Store::new(&config.database.path).await?;
     // Shared pool, not a second connection: opening the same file twice means
     // two WAL writers and two migration runs.

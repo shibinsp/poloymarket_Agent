@@ -68,12 +68,18 @@ DISCORD_WEBHOOK_URL=
 NOAA_API_TOKEN=
 ESPN_API_KEY=
 RUST_LOG=info
-DATABASE_URL=sqlite:polymarket-agent.db
 
 # OPTIONAL for localhost; REQUIRED if you bind the dashboard to a non-loopback
 # address. All /api/* routes then need `Authorization: Bearer <token>`.
 DASHBOARD_TOKEN=
 ```
+
+The database is **not** an environment variable. It is `[database] path` in
+the config file, and `DATABASE_URL` is read by nothing — set it and the agent
+still opens the path from the config, against a ledger you did not choose. Use
+`CONFIG_PATH` to point at a config file whose `path` is absolute; a relative
+one resolves against the working directory, so starting the agent from
+elsewhere silently opens a different ledger.
 
 ### 4. Build and Run Tests
 
