@@ -276,6 +276,8 @@ mod tests {
                 ..RiskConfig::default()
             },
             valuation_config: ValuationConfig {
+                temperature: None,
+                response_format: None,
                 provider: crate::config::LlmProvider::Anthropic,
                 model: "claude-sonnet-4-5-20250929".to_string(),
                 base_url: None,

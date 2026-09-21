@@ -287,6 +287,8 @@ fn config(alpaca: &MockServer, model: &MockServer, poly: &MockServer, db: &str) 
             categories: vec!["crypto".to_string()],
         },
         valuation: ValuationConfig {
+            temperature: None,
+            response_format: None,
             provider: LlmProvider::OpenAiCompatible,
             model: "test-model".to_string(),
             base_url: Some(format!("{}/v1", model.uri())),

@@ -59,6 +59,11 @@ categories = []
 [valuation]
 provider = "anthropic"
 model = "claude-sonnet-4-20250514"
+# Written explicitly, not left to the 1024 default. A reasoning model spends
+# that budget on its working before it emits the JSON schema, hits
+# finish_reason = "length", and every call fails — which looks like a broken
+# endpoint rather than a config value.
+max_tokens = 4096
 min_edge_threshold = 0.08
 high_confidence_edge = 0.06
 low_confidence_edge = 0.10

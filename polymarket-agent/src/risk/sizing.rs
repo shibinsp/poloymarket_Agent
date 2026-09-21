@@ -11,7 +11,7 @@
 
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::config::{ContinuousSizingConfig, RiskConfig};
 use crate::market::models::AgentState;
@@ -101,6 +101,16 @@ pub struct SizeInputs<'a> {
     /// See `circuit_breaker::live_notional_ceiling`, which accounts for what
     /// is already committed against the total cap.
     pub live_ceiling: Option<Decimal>,
+    /// How much of the configured size the agent's own forecast record
+    /// justifies, in `(floor, 1]`. `None` means "no opinion yet" and leaves
+    /// the size exactly as configured.
+    ///
+    /// Applied *after* every other constraint and clamped to at most 1.0, so
+    /// it can only ever shrink. A calibration signal that could grow a
+    /// position would be leverage earned by a lucky streak.
+    ///
+    /// See `valuation::calibration::size_multiplier`.
+    pub calibration: Option<Decimal>,
 }
 
 /// Size a position using the method appropriate to the asset class.
@@ -177,6 +187,28 @@ fn size_continuous(
         if position_usd > ceiling {
             position_usd = ceiling;
         }
+    }
+
+    // Last, and shrink-only. After the caps rather than before them, so the
+    // caps are not quietly widened by a multiplier applied to the input: the
+    // operator's ceiling stays the ceiling and this only moves below it.
+    if let Some(multiplier) = inputs.calibration {
+        // The clamp is the mechanism, not decoration: it is what makes this
+        // shrink-only. Guarding on `multiplier < 1` instead and skipping
+        // would leave the clamp untestable — and a caller passing 2.0 would
+        // then depend on the guard, not the clamp, to avoid doubling the size.
+        let multiplier = multiplier.clamp(Decimal::ZERO, Decimal::ONE);
+        let shrunk = position_usd * multiplier;
+        if shrunk < position_usd {
+            debug!(
+                instrument = %inputs.instrument.id,
+                before = %position_usd,
+                after = %shrunk,
+                multiplier = %multiplier,
+                "Forecast record does not support the configured size"
+            );
+        }
+        position_usd = shrunk;
     }
 
     if position_usd < risk.min_position_usd {
@@ -326,6 +358,7 @@ mod tests {
         state: AgentState,
     ) -> SizeInputs<'a> {
         SizeInputs {
+            calibration: None,
             instrument,
             probability: dec!(0.65),
             price: dec!(100),
@@ -335,6 +368,91 @@ mod tests {
             candles,
             live_ceiling: None,
         }
+    }
+
+    /// The whole point of the feedback loop: a poor forecast record has to
+    /// actually move the number, not merely be recorded and displayed. It was
+    /// computed and written to a JSON field nothing rendered.
+    #[test]
+    fn a_poor_forecast_record_shrinks_the_position() {
+        let instrument = equity(None);
+        let candles = candles();
+        let risk = risk_config();
+
+        let full = size_position(
+            &inputs(&instrument, &candles, dec!(10_000), AgentState::Alive),
+            &risk,
+            &continuous_config(),
+        );
+        let half = size_position(
+            &SizeInputs {
+                calibration: Some(dec!(0.5)),
+                ..inputs(&instrument, &candles, dec!(10_000), AgentState::Alive)
+            },
+            &risk,
+            &continuous_config(),
+        );
+
+        assert!(full.position_usd > Decimal::ZERO, "baseline must trade");
+        assert_eq!(
+            half.position_usd,
+            full.position_usd * dec!(0.5),
+            "half the multiplier is half the notional"
+        );
+    }
+
+    /// Shrink-only. A multiplier above 1.0 would turn a lucky streak into
+    /// leverage the operator never configured, so it is clamped rather than
+    /// obeyed.
+    #[test]
+    fn a_multiplier_above_one_cannot_grow_the_position() {
+        let instrument = equity(None);
+        let candles = candles();
+        let risk = risk_config();
+
+        let baseline = size_position(
+            &inputs(&instrument, &candles, dec!(10_000), AgentState::Alive),
+            &risk,
+            &continuous_config(),
+        );
+        let greedy = size_position(
+            &SizeInputs {
+                calibration: Some(dec!(2.0)),
+                ..inputs(&instrument, &candles, dec!(10_000), AgentState::Alive)
+            },
+            &risk,
+            &continuous_config(),
+        );
+
+        assert_eq!(greedy.position_usd, baseline.position_usd);
+    }
+
+    /// Applied after the caps, so the operator's ceiling stays the ceiling.
+    /// Applying it to the input instead would let a shrink be swallowed by a
+    /// cap that was already binding — and at the defaults the cap almost
+    /// always is.
+    #[test]
+    fn the_hard_caps_still_bind_under_a_multiplier() {
+        let instrument = equity(None);
+        let candles = candles();
+        let risk = risk_config();
+        let bankroll = dec!(10_000);
+
+        let result = size_position(
+            &SizeInputs {
+                calibration: Some(dec!(0.9)),
+                ..inputs(&instrument, &candles, bankroll, AgentState::Alive)
+            },
+            &risk,
+            &continuous_config(),
+        );
+
+        assert!(
+            result.position_usd <= bankroll * risk.max_position_pct,
+            "max_position_pct must still hold: {} vs {}",
+            result.position_usd,
+            bankroll * risk.max_position_pct
+        );
     }
 
     /// The absolute cash cap has to actually bind, not merely exist.

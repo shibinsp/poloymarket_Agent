@@ -238,6 +238,8 @@ mod tests {
     /// really exercising whichever check happens to come first.
     fn cfg() -> RiskConfig {
         RiskConfig {
+            calibration_min_samples: 30,
+            calibration_floor: dec!(0.5),
             kelly_fraction: dec!(0.5),
             max_position_pct: dec!(0.06),
             max_total_exposure_pct: dec!(0.30),

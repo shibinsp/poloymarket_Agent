@@ -28,6 +28,25 @@ categories = ["weather", "sports", "crypto", "politics"]
 # edge-justifies-cost gate will both treat calls as free.
 provider = "anthropic"
 model = "claude-sonnet-4-20250514"
+# Written explicitly, not left to the 1024 default. A reasoning model spends
+# that budget on its working before it emits the JSON schema, hits
+# finish_reason = "length", and every call fails — which looks like a broken
+# endpoint rather than a config value.
+max_tokens = 4096
+#
+# Any OpenAI-compatible endpoint works — NVIDIA NIM, OpenRouter, Together,
+# vLLM, Ollama, LM Studio. A Nous Research Hermes model, for example:
+#
+#   provider = "openai_compatible"
+#   base_url = "https://openrouter.ai/api/v1"
+#   model    = "nousresearch/hermes-4-70b"
+#   max_tokens = 4096
+#   input_price_per_million  = 0.40
+#   output_price_per_million = 0.40
+#
+# Set the prices. Leaving them unset means $0, which silently disables the
+# daily budget cap, the affordability check and the edge-justifies-cost gate —
+# the agent warns about this at startup.
 # base_url = "https://api.anthropic.com/v1"
 # input_price_per_million = 3.00
 # output_price_per_million = 15.00
@@ -72,6 +91,22 @@ max_drawdown_pct = 0.15
 # Positions opened per UTC day, and losing closes in a row. Both rest-of-day.
 max_trades_per_day = 10
 max_consecutive_losses = 4
+
+# How the agent's own forecast record feeds back into sizing.
+#
+# Shrink-only, by construction: a good record earns nothing extra, because the
+# sizes above are a ceiling you chose and a lucky streak is not a reason to
+# exceed it. A record worse than an uninformative forecast (Brier 0.25, which
+# is what always guessing 50% scores) shrinks positions toward the floor.
+#
+# Below calibration_min_samples the agent sizes exactly as configured — a
+# multiplier derived from four resolutions is noise that looks like evidence.
+# The default matches the paper window's promotion criterion, so the number
+# gating sizing is the one you are already reading.
+calibration_min_samples = 30
+# Never below half the configured size. A record bad enough to justify less is
+# a reason to stop, which is the kill switch's job and needs a human.
+calibration_floor = 0.5
 # Absolute ceilings, applied only in live mode. A percentage of a paper
 # balance is a number nobody agreed to, and the first live run must not
 # inherit it: 6% of a $100,000 paper account is a $6,000 position.

@@ -111,6 +111,8 @@ mod tests {
 
     fn test_config() -> ValuationConfig {
         ValuationConfig {
+            temperature: None,
+            response_format: None,
             provider: crate::config::LlmProvider::Anthropic,
             model: "claude-sonnet-4-20250514".to_string(),
             base_url: None,

@@ -78,6 +78,18 @@ pub struct ScanningConfig {
     pub categories: Vec<String>,
 }
 
+/// Matches the promotion criterion the paper window is judged by, so the
+/// number that gates sizing is the same one an operator reads.
+fn default_calibration_min_samples() -> usize {
+    30
+}
+
+/// Half the configured size. A record bad enough to justify less than this is
+/// a reason to stop, not to keep trading in miniature.
+fn default_calibration_floor() -> Decimal {
+    Decimal::new(5, 1)
+}
+
 /// Claude Sonnet list pricing, used when an Anthropic config doesn't override it.
 pub const ANTHROPIC_DEFAULT_INPUT_PRICE: Decimal = rust_decimal_macros::dec!(3.00);
 pub const ANTHROPIC_DEFAULT_OUTPUT_PRICE: Decimal = rust_decimal_macros::dec!(15.00);
@@ -146,6 +158,20 @@ pub struct ValuationConfig {
     pub high_confidence_edge: Decimal,
     pub low_confidence_edge: Decimal,
     pub cache_ttl_seconds: u64,
+    /// Sampling temperature, when the endpoint takes one.
+    ///
+    /// Omitted from the request unless set, so a provider that rejects the
+    /// field is unaffected. Lower is steadier for a task whose whole output is
+    /// a fixed schema.
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    /// Ask the endpoint to emit JSON and nothing else, e.g. `"json_object"`.
+    ///
+    /// Where supported this removes the reasoning-preamble and quoted-number
+    /// problems at the source, instead of relying on the parser to survive
+    /// them. Omitted unless set — not every endpoint accepts it.
+    #[serde(default)]
+    pub response_format: Option<String>,
 }
 
 impl AppConfig {
@@ -369,6 +395,19 @@ pub struct RiskConfig {
     /// Absolute ceiling on all live positions together, in dollars.
     #[serde(default = "default_max_live_total_notional_usd")]
     pub max_live_total_notional_usd: Decimal,
+    /// Resolved forecasts required before the agent's own record is allowed to
+    /// change its sizing. Below this it sizes exactly as configured — a
+    /// multiplier derived from four resolutions is noise that looks like
+    /// evidence.
+    #[serde(default = "default_calibration_min_samples")]
+    pub calibration_min_samples: usize,
+    /// The smallest fraction of the configured size a bad forecast record can
+    /// shrink to.
+    ///
+    /// Not zero: a multiplier of zero is a halt wearing a size, and halting is
+    /// the kill switch's job, where it is visible and needs a human to clear.
+    #[serde(default = "default_calibration_floor")]
+    pub calibration_floor: Decimal,
 }
 
 fn default_max_daily_loss_pct() -> Decimal {
@@ -402,6 +441,8 @@ impl Default for RiskConfig {
     /// Only the breaker limits below fall back to these when absent.
     fn default() -> Self {
         Self {
+            calibration_min_samples: default_calibration_min_samples(),
+            calibration_floor: default_calibration_floor(),
             kelly_fraction: rust_decimal_macros::dec!(0.5),
             max_position_pct: rust_decimal_macros::dec!(0.06),
             max_total_exposure_pct: rust_decimal_macros::dec!(0.30),

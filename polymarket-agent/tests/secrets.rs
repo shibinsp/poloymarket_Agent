@@ -75,6 +75,8 @@ async fn the_llm_client_redacts_its_api_key() {
         .await
         .unwrap();
     let config = polymarket_agent::config::ValuationConfig {
+        temperature: None,
+        response_format: None,
         provider: polymarket_agent::config::LlmProvider::Anthropic,
         model: "claude-sonnet-4-20250514".to_string(),
         base_url: None,

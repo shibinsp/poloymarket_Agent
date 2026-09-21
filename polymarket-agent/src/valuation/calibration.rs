@@ -9,16 +9,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use sqlx::SqlitePool;
 use std::str::FromStr;
-use tracing::{info, warn};
-
-/// Default confidence discount applied before enough calibration data is collected.
-const DEFAULT_DISCOUNT: Decimal = dec!(0.85);
-
-/// Minimum number of resolved trades before using empirical calibration.
-const MIN_CALIBRATION_SAMPLES: usize = 50;
-
-/// Floor for the calibration discount (never reduce confidence by more than 70%).
-const MIN_DISCOUNT: Decimal = dec!(0.30);
+use tracing::warn;
 
 /// Record a prediction for calibration tracking.
 pub async fn record_prediction(
@@ -210,68 +201,128 @@ pub async fn brier_score(pool: &SqlitePool, minimum: usize) -> Result<Option<(De
     Ok(Some((total / Decimal::from(n), n)))
 }
 
-/// Compute the confidence discount factor based on historical calibration data.
+/// Brier score of an uninformative forecast.
 ///
-/// Returns a value between `MIN_DISCOUNT` and `1.0` that should multiply
-/// Claude's self-reported confidence before it's used in Kelly sizing.
+/// A constant 0.5 on a binary outcome scores exactly this, so it is the line
+/// between "the model knows something" and "the model is guessing". Worse than
+/// this is the only evidence that justifies trading smaller than configured.
+pub const UNINFORMATIVE_BRIER: Decimal = dec!(0.25);
+
+/// How much of the configured size a forecast record justifies, in `(floor, 1]`.
 ///
-/// If fewer than `MIN_CALIBRATION_SAMPLES` resolved trades exist,
-/// returns `DEFAULT_DISCOUNT` (0.85).
-pub async fn compute_discount(pool: &SqlitePool, lookback: usize) -> Result<Decimal> {
-    let rows: Vec<(String, bool)> = sqlx::query_as(
-        "SELECT claude_confidence, forecast_correct FROM confidence_calibration
-         WHERE resolved = 1
-         ORDER BY resolved_at DESC
-         LIMIT ?",
-    )
-    .bind(lookback as i64)
-    .fetch_all(pool)
-    .await
-    .context("Failed to fetch calibration data")?;
-
-    if rows.len() < MIN_CALIBRATION_SAMPLES {
-        info!(
-            samples = rows.len(),
-            required = MIN_CALIBRATION_SAMPLES,
-            discount = %DEFAULT_DISCOUNT,
-            "Insufficient calibration data — using default discount"
-        );
-        return Ok(DEFAULT_DISCOUNT);
-    }
-
-    // Empirical accuracy: fraction of correct directional calls
-    let correct_count = rows.iter().filter(|(_, correct)| *correct).count();
-    let empirical_accuracy = Decimal::from(correct_count as u64) / Decimal::from(rows.len() as u64);
-
-    // Average reported confidence
-    let total_confidence: Decimal = rows
-        .iter()
-        .filter_map(|(c, _)| Decimal::from_str(c).ok())
-        .sum();
-    let avg_confidence = total_confidence / Decimal::from(rows.len() as u64);
-
-    // Discount = empirical_accuracy / avg_confidence (capped at 1.0, floored at MIN_DISCOUNT)
-    let discount = if avg_confidence > Decimal::ZERO {
-        (empirical_accuracy / avg_confidence)
-            .min(Decimal::ONE)
-            .max(MIN_DISCOUNT)
-    } else {
-        DEFAULT_DISCOUNT
+/// **Never above 1.0, by construction.** Evidence of skill does not buy extra
+/// risk: the configured size is a ceiling the operator chose, and a lucky
+/// streak is not a reason to exceed it. This can only make the agent smaller
+/// than it was told to be.
+///
+/// `None` below `min_samples`, which means "no opinion" and leaves sizing
+/// exactly as configured. That is deliberately unlike the old
+/// `DEFAULT_DISCOUNT`, which applied a flat 15% haircut *before any evidence
+/// existed* — a made-up number, not a prior.
+///
+/// Scoring: at or better than [`UNINFORMATIVE_BRIER`] the multiplier is 1.0.
+/// Beyond it the multiplier falls linearly, reaching `floor` when the score is
+/// twice the uninformative one. The curve is arbitrary in its steepness but
+/// not in its shape — it is monotone, continuous at the threshold, and
+/// bounded at both ends, which is what keeps one bad week from zeroing the
+/// book and one good week from unbounding it.
+pub async fn size_multiplier(
+    pool: &SqlitePool,
+    min_samples: usize,
+    floor: Decimal,
+) -> Result<Option<Decimal>> {
+    let Some((brier, _n)) = brier_score(pool, min_samples).await? else {
+        return Ok(None);
     };
+    Ok(Some(multiplier_for_brier(brier, floor)))
+}
 
-    info!(
-        samples = rows.len(),
-        empirical_accuracy = %empirical_accuracy,
-        avg_confidence = %avg_confidence,
-        discount = %discount,
-        "Calibration discount computed"
-    );
+/// The curve, separated from the query so it can be tested without a database.
+pub fn multiplier_for_brier(brier: Decimal, floor: Decimal) -> Decimal {
+    // Clamp the floor itself: a config of 2.0 must not become a licence to
+    // double the size, and a negative floor must not produce a negative one.
+    let floor = floor.clamp(Decimal::ZERO, Decimal::ONE);
 
-    Ok(discount)
+    // How far past uninformative, as a fraction of one more whole
+    // `UNINFORMATIVE_BRIER` of badness. Negative for a good record, which the
+    // clamp below turns into 1.0 — there is deliberately no early return for
+    // that case, because a branch the clamp already covers is a branch no
+    // test can distinguish from its own absence.
+    let excess = (brier - UNINFORMATIVE_BRIER) / UNINFORMATIVE_BRIER;
+    let scaled = Decimal::ONE - excess * (Decimal::ONE - floor);
+    scaled.clamp(floor, Decimal::ONE)
 }
 
 #[cfg(test)]
 mod tests {
+    /// Skill does not buy extra risk. The configured size is a ceiling the
+    /// operator chose; a good streak is not a reason to exceed it, and a
+    /// multiplier above 1.0 would silently turn calibration into leverage.
+    #[test]
+    fn a_good_forecast_record_never_earns_more_than_the_configured_size() {
+        for brier in [dec!(0), dec!(0.05), dec!(0.2), UNINFORMATIVE_BRIER] {
+            assert_eq!(
+                multiplier_for_brier(brier, dec!(0.5)),
+                Decimal::ONE,
+                "brier {brier} must not exceed the configured size"
+            );
+        }
+    }
+
+    /// Worse than a coin flip is the only evidence that justifies shrinking.
+    #[test]
+    fn a_worse_than_uninformative_record_shrinks_the_size() {
+        let floor = dec!(0.5);
+        // Halfway to twice-uninformative: halfway from 1.0 to the floor.
+        assert_eq!(multiplier_for_brier(dec!(0.375), floor), dec!(0.75));
+        // Twice uninformative: exactly the floor.
+        assert_eq!(multiplier_for_brier(dec!(0.5), floor), floor);
+    }
+
+    /// The worst possible record still trades the floor rather than zero: a
+    /// multiplier of 0 is a halt dressed as a size, and halting is the kill
+    /// switch's job, where it is visible and needs a human to clear.
+    #[test]
+    fn the_floor_holds_however_bad_the_record_is() {
+        let floor = dec!(0.5);
+        assert_eq!(multiplier_for_brier(dec!(0.9), floor), floor);
+        assert_eq!(multiplier_for_brier(Decimal::ONE, floor), floor);
+        assert_eq!(multiplier_for_brier(dec!(99), floor), floor);
+    }
+
+    /// A misconfigured floor must not become a licence to size up.
+    #[test]
+    fn an_out_of_range_floor_is_clamped_rather_than_obeyed() {
+        assert_eq!(multiplier_for_brier(dec!(0.5), dec!(2)), Decimal::ONE);
+        assert!(multiplier_for_brier(dec!(0.9), dec!(-1)) >= Decimal::ZERO);
+    }
+
+    /// The curve is continuous at the threshold: one resolution crossing the
+    /// line must not step the size.
+    #[test]
+    fn the_curve_is_continuous_where_it_starts_to_bite() {
+        let floor = dec!(0.5);
+        let just_under = multiplier_for_brier(dec!(0.2499), floor);
+        let just_over = multiplier_for_brier(dec!(0.2501), floor);
+        assert_eq!(just_under, Decimal::ONE);
+        assert!(
+            (just_under - just_over).abs() < dec!(0.01),
+            "a hair past the threshold should not step: {just_under} vs {just_over}"
+        );
+    }
+
+    /// Below the sample minimum there is no opinion — sizing is left exactly
+    /// as configured. A number invented from four resolutions is worse than
+    /// no number, because it looks like evidence.
+    #[tokio::test]
+    async fn no_opinion_until_there_are_enough_resolutions() {
+        let store = Store::new(":memory:").await.unwrap();
+        assert_eq!(
+            size_multiplier(store.pool(), 30, dec!(0.5)).await.unwrap(),
+            None
+        );
+    }
+
     use super::*;
     use crate::db::store::Store;
 
@@ -453,29 +504,5 @@ mod tests {
     async fn a_zero_minimum_on_an_empty_table_does_not_divide_by_zero() {
         let pool = pool().await;
         assert!(brier_score(&pool, 0).await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn test_default_discount_with_no_data() {
-        let store = Store::new(":memory:").await.unwrap();
-        let discount = compute_discount(store.pool(), 100).await.unwrap();
-        assert_eq!(discount, DEFAULT_DISCOUNT);
-    }
-
-    #[tokio::test]
-    async fn test_record_and_resolve_prediction() {
-        let store = Store::new(":memory:").await.unwrap();
-
-        record_prediction(store.pool(), "market_1", dec!(0.85), dec!(0.70), dec!(0.50))
-            .await
-            .unwrap();
-
-        record_resolution(store.pool(), "market_1", Decimal::ONE)
-            .await
-            .unwrap();
-
-        // Still below MIN_CALIBRATION_SAMPLES
-        let discount = compute_discount(store.pool(), 100).await.unwrap();
-        assert_eq!(discount, DEFAULT_DISCOUNT);
     }
 }

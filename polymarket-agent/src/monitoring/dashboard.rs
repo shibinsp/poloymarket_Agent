@@ -349,6 +349,13 @@ async fn risk_handler(State(state): State<DashboardState>) -> impl IntoResponse 
     // positions. Below that count it is reported as `null` rather than as a
     // number, because a Brier over four closes is noise with a decimal point
     // and would be read as a pass.
+    let multiplier = crate::valuation::calibration::size_multiplier(
+        state.store.pool(),
+        state.risk.calibration_min_samples,
+        state.risk.calibration_floor,
+    )
+    .await
+    .unwrap_or(None);
     let brier = crate::valuation::calibration::brier_score(state.store.pool(), 30)
         .await
         .unwrap_or(None);
@@ -376,7 +383,16 @@ async fn risk_handler(State(state): State<DashboardState>) -> impl IntoResponse 
             "max_live_total_notional_usd": cfg.max_live_total_notional_usd.to_string(),
             // The absolute caps only bind with real money on the line.
             "live_caps_apply": state.mode == AgentMode::Live,
+            "calibration_min_samples": cfg.calibration_min_samples,
+            "calibration_floor": cfg.calibration_floor.to_string(),
         },
+        // What the forecast record is currently doing to position sizes.
+        //
+        // The Brier score above it was computed and serialised and then
+        // rendered nowhere; reporting the multiplier beside it is what makes
+        // the number actionable, because it says what the agent did about it
+        // rather than only how it scored.
+        "calibration_multiplier": multiplier.map(|m| m.to_string()),
     }))
 }
 
@@ -556,6 +572,27 @@ async fn costs_handler(State(state): State<DashboardState>) -> impl IntoResponse
 
 #[cfg(test)]
 mod tests {
+    /// The number was computed, serialised, and rendered nowhere. Reporting
+    /// what the agent *did* about it — the multiplier — is what makes the
+    /// score actionable rather than decorative.
+    #[tokio::test]
+    async fn the_risk_route_reports_what_calibration_did_to_sizing() {
+        let app = build_router(state_with_token(None).await);
+        let body = get_json(app, "/api/risk").await;
+
+        assert!(
+            body.get("calibration_multiplier").is_some(),
+            "the applied multiplier belongs beside the score: {body}"
+        );
+        assert!(
+            body["limits"].get("calibration_min_samples").is_some(),
+            "and the gate that decides whether it applies: {body}"
+        );
+        // No resolved forecasts in a fresh store, so there is no opinion yet —
+        // which must read as null rather than as a multiplier of zero.
+        assert!(body["calibration_multiplier"].is_null());
+    }
+
     use super::*;
     use axum::body::Body;
     use axum::http::Request as HttpRequest;

@@ -148,7 +148,35 @@ impl VenueCycle<'_> {
         let mut open_notional = self.open_venue_notional().await?;
         let mut open_positions = self.store.get_open_venue_trades().await?.len();
 
-        let ctx = CycleContext { now, state, cycle };
+        // Once per cycle, not per instrument: the answer is identical for every
+        // instrument in the pass, and it is a query over the whole resolved
+        // history.
+        let calibration = match crate::valuation::calibration::size_multiplier(
+            self.store.pool(),
+            self.config.risk.calibration_min_samples,
+            self.config.risk.calibration_floor,
+        )
+        .await
+        {
+            Ok(m) => m,
+            // Not fatal, and deliberately not a shrink either: failing to read
+            // the record is not evidence against the agent, and inventing a
+            // penalty from a database error would be a number with no meaning.
+            Err(e) => {
+                warn!(error = %format!("{e:#}"), "Could not read the forecast record — sizing as configured");
+                None
+            }
+        };
+        if let Some(multiplier) = calibration {
+            info!(multiplier = %multiplier, "Sizing scaled by the agent's own forecast record");
+        }
+
+        let ctx = CycleContext {
+            now,
+            state,
+            cycle,
+            calibration,
+        };
         let instruments = self.registry.list_tradeable_instruments(now, &filter).await;
         outcome.instruments_scanned = instruments.len();
 
@@ -302,6 +330,7 @@ impl VenueCycle<'_> {
                 bankroll,
                 state: ctx.state,
                 candles: &candles,
+                calibration: ctx.calibration,
                 // Absolute cash caps, live only, accounting for what is
                 // already committed against the total.
                 live_ceiling: circuit_breaker::live_notional_ceiling(
@@ -622,6 +651,10 @@ struct CycleContext {
     now: DateTime<Utc>,
     state: AgentState,
     cycle: i64,
+    /// How much of the configured size the agent's own forecast record
+    /// justifies. Read once per cycle — it is one query over resolved
+    /// history, and it cannot change between instruments in the same pass.
+    calibration: Option<Decimal>,
 }
 
 struct EvaluationResult {

@@ -54,6 +54,8 @@ pub struct LlmClient {
     /// `None` leaves spend unbounded, which is only right for the throwaway
     /// probe clients in the dry run and in tests.
     budget: Option<std::sync::Arc<crate::agent::budget::BudgetLedger>>,
+    temperature: Option<f32>,
+    response_format: Option<String>,
 }
 
 /// Hand-written so the API key can never reach a log line or panic message.
@@ -127,6 +129,8 @@ impl LlmClient {
 
         Ok(Self {
             client,
+            temperature: config.temperature,
+            response_format: config.response_format.clone(),
             api_key,
             model: config.model.clone(),
             provider: config.provider,
@@ -358,6 +362,11 @@ impl LlmClient {
         // OpenAI-compatible APIs carry the system prompt as the first message
         // rather than a dedicated field.
         let request = OpenAiRequest {
+            temperature: self.temperature,
+            response_format: self
+                .response_format
+                .as_ref()
+                .map(|kind| serde_json::json!({ "type": kind })),
             model: self.model.clone(),
             max_tokens: self.max_tokens,
             messages: vec![
@@ -520,6 +529,15 @@ struct OpenAiRequest {
     model: String,
     max_tokens: u32,
     messages: Vec<ChatMessage>,
+    /// Omitted unless configured, so every existing endpoint sees the exact
+    /// request it saw before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    /// `{"type": "json_object"}` on an endpoint that supports it, which makes
+    /// the model emit JSON and nothing else — fixing reasoning-tag leakage and
+    /// quoted numbers at the source rather than in the parser.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -568,6 +586,8 @@ mod tests {
 
     fn valuation_config(provider: LlmProvider, base_url: Option<String>) -> ValuationConfig {
         ValuationConfig {
+            temperature: None,
+            response_format: None,
             provider,
             model: "test-model".to_string(),
             base_url,
@@ -899,6 +919,56 @@ mod tests {
         assert_eq!(resp.output_tokens, 500);
         // 1000 * 1.00 / 1M + 500 * 2.00 / 1M
         assert_eq!(resp.cost, dec!(0.002));
+    }
+
+    /// The compatibility guarantee: an endpoint that has never seen these
+    /// fields must get byte-identical requests to before. `body_partial_json`
+    /// cannot assert absence, so this inspects the serialised body directly.
+    #[test]
+    fn the_new_request_params_are_omitted_unless_configured() {
+        let request = OpenAiRequest {
+            model: "m".to_string(),
+            max_tokens: 100,
+            messages: vec![],
+            temperature: None,
+            response_format: None,
+        };
+        let body = serde_json::to_string(&request).unwrap();
+        assert!(!body.contains("temperature"), "{body}");
+        assert!(!body.contains("response_format"), "{body}");
+    }
+
+    /// And when they are configured, they reach the wire.
+    ///
+    /// Through the real path — config to client to request — not by building
+    /// the struct by hand. An earlier version of this test did the latter,
+    /// which asserted that serde works and left the plumbing untested: the
+    /// config fields could have gone nowhere and it would still have passed.
+    #[tokio::test]
+    async fn configured_request_params_reach_the_endpoint() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(serde_json::json!({
+                "temperature": 0.2,
+                "response_format": {"type": "json_object"}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            })))
+            .mount(&server)
+            .await;
+
+        let store = Store::new(":memory:").await.unwrap();
+        let mut config = valuation_config(LlmProvider::OpenAiCompatible, Some(server.uri()));
+        config.temperature = Some(0.2);
+        config.response_format = Some("json_object".to_string());
+        let client = LlmClient::new("k".to_string(), &config, store).unwrap();
+
+        // The mock only matches a body carrying both fields, so reaching a
+        // response at all is the assertion.
+        assert_eq!(client.complete("s", "u", Some(1)).await.unwrap().text, "ok");
     }
 
     #[tokio::test]

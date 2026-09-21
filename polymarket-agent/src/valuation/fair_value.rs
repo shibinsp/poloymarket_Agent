@@ -43,9 +43,32 @@ pub struct ValuationResult {
 }
 
 /// Raw JSON form — Claude outputs floats, but we store as Decimal.
+/// A JSON number, or a string holding one.
+fn de_lenient_f64<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let value = serde_json::Value::deserialize(deserializer)?;
+    crate::json_decimal::value_to_decimal(&value)
+        .map_err(D::Error::custom)?
+        .to_string()
+        .parse()
+        .map_err(D::Error::custom)
+}
+
 #[derive(Debug, Deserialize)]
 struct RawValuationResult {
+    /// Accepts `0.72` and `"0.72"` alike.
+    ///
+    /// The directional path has always tolerated a quoted number, and models
+    /// vary on this; requiring a bare number here meant the two paths failed
+    /// on different output from the same model, and the strict one failed
+    /// first. `deserialize_with` rather than a looser type so the bounds
+    /// checks downstream still see an `f64`.
+    #[serde(deserialize_with = "de_lenient_f64")]
     probability: f64,
+    #[serde(deserialize_with = "de_lenient_f64")]
     confidence: f64,
     reasoning_summary: String,
     key_factors: Vec<String>,
@@ -378,6 +401,15 @@ fn parse_valuation_response(text: &str) -> Result<ValuationResult> {
 /// Uses proper brace-depth tracking that respects string escaping,
 /// then validates with serde_json before returning. (SEC-02)
 pub fn extract_json(text: &str) -> Option<String> {
+    // Reasoning first, before anything looks for JSON.
+    //
+    // A reasoning model emits its working in `<think>` tags and the answer
+    // after them — and because the schema is quoted in the system prompt, that
+    // working very often *restates the schema*. Every strategy below takes the
+    // first thing it finds, so without this the decoy inside the reasoning
+    // wins and the real answer is never read.
+    let text = &strip_reasoning(text);
+
     // Strategy 1: Try markdown code blocks with language tag
     if let Some(json) = try_markdown_block(text, "```json") {
         return Some(json);
@@ -390,6 +422,31 @@ pub fn extract_json(text: &str) -> Option<String> {
 
     // Strategy 3: Extract JSON object with proper brace-depth tracking
     try_raw_json_object(text)
+}
+
+/// Remove `<think>`/`<reasoning>` blocks, including an unclosed trailing one.
+///
+/// An unterminated block is the truncation case: the model ran out of tokens
+/// mid-thought, so everything from the opening tag on is working, not answer.
+/// Dropping it leaves the earlier text intact rather than failing outright.
+fn strip_reasoning(text: &str) -> String {
+    const TAGS: [(&str, &str); 2] = [("<think>", "</think>"), ("<reasoning>", "</reasoning>")];
+    let mut out = text.to_string();
+    for (open, close) in TAGS {
+        while let Some(start) = out.find(open) {
+            match out[start..].find(close) {
+                Some(offset) => {
+                    let end = start + offset + close.len();
+                    out.replace_range(start..end, "");
+                }
+                None => {
+                    out.truncate(start);
+                    break;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Try to extract JSON from a markdown code block.
@@ -418,42 +475,56 @@ fn try_markdown_block(text: &str, marker: &str) -> Option<String> {
 /// Respects string escaping so nested braces inside strings don't
 /// cause incorrect extraction.
 fn try_raw_json_object(text: &str) -> Option<String> {
-    let start = text.find('{')?;
-    let mut depth: i32 = 0;
-    let mut in_string = false;
-    let mut escape_next = false;
+    // Every balanced `{...}` in the text, not just the first.
+    //
+    // The first one is the wrong default for a reasoning model: its working
+    // frequently contains a JSON-shaped example, and the answer comes after.
+    // The previous version scanned from the first `{` only and `break`ed on
+    // the first candidate that failed to parse, so a single malformed decoy
+    // hid a perfectly good answer further down.
+    let mut last_valid: Option<String> = None;
+    let bytes = text.as_bytes();
 
-    for (i, ch) in text[start..].char_indices() {
-        if escape_next {
-            escape_next = false;
-            continue;
-        }
-        if ch == '\\' && in_string {
-            escape_next = true;
-            continue;
-        }
-        if ch == '"' {
-            in_string = !in_string;
-            continue;
-        }
-        if !in_string {
+    for (start, _) in text
+        .char_indices()
+        .filter(|(i, c)| *c == '{' && bytes[*i] == b'{')
+    {
+        let mut depth: i32 = 0;
+        let mut in_string = false;
+        let mut escape_next = false;
+
+        for (i, ch) in text[start..].char_indices() {
+            if escape_next {
+                escape_next = false;
+                continue;
+            }
+            if ch == '\\' && in_string {
+                escape_next = true;
+                continue;
+            }
+            if ch == '"' {
+                in_string = !in_string;
+                continue;
+            }
+            if in_string {
+                continue;
+            }
             if ch == '{' {
                 depth += 1;
             } else if ch == '}' {
                 depth -= 1;
                 if depth == 0 {
                     let candidate = &text[start..start + i + 1];
-                    // Validate the extracted text is actually valid JSON
                     if serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
-                        return Some(candidate.to_string());
+                        last_valid = Some(candidate.to_string());
                     }
-                    // If validation fails, continue looking for another object
                     break;
                 }
             }
         }
     }
-    None
+
+    last_valid
 }
 
 /// Truncate a JSON value to a maximum string length.
@@ -483,6 +554,105 @@ fn format_order_book_depth(book: &OrderBookSnapshot) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The directional path has always accepted a quoted number; this one
+    /// required a bare one, so the same model's output parsed on one path and
+    /// failed on the other — and the strict path failed first.
+    #[test]
+    fn a_quoted_number_parses_like_a_bare_one() {
+        let quoted = r#"{"probability": "0.72", "confidence": "0.85",
+ "reasoning_summary": "s", "key_factors": ["k"], "data_quality": "high",
+ "time_sensitivity": "hours"}"#;
+        let bare = r#"{"probability": 0.72, "confidence": 0.85,
+ "reasoning_summary": "s", "key_factors": ["k"], "data_quality": "high",
+ "time_sensitivity": "hours"}"#;
+
+        let a = parse_valuation_response(quoted).expect("a quoted number is a number");
+        let b = parse_valuation_response(bare).expect("and so is a bare one");
+        assert_eq!(a.probability, b.probability);
+        assert_eq!(a.confidence, b.confidence);
+        assert_eq!(a.probability, dec!(0.72));
+    }
+
+    /// Leniency about *shape* is not leniency about *content*: a value that is
+    /// not a number at all must still be rejected, or a typo becomes a trade.
+    #[test]
+    fn a_non_numeric_probability_is_still_refused() {
+        let raw = r#"{"probability": "high", "confidence": 0.8,
+ "reasoning_summary": "s", "key_factors": ["k"], "data_quality": "high",
+ "time_sensitivity": "hours"}"#;
+        assert!(parse_valuation_response(raw).is_err());
+    }
+
+    /// Isolates `strip_reasoning`: the decoy is inside a ```json fence, and
+    /// fenced blocks are tried *before* the raw scan — so "last valid object
+    /// wins" cannot save this one. Only removing the reasoning can.
+    #[test]
+    fn a_fenced_decoy_inside_reasoning_tags_does_not_win() {
+        let raw = "<think>\nThe schema is:\n```json\n{\"probability\": 0.5, \
+\"confidence\": 0.5, \"reasoning_summary\": \"decoy\", \"key_factors\": [\"x\"], \
+\"data_quality\": \"low\", \"time_sensitivity\": \"days\"}\n```\n</think>\n```json\n{\"probability\": 0.81, \"confidence\": 0.9, \"reasoning_summary\": \
+\"real\", \"key_factors\": [\"a\"], \"data_quality\": \"high\", \
+\"time_sensitivity\": \"hours\"}\n```";
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&extract_json(raw).expect("an object")).unwrap();
+        assert_eq!(parsed["reasoning_summary"], "real", "the fenced decoy won");
+    }
+
+    /// Isolates the truncation branch: an unclosed `<think>` whose contents
+    /// include a *complete, valid* object. Keeping it would make that decoy
+    /// the last valid object and therefore the winner.
+    #[test]
+    fn an_unclosed_reasoning_block_is_dropped_not_parsed() {
+        let raw = r#"{"probability": 0.7, "confidence": 0.8, "reasoning_summary": "real",
+ "key_factors": ["a"], "data_quality": "high", "time_sensitivity": "hours"}
+<think>reconsidering: {"probability": 0.1, "confidence": 0.1,
+ "reasoning_summary": "decoy", "key_factors": ["x"], "data_quality": "low",
+ "time_sensitivity": "days"}"#;
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&extract_json(raw).expect("an object")).unwrap();
+        assert_eq!(parsed["reasoning_summary"], "real", "the working won");
+    }
+
+    /// Isolates "last valid wins": no tags at all, just prose reasoning with a
+    /// decoy object before the answer. Some models do exactly this.
+    #[test]
+    fn an_untagged_decoy_before_the_answer_does_not_win() {
+        let raw = r#"First I considered {"probability": 0.5, "confidence": 0.5,
+ "reasoning_summary": "decoy", "key_factors": ["x"], "data_quality": "low",
+ "time_sensitivity": "days"} but on reflection the answer is
+{"probability": 0.81, "confidence": 0.9, "reasoning_summary": "real",
+ "key_factors": ["a"], "data_quality": "high", "time_sensitivity": "hours"}"#;
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&extract_json(raw).expect("an object")).unwrap();
+        assert_eq!(parsed["reasoning_summary"], "real");
+    }
+
+    /// Isolates the outer scan: a malformed object before a good one used to
+    /// end the search, because the scanner `break`ed on the first failure
+    /// while its comment claimed it kept looking.
+    #[test]
+    fn a_malformed_object_does_not_hide_a_later_valid_one() {
+        let raw = r#"broken {"probability": } then
+{"probability": 0.66, "confidence": 0.7, "reasoning_summary": "r",
+ "key_factors": ["k"], "data_quality": "medium", "time_sensitivity": "days"}"#;
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&extract_json(raw).expect("an object")).unwrap();
+        assert_eq!(parsed["probability"], 0.66);
+    }
+
+    /// Plain output must still work exactly as before.
+    #[test]
+    fn output_without_reasoning_is_unaffected() {
+        let raw = r#"{"probability": 0.42, "confidence": 0.6, "reasoning_summary": "s",
+ "key_factors": ["f"], "data_quality": "low", "time_sensitivity": "weeks"}"#;
+        let parsed: serde_json::Value = serde_json::from_str(&extract_json(raw).unwrap()).unwrap();
+        assert_eq!(parsed["probability"], 0.42);
+    }
+
     use super::*;
 
     use crate::config::LlmProvider;
@@ -490,6 +660,8 @@ mod tests {
     async fn engine_with_cache_ttl(ttl: u64) -> ValuationEngine {
         let store = Store::new(":memory:").await.expect("in-memory store");
         let config = ValuationConfig {
+            temperature: None,
+            response_format: None,
             provider: LlmProvider::Anthropic,
             model: "test-model".to_string(),
             base_url: None,

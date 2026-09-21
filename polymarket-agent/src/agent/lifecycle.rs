@@ -4,7 +4,6 @@ use std::time::Instant;
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
 use tracing::{error, info, instrument, warn};
 
 use crate::agent::budget::BudgetLedger;
@@ -1100,36 +1099,20 @@ impl Agent {
             result.opportunities += 1;
             self.log_opportunity(&candidate, &valuation, &edge);
 
-            // Apply calibration discount to confidence (HAL-01)
-            let calibrated_confidence = match crate::valuation::calibration::compute_discount(
-                self.store.pool(),
-                200, // Look back 200 resolved trades
-            )
-            .await
-            {
-                Ok(discount) => {
-                    let calibrated = valuation.confidence * discount;
-                    if discount < dec!(1.0) {
-                        info!(
-                            original_confidence = %valuation.confidence,
-                            discount = %discount,
-                            calibrated_confidence = %calibrated,
-                            "Calibration discount applied"
-                        );
-                    }
-                    calibrated
-                }
-                Err(e) => {
-                    warn!(error = %e, "Failed to compute calibration discount — using raw confidence");
-                    valuation.confidence
-                }
-            };
+            // Calibration is applied in sizing on the venue path, not here.
+            //
+            // This used to multiply confidence by `compute_discount` before
+            // Kelly. Two things were wrong with it: this loop only runs on the
+            // legacy Polymarket path, which is empty in any venue deployment,
+            // so it never executed; and `compute_discount` returned a flat
+            // 0.85 until 50 resolutions, which is a haircut invented rather
+            // than measured. Keeping it would leave two mechanisms that
+            // disagree about what calibration means.
 
-            // Phase 5: Kelly sizing with calibrated confidence
             let kelly_result = kelly::kelly_size(
                 valuation.probability,
                 edge.trade_price,
-                calibrated_confidence,
+                valuation.confidence,
                 bankroll - result.api_cost,
                 self.state,
                 &self.config.risk,
