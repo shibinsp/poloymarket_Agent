@@ -1506,6 +1506,8 @@ mod tests {
             espn_api_key: None,
             dashboard_token: None,
             alpaca_key_id: None,
+            coinbase_key_name: None,
+            coinbase_private_key: None,
             alpaca_secret_key: None,
         }
     }

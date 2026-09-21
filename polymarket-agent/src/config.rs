@@ -657,6 +657,13 @@ pub struct Secrets {
     /// Alpaca trading credentials. Paper and live use different keys.
     pub alpaca_key_id: Option<SecretString>,
     pub alpaca_secret_key: Option<SecretString>,
+    /// Coinbase CDP key name — `organizations/{org}/apiKeys/{key}`. Public,
+    /// but kept beside the key it names.
+    pub coinbase_key_name: Option<SecretString>,
+    /// The EC private key PEM Coinbase issues with it. Newlines may be
+    /// escaped, which is how it arrives when pasted out of the downloaded
+    /// JSON into an env var.
+    pub coinbase_private_key: Option<SecretString>,
 }
 
 /// Read an env var, treating blank/whitespace-only as unset.
@@ -686,6 +693,8 @@ impl Secrets {
             dashboard_token: secret_env("DASHBOARD_TOKEN"),
             alpaca_key_id: secret_env("ALPACA_API_KEY_ID"),
             alpaca_secret_key: secret_env("ALPACA_API_SECRET_KEY"),
+            coinbase_key_name: secret_env("COINBASE_API_KEY_NAME"),
+            coinbase_private_key: secret_env("COINBASE_API_PRIVATE_KEY"),
         }
     }
 }
