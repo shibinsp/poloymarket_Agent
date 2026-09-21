@@ -1638,4 +1638,70 @@ mod tests {
         let store = Store::new(":memory:").await.unwrap();
         assert_eq!(store.consecutive_losses().await.unwrap(), 0);
     }
+
+    /// `max_trades_per_day` is only a limit if the count can see the rows.
+    ///
+    /// Neither insert sets `created_at`; both rely on the column default
+    /// `datetime('now')`, which writes zone-less UTC as `YYYY-MM-DD HH:MM:SS`.
+    /// The count compares `date(created_at)` against a `NaiveDate`. A format
+    /// mismatch between those two would not error — it would silently return
+    /// zero forever, and the trade-count breaker would never bind.
+    #[tokio::test]
+    async fn todays_trades_are_counted_through_the_real_insert_path() {
+        let store = Store::new(":memory:").await.unwrap();
+        let today = Utc::now().date_naive();
+
+        assert_eq!(store.count_trades_opened_on(today).await.unwrap(), 0);
+
+        store
+            .insert_trade(&TradeRecord {
+                id: None,
+                cycle: 1,
+                market_id: "0xabc".to_string(),
+                market_question: Some("Will it rain?".to_string()),
+                direction: "YES".to_string(),
+                entry_price: "0.40".to_string(),
+                size: "10".to_string(),
+                edge_at_entry: "0.1".to_string(),
+                claude_fair_value: "0.5".to_string(),
+                confidence: "0.8".to_string(),
+                kelly_raw: "0.05".to_string(),
+                kelly_adjusted: "0.02".to_string(),
+                status: "OPEN".to_string(),
+                pnl: None,
+                created_at: None,
+                resolved_at: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.count_trades_opened_on(today).await.unwrap(),
+            1,
+            "a trade opened today must be visible to the daily cap"
+        );
+        assert_eq!(
+            store
+                .count_trades_opened_on(today - chrono::Duration::days(1))
+                .await
+                .unwrap(),
+            0,
+            "and must not be counted against yesterday"
+        );
+    }
+
+    #[tokio::test]
+    async fn trades_opened_on_another_day_are_not_counted_today() {
+        let store = Store::new(":memory:").await.unwrap();
+        seed_closed(&store, "2026-01-02T09:00:00Z", "2026-01-02T10:00:00Z", "-1").await;
+        let that_day = chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap();
+        assert_eq!(store.count_trades_opened_on(that_day).await.unwrap(), 1);
+        assert_eq!(
+            store
+                .count_trades_opened_on(Utc::now().date_naive())
+                .await
+                .unwrap(),
+            0
+        );
+    }
 }
