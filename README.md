@@ -392,6 +392,31 @@ all; that is the point of the threshold.
 
 **30 closed positions proves the plumbing, not edge.**
 
+### Venues
+
+| Venue | Assets | Paper mode | Status |
+|---|---|---|---|
+| Alpaca | US equities + crypto | yes, separate keys and host | the paper-window target |
+| Coinbase Advanced Trade | spot crypto, 24/7 | **no** | implemented, disabled by default |
+| Polymarket | prediction markets | in-process | legacy path; US persons may not trade it |
+
+**Coinbase has no paper endpoint.** Its sandbox serves authentication and
+serialization only — there is no matching engine — so an enabled Coinbase
+venue reaches the *live* exchange whatever `agent.mode` says. That is
+different from Alpaca, where paper and live are different hosts and different
+keys, and it is why Coinbase ships disabled: the config is the safety
+mechanism, not the mode flag. A test pins that the paper template does not
+enable it.
+
+Credentials are `COINBASE_API_KEY_NAME` (`organizations/{org}/apiKeys/{key}`)
+and `COINBASE_API_PRIVATE_KEY`, the EC PEM issued with it. Escaped newlines
+are accepted, since that is how the key arrives when pasted out of the
+downloaded JSON.
+
+Requests are signed with a per-request ES256 JWT whose `uri` claim names the
+method, host and path, so a token cannot be replayed against another
+endpoint. It expires in two minutes.
+
 ### Tracing (OpenTelemetry / Langfuse)
 
 The agent exports spans over OTLP when an endpoint is configured, and stays

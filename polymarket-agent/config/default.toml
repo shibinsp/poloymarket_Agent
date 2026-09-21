@@ -120,6 +120,24 @@ path = "polymarket-agent.db"
 # data_url = "https://data.alpaca.markets"
 # symbols = ["BTC/USD", "ETH/USD", "SPY", "AAPL"]
 # fee_pct = 0.0025
+#
+# Coinbase Advanced Trade — spot crypto, 24/7.
+#
+# Credentials are COINBASE_API_KEY_NAME (organizations/{org}/apiKeys/{key})
+# and COINBASE_API_PRIVATE_KEY (the EC PEM issued with it).
+#
+# WARNING: Coinbase has no paper endpoint. Its sandbox serves auth and
+# serialization only — there is no matching engine — so an enabled Coinbase
+# venue reaches the LIVE exchange whatever `agent.mode` says. Unlike Alpaca,
+# `mode = "paper"` does not protect you here. Leave it disabled until you
+# intend to trade real money on it.
+#
+# [[venues]]
+# id = "coinbase"
+# kind = "coinbase"
+# enabled = false
+# symbols = ["BTC/USD", "ETH/USD"]
+# fee_pct = 0.006
 
 [sizing_continuous]
 risk_per_trade_pct = 0.0075     # fraction of bankroll risked if the stop hits

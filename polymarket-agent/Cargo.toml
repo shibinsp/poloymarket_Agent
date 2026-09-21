@@ -41,6 +41,11 @@ rust_decimal_macros = "1"
 hmac = "0.12"
 sha2 = "0.10"
 
+# NIST P-256, for Coinbase's CDP JWTs. Distinct from alloy's k256
+# (secp256k1) — different curve, same RustCrypto ecdsa/elliptic-curve
+# versions already in the tree.
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
+
 # Ethereum signing for live trading (EIP-712 order signing)
 alloy = { version = "1.5", default-features = false, features = ["dyn-abi", "reqwest", "reqwest-rustls-tls", "serde", "signer-local", "signers", "sol-types"] }
 
