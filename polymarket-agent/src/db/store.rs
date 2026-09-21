@@ -650,30 +650,22 @@ impl Store {
         let day_str = day.to_string();
 
         // Carry the peak forward from whatever the account has ever reached.
-        let prior_peak: Option<String> =
-            sqlx::query_scalar("SELECT MAX(CAST(high_water_mark AS REAL)) FROM daily_equity")
-                .fetch_optional(&self.pool)
-                .await
-                .context("Failed to read the prior high-water mark")?
-                .flatten();
-        // Read back as TEXT to avoid a float round-trip on money; the MAX
-        // above is only used to pick a row, never as the value itself.
-        let prior_peak: Decimal = match prior_peak {
-            Some(_) => {
-                let best: Option<String> = sqlx::query_scalar(
-                    "SELECT high_water_mark FROM daily_equity
-                     ORDER BY CAST(high_water_mark AS REAL) DESC LIMIT 1",
-                )
-                .fetch_optional(&self.pool)
-                .await
-                .context("Failed to read the prior high-water mark")?;
-                match best {
-                    Some(v) => parse_money(&v, "daily_equity.high_water_mark")?,
-                    None => Decimal::ZERO,
-                }
-            }
-            None => Decimal::ZERO,
-        };
+        //
+        // Every stored mark is read and compared in `Decimal`, not picked by a
+        // SQL `MAX` over a float cast. The number of rows is one per day, so
+        // reading them all costs nothing, and money never goes out through a
+        // binary float and back — the discipline the rest of this file keeps.
+        let marks: Vec<(String,)> = sqlx::query_as("SELECT high_water_mark FROM daily_equity")
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to read the prior high-water marks")?;
+        let prior_peak = marks
+            .iter()
+            .map(|(v,)| parse_money(v, "daily_equity.high_water_mark"))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .max()
+            .unwrap_or(Decimal::ZERO);
 
         let high_water_mark = prior_peak.max(equity);
 
@@ -729,11 +721,16 @@ impl Store {
     /// Ordered by when each position *closed*, not when it opened: a streak
     /// is about the order the results arrived in, and a long-held winner
     /// opened before three quick losers does not break them up.
+    ///
+    /// Both close columns are consulted, because two paths write two of them:
+    /// venue exits set `closed_at` and only the legacy prediction resolution
+    /// sets `resolved_at`. Falling back to `created_at` alone sorted by entry
+    /// time, so the streak read zero during an actual losing run.
     pub async fn consecutive_losses(&self) -> Result<u32> {
         let rows: Vec<(String, Option<String>)> = sqlx::query_as(
             "SELECT status, pnl FROM trades
              WHERE status IN ('CLOSED', 'RESOLVED_WIN', 'RESOLVED_LOSS')
-             ORDER BY COALESCE(resolved_at, created_at) DESC, id DESC
+             ORDER BY COALESCE(resolved_at, closed_at, created_at) DESC, id DESC
              LIMIT 50",
         )
         .fetch_all(&self.pool)
@@ -1129,6 +1126,7 @@ pub struct VenueTradeRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal_macros::dec;
 
     /// Continuous assets are not sized by Kelly, so the risk fraction and the
     /// stop distance have columns of their own. They used to be written into
@@ -1430,5 +1428,214 @@ mod tests {
             store.active_halt().await.unwrap().is_none(),
             "a resume must not leave a second halt silently in force"
         );
+    }
+
+    /// The day's *opening* equity is fixed by the first cycle of that day and
+    /// never moves again.
+    ///
+    /// The daily-loss breaker measures against it. Letting a later cycle
+    /// rewrite it would make the limit measure the loss since the last cycle
+    /// rather than since the open — a limit that can never be reached no
+    /// matter how much is lost.
+    #[tokio::test]
+    async fn the_days_opening_equity_is_fixed_by_the_first_cycle() {
+        let store = Store::new(":memory:").await.unwrap();
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 21).unwrap();
+
+        let first = store.record_equity(day, dec!(100)).await.unwrap();
+        assert_eq!(first.starting_equity, dec!(100));
+
+        let later = store.record_equity(day, dec!(80)).await.unwrap();
+        assert_eq!(
+            later.starting_equity,
+            dec!(100),
+            "the open must not follow the current value down"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_high_water_mark_rises_with_a_new_high_and_never_falls() {
+        let store = Store::new(":memory:").await.unwrap();
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 21).unwrap();
+
+        assert_eq!(
+            store
+                .record_equity(day, dec!(100))
+                .await
+                .unwrap()
+                .high_water_mark,
+            dec!(100)
+        );
+        assert_eq!(
+            store
+                .record_equity(day, dec!(120))
+                .await
+                .unwrap()
+                .high_water_mark,
+            dec!(120),
+            "a new high raises the peak"
+        );
+        assert_eq!(
+            store
+                .record_equity(day, dec!(90))
+                .await
+                .unwrap()
+                .high_water_mark,
+            dec!(120),
+            "a fall must not lower it, or drawdown is always zero"
+        );
+    }
+
+    /// Drawdown is peak-to-trough over the life of the account. A peak that
+    /// reset each midnight would let an account bleed a few percent a day for
+    /// a fortnight without ever reporting a drawdown worth halting on.
+    #[tokio::test]
+    async fn the_high_water_mark_carries_across_days() {
+        let store = Store::new(":memory:").await.unwrap();
+        let d = |n| chrono::NaiveDate::from_ymd_opt(2026, 9, n).unwrap();
+
+        store.record_equity(d(19), dec!(100)).await.unwrap();
+        store.record_equity(d(19), dec!(140)).await.unwrap();
+
+        let next_day = store.record_equity(d(20), dec!(90)).await.unwrap();
+        assert_eq!(
+            next_day.starting_equity,
+            dec!(90),
+            "a new day opens where it opens"
+        );
+        assert_eq!(
+            next_day.high_water_mark,
+            dec!(140),
+            "yesterday's peak is still the yardstick"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_first_ever_reading_becomes_the_peak() {
+        let store = Store::new(":memory:").await.unwrap();
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 21).unwrap();
+        let marks = store.record_equity(day, dec!(250)).await.unwrap();
+        assert_eq!(marks.high_water_mark, dec!(250));
+        assert_eq!(marks.starting_equity, dec!(250));
+    }
+
+    /// The peak is compared in `Decimal`, not by a SQL MAX over a float cast.
+    /// These two differ only past f64's precision, which is exactly where a
+    /// float comparison would pick the wrong row.
+    #[tokio::test]
+    async fn the_peak_is_chosen_by_decimal_comparison() {
+        let store = Store::new(":memory:").await.unwrap();
+        let d = |n| chrono::NaiveDate::from_ymd_opt(2026, 9, n).unwrap();
+        store
+            .record_equity(d(19), dec!(10000.00000000000001))
+            .await
+            .unwrap();
+        store
+            .record_equity(d(20), dec!(10000.00000000000002))
+            .await
+            .unwrap();
+        let marks = store.record_equity(d(21), dec!(1)).await.unwrap();
+        assert_eq!(marks.high_water_mark, dec!(10000.00000000000002));
+    }
+
+    #[tokio::test]
+    async fn todays_equity_is_readable_back_through_the_dashboard_query() {
+        // The risk page reads this series; a mark the breaker wrote and the
+        // page cannot see is a silent disagreement between two screens.
+        let store = Store::new(":memory:").await.unwrap();
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 21).unwrap();
+        store.record_equity(day, dec!(100)).await.unwrap();
+        store.record_equity(day, dec!(97.5)).await.unwrap();
+
+        let rows = store.get_daily_equity().await.unwrap();
+        assert_eq!(rows.len(), 1, "one row per day, not one per cycle");
+        assert_eq!(rows[0].starting_equity, "100");
+        assert_eq!(
+            rows[0].closing_equity.as_deref(),
+            Some("97.5"),
+            "the latest reading is what the page shows as current"
+        );
+    }
+
+    /// Insert a closed trade with explicit open and close times.
+    #[cfg(test)]
+    async fn seed_closed(store: &Store, opened: &str, closed: &str, pnl: &str) {
+        sqlx::query(
+            "INSERT INTO trades (cycle, venue_id, market_id, symbol, asset_class, direction,
+                                 side, entry_price, size, edge_at_entry, claude_fair_value,
+                                 confidence, kelly_raw, kelly_adjusted, status, pnl,
+                                 created_at, closed_at)
+             VALUES (1,'alpaca','BTC/USD','BTC/USD','crypto_spot','LONG','BUY','100','1',
+                     '0.1','0.6','0.8','0','0','CLOSED', ?, ?, ?)",
+        )
+        .bind(pnl)
+        .bind(opened)
+        .bind(closed)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    }
+
+    /// A streak is about the order results *arrived* in, not the order the
+    /// positions were opened in.
+    ///
+    /// Venue trades record their close in `closed_at`; only the legacy
+    /// prediction path writes `resolved_at`. Ordering by `created_at` as the
+    /// fallback sorted by entry time, so a long-held loser that closed most
+    /// recently was buried under a position opened later and closed sooner —
+    /// and the losing streak read zero while the account was on a losing run.
+    #[tokio::test]
+    async fn a_losing_streak_is_ordered_by_when_positions_closed() {
+        let store = Store::new(":memory:").await.unwrap();
+
+        // Opened first, closed last, and lost.
+        seed_closed(&store, "2026-09-19T09:00:00Z", "2026-09-21T09:00:00Z", "-5").await;
+        // Opened later, closed sooner, and won.
+        seed_closed(&store, "2026-09-20T09:00:00Z", "2026-09-20T10:00:00Z", "10").await;
+
+        assert_eq!(
+            store.consecutive_losses().await.unwrap(),
+            1,
+            "the most recent close was a loss, so the streak is one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_win_arriving_last_ends_the_streak() {
+        let store = Store::new(":memory:").await.unwrap();
+        seed_closed(&store, "2026-09-19T09:00:00Z", "2026-09-19T10:00:00Z", "-5").await;
+        seed_closed(&store, "2026-09-20T09:00:00Z", "2026-09-20T10:00:00Z", "-3").await;
+        seed_closed(&store, "2026-09-21T09:00:00Z", "2026-09-21T10:00:00Z", "2").await;
+        assert_eq!(store.consecutive_losses().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn consecutive_losses_counts_back_to_the_first_non_loss() {
+        let store = Store::new(":memory:").await.unwrap();
+        seed_closed(&store, "2026-09-18T09:00:00Z", "2026-09-18T10:00:00Z", "-1").await;
+        seed_closed(&store, "2026-09-19T09:00:00Z", "2026-09-19T10:00:00Z", "7").await;
+        seed_closed(&store, "2026-09-20T09:00:00Z", "2026-09-20T10:00:00Z", "-2").await;
+        seed_closed(&store, "2026-09-21T09:00:00Z", "2026-09-21T10:00:00Z", "-3").await;
+        assert_eq!(
+            store.consecutive_losses().await.unwrap(),
+            2,
+            "the win two closes back ends the count"
+        );
+    }
+
+    /// A flat close is not a loss. Counting it as one would trip the breaker
+    /// on a run of break-even exits, which is not a losing streak.
+    #[tokio::test]
+    async fn a_flat_close_ends_the_streak() {
+        let store = Store::new(":memory:").await.unwrap();
+        seed_closed(&store, "2026-09-20T09:00:00Z", "2026-09-20T10:00:00Z", "-4").await;
+        seed_closed(&store, "2026-09-21T09:00:00Z", "2026-09-21T10:00:00Z", "0").await;
+        assert_eq!(store.consecutive_losses().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn no_closes_is_no_streak() {
+        let store = Store::new(":memory:").await.unwrap();
+        assert_eq!(store.consecutive_losses().await.unwrap(), 0);
     }
 }
