@@ -97,8 +97,7 @@ async fn the_llm_client_redacts_its_api_key() {
 
 #[test]
 fn the_alpaca_venue_config_redacts_both_credentials() {
-    let config =
-        polymarket_agent::venue::alpaca::AlpacaConfig::paper(ALPACA_KEY_ID, ALPACA_SECRET);
+    let config = polymarket_agent::venue::alpaca::AlpacaConfig::paper(ALPACA_KEY_ID, ALPACA_SECRET);
     assert_clean("AlpacaConfig Debug", &format!("{config:?}"));
     assert!(
         format!("{config:?}").contains("paper-api.alpaca.markets"),

@@ -258,4 +258,20 @@ grep "budget exhausted" agent.log
 
 4. **Claude costs are real** — Even in paper mode, each valuation call costs ~$0.009 in real Anthropic credits. The $5/day budget cap protects you.
 
-5. **Live mode exists but is NOT yet safe to use** — Since commit `7c351e8`, `--mode live` places real EIP-712-signed orders on Polymarket's CLOB. As of 2026-09-17 the live path still: records orders as filled the moment an order id is returned (no fill confirmation or reconciliation); hardcodes a 7-day order expiry regardless of `order_ttl_seconds`; has no kill switch, drawdown breaker or daily-loss limit; and submits NO-side entries with an inverted order side (`ClobSide::Sell` on the NO token). **Do not run live until the go-live gate in the roadmap is complete.** Separately, Polymarket's international CLOB prohibits US persons from trading — check the current Terms of Service for your jurisdiction.
+5. **Live mode: the venue path is gated, the Polymarket path is not.**
+
+   Since commit `7c351e8`, `--mode live` places real EIP-712-signed orders on
+   Polymarket's CLOB. That path **still** records an order as filled the
+   moment an order id is returned (no fill confirmation) and **still**
+   hardcodes a 7-day order expiry regardless of `order_ttl_seconds`. The
+   inverted NO-side bug previously listed here has been fixed. **Do not run
+   live against Polymarket.** Separately, its international CLOB prohibits US
+   persons from trading — check the current Terms of Service for your
+   jurisdiction; if you are a US person this path is not available to you at
+   all.
+
+   The **venue path** (`[[venues]]`, e.g. Alpaca) has the go-live safety gate:
+   confirmed fills, per-cycle reconciliation, circuit breakers, a kill switch,
+   a budget ledger and verified hourly backups. See *Safety controls* in the
+   README. Having the gate is necessary, not sufficient — the paper-window
+   promotion criteria below still have to be met before real money.

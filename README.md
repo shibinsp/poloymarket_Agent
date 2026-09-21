@@ -353,9 +353,122 @@ curl http://localhost:8080/api/health
   "cycle_number": 42,
   "started_at": "2026-09-17T08:00:00Z",
   "last_cycle_at": "2026-09-17T15:00:00Z",
-  "uptime_seconds": 25200
+  "next_cycle_due": "2026-09-17T15:10:00Z",
+  "uptime_seconds": 25200,
+  "alerts_delivering": true,
+  "anomalies": { "venue_unreachable": 3 },
+  "halted": false,
+  "halt": null
 }
 ```
+
+`status` is `ok`, `halted`, or `dead`. `anomalies` counts *occurrences* per
+kind since start — alerts are deduped per `(kind, scope)` for 30 minutes, so
+one webhook message can stand for hundreds of these, and the difference
+between "once" and "four hundred times" is the interesting part.
+
+`halted` and `halt` are read from the kill switch at request time, not from
+the last completed cycle, so a halt raised mid-cycle shows up immediately.
+
+## Safety controls
+
+These are what stand between a bad afternoon and a lost account. All of them
+apply to the **venue path**; see caveat 8 for what the legacy Polymarket path
+still lacks.
+
+### Stopping the agent
+
+Halting stops *new positions*. Exits, order polling, reconciliation and
+settlement all keep running — refusing to close a position because the day
+went badly is how a bounded loss becomes an unbounded one. It is not a
+shutdown, and it does not close what is already open.
+
+Four ways in, because the one that works is whichever is reachable:
+
+The data directory is `database.data_dir` in the config file, defaulting to
+whatever directory `database.path` lives in.
+
+```bash
+touch <data_dir>/HALT                    # survives a restart; no token needed
+echo "why" > <data_dir>/HALT             # the contents become the reason
+curl -X POST localhost:8080/api/halt     # or the button on the Health page
+kill -USR1 $(pgrep polymarket-agent)     # a PID and nothing else
+```
+
+The `HALT` file is polled every five seconds and wakes the idle loop, so the
+agent cancels its resting orders promptly rather than at its next scheduled
+wake — which across a closed weekend is an hour away. Removing the file
+resumes; it does not clear a halt raised by anything else.
+
+```bash
+curl -X POST localhost:8080/api/resume            # also removes the HALT file
+curl -X POST localhost:8080/api/reconcile/ack     # the same thing, named for a mismatch
+```
+
+A halt is written to the `halts` table and reinstated on startup. Restarting
+the process is the first thing anyone does when something looks wrong; if
+that cleared a drawdown halt, the breaker would be decorative.
+
+### Circuit breakers
+
+Configured under `[risk]`. Every other control here is per-trade — Kelly sizes
+one position, the stop bounds one loss — and none of them bounds a *sequence*.
+Twenty trades each losing their stop is twenty correctly-sized losses and a
+ruined account.
+
+| Limit | Default | Halt lasts |
+|---|---|---|
+| `max_daily_loss_pct` | 5% of the day's opening equity | rest of the UTC day |
+| `max_daily_loss_usd` | $5 | rest of the UTC day |
+| `max_drawdown_pct` | 15% below the all-time equity high | until resumed |
+| `max_trades_per_day` | 10 | rest of the UTC day |
+| `max_consecutive_losses` | 4 | rest of the UTC day |
+| `max_live_notional_per_position_usd` | $10 | sizing cap, live only |
+| `max_live_total_notional_usd` | $60 | sizing cap, live only |
+
+Drawdown is measured peak-to-trough over the life of the account, not within
+the day: an intraday high would reset the yardstick every midnight and let an
+account bleed 3% a day for a fortnight without ever reporting a drawdown.
+
+The two `max_live_*` caps are absolute cash and apply only in live mode. A
+percentage of a paper balance is a number nobody agreed to — 6% of a $100,000
+paper account is a $6,000 position, and the first live run must not inherit
+it.
+
+Losses trip on a strict `>` and counts on a `>=`, so `0` means "none
+tolerated" rather than "disabled". To switch a check off, set it high.
+
+### Reconciliation
+
+Every cycle, each venue is asked what positions it holds and what orders are
+resting, and the answer is compared with the local ledger. A disagreement
+halts until acknowledged; a venue that cannot be *asked* does not halt, since
+a venue that cannot answer cannot accept orders either. Results go to
+`reconciliation_runs`.
+
+The cash comparison the roadmap called for is deliberately not implemented:
+there is no local cash ledger to compare against, and Alpaca's `available` is
+`non_marginable_buying_power`, which moves with margin state, dividends and
+settlement timing. Comparing against it would produce mismatches that are not
+mismatches, and a false halt is an outage with extra steps.
+
+### Valuation budget
+
+`agent.daily_api_budget` (default **$0.50**) is enforced by a ledger that
+reserves each call's estimated cost *before* it is made. The previous check
+read the day's total once and then spawned a batch against that number, so ten
+concurrent calls could each see "$0.40 of $0.50 spent, fine". A failed call
+releases its reservation, so a provider outage cannot consume the day's budget
+having produced nothing.
+
+### Backups
+
+An hourly `VACUUM INTO` snapshot into `<data_dir>/backups`, then opened and
+`PRAGMA integrity_check`ed — an unverified backup is a guess, and you find out
+it was wrong at the worst moment. A snapshot that fails the check is deleted
+so a restore reaches for an older one. Retention is 48 hourly plus one per day
+for 30 days, as a union, so an agent that was offline for a month does not
+come back to an empty directory.
 
 ### Discord Alerts
 
@@ -460,7 +573,20 @@ cargo clippy -- -D warnings
 5. **Model risk.** Claude can be confidently wrong. The confidence score is self-assessed, not externally calibrated.
 6. **Black swan risk.** A single unexpected event can wipe correlated positions.
 7. **Jurisdiction.** Polymarket's international CLOB prohibits US persons from trading under its Terms of Service. If you are in the US, do not fund or run live mode against it.
-8. **Live mode is not yet production-safe.** As of 2026-09-17 the live path records orders as filled without confirmation, hardcodes a 7-day order expiry, has no kill switch, drawdown breaker, or daily-loss limit, and submits NO-side entries with an inverted order side. Do not run `--mode live` until the go-live gate in the roadmap is complete.
+8. **The two live paths are not equally ready, and the difference matters.**
+
+   The **venue path** (Alpaca; `[[venues]]` configured) has the go-live safety
+   gate described under *Safety controls* below: confirmed fills, per-cycle
+   reconciliation, circuit breakers, a kill switch, a budget ledger, and
+   hourly verified backups.
+
+   The **legacy Polymarket path** does not. It still records an order as
+   filled the moment an order id comes back (`src/execution/order.rs:160`) and
+   still hardcodes a 7-day order expiry regardless of `order_ttl_seconds`
+   (`order.rs:220`, `polymarket.rs:488`). The inverted NO-side bug reported
+   here previously *has* been fixed. Do not run `--mode live` against
+   Polymarket — and if you are a US person, see point 7, which makes the
+   question moot.
 
 ## License
 
