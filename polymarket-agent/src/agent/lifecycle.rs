@@ -1541,15 +1541,26 @@ impl Agent {
         }
 
         let mut total = Decimal::ZERO;
+        let mut any_success = false;
         for venue in self.venues.all() {
             match venue.balance().await {
-                Ok(balance) => total += balance.available,
+                Ok(balance) => {
+                    total += balance.available;
+                    any_success = true;
+                }
                 Err(e) => warn!(
                     venue = %venue.id(),
                     error = %format!("{e:#}"),
                     "Could not read venue cash — it is missing from the balance"
                 ),
             }
+        }
+        if !any_success && self.last_balance > Decimal::ZERO {
+            warn!(
+                fallback_balance = %self.last_balance,
+                "Venues unreachable during balance check — using last known balance to prevent false agent death"
+            );
+            return self.last_balance;
         }
         total
     }
