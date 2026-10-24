@@ -1,3 +1,5 @@
+#![allow(clippy::double_must_use)]
+
 pub mod agent;
 pub mod backtesting;
 pub mod config;

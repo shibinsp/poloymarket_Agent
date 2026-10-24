@@ -1,3 +1,5 @@
+#![allow(clippy::double_must_use)]
+
 use anyhow::Result;
 use chrono::Utc;
 use clap::Parser;

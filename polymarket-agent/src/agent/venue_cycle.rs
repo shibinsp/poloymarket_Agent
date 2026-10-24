@@ -685,7 +685,7 @@ fn generate_algorithmic_view(
     };
 
     let invalidation_price = Some(quote.mid * dec!(0.96)); // 4% stop loss
-    let target_price = Some(quote.mid * dec!(1.08));       // 8% take-profit target
+    let target_price = Some(quote.mid * dec!(1.08)); // 8% take-profit target
 
     DirectionalView {
         direction: Direction::Long,
