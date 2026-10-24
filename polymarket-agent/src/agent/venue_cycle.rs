@@ -632,83 +632,129 @@ impl VenueCycle<'_> {
 }
 
 /// Algorithmic quantitative momentum & trend strategy used when no LLM API key is configured.
+/// Enforces trend alignment (SMA5 > SMA14), momentum confirmation, and healthy RSI before entering Long.
+/// Returns Direction::Flat (no trade) in choppy or downtrending conditions to protect capital.
 fn generate_algorithmic_view(
     instrument: &Instrument,
     quote: &Quote,
     candles: &[Candle],
 ) -> DirectionalView {
-    let (p_up, ret, reasoning) = if candles.len() >= 3 {
-        let last_close = candles.last().unwrap().close;
-        let first_close = candles.first().unwrap().close;
-        let short_window = candles.len().min(5);
-        let recent_slice = &candles[candles.len() - short_window..];
-        let short_avg =
-            recent_slice.iter().map(|c| c.close).sum::<Decimal>() / Decimal::from(short_window);
-
-        let overall_trend = if first_close > Decimal::ZERO {
-            (last_close - first_close) / first_close
-        } else {
-            Decimal::ZERO
-        };
-
-        if last_close >= short_avg {
-            (
-                dec!(0.65),
-                dec!(0.12),
-                format!(
-                    "Bullish momentum: current close {} above {}-bar SMA {}",
-                    last_close, short_window, short_avg
-                ),
-            )
-        } else if overall_trend >= dec!(-0.02) {
-            (
-                dec!(0.60),
-                dec!(0.10),
-                format!(
-                    "Consolidation near base: close {} with trend {:.2}%",
-                    last_close,
-                    overall_trend * dec!(100)
-                ),
-            )
-        } else {
-            (
-                dec!(0.57),
-                dec!(0.095),
-                format!(
-                    "Mean reversion bounce candidate: price {} pulled back {:.2}%",
-                    last_close,
-                    overall_trend.abs() * dec!(100)
-                ),
-            )
-        }
-    } else {
-        (
-            dec!(0.62),
-            dec!(0.11),
-            format!(
-                "Algorithmic trend initialization for {}",
+    // Need at least 15 candles to calculate meaningful moving averages & momentum
+    if candles.len() < 15 {
+        return DirectionalView {
+            direction: Direction::Flat,
+            p_up: dec!(0.50),
+            expected_return_pct: Decimal::ZERO,
+            horizon_hours: 24,
+            confidence: dec!(0.50),
+            invalidation_price: None,
+            target_price: None,
+            reasoning_summary: format!(
+                "Insufficient candle history ({} bars) for {} — waiting for trend data",
+                candles.len(),
                 instrument.symbol()
             ),
-        )
+            key_factors: vec!["no_trend_history".to_string()],
+            data_quality: DataQuality::Medium,
+        };
+    }
+
+    let n = candles.len();
+    let last_close = candles[n - 1].close;
+
+    // 1. Fast SMA (last 5 bars) vs Medium SMA (last 14 bars)
+    let fast_window = 5.min(n);
+    let med_window = 14.min(n);
+    let fast_sma = candles[n - fast_window..]
+        .iter()
+        .map(|c| c.close)
+        .sum::<Decimal>()
+        / Decimal::from(fast_window);
+    let med_sma = candles[n - med_window..]
+        .iter()
+        .map(|c| c.close)
+        .sum::<Decimal>()
+        / Decimal::from(med_window);
+
+    // 2. Simplified 14-period RSI
+    let mut gains = Decimal::ZERO;
+    let mut losses = Decimal::ZERO;
+    for i in (n - med_window + 1)..n {
+        let diff = candles[i].close - candles[i - 1].close;
+        if diff > Decimal::ZERO {
+            gains += diff;
+        } else {
+            losses += diff.abs();
+        }
+    }
+    let rsi = if losses == Decimal::ZERO {
+        dec!(100)
+    } else if gains == Decimal::ZERO {
+        dec!(0)
+    } else {
+        let rs = gains / losses;
+        dec!(100) - (dec!(100) / (Decimal::ONE + rs))
     };
 
-    let invalidation_price = Some(quote.mid * dec!(0.96)); // 4% stop loss
-    let target_price = Some(quote.mid * dec!(1.08)); // 8% take-profit target
+    // 3. Trend Alignment & Quality Check
+    let is_uptrend = fast_sma > med_sma && last_close >= med_sma;
+    let is_healthy_rsi = rsi >= dec!(40) && rsi <= dec!(68);
+    let last_candle_bullish = candles[n - 1].close >= candles[n - 1].open;
 
-    DirectionalView {
-        direction: Direction::Long,
-        p_up,
-        expected_return_pct: ret,
-        horizon_hours: 24,
-        confidence: dec!(0.75),
-        invalidation_price,
-        target_price,
-        reasoning_summary: reasoning,
-        key_factors: vec![
-            "technical_momentum".to_string(),
-            "trend_following".to_string(),
-        ],
-        data_quality: DataQuality::High,
+    if is_uptrend && is_healthy_rsi && last_candle_bullish {
+        // High Probability Long Setup
+        // Realistic target: +2.0% take profit, -1.2% stop loss (1.67 : 1 reward/risk)
+        let invalidation_price = Some(quote.mid * dec!(0.988)); // 1.2% stop loss
+        let target_price = Some(quote.mid * dec!(1.020)); // 2.0% take profit
+
+        DirectionalView {
+            direction: Direction::Long,
+            p_up: dec!(0.68),
+            expected_return_pct: dec!(0.025), // 2.5% expected move
+            horizon_hours: 24,
+            confidence: dec!(0.80),
+            invalidation_price,
+            target_price,
+            reasoning_summary: format!(
+                "High-probability bullish trend for {}: Close ({}) > SMA5 ({:.2}) > SMA14 ({:.2}) with healthy RSI {:.1}",
+                instrument.symbol(),
+                last_close,
+                fast_sma,
+                med_sma,
+                rsi
+            ),
+            key_factors: vec![
+                "trend_alignment".to_string(),
+                "healthy_rsi".to_string(),
+                "bullish_candle".to_string(),
+            ],
+            data_quality: DataQuality::High,
+        }
+    } else {
+        // Filter out bad trades! Protect capital!
+        let reason = if !is_uptrend {
+            format!(
+                "Downtrend or flat structure (Close: {}, SMA5: {:.2}, SMA14: {:.2})",
+                last_close, fast_sma, med_sma
+            )
+        } else if !is_healthy_rsi {
+            format!("RSI ({:.1}) outside optimal range (40-68)", rsi)
+        } else {
+            "Waiting for bullish confirmation candle".to_string()
+        };
+
+        DirectionalView {
+            direction: Direction::Flat,
+            p_up: dec!(0.50),
+            expected_return_pct: Decimal::ZERO,
+            horizon_hours: 24,
+            confidence: dec!(0.50),
+            invalidation_price: None,
+            target_price: None,
+            reasoning_summary: format!("Skipping {} — {}", instrument.symbol(), reason),
+            key_factors: vec!["capital_preservation".to_string()],
+            data_quality: DataQuality::Medium,
+        }
     }
 }
 

@@ -31,9 +31,9 @@ model = "claude-3-5-sonnet-20241022"
 # base_url = "https://api.anthropic.com/v1"
 # input_price_per_million = 3.00
 # output_price_per_million = 15.00
-min_edge_threshold = 0.08
-high_confidence_edge = 0.06
-low_confidence_edge = 0.10
+min_edge_threshold = 0.015
+high_confidence_edge = 0.010
+low_confidence_edge = 0.020
 cache_ttl_seconds = 300
 
 [risk]
@@ -117,7 +117,7 @@ kind = "alpaca"
 enabled = true
 base_url = "https://paper-api.alpaca.markets"
 data_url = "https://data.alpaca.markets"
-symbols = ["BTC/USD", "ETH/USD", "SPY", "AAPL", "NIO", "PLUG", "LCID", "OPEN", "CLOV"]
+symbols = ["BTC/USD", "ETH/USD", "SPY", "AAPL", "NVDA", "QQQ"]
 fee_pct = 0.0025
 #
 # Coinbase Advanced Trade — spot crypto, 24/7.
@@ -171,11 +171,15 @@ fee_pct = 0.0025
 [sizing_continuous]
 risk_per_trade_pct = 0.0075     # fraction of bankroll risked if the stop hits
 atr_period = 14
-atr_multiplier = 2.0            # stop distance = ATR x this, then clamped
-min_stop_pct = 0.03
-max_stop_pct = 0.12
+atr_multiplier = 1.5            # stop distance = ATR x this, then clamped
+min_stop_pct = 0.01             # 1.0% min stop
+max_stop_pct = 0.03             # 3.0% max stop
 min_p_up = 0.55                 # minimum probability-of-up before a view is tradeable
 max_orders_per_cycle = 2        # cap on new positions opened per cycle
+
+[exits_continuous]
+take_profit_pct = 0.02          # 2.0% realistic take-profit target
+max_hold_hours = 24             # 24 hours max hold
 
 [telemetry]
 # OpenTelemetry span export. Off unless an endpoint is set here or via
