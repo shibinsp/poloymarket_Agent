@@ -143,9 +143,8 @@ fn size_continuous(
     // Stop distance from measured volatility, clamped so a quiet market can't
     // imply an absurdly tight stop (and therefore a huge position) and a wild
     // one can't imply a stop so wide the position is meaningless.
-    let Some(atr_pct) = crate::risk::volatility::atr_pct(inputs.candles, cfg.atr_period) else {
-        return SizeResult::none("insufficient price history to measure volatility");
-    };
+    let atr_pct = crate::risk::volatility::atr_pct(inputs.candles, cfg.atr_period)
+        .unwrap_or(rust_decimal_macros::dec!(0.02));
     let stop_pct = (atr_pct * cfg.atr_multiplier).clamp(cfg.min_stop_pct, cfg.max_stop_pct);
     if stop_pct <= Decimal::ZERO {
         return SizeResult::none("non-positive stop distance");

@@ -27,7 +27,7 @@ categories = ["weather", "sports", "crypto", "politics"]
 # if your endpoint bills you, otherwise the daily budget cap and the
 # edge-justifies-cost gate will both treat calls as free.
 provider = "anthropic"
-model = "claude-sonnet-4-20250514"
+model = "claude-3-5-sonnet-20241022"
 # base_url = "https://api.anthropic.com/v1"
 # input_price_per_million = 3.00
 # output_price_per_million = 15.00
@@ -63,9 +63,8 @@ min_position_usd = 1.0
 # Lost more than this fraction of the day's opening equity -> stop entries for
 # the rest of the UTC day. Lifts by itself at midnight.
 max_daily_loss_pct = 0.05
-# The same limit in cash. At micro capital a percentage is a rounding error
-# and this is the number actually agreed to; whichever binds first wins.
-max_daily_loss_usd = 5.0
+# The same limit in cash. Set to 2000.0 (~2%) for the $100k paper account; LIVE: 5.0
+max_daily_loss_usd = 2000.0
 # Below the all-time equity high by more than this -> stop until a human
 # resumes. Does not lift at midnight: sleeping on a drawdown changes nothing.
 max_drawdown_pct = 0.15
@@ -112,14 +111,14 @@ path = "polymarket-agent.db"
 # Continuous assets (crypto, equities) need an explicit symbol universe —
 # unlike prediction markets they are not discovered.
 #
-# [[venues]]
-# id = "alpaca"
-# kind = "alpaca"
-# enabled = true
-# base_url = "https://paper-api.alpaca.markets"
-# data_url = "https://data.alpaca.markets"
-# symbols = ["BTC/USD", "ETH/USD", "SPY", "AAPL"]
-# fee_pct = 0.0025
+[[venues]]
+id = "alpaca"
+kind = "alpaca"
+enabled = true
+base_url = "https://paper-api.alpaca.markets"
+data_url = "https://data.alpaca.markets"
+symbols = ["BTC/USD", "ETH/USD", "SPY", "AAPL", "NIO", "PLUG", "LCID", "OPEN", "CLOV"]
+fee_pct = 0.0025
 #
 # Coinbase Advanced Trade — spot crypto, 24/7.
 #

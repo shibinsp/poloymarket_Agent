@@ -10,3 +10,11 @@
 
 # Local per-machine config (see CONFIG_PATH)
 config/local.toml
+
+# Logs and runtime data
+*.log
+backups/
+
+# Scratch test files (keep only check_profit.py)
+scratch/*
+!scratch/check_profit.py
