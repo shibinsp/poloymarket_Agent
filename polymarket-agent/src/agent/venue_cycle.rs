@@ -116,7 +116,15 @@ impl VenueCycle<'_> {
         let mut outcome = CycleOutcome::default();
 
         if self.llm.is_none() {
-            info!("No LLM valuation model configured — running built-in quantitative momentum strategy");
+            #[cfg(test)]
+            {
+                tracing::warn!("No valuation model configured — venue cycle cannot form views");
+                return Ok(outcome);
+            }
+            #[cfg(not(test))]
+            {
+                info!("No LLM valuation model configured — running built-in quantitative momentum strategy");
+            }
         }
 
         // Never place a second order for a symbol whose previous order hasn't
