@@ -69,7 +69,7 @@ max_daily_loss_usd = 2000.0
 # resumes. Does not lift at midnight: sleeping on a drawdown changes nothing.
 max_drawdown_pct = 0.15
 # Positions opened per UTC day, and losing closes in a row. Both rest-of-day.
-max_trades_per_day = 10
+max_trades_per_day = 25
 max_consecutive_losses = 4
 # Absolute ceilings, applied only in live mode. A percentage of a paper
 # balance is a number nobody agreed to, and the first live run must not
