@@ -4,6 +4,7 @@ import { ROUTES } from "../../router/routes";
 import { Badge, agentStateTone } from "../ui/Badge";
 import { Freshness } from "../ui/Freshness";
 import { ConnectionBar } from "./ConnectionBar";
+import { MarketSessionRibbon } from "./MarketSessionRibbon";
 import { TokenDialog } from "./TokenDialog";
 import { useAllDatasets, useDataset } from "../../data/useDataset";
 import { dataStore } from "../../data/store";
@@ -82,6 +83,7 @@ export function AppShell({
 
       <main className="main">
         <ConnectionBar />
+        <MarketSessionRibbon />
         {children}
       </main>
 
