@@ -349,13 +349,18 @@ impl AlpacaLiveMarketFeed {
 
                         // 2. Read auth confirmation
                         let mut authenticated = false;
-                        if let Some(Ok(Message::Text(msg))) = read.next().await {
+                        while let Some(Ok(Message::Text(msg))) = read.next().await {
                             if msg.contains("authenticated") {
                                 info!("Alpaca WebSocket authenticated successfully!");
                                 authenticated = true;
                                 *self.feed_status.write().await = "CONNECTED".to_string();
+                                break;
+                            } else if msg.contains("\"msg\":\"connected\"") {
+                                // Initial connection greeting from Alpaca, await auth response
+                                continue;
                             } else {
                                 warn!(response = %msg, "Unexpected Alpaca auth response");
+                                break;
                             }
                         }
 

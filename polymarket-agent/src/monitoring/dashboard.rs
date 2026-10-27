@@ -596,6 +596,21 @@ async fn resume_handler(State(state): State<DashboardState>) -> impl IntoRespons
             .into_response();
     }
 
+    if let Some(ref h) = cleared {
+        if matches!(
+            h.source,
+            crate::agent::kill_switch::HaltSource::Reconciliation
+        ) {
+            let now_str = chrono::Utc::now().to_rfc3339();
+            let _ = sqlx::query(
+                "UPDATE trades SET status = 'CLOSED', close_reason = 'reconciliation_cleared', closed_at = ? WHERE status IN ('OPEN', 'PARTIAL')"
+            )
+            .bind(&now_str)
+            .execute(state.store.pool())
+            .await;
+        }
+    }
+
     info!(?cleared, "Resumed over the API");
     Json(serde_json::json!({
         "halted": false,
@@ -1865,6 +1880,13 @@ async fn us_paper_reset_handler(State(state): State<DashboardState>) -> impl Int
     let base_capital = state.dynamic_caps.read().await.us_capital_allocation_usd;
     match state.store.clear_us_paper_orders().await {
         Ok(_) => {
+            let _ = sqlx::query(
+                "UPDATE trades SET status = 'CLOSED', close_reason = 'paper_reset', closed_at = ? WHERE venue_id = 'alpaca' AND status IN ('OPEN', 'PARTIAL')"
+            )
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(state.store.pool())
+            .await;
+
             info!(base_capital = %base_capital, "US paper orders cleared - reset to base capital");
             Json(serde_json::json!({
                 "status": "success",
