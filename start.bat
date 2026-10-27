@@ -39,7 +39,7 @@ echo Select operation mode:
 echo   [1] Paper Trading Mode (Interactive Terminal - Foreground)
 echo   [2] Run in Background (Silent / Detached - keeps running when you close window)
 echo   [3] Stop Background Agent
-echo   [4] Check Status & Open Web Dashboard (http://127.0.0.1:8080)
+echo   [4] Check Status & Open Web Dashboard (http://127.0.0.1:8088)
 echo   [5] Show Profit & Performance Report (Track Earnings)
 echo   [6] Setup Auto-Start on Windows Login (Runs automatically offline/on boot)
 echo   [7] Remove Auto-Start from Windows
@@ -71,7 +71,7 @@ goto run_paper
 echo.
 echo =======================================================
 echo  Starting Agent in PAPER TRADING MODE (Foreground)
-echo  Dashboard: http://127.0.0.1:8080
+echo  Dashboard: http://127.0.0.1:8088
 echo =======================================================
 if exist "target\release\polymarket-agent.exe" (
     target\release\polymarket-agent.exe --mode paper
@@ -88,7 +88,7 @@ echo =======================================================
 tasklist /FI "IMAGENAME eq polymarket-agent.exe" 2>nul | find /I "polymarket-agent.exe" >nul
 if not errorlevel 1 (
     echo [INFO] Polymarket Agent is ALREADY running in the background!
-    echo [INFO] Dashboard: http://127.0.0.1:8080
+    echo [INFO] Dashboard: http://127.0.0.1:8088
     goto end
 )
 cscript //nologo "%~dp0run_background.vbs"
@@ -98,7 +98,7 @@ if not errorlevel 1 (
     echo [SUCCESS] Agent is now running in the background!
     echo [INFO] It will keep running even if you close this window.
     echo [INFO] Output log: %~dp0polymarket-agent\agent.log
-    echo [INFO] Dashboard: http://127.0.0.1:8080
+    echo [INFO] Dashboard: http://127.0.0.1:8088
 ) else (
     echo [ERROR] Agent failed to start. Check polymarket-agent\agent.log
 )
@@ -128,8 +128,8 @@ if not errorlevel 1 (
 ) else (
     echo [STATUS] Polymarket Agent process is NOT currently running.
 )
-echo Opening Web Dashboard in browser: http://127.0.0.1:8080
-start http://127.0.0.1:8080
+echo Opening Web Dashboard in browser: http://127.0.0.1:8088
+start http://127.0.0.1:8088
 goto end
 
 :show_profit
