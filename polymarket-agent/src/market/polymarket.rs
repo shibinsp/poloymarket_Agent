@@ -1498,19 +1498,6 @@ mod tests {
     }
 
     fn test_secrets() -> Secrets {
-        Secrets {
-            polymarket_private_key: None,
-            llm_api_key: None,
-            discord_webhook_url: None,
-            noaa_api_token: None,
-            espn_api_key: None,
-            dashboard_token: None,
-            alpaca_key_id: None,
-            coinbase_key_name: None,
-            coinbase_private_key: None,
-            binance_us_api_key: None,
-            binance_us_secret_key: None,
-            alpaca_secret_key: None,
-        }
+        Secrets::default()
     }
 }

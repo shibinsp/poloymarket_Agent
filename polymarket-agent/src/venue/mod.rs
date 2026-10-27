@@ -17,6 +17,7 @@ pub mod session;
 #[cfg(test)]
 pub mod test_support;
 pub mod types;
+pub mod upstox;
 
 use anyhow::Result;
 use async_trait::async_trait;

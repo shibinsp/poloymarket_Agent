@@ -144,10 +144,23 @@ pub fn build_registry_reporting(
                     "no Polymarket client was supplied".to_string(),
                 ),
             },
+            "upstox" | "upstox_sandbox" | "upstox-sandbox" => {
+                match build_upstox(venue_config, secrets, config.agent.mode) {
+                    Ok(venue) => {
+                        info!(
+                            venue = %venue_config.id,
+                            symbols = venue_config.symbols.len(),
+                            "Upstox sandbox venue enabled (NSE cash equities)"
+                        );
+                        venues.push(Box::new(venue));
+                    }
+                    Err(e) => skip(&venue_config.id, format!("{e:#}")),
+                }
+            }
             other => skip(
                 &venue_config.id,
                 format!(
-                    "unknown venue kind {other:?} — expected \"alpaca\", \"coinbase\", \"binance_us\" or \"polymarket\""
+                    "unknown venue kind {other:?} — expected \"alpaca\", \"coinbase\", \"binance_us\", \"upstox_sandbox\" or \"polymarket\""
                 ),
             ),
         }
@@ -286,6 +299,28 @@ fn build_alpaca(
     Ok(Some(venue))
 }
 
+/// Build the Upstox sandbox venue for Indian cash equities.
+///
+/// SAFETY: Live trading is strictly forbidden by construction.
+fn build_upstox(
+    _venue_config: &VenueConfig,
+    secrets: &Secrets,
+    mode: AgentMode,
+) -> Result<crate::venue::upstox::UpstoxSandboxVenue> {
+    if mode == AgentMode::Live {
+        anyhow::bail!(
+            "Upstox integration is SANDBOX ONLY. Live trading on Indian markets is strictly blocked by construction."
+        );
+    }
+
+    let token = secrets.upstox_sandbox_token.clone().map(|s| {
+        crate::config::SecretString::from(s.expose_secret().to_string())
+    });
+
+    let client = crate::venue::upstox::client::UpstoxSandboxClient::new(token)?;
+    Ok(crate::venue::upstox::UpstoxSandboxVenue::new(client))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,18 +354,9 @@ mod tests {
 
     fn secrets_with_alpaca(present: bool) -> Secrets {
         Secrets {
-            polymarket_private_key: None,
-            llm_api_key: None,
-            discord_webhook_url: None,
-            noaa_api_token: None,
-            espn_api_key: None,
-            dashboard_token: None,
             alpaca_key_id: present.then(|| crate::config::SecretString::from("key")),
-            coinbase_key_name: None,
-            coinbase_private_key: None,
-            binance_us_api_key: None,
-            binance_us_secret_key: None,
             alpaca_secret_key: present.then(|| crate::config::SecretString::from("secret")),
+            ..Default::default()
         }
     }
 
@@ -677,6 +703,34 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
         assert!(
             registry.is_empty(),
             "legacy behaviour when venues are unset"
+        );
+    }
+
+    #[test]
+    fn upstox_sandbox_venue_builds_in_paper_mode() {
+        let mut venue = alpaca_config(true);
+        venue.kind = "upstox_sandbox".to_string();
+        venue.id = "upstox_sandbox".to_string();
+        venue.symbols = vec!["RELIANCE".to_string()];
+        let config = config_with(vec![venue]);
+        let registry = build_registry(&config, &Secrets::default(), None).unwrap();
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.all().next().unwrap().id().as_str(), "upstox_sandbox");
+    }
+
+    #[test]
+    fn upstox_sandbox_venue_refused_in_live_mode() {
+        let mut venue = alpaca_config(true);
+        venue.kind = "upstox_sandbox".to_string();
+        venue.id = "upstox_sandbox".to_string();
+        let config = live_config_with(vec![venue]);
+        let (registry, skipped) = build_registry_reporting(&config, &Secrets::default(), None);
+        assert!(registry.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert!(
+            skipped[0].reason.contains("SANDBOX ONLY"),
+            "reason must explain live mode refusal: {}",
+            skipped[0].reason
         );
     }
 }

@@ -416,6 +416,8 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
         kill_switch.clone(),
         config.risk.clone(),
         config.agent.mode,
+        secrets.llm_api_key.is_some(),
+        config.valuation.model.clone(),
     );
     let dashboard_handle = spawn_dashboard(
         dashboard_state,

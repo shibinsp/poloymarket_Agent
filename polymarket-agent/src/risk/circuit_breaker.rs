@@ -250,6 +250,7 @@ mod tests {
             max_consecutive_losses: 4,
             max_live_notional_per_position_usd: dec!(10),
             max_live_total_notional_usd: dec!(60),
+            ..Default::default()
         }
     }
 

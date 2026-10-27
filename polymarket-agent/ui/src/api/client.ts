@@ -204,3 +204,65 @@ export async function post<T>(path: string): Promise<ApiResult<T>> {
   auth.clearToken();
   return { ok: false, error: { kind: "unauthorized" } };
 }
+
+/**
+ * POST a JSON payload to an endpoint.
+ */
+export async function postJson<T>(path: string, payload: unknown): Promise<ApiResult<T>> {
+  const once = async (token: string): Promise<ApiResult<T> | { retryWithAuth: true }> => {
+    let res: Response;
+    try {
+      res = await fetch(path, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          [CONTROL_HEADER]: "1",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify(payload),
+        cache: "no-store",
+      });
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      return { ok: false, error: { kind: "network", message } };
+    }
+
+    if (res.status === 401) return { retryWithAuth: true };
+
+    let body: unknown;
+    try {
+      body = await res.json();
+    } catch {
+      body = null;
+    }
+
+    if (!res.ok) {
+      const explained =
+        body && typeof body === "object" && "error" in body
+          ? String((body as { error: unknown }).error)
+          : "";
+      return {
+        ok: false,
+        error: { kind: "http", status: res.status, message: explained },
+      };
+    }
+
+    if (body === null || typeof body !== "object") {
+      return { ok: false, error: { kind: "malformed", message: "expected an object" } };
+    }
+    return { ok: true, value: body as T };
+  };
+
+  const first = await once(auth.getToken());
+  if (!("retryWithAuth" in first)) return first;
+
+  const token = await auth.requestToken();
+  if (token === "") return { ok: false, error: { kind: "unauthorized" } };
+
+  const second = await once(token);
+  if (!("retryWithAuth" in second)) return second;
+
+  auth.clearToken();
+  return { ok: false, error: { kind: "unauthorized" } };
+}
+

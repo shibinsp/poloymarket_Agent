@@ -59,6 +59,7 @@ categories = []
 [valuation]
 provider = "anthropic"
 model = "claude-sonnet-4-20250514"
+max_tokens = 4096
 min_edge_threshold = 0.08
 high_confidence_edge = 0.06
 low_confidence_edge = 0.10

@@ -36,6 +36,9 @@ export interface Health {
   /** Whether new positions are stopped, and why. */
   halted?: boolean;
   halt?: Halt | null;
+  /** Whether the AI valuation engine is enabled with a valid LLM API key. */
+  valuation_enabled?: boolean;
+  valuation_model?: string;
 }
 
 /** A halt in force, as `/api/halt` and `/api/health` report it. */
@@ -248,3 +251,44 @@ export interface ApiCostRecord {
   /** Bare UTC, no zone. Use `parseTs`. */
   created_at: string | null;
 }
+
+export interface MarketOrderRecord {
+  id: string;
+  client_order_id: string;
+  venue_order_id: string | null;
+  symbol: string;
+  side: string;
+  order_type: string;
+  quantity: number;
+  price: string | null;
+  trigger_price: string | null;
+  status: string;
+  fill_quantity: number;
+  average_fill_price: string | null;
+  rejection_reason: string | null;
+  created_at: string;
+  updated_at: string;
+  market_type?: "india" | "us" | "polymarket";
+  currency_symbol?: string;
+}
+
+export interface IndiaSandboxStatusResponse {
+  venue_id: string;
+  name: string;
+  currency: string;
+  currency_symbol: string;
+  timezone: string;
+  trading_hours: string;
+  recent_orders: MarketOrderRecord[];
+}
+
+export interface UsPaperStatusResponse {
+  venue_id: string;
+  name: string;
+  currency: string;
+  currency_symbol: string;
+  timezone: string;
+  trading_hours: string;
+  recent_orders: MarketOrderRecord[];
+}
+

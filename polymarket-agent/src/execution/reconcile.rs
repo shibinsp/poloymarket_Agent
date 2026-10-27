@@ -126,10 +126,18 @@ pub fn combined_equity(reports: &[VenueReconcileReport]) -> Option<Decimal> {
     if reports.is_empty() {
         return None;
     }
-    // One pass: a guard plus a second `filter_map` left the rule stated twice,
-    // and a later edit to either line would have them disagree about whether a
-    // missing venue is fatal.
-    reports
+    // Indian market funds (Upstox/NSE) are in INR and must NEVER be added directly
+    // to the USD equity pool at 1:1, preserving strict currency and pool isolation.
+    let relevant: Vec<&VenueReconcileReport> = reports
+        .iter()
+        .filter(|r| r.venue_id != "upstox" && r.venue_id != "upstox_sandbox")
+        .collect();
+
+    if relevant.is_empty() {
+        return None;
+    }
+
+    relevant
         .iter()
         .try_fold(Decimal::ZERO, |sum, report| Some(sum + report.equity?))
 }
@@ -154,11 +162,13 @@ impl VenueReconcileReport {
 const DUST: Decimal = dec!(0.000001);
 
 /// How far two quantities may differ and still be called equal.
-fn qty_tolerance(asset_class: AssetClass) -> Decimal {
+fn qty_tolerance(asset_class: AssetClass, local_qty: Decimal) -> Decimal {
     match asset_class {
         // Crypto quantities carry eight decimals and are computed from
-        // fractional fills on both sides; the last place is noise.
-        AssetClass::CryptoSpot => dec!(0.00000001),
+        // fractional fills on both sides; taker fees (up to ~1-1.5%) are often
+        // deducted directly in the coin received upon execution.
+        // We tolerate exchange fee deductions and rounding dust (up to 1.5% of qty or 10^-6 dust).
+        AssetClass::CryptoSpot => (local_qty.abs() * dec!(0.015)).max(DUST),
         // Share counts are exact, including Alpaca's fractional shares, which
         // are quoted to six places and arrive as decimal strings on both
         // sides. Any difference at all is a real difference.
@@ -255,6 +265,26 @@ impl StateReconciler<'_> {
             entry.0 += trade.quantity;
         }
 
+        // Also account for US paper orders on Alpaca
+        if venue_id == "alpaca" {
+            if let Ok(paper_orders) = self.store.get_us_paper_orders(500).await {
+                for po in paper_orders {
+                    if po.status.eq_ignore_ascii_case("FILLED") {
+                        let key = po.symbol.to_ascii_uppercase();
+                        let entry = local_qty
+                            .entry(key)
+                            .or_insert((Decimal::ZERO, AssetClass::Equity));
+                        let qty = Decimal::from(po.fill_quantity);
+                        if po.side.eq_ignore_ascii_case("BUY") {
+                            entry.0 += qty;
+                        } else if po.side.eq_ignore_ascii_case("SELL") {
+                            entry.0 -= qty;
+                        }
+                    }
+                }
+            }
+        }
+
         let mut venue_qty: HashMap<String, Decimal> = HashMap::new();
         for pos in &venue_positions {
             *venue_qty
@@ -283,7 +313,7 @@ impl StateReconciler<'_> {
                     symbol: symbol.clone(),
                     qty: *lq,
                 });
-            } else if (*lq - vq).abs() > qty_tolerance(*class) {
+            } else if (*lq - vq).abs() > qty_tolerance(*class, *lq) {
                 qty_mismatches.push(QtyMismatch {
                     symbol: symbol.clone(),
                     local_qty: *lq,
@@ -319,8 +349,13 @@ impl StateReconciler<'_> {
                 // branch above guards exactly this; this one did not.
                 match self.store.get_unresolved_orders().await {
                     Ok(orders) => {
-                        let known: std::collections::HashSet<_> =
+                        let mut known: std::collections::HashSet<_> =
                             orders.into_iter().map(|o| o.client_order_id).collect();
+                        if let Ok(paper_orders) = self.store.get_us_paper_orders(500).await {
+                            for po in paper_orders {
+                                known.insert(po.client_order_id);
+                            }
+                        }
                         Some(
                             acks.into_iter()
                                 .filter(|a| !known.contains(&a.client_order_id))

@@ -6,7 +6,7 @@
  * built once at module scope — constructing one per cell is measurable on a
  * few hundred table rows.
  */
-import { denormZero } from "./decimal";
+import { denormZero, num } from "./decimal";
 
 export const DASH = "—";
 /** U+2212. Wider than a hyphen, so signed columns line up. */
@@ -29,9 +29,19 @@ const compactFmt = new Intl.NumberFormat("en-US", {
   notation: "compact",
   maximumFractionDigits: 1,
 });
+const inrFmt = new Intl.NumberFormat("en-IN", {
+  style: "currency",
+  currency: "INR",
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 2,
+});
 
 export function money(v: number | null | undefined): string {
   return v === null || v === undefined ? DASH : money2.format(denormZero(v));
+}
+
+export function moneyInr(v: number | null | undefined): string {
+  return v === null || v === undefined ? DASH : inrFmt.format(denormZero(v));
 }
 
 /**
@@ -141,3 +151,65 @@ export function absTime(then: Date | null): string {
     timeZoneName: "short",
   });
 }
+
+const inr2 = new Intl.NumberFormat("en-IN", {
+  style: "currency",
+  currency: "INR",
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 2,
+});
+
+/** Format Indian Rupee currency amounts (₹1,23,456.78) */
+export function inr(v: number | string | null | undefined): string {
+  const n = num(v);
+  return n === null ? DASH : inr2.format(denormZero(n));
+}
+
+/** Signed INR for P&L columns */
+export function inrSigned(v: number | string | null | undefined): string {
+  const n = num(v);
+  if (n === null) return DASH;
+  const val = denormZero(n);
+  const body = inr2.format(Math.abs(val));
+  if (val > 0) return "+" + body;
+  if (val < 0) return MINUS + body;
+  return body;
+}
+
+/** Format equity share quantities — never labeled as currency */
+export function shares(v: number | string | null | undefined): string {
+  const n = num(v);
+  if (n === null) return DASH;
+  return `${intFmt.format(n)} sh`;
+}
+
+/** Format IST (Asia/Kolkata) timestamp */
+export function istTime(then: Date | null): string {
+  if (!then) return DASH;
+  return then.toLocaleString("en-IN", {
+    timeZone: "Asia/Kolkata",
+    year: "numeric",
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    timeZoneName: "short",
+  });
+}
+
+/** Format ET (America/New_York) timestamp */
+export function etTime(then: Date | null): string {
+  if (!then) return DASH;
+  return then.toLocaleString("en-US", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    timeZoneName: "short",
+  });
+}
+

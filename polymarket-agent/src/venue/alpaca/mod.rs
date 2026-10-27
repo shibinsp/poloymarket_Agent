@@ -448,6 +448,13 @@ impl AlpacaVenue {
         Ok(map)
     }
 
+    async fn asset(&self, symbol: &str) -> Result<AlpacaAsset> {
+        self.rest
+            .get(Api::Trading, &format!("/v2/assets/{symbol}"), &[])
+            .await
+            .with_context(|| format!("Failed to fetch Alpaca asset for {symbol}"))
+    }
+
     /// Asset metadata for exactly the symbols asked for, fetching only the
     /// classes those symbols belong to.
     async fn assets_for(&self, symbols: &[String]) -> Result<HashMap<String, AlpacaAsset>> {
@@ -462,10 +469,26 @@ impl AlpacaVenue {
             if !wanted {
                 continue;
             }
-            let listing = self.assets_for_class(class).await?;
-            for symbol in symbols {
-                if let Some(asset) = listing.get(symbol) {
-                    out.insert(symbol.clone(), asset.clone());
+            match self.assets_for_class(class).await {
+                Ok(listing) => {
+                    for symbol in symbols {
+                        if let Some(asset) = listing.get(symbol) {
+                            out.insert(symbol.clone(), asset.clone());
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(class, error = %e, "Batch asset listing failed — falling back to per-symbol lookup");
+                    for symbol in symbols {
+                        let is_crypto = is_crypto_symbol(symbol);
+                        if (class == ASSET_CLASS_CRYPTO && is_crypto)
+                            || (class == ASSET_CLASS_EQUITY && !is_crypto)
+                        {
+                            if let Ok(asset) = self.asset(symbol).await {
+                                out.insert(symbol.clone(), asset);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -771,6 +794,7 @@ impl Venue for AlpacaVenue {
         let mut seen = HashSet::new();
         let wanted: Vec<String> = requested
             .iter()
+            .filter(|symbol| self.symbols.is_empty() || self.symbols.contains(symbol))
             .filter(|symbol| {
                 if filter.asset_classes.is_empty() {
                     return true;

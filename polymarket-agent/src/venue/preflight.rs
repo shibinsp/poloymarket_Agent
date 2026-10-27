@@ -296,6 +296,7 @@ mod tests {
             weekdays: vec![chrono::Weekday::Mon],
             windows: Vec::new(),
             holidays: Vec::new(),
+            early_closes: Vec::new(),
         }
     }
 

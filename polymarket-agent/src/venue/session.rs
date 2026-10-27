@@ -75,10 +75,125 @@ pub enum TradingSession {
         windows: Vec<SessionWindow>,
         /// Full-day closures (holidays), in venue-local dates.
         holidays: Vec<NaiveDate>,
+        /// Early closes: (Date, local close time), e.g. 13:00 on day before July 4th.
+        early_closes: Vec<(NaiveDate, NaiveTime)>,
     },
 }
 
 impl TradingSession {
+    /// Standard US exchange holidays (NYSE / NASDAQ) for 2024-2026.
+    pub fn us_holidays() -> Vec<NaiveDate> {
+        vec![
+            // 2024
+            NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 1, 15).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 2, 19).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 3, 29).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 5, 27).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 6, 19).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 7, 4).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 9, 2).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 11, 28).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 12, 25).unwrap(),
+            // 2025
+            NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2025, 1, 20).unwrap(),
+            NaiveDate::from_ymd_opt(2025, 2, 17).unwrap(),
+            NaiveDate::from_ymd_opt(2025, 4, 18).unwrap(),
+            NaiveDate::from_ymd_opt(2025, 5, 26).unwrap(),
+            NaiveDate::from_ymd_opt(2025, 6, 19).unwrap(),
+            NaiveDate::from_ymd_opt(2025, 7, 4).unwrap(),
+            NaiveDate::from_ymd_opt(2025, 9, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2025, 11, 27).unwrap(),
+            NaiveDate::from_ymd_opt(2025, 12, 25).unwrap(),
+            // 2026
+            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 1, 19).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 2, 16).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 4, 3).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 5, 25).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 6, 19).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 7, 3).unwrap(), // Jul 4 on Sat
+            NaiveDate::from_ymd_opt(2026, 9, 7).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 11, 26).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 12, 25).unwrap(),
+        ]
+    }
+
+    /// Standard US exchange early closes (13:00 ET).
+    pub fn us_early_closes() -> Vec<(NaiveDate, NaiveTime)> {
+        let t13 = NaiveTime::from_hms_opt(13, 0, 0).unwrap();
+        vec![
+            // 2024
+            (NaiveDate::from_ymd_opt(2024, 7, 3).unwrap(), t13),
+            (NaiveDate::from_ymd_opt(2024, 11, 29).unwrap(), t13),
+            (NaiveDate::from_ymd_opt(2024, 12, 24).unwrap(), t13),
+            // 2025
+            (NaiveDate::from_ymd_opt(2025, 7, 3).unwrap(), t13),
+            (NaiveDate::from_ymd_opt(2025, 11, 28).unwrap(), t13),
+            (NaiveDate::from_ymd_opt(2025, 12, 24).unwrap(), t13),
+            // 2026
+            (NaiveDate::from_ymd_opt(2026, 11, 27).unwrap(), t13),
+            (NaiveDate::from_ymd_opt(2026, 12, 24).unwrap(), t13),
+        ]
+    }
+
+    /// Standard NSE cash equity holidays for 2024-2026.
+    pub fn nse_holidays() -> Vec<NaiveDate> {
+        vec![
+            // 2024
+            NaiveDate::from_ymd_opt(2024, 1, 22).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 1, 26).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 3, 8).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 3, 25).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 3, 29).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 4, 11).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 4, 17).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 5, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 5, 20).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 6, 17).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 7, 17).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 8, 15).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 10, 2).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 11, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 11, 15).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 11, 20).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 12, 25).unwrap(),
+            // 2025
+            NaiveDate::from_ymd_opt(2025, 2, 26).unwrap(),
+            NaiveDate::from_ymd_opt(2025, 3, 14).unwrap(),
+            NaiveDate::from_ymd_opt(2025, 3, 31).unwrap(),
+            NaiveDate::from_ymd_opt(2025, 4, 10).unwrap(),
+            NaiveDate::from_ymd_opt(2025, 4, 14).unwrap(),
+            NaiveDate::from_ymd_opt(2025, 4, 18).unwrap(),
+            NaiveDate::from_ymd_opt(2025, 5, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2025, 8, 15).unwrap(),
+            NaiveDate::from_ymd_opt(2025, 8, 27).unwrap(),
+            NaiveDate::from_ymd_opt(2025, 10, 2).unwrap(),
+            NaiveDate::from_ymd_opt(2025, 10, 21).unwrap(),
+            NaiveDate::from_ymd_opt(2025, 10, 22).unwrap(),
+            NaiveDate::from_ymd_opt(2025, 11, 5).unwrap(),
+            NaiveDate::from_ymd_opt(2025, 12, 25).unwrap(),
+            // 2026
+            NaiveDate::from_ymd_opt(2026, 1, 26).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 2, 16).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 3, 4).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 3, 20).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 4, 3).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 4, 14).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 5, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 5, 27).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 6, 26).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 8, 15).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 9, 15).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 10, 2).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 10, 20).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 11, 9).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 11, 24).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 12, 25).unwrap(),
+        ]
+    }
+
     /// US equities including Alpaca's extended and overnight sessions:
     /// overnight 20:00–04:00, pre-market 04:00–09:30, regular 09:30–16:00,
     /// after-hours 16:00–20:00 ET.
@@ -99,7 +214,8 @@ impl TradingSession {
                 // Wraps past midnight into the next calendar day.
                 SessionWindow::new((20, 0), (4, 0), SessionKind::Overnight),
             ],
-            holidays: Vec::new(),
+            holidays: Self::us_holidays(),
+            early_closes: Self::us_early_closes(),
         }
     }
 
@@ -116,7 +232,8 @@ impl TradingSession {
                 Weekday::Fri,
             ],
             windows: vec![SessionWindow::new((9, 30), (16, 0), SessionKind::Regular)],
-            holidays: Vec::new(),
+            holidays: Self::us_holidays(),
+            early_closes: Self::us_early_closes(),
         }
     }
 
@@ -132,7 +249,8 @@ impl TradingSession {
                 Weekday::Fri,
             ],
             windows: vec![SessionWindow::new((9, 15), (15, 30), SessionKind::Regular)],
-            holidays: Vec::new(),
+            holidays: Self::nse_holidays(),
+            early_closes: Vec::new(),
         }
     }
 
@@ -143,8 +261,98 @@ impl TradingSession {
         self
     }
 
+    pub fn with_early_closes(mut self, closes: Vec<(NaiveDate, NaiveTime)>) -> Self {
+        if let TradingSession::Windows { early_closes, .. } = &mut self {
+            *early_closes = closes;
+        }
+        self
+    }
+
     pub fn is_open_at(&self, at: DateTime<Utc>) -> bool {
         self.state_at(at).is_open()
+    }
+
+    /// Returns the exact close timestamp if currently in an open session.
+    pub fn current_session_close(&self, at: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        let TradingSession::Windows {
+            tz,
+            weekdays,
+            windows,
+            holidays,
+            early_closes,
+        } = self
+        else {
+            return None;
+        };
+
+        let local = at.with_timezone(tz);
+        let today = local.date_naive();
+        let time = local.time();
+
+        for window in windows {
+            let (session_date, effective_end) = if window.wraps_midnight() {
+                if time >= window.start {
+                    (today + Duration::days(1), window.end)
+                } else if time < window.end {
+                    (today, window.end)
+                } else {
+                    continue;
+                }
+            } else {
+                let end = early_closes
+                    .iter()
+                    .find(|(d, _)| *d == today)
+                    .map(|(_, t)| *t)
+                    .unwrap_or(window.end);
+                (today, end)
+            };
+
+            let inside = if window.wraps_midnight() {
+                time >= window.start || time < window.end
+            } else {
+                time >= window.start && time < effective_end
+            };
+
+            if inside && self.trades_on(session_date, weekdays, holidays) {
+                let close_naive = session_date.and_time(effective_end);
+                return tz
+                    .from_local_datetime(&close_naive)
+                    .earliest()
+                    .map(|dt| dt.with_timezone(&Utc));
+            }
+        }
+
+        None
+    }
+
+    /// Check if new intraday entries are permitted at the given time.
+    /// Returns true only if session is currently Regular open and session close is more than `cutoff_minutes` away.
+    pub fn entry_permitted_at(&self, at: DateTime<Utc>, cutoff_minutes: i64) -> bool {
+        match self.state_at(at) {
+            SessionState::Open(SessionKind::Regular) => {
+                if let Some(close_time) = self.current_session_close(at) {
+                    at + Duration::minutes(cutoff_minutes) <= close_time
+                } else {
+                    true
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Check if intraday square-off exit is due at the given time.
+    /// Returns true if the session is closed, or if regular session will close within `square_off_minutes`.
+    pub fn is_intraday_exit_due(&self, at: DateTime<Utc>, square_off_minutes: i64) -> bool {
+        match self.state_at(at) {
+            SessionState::Open(SessionKind::Regular) => {
+                if let Some(close_time) = self.current_session_close(at) {
+                    at + Duration::minutes(square_off_minutes) >= close_time
+                } else {
+                    false
+                }
+            }
+            _ => true,
+        }
     }
 
     /// Resolve the session state at an instant, and when it next opens if shut.
@@ -154,6 +362,7 @@ impl TradingSession {
             weekdays,
             windows,
             holidays,
+            early_closes,
         } = self
         else {
             return SessionState::Open(SessionKind::Regular);
@@ -164,22 +373,27 @@ impl TradingSession {
         let time = local.time();
 
         for window in windows {
-            // A wrapping window belongs to the trading day it *ends* on, not
-            // the one it starts on. Alpaca's overnight session runs Sunday
-            // 20:00 ET into Monday and Thursday 20:00 into Friday; there is no
-            // Friday-night session, because Saturday is not a trading day.
-            // Attaching it to the start date inverts exactly that: it opens
-            // Friday night into a shut venue and sits out Sunday night.
-            let (session_date, inside) = if window.wraps_midnight() {
+            let (session_date, effective_end) = if window.wraps_midnight() {
                 if time >= window.start {
-                    (today + Duration::days(1), true)
+                    (today + Duration::days(1), window.end)
                 } else if time < window.end {
-                    (today, true)
+                    (today, window.end)
                 } else {
-                    (today, false)
+                    (today, window.end)
                 }
             } else {
-                (today, time >= window.start && time < window.end)
+                let end = early_closes
+                    .iter()
+                    .find(|(d, _)| *d == today)
+                    .map(|(_, t)| *t)
+                    .unwrap_or(window.end);
+                (today, end)
+            };
+
+            let inside = if window.wraps_midnight() {
+                time >= window.start || time < window.end
+            } else {
+                time >= window.start && time < effective_end
             };
 
             if inside && self.trades_on(session_date, weekdays, holidays) {
@@ -204,6 +418,7 @@ impl TradingSession {
             weekdays,
             windows,
             holidays,
+            early_closes: _,
         } = self
         else {
             return at;

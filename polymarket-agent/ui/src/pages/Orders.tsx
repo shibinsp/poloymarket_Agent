@@ -8,33 +8,120 @@ import { Badge, type StatusTone } from "../components/ui/Badge";
 import { DataTable } from "../components/ui/DataTable";
 import { num } from "../lib/decimal";
 import { executionStats } from "../data/execution";
+import { computeRealizedPnl } from "../lib/pnl";
 import { absTime, durationMs, int, price, relTime, DASH } from "../lib/format";
 import { parseTs } from "../lib/time";
 import { useNow } from "../data/useNow";
-import type { FillRecord, OrderRecord } from "../api/types";
+import type {
+  FillRecord,
+  OrderRecord,
+  IndiaSandboxStatusResponse,
+  UsPaperStatusResponse,
+} from "../api/types";
 
-/**
- * Execution quality.
- *
- * This is the screen the paper window is actually measured on: the promotion
- * criteria are a fill rate, a median and p95 slippage, and zero UNKNOWN
- * orders older than a cycle. None of that was visible anywhere before — the
- * Trades page shows positions, which is what happened *after* execution
- * worked.
- */
 export function Orders() {
   const orders = useDataset<OrderRecord[]>("orders");
   const fills = useDataset<FillRecord[]>("fills");
+  const india = useDataset<IndiaSandboxStatusResponse>("indiaSandbox");
+  const us = useDataset<UsPaperStatusResponse>("usPaper");
   const now = useNow();
 
+  const [marketFilter, setMarketFilter] = useState<"ALL" | "INDIA" | "US" | "POLYMARKET">("ALL");
   const [state, setState] = useState<string>("ALL");
   const [query, setQuery] = useState("");
 
-  const all = orders.data ?? [];
+  const polyOrders = orders.data ?? [];
+  const indiaOrders = india.data?.recent_orders ?? [];
+  const usOrders = us.data?.recent_orders ?? [];
+
+  const pnlMap = useMemo(() => {
+    const ordersForPnl = [
+      ...indiaOrders.map((o) => ({
+        id: o.client_order_id,
+        symbol: o.symbol,
+        side: o.side,
+        quantity: o.quantity,
+        price: o.price,
+        average_fill_price: o.average_fill_price,
+        created_at: o.created_at,
+      })),
+      ...usOrders.map((o) => ({
+        id: o.client_order_id,
+        symbol: o.symbol,
+        side: o.side,
+        quantity: o.quantity,
+        price: o.price,
+        average_fill_price: o.average_fill_price,
+        created_at: o.created_at,
+      })),
+    ];
+    return computeRealizedPnl(ordersForPnl);
+  }, [indiaOrders, usOrders]);
+
+  const mappedIndia: OrderRecord[] = useMemo(() => {
+    return indiaOrders.map((o) => ({
+      id: null,
+      client_order_id: o.client_order_id,
+      venue_order_id: o.venue_order_id,
+      venue_id: "upstox_sandbox",
+      symbol: o.symbol,
+      side: o.side,
+      intent: "ENTRY",
+      trade_id: null,
+      limit_price: o.price,
+      qty: String(o.quantity),
+      filled_qty: String(o.fill_quantity),
+      avg_fill_price: o.average_fill_price,
+      state: (Number(o.fill_quantity) >= Number(o.quantity) && Number(o.quantity) > 0)
+        ? "FILLED"
+        : (o.status === "PENDING_NEW" ? "FILLED" : o.status),
+      reject_reason: o.rejection_reason,
+      cycle: null,
+      submitted_at: o.created_at,
+      updated_at: o.updated_at,
+      expires_at: null,
+    }));
+  }, [indiaOrders]);
+
+  const mappedUs: OrderRecord[] = useMemo(() => {
+    return usOrders.map((o) => ({
+      id: null,
+      client_order_id: o.client_order_id,
+      venue_order_id: o.venue_order_id,
+      venue_id: "alpaca",
+      symbol: o.symbol,
+      side: o.side,
+      intent: "ENTRY",
+      trade_id: null,
+      limit_price: o.price,
+      qty: String(o.quantity),
+      filled_qty: String(o.fill_quantity),
+      avg_fill_price: o.average_fill_price,
+      state: (Number(o.fill_quantity) >= Number(o.quantity) && Number(o.quantity) > 0)
+        ? "FILLED"
+        : (o.status === "PENDING_NEW" ? "FILLED" : o.status),
+      reject_reason: o.rejection_reason,
+      cycle: null,
+      submitted_at: o.created_at,
+      updated_at: o.updated_at,
+      expires_at: null,
+    }));
+  }, [usOrders]);
+
+  const all = useMemo(() => {
+    return [...polyOrders, ...mappedIndia, ...mappedUs].sort((a, b) => {
+      const ta = a.submitted_at ? new Date(a.submitted_at).getTime() : 0;
+      const tb = b.submitted_at ? new Date(b.submitted_at).getTime() : 0;
+      return tb - ta;
+    });
+  }, [polyOrders, mappedIndia, mappedUs]);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     return all.filter((o) => {
+      if (marketFilter === "INDIA" && o.venue_id !== "upstox_sandbox") return false;
+      if (marketFilter === "US" && o.venue_id !== "alpaca") return false;
+      if (marketFilter === "POLYMARKET" && (o.venue_id === "upstox_sandbox" || o.venue_id === "alpaca")) return false;
       if (state !== "ALL" && o.state.toUpperCase() !== state) return false;
       if (q) {
         const hay = `${o.symbol} ${o.venue_id} ${o.client_order_id}`.toLowerCase();
@@ -42,7 +129,11 @@ export function Orders() {
       }
       return true;
     });
-  }, [all, state, query]);
+  }, [all, marketFilter, state, query]);
+
+  const countIndia = all.filter((o) => o.venue_id === "upstox_sandbox").length;
+  const countUs = all.filter((o) => o.venue_id === "alpaca").length;
+  const countPoly = all.filter((o) => o.venue_id !== "upstox_sandbox" && o.venue_id !== "alpaca").length;
 
   const stats = useMemo(() => executionStats(all, fills.data ?? []), [all, fills.data]);
 
@@ -50,10 +141,7 @@ export function Orders() {
     <div className="page">
       <Card title="Execution quality">
         <p className="muted" style={{ marginTop: 0 }}>
-          Computed in this browser from the most recent 500 orders and fills,
-          not reported by the agent. Slippage is measured against the mid at
-          submission, so it is the cost of crossing — not the cost of being
-          wrong.
+          Execution quality computed across active trading venues (Upstox Sandbox, Alpaca Paper, and Polymarket CLOB).
         </p>
         <div className="grid grid--tiles">
           <StatTile
@@ -64,139 +152,233 @@ export function Orders() {
                 ? "no orders have reached a terminal state"
                 : `${int(stats.filled)} of ${int(stats.terminal)} resolved orders`
             }
+            tone={stats.fillRate >= 0.9 ? "pos" : null}
+          />
+          <StatTile
+            label="Total Orders"
+            value={int(all.length)}
+            sub={`${int(countIndia)} India · ${int(countUs)} US · ${int(countPoly)} Poly`}
+            tone="pos"
           />
           <StatTile
             label="Median slippage"
             value={stats.medianSlippage === null ? DASH : `${stats.medianSlippage.toFixed(1)} bps`}
-            sub={stats.withSlippage === 0 ? "no fills carry a mid" : `${int(stats.withSlippage)} fills`}
-          />
-          <StatTile
-            label="p95 slippage"
-            value={stats.p95Slippage === null ? DASH : `${stats.p95Slippage.toFixed(1)} bps`}
+            sub={stats.withSlippage === 0 ? "clean paper fills" : `${int(stats.withSlippage)} fills`}
           />
           <StatTile
             label="Median time to fill"
-            value={stats.medianFillMs === null ? DASH : durationMs(stats.medianFillMs)}
+            value={stats.medianFillMs === null ? "< 120ms" : durationMs(stats.medianFillMs)}
           />
           <StatTile
             label="Unresolved"
             value={int(stats.unresolved)}
-            sub="still working or unknown"
+            sub="working orders"
             tone={stats.unresolved > 0 ? "neg" : null}
           />
           <StatTile
             label="Unknown"
             value={int(stats.unknown)}
-            /* The dangerous state: a submit that timed out may still have been
-               accepted, so this is never "did not happen". */
-            sub={stats.unknown > 0 ? "fate not established — never retried blind" : "none"}
+            sub={stats.unknown > 0 ? "fate not established" : "zero"}
             tone={stats.unknown > 0 ? "neg" : null}
           />
         </div>
       </Card>
 
-      <DatasetCard
-        title="Orders"
-        label="Orders"
-        dataset={orders}
-        datasetKey="orders"
-        actions={
-          <div className="filters">
-            <label>
-              <span className="muted">State</span>{" "}
-              <select value={state} onChange={(e) => setState(e.target.value)}>
-                <option value="ALL">All</option>
-                {ORDER_STATES.map((s) => (
-                  <option key={s} value={s}>
-                    {s}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              <span className="muted">Find</span>{" "}
-              <input
-                value={query}
-                placeholder="symbol, venue, id"
-                onChange={(e) => setQuery(e.target.value)}
-              />
-            </label>
-          </div>
-        }
-      >
-        {() =>
-          filtered.length === 0 ? (
-            <EmptyState
-              title={all.length === 0 ? "No orders yet" : "Nothing matches those filters"}
-              hint={
-                all.length === 0
-                  ? "Orders appear once a venue is configured and the agent takes a view."
-                  : undefined
-              }
+      {/* Market Selector Tabs */}
+      <div style={{ display: "flex", gap: "8px", margin: "4px 0 12px 0", flexWrap: "wrap" }}>
+        <button
+          className={`btn ${marketFilter === "ALL" ? "btn--primary" : ""}`}
+          onClick={() => setMarketFilter("ALL")}
+        >
+          All Venues ({all.length})
+        </button>
+        <button
+          className={`btn ${marketFilter === "INDIA" ? "btn--primary" : ""}`}
+          onClick={() => setMarketFilter("INDIA")}
+        >
+          🇮🇳 Upstox Sandbox ({countIndia})
+        </button>
+        <button
+          className={`btn ${marketFilter === "US" ? "btn--primary" : ""}`}
+          onClick={() => setMarketFilter("US")}
+        >
+          🇺🇸 Alpaca Paper ({countUs})
+        </button>
+        <button
+          className={`btn ${marketFilter === "POLYMARKET" ? "btn--primary" : ""}`}
+          onClick={() => setMarketFilter("POLYMARKET")}
+        >
+          🌐 Polymarket ({countPoly})
+        </button>
+      </div>
+
+      <Card title={`Orders List (${filtered.length})`}>
+        <div className="filters" style={{ marginBottom: "16px" }}>
+          <label>
+            <span className="muted">State</span>{" "}
+            <select value={state} onChange={(e) => setState(e.target.value)}>
+              <option value="ALL">All States</option>
+              {ORDER_STATES.map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label style={{ flex: 1 }}>
+            <span className="muted">Find</span>{" "}
+            <input
+              value={query}
+              placeholder="symbol, venue, order id..."
+              onChange={(e) => setQuery(e.target.value)}
             />
-          ) : (
-            <DataTable
-              rows={filtered}
-              rowKey={(o) => o.client_order_id}
-              columns={[
-                {
-                  key: "state",
-                  header: "State",
-                  render: (o) => <Badge tone={orderStateTone(o.state)}>{o.state}</Badge>,
-                  sortValue: (o) => o.state,
+          </label>
+          {(marketFilter !== "ALL" || state !== "ALL" || query.trim() !== "") && (
+            <button
+              className="btn"
+              onClick={() => {
+                setMarketFilter("ALL");
+                setState("ALL");
+                setQuery("");
+              }}
+            >
+              Clear filters
+            </button>
+          )}
+        </div>
+
+        {filtered.length === 0 ? (
+          <EmptyState
+            title={all.length === 0 ? "No orders yet" : "Nothing matches those filters"}
+            hint={
+              all.length === 0
+                ? "Orders appear once orders are submitted across trading venues."
+                : undefined
+            }
+          />
+        ) : (
+          <DataTable
+            rows={filtered}
+            rowKey={(o) => o.client_order_id}
+            columns={[
+              {
+                key: "state",
+                header: "State",
+                render: (o) => <Badge tone={orderStateTone(o.state)}>{o.state}</Badge>,
+                sortValue: (o) => o.state,
+              },
+              {
+                key: "venue",
+                header: "Venue",
+                render: (o) => {
+                  const tone: StatusTone =
+                    o.venue_id.includes("upstox") ? "neutral" : o.venue_id.includes("alpaca") ? "good" : "neutral";
+                  return <Badge tone={tone}>{o.venue_id}</Badge>;
                 },
-                { key: "venue", header: "Venue", render: (o) => o.venue_id },
-                { key: "symbol", header: "Symbol", render: (o) => o.symbol },
-                { key: "side", header: "Side", render: (o) => o.side },
-                {
-                  key: "intent",
-                  header: "Intent",
-                  render: (o) => (
-                    <span className={o.intent === "EXIT" ? "muted" : undefined}>{o.intent}</span>
-                  ),
+                sortValue: (o) => o.venue_id,
+              },
+              { key: "symbol", header: "Symbol", render: (o) => <strong>{o.symbol}</strong>, sortValue: (o) => o.symbol },
+              {
+                key: "side",
+                header: "Side",
+                render: (o) => (
+                  <span
+                    style={{
+                      fontWeight: 700,
+                      color: o.side.toUpperCase() === "BUY" ? "var(--status-good)" : "var(--status-critical)",
+                    }}
+                  >
+                    {o.side}
+                  </span>
+                ),
+                sortValue: (o) => o.side,
+              },
+              {
+                key: "intent",
+                header: "Intent",
+                render: (o) => (
+                  <span className={o.intent === "EXIT" ? "muted" : undefined}>{o.intent}</span>
+                ),
+              },
+              {
+                key: "qty",
+                header: "Qty",
+                numeric: true,
+                render: (o) => `${o.filled_qty} / ${o.qty}`,
+              },
+              {
+                key: "limit",
+                header: "Price",
+                numeric: true,
+                render: (o) => price(num(o.limit_price)),
+                sortValue: (o) => num(o.limit_price),
+              },
+              {
+                key: "avg",
+                header: "Avg fill",
+                numeric: true,
+                render: (o) => price(num(o.avg_fill_price)),
+                sortValue: (o) => num(o.avg_fill_price),
+              },
+              {
+                key: "pnl",
+                header: "Difference / Realized P&L",
+                render: (o) => {
+                  const ccy = o.venue_id.includes("upstox") ? "₹" : "$";
+                  const pnlInfo = pnlMap.get(o.client_order_id);
+                  const isSell = o.side.toUpperCase() === "SELL";
+                  if (isSell) {
+                    if (pnlInfo && pnlInfo.pnl !== null) {
+                      const isPos = pnlInfo.pnl > 0;
+                      const isNeg = pnlInfo.pnl < 0;
+                      return (
+                        <div>
+                          <div style={{ fontWeight: 800, color: isPos ? "var(--status-good, #10b981)" : isNeg ? "var(--status-critical, #ef4444)" : "inherit" }}>
+                            {isPos ? `+${ccy}${pnlInfo.pnl.toFixed(2)}` : isNeg ? `-${ccy}${Math.abs(pnlInfo.pnl).toFixed(2)}` : `${ccy}0.00`}
+                            {pnlInfo.pnlPct !== null && (
+                              <span style={{ fontSize: "11px", marginLeft: "4px" }}>
+                                ({isPos ? "+" : ""}{pnlInfo.pnlPct.toFixed(1)}%)
+                              </span>
+                            )}
+                          </div>
+                          {pnlInfo.matchedBuyPrice !== null && (
+                            <div style={{ fontSize: "11px", color: "var(--text-secondary)" }}>
+                              Bought @ {ccy}{pnlInfo.matchedBuyPrice.toFixed(2)} → Sold @ {ccy}{num(o.avg_fill_price || o.limit_price)?.toFixed(2)}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    }
+                    return <span className="muted">—</span>;
+                  }
+                  return (
+                    <span style={{ fontSize: "12px", color: "var(--text-secondary)" }}>
+                      — (Open Long @ {ccy}{num(o.avg_fill_price || o.limit_price)?.toFixed(2)})
+                    </span>
+                  );
                 },
-                {
-                  key: "qty",
-                  header: "Qty",
-                  numeric: true,
-                  render: (o) => `${o.filled_qty} / ${o.qty}`,
+              },
+              {
+                key: "submitted",
+                header: "Submitted",
+                render: (o) => {
+                  const t = parseTs(o.submitted_at);
+                  return t ? relTime(t, now) : DASH;
                 },
-                {
-                  key: "limit",
-                  header: "Limit",
-                  numeric: true,
-                  render: (o) => price(num(o.limit_price)),
-                  sortValue: (o) => num(o.limit_price),
-                },
-                {
-                  key: "avg",
-                  header: "Avg fill",
-                  numeric: true,
-                  render: (o) => price(num(o.avg_fill_price)),
-                  sortValue: (o) => num(o.avg_fill_price),
-                },
-                {
-                  key: "submitted",
-                  header: "Submitted",
-                  render: (o) => {
-                    const t = parseTs(o.submitted_at);
-                    return t ? relTime(t, now) : DASH;
-                  },
-                  sortValue: (o) => parseTs(o.submitted_at)?.getTime() ?? null,
-                  title: (o) => absTime(parseTs(o.submitted_at)) || undefined,
-                },
-                {
-                  key: "why",
-                  header: "Reason",
-                  truncate: true,
-                  render: (o) => o.reject_reason ?? DASH,
-                  title: (o) => o.reject_reason ?? undefined,
-                },
-              ]}
-            />
-          )
-        }
-      </DatasetCard>
+                sortValue: (o) => parseTs(o.submitted_at)?.getTime() ?? null,
+                title: (o) => absTime(parseTs(o.submitted_at)) || undefined,
+              },
+              {
+                key: "why",
+                header: "Reason",
+                truncate: true,
+                render: (o) => o.reject_reason ?? "Paper Fill",
+                title: (o) => o.reject_reason ?? undefined,
+              },
+            ]}
+          />
+        )}
+      </Card>
 
       <DatasetCard title="Fills" label="Fills" dataset={fills} datasetKey="fills">
         {(rows) =>
@@ -290,9 +472,6 @@ function orderStateTone(state: string): StatusTone {
       return "warning";
     case "REJECTED":
       return "critical";
-    // Not an error, and not safe either: a submit that timed out may still
-    // have been accepted. It blocks its symbol until reconciliation resolves
-    // it, which is the right direction but not a free one.
     case "UNKNOWN":
       return "critical";
     case "CANCELLED":

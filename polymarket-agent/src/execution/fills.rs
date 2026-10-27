@@ -27,6 +27,7 @@ pub async fn record_trade(
                 direction: order.side.to_string(),
                 entry_price: execution.price.to_string(),
                 size: execution.size.to_string(),
+                quantity: None,
                 edge_at_entry: order.edge.to_string(),
                 claude_fair_value: order.fair_value.to_string(),
                 confidence: order.confidence.to_string(),
@@ -70,6 +71,36 @@ pub async fn open_trade_count(store: &Store) -> Result<usize> {
     Ok(trades.len())
 }
 
+/// Calculate dollar exposure for an open trade.
+///
+/// For continuous-asset positions (equities/crypto), `quantity` is the units of asset held
+/// (e.g. 0.05 ETH or 0.003 BTC) and `entry_price` is the unit price (e.g. $2,356 or $80,750).
+/// Multiplying unit price by cash notional would wildly inflate exposure.
+/// If `quantity` is recorded, exposure is `quantity * entry_price`.
+///
+/// For legacy Polymarket binary prediction markets, `size` was the share count,
+/// and `entry_price` is the per-share price (<= $1.00). Exposure is `price * size`.
+///
+/// If `quantity` is not available:
+/// - If `entry_price <= 1.0`, it is treated as a prediction market outcome: `price * size`.
+/// - If `entry_price > 1.0`, it is a continuous asset where `size` holds the cash notional in dollars.
+pub fn calculate_trade_exposure(
+    entry_price: Decimal,
+    size: Decimal,
+    quantity: Option<Decimal>,
+) -> Decimal {
+    if let Some(qty) = quantity {
+        if qty > Decimal::ZERO {
+            return qty * entry_price;
+        }
+    }
+    if entry_price <= Decimal::ONE {
+        entry_price * size
+    } else {
+        size
+    }
+}
+
 /// Calculate total unrealized exposure from open trades.
 pub async fn unrealized_exposure(store: &Store) -> Result<Decimal> {
     let trades = store.get_open_trades().await?;
@@ -80,7 +111,11 @@ pub async fn unrealized_exposure(store: &Store) -> Result<Decimal> {
             trade.size.parse::<Decimal>(),
         ) {
             (Ok(price), Ok(size)) => {
-                total += price * size;
+                let qty = trade
+                    .quantity
+                    .as_deref()
+                    .and_then(|q| q.parse::<Decimal>().ok());
+                total += calculate_trade_exposure(price, size, qty);
             }
             (Err(e), _) => {
                 warn!(
@@ -181,6 +216,7 @@ mod tests {
             direction: "YES".to_string(),
             entry_price: "0.60".to_string(),
             size: "10".to_string(),
+            quantity: None,
             edge_at_entry: "0.10".to_string(),
             claude_fair_value: "0.70".to_string(),
             confidence: "0.85".to_string(),
@@ -199,6 +235,7 @@ mod tests {
             direction: "NO".to_string(),
             entry_price: "0.40".to_string(),
             size: "20".to_string(),
+            quantity: None,
             edge_at_entry: "0.12".to_string(),
             claude_fair_value: "0.30".to_string(),
             confidence: "0.80".to_string(),
@@ -216,5 +253,29 @@ mod tests {
         let exposure = unrealized_exposure(&store).await.unwrap();
         // 0.60 * 10 + 0.40 * 20 = 6 + 8 = 14
         assert_eq!(exposure, dec!(14));
+
+        let trade3 = TradeRecord {
+            id: None,
+            cycle: 1,
+            market_id: "ETH/USD".to_string(),
+            market_question: Some("Ethereum".to_string()),
+            direction: "BUY".to_string(),
+            entry_price: "2000".to_string(),
+            size: "100".to_string(),
+            quantity: Some("0.05".to_string()),
+            edge_at_entry: "0.05".to_string(),
+            claude_fair_value: "0.50".to_string(),
+            confidence: "0.80".to_string(),
+            kelly_raw: "0".to_string(),
+            kelly_adjusted: "0".to_string(),
+            status: "OPEN".to_string(),
+            pnl: None,
+            created_at: None,
+            resolved_at: None,
+        };
+        store.insert_trade(&trade3).await.unwrap();
+        let exposure2 = unrealized_exposure(&store).await.unwrap();
+        // 14 + (0.05 * 2000) = 14 + 100 = 114
+        assert_eq!(exposure2, dec!(114));
     }
 }

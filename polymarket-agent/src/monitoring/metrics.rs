@@ -128,7 +128,12 @@ pub async fn compute_metrics(
             Decimal::from_str(&trade.entry_price),
             Decimal::from_str(&trade.size),
         ) {
-            unrealized_exposure += price * size;
+            let qty = trade
+                .quantity
+                .as_deref()
+                .and_then(|q| Decimal::from_str(q).ok());
+            unrealized_exposure +=
+                crate::execution::fills::calculate_trade_exposure(price, size, qty);
         }
     }
 
@@ -399,6 +404,7 @@ mod tests {
             direction: "YES".to_string(),
             entry_price: "0.60".to_string(),
             size: "10".to_string(),
+            quantity: None,
             edge_at_entry: "0.10".to_string(),
             claude_fair_value: "0.70".to_string(),
             confidence: "0.85".to_string(),

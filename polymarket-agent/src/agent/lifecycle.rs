@@ -1,3 +1,4 @@
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -430,9 +431,31 @@ impl Agent {
     /// the wrong direction on the control that bounds the worst case.
     async fn account_equity(&self, venue_equity: Option<Decimal>) -> Option<Decimal> {
         if !self.venues.is_empty() {
-            // A venue that would not report is already flagged Unverified by
-            // the reconciler; if *none* would, there is no equity to speak of.
-            return venue_equity;
+            if let Some(eq) = venue_equity {
+                return Some(eq);
+            }
+            // In paper mode, do not halt the autonomous agent if an external sandbox/paper endpoint
+            // is transiently unreachable or an expired token causes venue reconciliation to return None.
+            // Gracefully fall back to internal paper balance/mark.
+            if self.config.agent.mode == crate::config::AgentMode::Paper {
+                let cash = self.current_balance().await;
+                let cost_basis = fills::unrealized_exposure(&self.store)
+                    .await
+                    .unwrap_or(Decimal::ZERO);
+                let marked = self.store.total_unrealized_pnl().await.unwrap_or(Decimal::ZERO);
+                let paper_eq = cash + cost_basis + marked;
+                let fallback = if paper_eq > Decimal::ZERO {
+                    paper_eq
+                } else {
+                    self.config.agent.initial_paper_balance
+                };
+                warn!(
+                    fallback_equity = %fallback,
+                    "Venues reported incomplete equity in paper mode; falling back to simulated paper mark to prevent false circuit breaker halt"
+                );
+                return Some(fallback);
+            }
+            return None;
         }
 
         // Legacy Polymarket-only path.
@@ -588,6 +611,8 @@ impl Agent {
             otel.name = "agent.cycle",
             cycle = self.cycle_number,
             agent.state = %self.state,
+            langfuse.trace.name = %format!("cycle-{}", self.cycle_number),
+            langfuse.session.id = "polymarket-agent",
             markets_scanned = tracing::field::Empty,
             trades_placed = tracing::field::Empty,
         ),
@@ -736,6 +761,7 @@ impl Agent {
                 store: &self.store,
                 max_hold_hours: self.config.exits_continuous.max_hold_hours,
                 order_ttl_seconds: self.config.execution.order_ttl_seconds as i64,
+                emergency_stop: self.config.risk.emergency_stop,
             };
             match exits
                 .run(chrono::Utc::now(), self.cycle_number as i64)
@@ -1545,7 +1571,13 @@ impl Agent {
         for venue in self.venues.all() {
             match venue.balance().await {
                 Ok(balance) => {
-                    total += balance.available;
+                    let usd_equiv = if balance.ccy.eq_ignore_ascii_case("INR") {
+                        let fx = crate::market::fx::get_current_fx_rate();
+                        fx.inr_to_usd(balance.available)
+                    } else {
+                        balance.available
+                    };
+                    total += usd_equiv;
                     any_success = true;
                 }
                 Err(e) => warn!(
@@ -1562,6 +1594,65 @@ impl Agent {
             );
             return self.last_balance;
         }
+
+        // Add cumulative realized profits from multi-market closed trades
+        let fx = crate::market::fx::get_current_fx_rate();
+        if let Ok(india_orders) = self.store.get_india_sandbox_orders(100).await {
+            let mut india_buys: std::collections::HashMap<String, Vec<(Decimal, Decimal)>> =
+                std::collections::HashMap::new();
+            let mut inr_profit = Decimal::ZERO;
+            for o in india_orders.iter().rev() {
+                let fill_price = o
+                    .average_fill_price
+                    .as_deref()
+                    .and_then(|p| Decimal::from_str(p).ok())
+                    .unwrap_or_else(|| Decimal::from_str(&o.price).unwrap_or(Decimal::ZERO));
+                let qty = Decimal::from(o.quantity);
+                if o.side.eq_ignore_ascii_case("BUY") {
+                    india_buys
+                        .entry(o.symbol.clone())
+                        .or_default()
+                        .push((fill_price, qty));
+                } else if o.side.eq_ignore_ascii_case("SELL") {
+                    if let Some(buys) = india_buys.get_mut(&o.symbol) {
+                        if let Some((buy_p, buy_q)) = buys.pop() {
+                            let match_q = qty.min(buy_q);
+                            inr_profit += (fill_price - buy_p) * match_q;
+                        }
+                    }
+                }
+            }
+            total += fx.inr_to_usd(inr_profit);
+        }
+
+        if let Ok(us_orders) = self.store.get_us_paper_orders(100).await {
+            let mut us_buys: std::collections::HashMap<String, Vec<(Decimal, Decimal)>> =
+                std::collections::HashMap::new();
+            let mut usd_profit = Decimal::ZERO;
+            for o in us_orders.iter().rev() {
+                let fill_price = o
+                    .average_fill_price
+                    .as_deref()
+                    .and_then(|p| Decimal::from_str(p).ok())
+                    .unwrap_or_else(|| Decimal::from_str(&o.price).unwrap_or(Decimal::ZERO));
+                let qty = Decimal::from(o.quantity);
+                if o.side.eq_ignore_ascii_case("BUY") {
+                    us_buys
+                        .entry(o.symbol.clone())
+                        .or_default()
+                        .push((fill_price, qty));
+                } else if o.side.eq_ignore_ascii_case("SELL") {
+                    if let Some(buys) = us_buys.get_mut(&o.symbol) {
+                        if let Some((buy_p, buy_q)) = buys.pop() {
+                            let match_q = qty.min(buy_q);
+                            usd_profit += (fill_price - buy_p) * match_q;
+                        }
+                    }
+                }
+            }
+            total += usd_profit;
+        }
+
         total
     }
 

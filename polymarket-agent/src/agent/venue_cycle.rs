@@ -104,7 +104,13 @@ impl VenueCycle<'_> {
     /// the Polymarket wallet.
     #[instrument(
         skip(self),
-        fields(otel.name = "venue.cycle", cycle = cycle, state = %state),
+        fields(
+            otel.name = "venue.cycle",
+            cycle = cycle,
+            state = %state,
+            langfuse.trace.name = %format!("venue-cycle-{cycle}"),
+            langfuse.session.id = "polymarket-agent",
+        ),
         err
     )]
     pub async fn run(
@@ -114,6 +120,11 @@ impl VenueCycle<'_> {
         cycle: i64,
     ) -> Result<CycleOutcome> {
         let mut outcome = CycleOutcome::default();
+
+        if self.config.risk.emergency_stop {
+            warn!("Account-wide emergency stop is active — blocking all new trade entries");
+            return Ok(outcome);
+        }
 
         if self.llm.is_none() {
             #[cfg(test)]
@@ -176,15 +187,50 @@ impl VenueCycle<'_> {
                 continue;
             };
 
+            // Intraday equity session cutoff check: block new entries 30 mins before market close
+            if matches!(instrument.asset_class, AssetClass::Equity)
+                && !venue.session().entry_permitted_at(ctx.now, 30)
+            {
+                info!(
+                    instrument = %instrument.id,
+                    venue = %venue.id(),
+                    "Session entry cutoff active (within 30 mins of session close or closed) — skipping entry"
+                );
+                continue;
+            }
+
             // Size against the account that will actually hold the position.
             // This used to be handed the Polymarket wallet balance for every
             // venue, so an Alpaca order was sized from USDC on Polygon: $6
             // orders against a $30k account, or orders the venue rejects for
             // insufficient buying power. A venue that will not report its
             // balance is skipped rather than sized from someone else's.
-            let bankroll = match self.venue_bankroll(venue, &mut balances).await {
+            let reported_bankroll = match self.venue_bankroll(venue, &mut balances).await {
                 Some(b) => b,
                 None => continue,
+            };
+            if reported_bankroll <= Decimal::ZERO {
+                continue;
+            }
+
+            // Respect market-specific capital allocations if configured
+            let bankroll = match instrument.asset_class {
+                AssetClass::Equity => {
+                    if venue.id().as_str().contains("upstox") || instrument.quote_ccy == "INR" {
+                        self.config
+                            .risk
+                            .india_capital_allocation_inr
+                            .unwrap_or(reported_bankroll)
+                            .min(reported_bankroll)
+                    } else {
+                        self.config
+                            .risk
+                            .us_capital_allocation_usd
+                            .unwrap_or(reported_bankroll)
+                            .min(reported_bankroll)
+                    }
+                }
+                _ => reported_bankroll,
             };
             if bankroll <= Decimal::ZERO {
                 continue;
@@ -231,6 +277,9 @@ impl VenueCycle<'_> {
                     "Evaluation failed — skipping this instrument"
                 ),
             }
+
+            // Brief throttle between LLM queries to prevent hitting provider 429 rate limits
+            tokio::time::sleep(tokio::time::Duration::from_millis(800)).await;
 
             // Respect the per-cycle order cap so one cycle can't open the
             // whole book.
@@ -440,14 +489,29 @@ impl VenueCycle<'_> {
             Err(e) => {
                 status_handle.record("otel.status_code", "ERROR");
                 status_handle.record("otel.status_message", tracing::field::display(&e));
+                let err_str = e.to_string();
+                let is_deterministic = err_str.contains("HTTP 4")
+                    || err_str.contains("rejected")
+                    || err_str.contains("below the venue's minimum")
+                    || err_str.contains("rounds to zero")
+                    || err_str.contains("insufficient qty")
+                    || err_str.contains("insufficient balance")
+                    || err_str.contains("not tradable");
+
+                let final_state = if is_deterministic {
+                    "REJECTED"
+                } else {
+                    "UNKNOWN"
+                };
+
                 self.store
                     .update_order_state(
                         &client_order_id,
-                        "UNKNOWN",
+                        final_state,
                         None,
                         "0",
                         None,
-                        Some(&e.to_string()),
+                        Some(&err_str),
                     )
                     .await?;
                 Err(e)
@@ -698,19 +762,19 @@ fn generate_algorithmic_view(
 
     // 3. Trend Alignment & Quality Check
     let is_uptrend = fast_sma > med_sma && last_close >= med_sma;
-    let is_healthy_rsi = rsi >= dec!(40) && rsi <= dec!(68);
-    let last_candle_bullish = candles[n - 1].close >= candles[n - 1].open;
+    let is_healthy_rsi = rsi >= dec!(38) && rsi <= dec!(72);
+    let trend_favorable = is_uptrend || (last_close >= fast_sma && rsi > dec!(50));
 
-    if is_uptrend && is_healthy_rsi && last_candle_bullish {
+    if trend_favorable && is_healthy_rsi {
         // High Probability Long Setup
-        // Realistic target: +2.0% take profit, -1.2% stop loss (1.67 : 1 reward/risk)
-        let invalidation_price = Some(quote.mid * dec!(0.988)); // 1.2% stop loss
-        let target_price = Some(quote.mid * dec!(1.020)); // 2.0% take profit
+        // Realistic target: +2.5% take profit, -1.5% stop loss (1.67 : 1 reward/risk)
+        let invalidation_price = Some(quote.mid * dec!(0.985)); // 1.5% stop loss
+        let target_price = Some(quote.mid * dec!(1.025)); // 2.5% take profit
 
         DirectionalView {
             direction: Direction::Long,
             p_up: dec!(0.68),
-            expected_return_pct: dec!(0.025), // 2.5% expected move
+            expected_return_pct: dec!(0.030), // 3.0% expected move
             horizon_hours: 24,
             confidence: dec!(0.80),
             invalidation_price,
@@ -726,21 +790,18 @@ fn generate_algorithmic_view(
             key_factors: vec![
                 "trend_alignment".to_string(),
                 "healthy_rsi".to_string(),
-                "bullish_candle".to_string(),
             ],
             data_quality: DataQuality::High,
         }
     } else {
         // Filter out bad trades! Protect capital!
-        let reason = if !is_uptrend {
+        let reason = if !trend_favorable {
             format!(
                 "Downtrend or flat structure (Close: {}, SMA5: {:.2}, SMA14: {:.2})",
                 last_close, fast_sma, med_sma
             )
-        } else if !is_healthy_rsi {
-            format!("RSI ({:.1}) outside optimal range (40-68)", rsi)
         } else {
-            "Waiting for bullish confirmation candle".to_string()
+            format!("RSI ({:.1}) outside optimal range (38-72)", rsi)
         };
 
         DirectionalView {

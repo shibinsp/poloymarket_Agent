@@ -23,6 +23,8 @@ import {
   fetchRisk,
   fetchTrades,
   fetchTradesAll,
+  fetchIndiaSandbox,
+  fetchUsPaper,
   type DatasetKey,
 } from "../api/endpoints";
 import { settings } from "./settings";
@@ -54,6 +56,8 @@ const FETCHERS: Record<DatasetKey, Fetcher> = {
   equity: fetchEquity,
   reconciliation: fetchReconciliation,
   risk: fetchRisk,
+  indiaSandbox: fetchIndiaSandbox,
+  usPaper: fetchUsPaper,
 };
 
 function blank(): DatasetState {

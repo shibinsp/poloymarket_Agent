@@ -9,5 +9,10 @@
 # Temporary files
 *.tmp
 
+# Large archives and text dumps
+*.zip
+all_code.txt
+
 # macOS
 .DS_Store
+

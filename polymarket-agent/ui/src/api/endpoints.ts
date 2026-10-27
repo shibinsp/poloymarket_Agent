@@ -8,11 +8,13 @@ import type {
   FillRecord,
   HaltResponse,
   Health,
+  IndiaSandboxStatusResponse,
   Metrics,
   OrderRecord,
   ReconciliationRun,
   RiskStatus,
   TradeRecord,
+  UsPaperStatusResponse,
 } from "./types";
 
 export const DATASET_KEYS = [
@@ -28,6 +30,8 @@ export const DATASET_KEYS = [
   "equity",
   "reconciliation",
   "risk",
+  "indiaSandbox",
+  "usPaper",
 ] as const;
 export type DatasetKey = (typeof DATASET_KEYS)[number];
 
@@ -45,6 +49,8 @@ export const DATASET_LABELS: Record<DatasetKey, string> = {
   equity: "Daily equity",
   reconciliation: "Reconciliation",
   risk: "Risk limits",
+  indiaSandbox: "India Sandbox",
+  usPaper: "US Paper",
 };
 
 export const DATASET_PATHS: Record<DatasetKey, string> = {
@@ -60,6 +66,8 @@ export const DATASET_PATHS: Record<DatasetKey, string> = {
   equity: "/api/equity",
   reconciliation: "/api/reconciliation",
   risk: "/api/risk",
+  indiaSandbox: "/api/india/sandbox/status",
+  usPaper: "/api/us/paper/status",
 };
 
 /**
@@ -85,6 +93,8 @@ export const DATASET_INTERVAL_MULTIPLIER: Record<DatasetKey, number> = {
   // One row per day and one per reconciliation pass; neither moves fast.
   equity: 4,
   reconciliation: 4,
+  indiaSandbox: 1,
+  usPaper: 1,
 };
 
 export function fetchHealth(signal?: AbortSignal): Promise<ApiResult<Health>> {
@@ -207,3 +217,24 @@ export function fetchCosts(
     signal,
   });
 }
+
+export function fetchIndiaSandbox(
+  signal?: AbortSignal,
+): Promise<ApiResult<IndiaSandboxStatusResponse>> {
+  return get({
+    path: DATASET_PATHS.indiaSandbox,
+    narrow: asObject<IndiaSandboxStatusResponse>,
+    signal,
+  });
+}
+
+export function fetchUsPaper(
+  signal?: AbortSignal,
+): Promise<ApiResult<UsPaperStatusResponse>> {
+  return get({
+    path: DATASET_PATHS.usPaper,
+    narrow: asObject<UsPaperStatusResponse>,
+    signal,
+  });
+}
+

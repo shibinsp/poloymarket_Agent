@@ -29,6 +29,8 @@ pub enum ExitReason {
     StopLoss,
     TakeProfit,
     MaxHold,
+    SessionClose,
+    EmergencyStop,
 }
 
 impl ExitReason {
@@ -37,6 +39,8 @@ impl ExitReason {
             ExitReason::StopLoss => "STOP_LOSS",
             ExitReason::TakeProfit => "TAKE_PROFIT",
             ExitReason::MaxHold => "MAX_HOLD",
+            ExitReason::SessionClose => "SESSION_CLOSE",
+            ExitReason::EmergencyStop => "EMERGENCY_STOP",
         }
     }
 }
@@ -47,10 +51,13 @@ pub struct ExitRules {
     pub stop_price: Option<Decimal>,
     pub target_price: Option<Decimal>,
     pub max_hold_until: Option<DateTime<Utc>>,
+    pub session_close_due: bool,
+    pub emergency_stop: bool,
 }
 
 /// Decide whether an open long should be closed at the current mark.
 ///
+/// Emergency stop and session close take precedence over price boundaries.
 /// Stop is checked before target: if a bar straddles both, assuming the good
 /// outcome would flatter every backtest and every logged P&L.
 pub fn evaluate_exit(
@@ -58,6 +65,12 @@ pub fn evaluate_exit(
     now: DateTime<Utc>,
     rules: &ExitRules,
 ) -> Option<ExitReason> {
+    if rules.emergency_stop {
+        return Some(ExitReason::EmergencyStop);
+    }
+    if rules.session_close_due {
+        return Some(ExitReason::SessionClose);
+    }
     if let Some(stop) = rules.stop_price {
         if mark_price <= stop {
             return Some(ExitReason::StopLoss);
@@ -90,6 +103,8 @@ pub struct VenueExits<'a> {
     pub max_hold_hours: i64,
     /// How long an exit order may rest before reconciliation cancels it.
     pub order_ttl_seconds: i64,
+    /// Account-wide emergency stop flag.
+    pub emergency_stop: bool,
 }
 
 impl VenueExits<'_> {
@@ -195,12 +210,17 @@ impl VenueExits<'_> {
             .mark_trade(trade.id, &mark.to_string(), &pnl.to_string(), now)
             .await?;
 
+        let is_equity = trade.asset_class.eq_ignore_ascii_case("equity");
+        let session_close_due = is_equity && venue.session().is_intraday_exit_due(now, 15);
+
         let rules = ExitRules {
             stop_price: trade.stop_price,
             target_price: trade.target_price,
             max_hold_until: trade
                 .opened_at
                 .map(|opened| opened + Duration::hours(self.max_hold_hours)),
+            session_close_due,
+            emergency_stop: self.emergency_stop,
         };
 
         let Some(reason) = evaluate_exit(mark, now, &rules) else {
@@ -248,6 +268,51 @@ impl VenueExits<'_> {
         cycle: i64,
         instruments: &mut HashMap<String, Vec<Instrument>>,
     ) -> Result<()> {
+        // Query venue positions to size exit using reconciled available positions if reported
+        let exit_qty = match venue.positions().await {
+            Ok(pos_list) => {
+                if let Some(pos) = pos_list
+                    .iter()
+                    .find(|p| p.instrument.symbol.eq_ignore_ascii_case(&trade.symbol))
+                {
+                    if pos.qty > Decimal::ZERO {
+                        qty.min(pos.qty)
+                    } else {
+                        // Venue explicitly returned this symbol with 0 quantity (already closed/liquidated)
+                        warn!(
+                            trade_id = trade.id,
+                            symbol = %trade.symbol,
+                            "Venue explicitly reports 0 position for symbol — closing local trade record"
+                        );
+                        let entry = trade.avg_fill_price.unwrap_or(trade.entry_price);
+                        let realized = unrealized_pnl(entry, mark, qty);
+                        self.store
+                            .close_trade(
+                                trade.id,
+                                &mark.to_string(),
+                                &realized.to_string(),
+                                reason.as_str(),
+                                "POSITION_CLOSED_AT_VENUE",
+                            )
+                            .await?;
+                        return Ok(());
+                    }
+                } else {
+                    // Position list does not explicitly include symbol (e.g. test mock without position listing)
+                    qty
+                }
+            }
+            Err(e) => {
+                warn!(
+                    trade_id = trade.id,
+                    symbol = %trade.symbol,
+                    error = %e,
+                    "Failed to query venue positions before exit — defaulting to trade quantity"
+                );
+                qty
+            }
+        };
+
         // Re-resolve the instrument so lot/tick rules come from the venue
         // rather than being reconstructed from the stored row.
         let instrument = self.resolve(venue, instrument_id, instruments).await?;
@@ -265,7 +330,7 @@ impl VenueExits<'_> {
                 intent: "EXIT".to_string(),
                 trade_id: Some(trade.id),
                 limit_price: Some(limit_price.to_string()),
-                qty: qty.to_string(),
+                qty: exit_qty.to_string(),
                 filled_qty: "0".to_string(),
                 avg_fill_price: None,
                 state: "PENDING".to_string(),
@@ -291,7 +356,7 @@ impl VenueExits<'_> {
             instrument,
             side: Side::Sell,
             kind: OrderKind::Limit { price: limit_price },
-            qty,
+            qty: exit_qty,
             tif: TimeInForce::Gtc,
             extended_hours: false,
             client_order_id: client_order_id.clone(),
@@ -300,16 +365,28 @@ impl VenueExits<'_> {
         let ack = match venue.place_order(&request).await {
             Ok(ack) => ack,
             Err(e) => {
-                // The position stays OPEN: an exit we cannot confirm has not
-                // happened, and marking it closed would hide live exposure.
+                let err_str = e.to_string();
+                let is_deterministic = err_str.contains("HTTP 4")
+                    || err_str.contains("rejected")
+                    || err_str.contains("below the venue's minimum")
+                    || err_str.contains("rounds to zero")
+                    || err_str.contains("insufficient qty")
+                    || err_str.contains("not tradable");
+
+                let final_state = if is_deterministic {
+                    "REJECTED"
+                } else {
+                    "UNKNOWN"
+                };
+
                 self.store
                     .update_order_state(
                         &client_order_id,
-                        "UNKNOWN",
+                        final_state,
                         None,
                         "0",
                         None,
-                        Some(&e.to_string()),
+                        Some(&err_str),
                     )
                     .await?;
                 return Err(e);
@@ -491,6 +568,7 @@ mod tests {
             store: &store,
             max_hold_hours: 72,
             order_ttl_seconds: 300,
+            emergency_stop: false,
         };
         exits.run(Utc::now(), 1).await.expect("first pass");
         let after_first = store.get_unresolved_orders().await.unwrap().len();
@@ -518,6 +596,7 @@ mod tests {
             store: &store,
             max_hold_hours: 72,
             order_ttl_seconds: 300,
+            emergency_stop: false,
         };
         exits.run(Utc::now(), 1).await.expect("pass");
 
@@ -591,7 +670,29 @@ mod tests {
             stop_price: stop,
             target_price: target,
             max_hold_until: deadline,
+            session_close_due: false,
+            emergency_stop: false,
         }
+    }
+
+    #[test]
+    fn session_close_triggers_controlled_exit() {
+        let mut r = rules(None, None, None);
+        r.session_close_due = true;
+        assert_eq!(
+            evaluate_exit(dec!(100), Utc::now(), &r),
+            Some(ExitReason::SessionClose)
+        );
+    }
+
+    #[test]
+    fn emergency_stop_triggers_immediately() {
+        let mut r = rules(Some(dec!(90)), Some(dec!(110)), None);
+        r.emergency_stop = true;
+        assert_eq!(
+            evaluate_exit(dec!(100), Utc::now(), &r),
+            Some(ExitReason::EmergencyStop)
+        );
     }
 
     #[test]

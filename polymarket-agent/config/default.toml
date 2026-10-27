@@ -1,6 +1,6 @@
 [agent]
 mode = "paper"                    # paper | live | backtest
-cycle_interval_seconds = 600      # 10 minutes
+cycle_interval_seconds = 60       # 1 minute (reduced from 600s to eliminate latency)
 death_balance_threshold = 0.0
 low_fuel_threshold = 10.0
 api_reserve = 2.0
@@ -26,22 +26,26 @@ categories = ["weather", "sports", "crypto", "politics"]
 # Pricing defaults to $0 for openai_compatible — set input/output prices below
 # if your endpoint bills you, otherwise the daily budget cap and the
 # edge-justifies-cost gate will both treat calls as free.
-provider = "anthropic"
-model = "claude-3-5-sonnet-20241022"
-# base_url = "https://api.anthropic.com/v1"
+provider = "openai_compatible"
+base_url = "https://integrate.api.nvidia.com/v1"
+model = "minimaxai/minimax-m3.1-flash"
+max_tokens = 4096
 # input_price_per_million = 3.00
 # output_price_per_million = 15.00
-min_edge_threshold = 0.015
-high_confidence_edge = 0.010
-low_confidence_edge = 0.020
+min_edge_threshold = 0.005
+high_confidence_edge = 0.005
+low_confidence_edge = 0.010
 cache_ttl_seconds = 300
 
 [risk]
 kelly_fraction = 0.5
-max_position_pct = 0.06
-max_total_exposure_pct = 0.30
+max_position_pct = 1.0               # Allow up to 100% allocation for micro $5.00 seed capital
+max_total_exposure_pct = 1.0         # Full exposure cap for micro-capital trading
 max_positions_per_category = 3
 min_position_usd = 1.0
+india_capital_allocation_inr = 100000.0   # INR: ₹100,000 isolated paper/sandbox allocation
+us_capital_allocation_usd = 5.0          # USD: strictly $5.00 initial capital for US equities
+
 
 # --- Circuit breakers -------------------------------------------------------
 #
@@ -69,7 +73,7 @@ max_daily_loss_usd = 2000.0
 # resumes. Does not lift at midnight: sleeping on a drawdown changes nothing.
 max_drawdown_pct = 0.15
 # Positions opened per UTC day, and losing closes in a row. Both rest-of-day.
-max_trades_per_day = 25
+max_trades_per_day = 500
 max_consecutive_losses = 4
 # Absolute ceilings, applied only in live mode. A percentage of a paper
 # balance is a number nobody agreed to, and the first live run must not
@@ -80,7 +84,7 @@ max_live_total_notional_usd = 60.0
 [execution]
 order_type = "limit"
 order_ttl_seconds = 300
-max_slippage_pct = 0.02
+max_slippage_pct = 0.002
 max_retries = 3
 
 [monitoring]
@@ -117,7 +121,7 @@ kind = "alpaca"
 enabled = true
 base_url = "https://paper-api.alpaca.markets"
 data_url = "https://data.alpaca.markets"
-symbols = ["BTC/USD", "ETH/USD", "SPY", "AAPL", "NVDA", "QQQ"]
+symbols = ["SIRI", "NOK", "LCID", "PLUG", "NIO", "SOFI", "BTC/USD", "ETH/USD", "SPY", "AAPL", "NVDA", "QQQ"]
 fee_pct = 0.0025
 #
 # Coinbase Advanced Trade — spot crypto, 24/7.
@@ -168,13 +172,23 @@ fee_pct = 0.0025
 # symbols = ["BTC/USD", "ETH/USD"]
 # fee_pct = 0.006
 
+# Upstox Sandbox (NSE Cash Equities).
+# SAFETY: Strictly isolated from real-money live order execution.
+# Allows testing against official Upstox API v2 Sandbox endpoints or in-memory mock engine.
+[[venues]]
+id = "upstox_sandbox"
+kind = "upstox_sandbox"
+enabled = true
+symbols = ["RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK"]
+fee_pct = 0.001
+
 [sizing_continuous]
-risk_per_trade_pct = 0.0075     # fraction of bankroll risked if the stop hits
+risk_per_trade_pct = 0.95           # Allow micro $5 capital allocation to size 1 full share of sub-$5 stock
 atr_period = 14
 atr_multiplier = 1.5            # stop distance = ATR x this, then clamped
 min_stop_pct = 0.01             # 1.0% min stop
 max_stop_pct = 0.03             # 3.0% max stop
-min_p_up = 0.55                 # minimum probability-of-up before a view is tradeable
+min_p_up = 0.51                 # minimum probability-of-up before a view is tradeable
 max_orders_per_cycle = 2        # cap on new positions opened per cycle
 
 [exits_continuous]

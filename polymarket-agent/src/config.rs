@@ -369,6 +369,26 @@ pub struct RiskConfig {
     /// Absolute ceiling on all live positions together, in dollars.
     #[serde(default = "default_max_live_total_notional_usd")]
     pub max_live_total_notional_usd: Decimal,
+
+    /// Account-wide emergency stop switch.
+    #[serde(default)]
+    pub emergency_stop: bool,
+
+    /// Market-specific limits for Indian equities (NSE, INR).
+    #[serde(default)]
+    pub india_capital_allocation_inr: Option<Decimal>,
+    #[serde(default)]
+    pub india_max_exposure_pct: Option<Decimal>,
+    #[serde(default)]
+    pub india_max_daily_loss_inr: Option<Decimal>,
+
+    /// Market-specific limits for US equities (NYSE/NASDAQ, USD).
+    #[serde(default)]
+    pub us_capital_allocation_usd: Option<Decimal>,
+    #[serde(default)]
+    pub us_max_exposure_pct: Option<Decimal>,
+    #[serde(default)]
+    pub us_max_daily_loss_usd: Option<Decimal>,
 }
 
 fn default_max_daily_loss_pct() -> Decimal {
@@ -414,6 +434,13 @@ impl Default for RiskConfig {
             max_consecutive_losses: default_max_consecutive_losses(),
             max_live_notional_per_position_usd: default_max_live_notional_per_position_usd(),
             max_live_total_notional_usd: default_max_live_total_notional_usd(),
+            emergency_stop: false,
+            india_capital_allocation_inr: None,
+            india_max_exposure_pct: None,
+            india_max_daily_loss_inr: None,
+            us_capital_allocation_usd: None,
+            us_max_exposure_pct: None,
+            us_max_daily_loss_usd: None,
         }
     }
 }
@@ -617,7 +644,10 @@ impl DatabaseConfig {
     /// is indistinguishable from "nothing has happened yet" right up until it
     /// places a duplicate of every position it already holds.
     pub fn warn_if_relative(&self) {
-        if self.path == ":memory:" || Path::new(&self.path).is_absolute() {
+        if self.path == ":memory:"
+            || Path::new(&self.path).is_absolute()
+            || Path::new(&self.path).has_root()
+        {
             return;
         }
         let resolved = std::env::current_dir()
@@ -725,6 +755,10 @@ pub struct Secrets {
     /// live-exchange keys whatever `agent.mode` says.
     pub binance_us_api_key: Option<SecretString>,
     pub binance_us_secret_key: Option<SecretString>,
+    /// Upstox sandbox credentials (NSE cash equities).
+    pub upstox_api_key: Option<SecretString>,
+    pub upstox_api_secret: Option<SecretString>,
+    pub upstox_sandbox_token: Option<SecretString>,
 }
 
 impl AppConfig {
@@ -776,6 +810,9 @@ impl Secrets {
             coinbase_private_key: secret_env("COINBASE_API_PRIVATE_KEY"),
             binance_us_api_key: secret_env("BINANCE_US_API_KEY"),
             binance_us_secret_key: secret_env("BINANCE_US_SECRET_KEY"),
+            upstox_api_key: secret_env("UPSTOX_API_KEY"),
+            upstox_api_secret: secret_env("UPSTOX_API_SECRET"),
+            upstox_sandbox_token: secret_env("UPSTOX_SANDBOX_TOKEN"),
         }
     }
 }
@@ -808,11 +845,15 @@ impl AppConfig {
         // collector without editing a tracked file.
         config.telemetry.langfuse_public_key = non_empty_env("LANGFUSE_PUBLIC_KEY");
         config.telemetry.langfuse_secret_key = non_empty_env("LANGFUSE_SECRET_KEY");
-        apply_telemetry_endpoint(
-            &mut config.telemetry,
+        let endpoint = if config.telemetry.langfuse_public_key.is_some()
+            && config.telemetry.langfuse_secret_key.is_some()
+        {
             non_empty_env("OTEL_EXPORTER_OTLP_ENDPOINT")
-                .or_else(|| non_empty_env("LANGFUSE_HOST").map(|h| format!("{h}/api/public/otel"))),
-        );
+                .or_else(|| non_empty_env("LANGFUSE_HOST").map(|h| format!("{h}/api/public/otel")))
+        } else {
+            non_empty_env("OTEL_EXPORTER_OTLP_ENDPOINT")
+        };
+        apply_telemetry_endpoint(&mut config.telemetry, endpoint);
 
         let secrets = Secrets::from_env();
 
@@ -1214,7 +1255,8 @@ mod tests {
 
         // Absolute, or the ledger depends on the working directory.
         assert!(
-            Path::new(&config.database.path).is_absolute(),
+            Path::new(&config.database.path).is_absolute()
+                || Path::new(&config.database.path).has_root(),
             "the template must not ship a relative database path"
         );
 

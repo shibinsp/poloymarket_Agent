@@ -372,6 +372,7 @@ mod tests {
             direction: "YES".to_string(),
             entry_price: entry.to_string(),
             size: size.to_string(),
+            quantity: None,
             edge_at_entry: "0.10".to_string(),
             claude_fair_value: "0.70".to_string(),
             confidence: "0.85".to_string(),

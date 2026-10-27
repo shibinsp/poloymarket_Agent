@@ -89,6 +89,19 @@ export function Health() {
                     title={due ? absTime(due) : undefined}
                   />
                 )}
+                {"valuation_enabled" in h && (
+                  <StatTile
+                    label="AI Valuation Engine"
+                    value={
+                      h.valuation_enabled ? (
+                        <Badge tone="good">ACTIVE</Badge>
+                      ) : (
+                        <Badge tone="neutral">DISABLED</Badge>
+                      )
+                    }
+                    sub={h.valuation_model || "No LLM configured"}
+                  />
+                )}
               </div>
 
               {hasHalt && (

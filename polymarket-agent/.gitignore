@@ -14,7 +14,9 @@ config/local.toml
 # Logs and runtime data
 *.log
 backups/
-
+archive_previous_run/
+stdout.txt
+stderr.txt
 # Scratch test files (keep only check_profit.py)
 scratch/*
 !scratch/check_profit.py

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{FromRow, SqlitePool};
 use std::str::FromStr;
@@ -19,6 +19,9 @@ pub struct TradeRecord {
     pub direction: String,
     pub entry_price: String,
     pub size: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[sqlx(default)]
+    pub quantity: Option<String>,
     pub edge_at_entry: String,
     pub claude_fair_value: String,
     pub confidence: String,
@@ -131,12 +134,8 @@ impl Store {
         .bind(&trade.direction)
         .bind(&trade.entry_price)
         .bind(&trade.size)
-        // `quantity` stays NULL here. It means "what actually filled", and the
-        // legacy execution path records a trade the moment an order id comes
-        // back, without confirming anything. Mirroring `size` into it asserts
-        // a fill nobody saw — the same claim migration 003 removes from the
-        // rows 002 carried across.
-        .bind(Option::<String>::None)
+        // `quantity` stays NULL for Polymarket orders unless explicitly supplied.
+        .bind(&trade.quantity)
         .bind(&trade.edge_at_entry)
         .bind(&trade.claude_fair_value)
         .bind(&trade.confidence)
@@ -299,14 +298,11 @@ impl Store {
     /// read `get_today_api_cost`, which is bounded by the day and summed
     /// exactly in `Decimal`.
     pub async fn get_total_api_cost(&self) -> Result<Decimal> {
-        let total: Option<f64> = sqlx::query_scalar("SELECT SUM(cost) FROM api_costs")
-            .fetch_one(&self.pool)
+        let rows: Vec<(String,)> = sqlx::query_as("SELECT cost FROM api_costs")
+            .fetch_all(&self.pool)
             .await
             .context("Failed to get total API cost")?;
-        Ok(total
-            .and_then(Decimal::from_f64_retain)
-            .unwrap_or(Decimal::ZERO)
-            .round_dp(6))
+        sum_money(&rows, "api_costs.cost")
     }
 
     /// Get total API spend for the current UTC day.
@@ -723,13 +719,26 @@ impl Store {
     /// willing to take a new view in a day, and an entry that filled in three
     /// parts is still one decision.
     pub async fn count_trades_opened_on(&self, day: chrono::NaiveDate) -> Result<u32> {
-        let count: i64 =
+        let count_legacy: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM trades WHERE date(created_at) = ?")
                 .bind(day.to_string())
                 .fetch_one(&self.pool)
                 .await
                 .context("Failed to count today's trades")?;
-        Ok(count.max(0) as u32)
+        let count_us: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM us_paper_orders WHERE date(created_at) = ?")
+                .bind(day.to_string())
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or(0);
+        let count_india: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sandbox_orders WHERE date(created_at) = ?")
+                .bind(day.to_string())
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or(0);
+        let total = (count_legacy + count_us + count_india).max(0);
+        Ok(total as u32)
     }
 
     /// How many of the most recently closed positions were losses, counting
@@ -1107,6 +1116,294 @@ impl Store {
         .context("Failed to read the active halt")?;
         Ok(row)
     }
+
+    /// Save an Indian market backtest run.
+    pub async fn save_india_backtest(
+        &self,
+        id: &str,
+        name: &str,
+        config_json: &str,
+        results_json: &str,
+        status: &str,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO india_backtests (id, name, created_at, config_json, results_json, status)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(now)
+        .bind(config_json)
+        .bind(results_json)
+        .bind(status)
+        .execute(&self.pool)
+        .await
+        .context("Failed to save India backtest record")?;
+        Ok(())
+    }
+
+    /// Get recent Indian market backtests.
+    pub async fn get_india_backtests(&self, limit: i64) -> Result<Vec<IndiaBacktestRecord>> {
+        let rows = sqlx::query_as::<_, IndiaBacktestRecord>(
+            "SELECT id, name, created_at, config_json, results_json, status
+             FROM india_backtests
+             ORDER BY created_at DESC
+             LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to load India backtests")?;
+        Ok(rows)
+    }
+
+    /// Get a specific Indian market backtest by ID.
+    pub async fn get_india_backtest_by_id(&self, id: &str) -> Result<Option<IndiaBacktestRecord>> {
+        let row = sqlx::query_as::<_, IndiaBacktestRecord>(
+            "SELECT id, name, created_at, config_json, results_json, status
+             FROM india_backtests
+             WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("Failed to load India backtest by id")?;
+        Ok(row)
+    }
+
+    /// Save a US backtest run to database.
+    pub async fn save_us_backtest(
+        &self,
+        id: &str,
+        name: &str,
+        config_json: &str,
+        results_json: &str,
+        status: &str,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO us_backtests (id, name, created_at, config_json, results_json, status)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(now)
+        .bind(config_json)
+        .bind(results_json)
+        .bind(status)
+        .execute(&self.pool)
+        .await
+        .context("Failed to save US backtest record")?;
+        Ok(())
+    }
+
+    /// Get recent US market backtests.
+    pub async fn get_us_backtests(&self, limit: i64) -> Result<Vec<UsBacktestRecord>> {
+        let rows = sqlx::query_as::<_, UsBacktestRecord>(
+            "SELECT id, name, created_at, config_json, results_json, status
+             FROM us_backtests
+             ORDER BY created_at DESC
+             LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to load US backtests")?;
+        Ok(rows)
+    }
+
+    /// Get a specific US market backtest by ID.
+    pub async fn get_us_backtest_by_id(&self, id: &str) -> Result<Option<UsBacktestRecord>> {
+        let row = sqlx::query_as::<_, UsBacktestRecord>(
+            "SELECT id, name, created_at, config_json, results_json, status
+             FROM us_backtests
+             WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("Failed to load US backtest by id")?;
+        Ok(row)
+    }
+
+    /// Upsert an Indian sandbox order record.
+    pub async fn save_india_sandbox_order(
+        &self,
+        order: &IndiaSandboxOrderRecord,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO india_sandbox_orders (
+                id, client_order_id, venue_order_id, symbol, side, order_type,
+                quantity, price, trigger_price, status, fill_quantity, average_fill_price,
+                rejection_reason, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(client_order_id) DO UPDATE SET
+                venue_order_id = excluded.venue_order_id,
+                status = excluded.status,
+                fill_quantity = excluded.fill_quantity,
+                average_fill_price = excluded.average_fill_price,
+                rejection_reason = excluded.rejection_reason,
+                updated_at = excluded.updated_at",
+        )
+        .bind(&order.id)
+        .bind(&order.client_order_id)
+        .bind(&order.venue_order_id)
+        .bind(&order.symbol)
+        .bind(&order.side)
+        .bind(&order.order_type)
+        .bind(order.quantity)
+        .bind(&order.price)
+        .bind(&order.trigger_price)
+        .bind(&order.status)
+        .bind(order.fill_quantity)
+        .bind(&order.average_fill_price)
+        .bind(&order.rejection_reason)
+        .bind(&order.created_at)
+        .bind(&order.updated_at)
+        .execute(&self.pool)
+        .await
+        .context("Failed to upsert India sandbox order")?;
+        Ok(())
+    }
+
+    /// Get recent Indian sandbox orders.
+    pub async fn get_india_sandbox_orders(&self, limit: i64) -> Result<Vec<IndiaSandboxOrderRecord>> {
+        let rows = sqlx::query_as::<_, IndiaSandboxOrderRecord>(
+            "SELECT id, client_order_id, venue_order_id, symbol, side, order_type,
+                    quantity, price, trigger_price, status, fill_quantity, average_fill_price,
+                    rejection_reason, created_at, updated_at
+             FROM india_sandbox_orders
+             ORDER BY created_at DESC
+             LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to load India sandbox orders")?;
+        Ok(rows)
+    }
+
+    /// Upsert a US paper order record.
+    pub async fn save_us_paper_order(&self, order: &UsPaperOrderRecord) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO us_paper_orders (
+                id, client_order_id, venue_order_id, symbol, side, order_type,
+                quantity, price, trigger_price, status, fill_quantity, average_fill_price,
+                rejection_reason, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(client_order_id) DO UPDATE SET
+                venue_order_id = excluded.venue_order_id,
+                status = excluded.status,
+                fill_quantity = excluded.fill_quantity,
+                average_fill_price = excluded.average_fill_price,
+                rejection_reason = excluded.rejection_reason,
+                updated_at = excluded.updated_at",
+        )
+        .bind(&order.id)
+        .bind(&order.client_order_id)
+        .bind(&order.venue_order_id)
+        .bind(&order.symbol)
+        .bind(&order.side)
+        .bind(&order.order_type)
+        .bind(order.quantity)
+        .bind(&order.price)
+        .bind(&order.trigger_price)
+        .bind(&order.status)
+        .bind(order.fill_quantity)
+        .bind(&order.average_fill_price)
+        .bind(&order.rejection_reason)
+        .bind(&order.created_at)
+        .bind(&order.updated_at)
+        .execute(&self.pool)
+        .await
+        .context("Failed to upsert US paper order")?;
+        Ok(())
+    }
+
+    /// Get recent US paper orders.
+    pub async fn get_us_paper_orders(&self, limit: i64) -> Result<Vec<UsPaperOrderRecord>> {
+        let rows = sqlx::query_as::<_, UsPaperOrderRecord>(
+            "SELECT id, client_order_id, venue_order_id, symbol, side, order_type,
+                    quantity, price, trigger_price, status, fill_quantity, average_fill_price,
+                    rejection_reason, created_at, updated_at
+             FROM us_paper_orders
+             ORDER BY created_at DESC
+             LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to load US paper orders")?;
+        Ok(rows)
+    }
+
+    /// Clear all US paper orders to reset the market to initial $5.00 capital.
+    pub async fn clear_us_paper_orders(&self) -> Result<()> {
+        sqlx::query("DELETE FROM us_paper_orders")
+            .execute(&self.pool)
+            .await
+            .context("Failed to clear US paper orders")?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct IndiaBacktestRecord {
+    pub id: String,
+    pub name: String,
+    pub created_at: String,
+    pub config_json: String,
+    pub results_json: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct UsBacktestRecord {
+    pub id: String,
+    pub name: String,
+    pub created_at: String,
+    pub config_json: String,
+    pub results_json: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct IndiaSandboxOrderRecord {
+    pub id: String,
+    pub client_order_id: String,
+    pub venue_order_id: Option<String>,
+    pub symbol: String,
+    pub side: String,
+    pub order_type: String,
+    pub quantity: i64,
+    pub price: String,
+    pub trigger_price: Option<String>,
+    pub status: String,
+    pub fill_quantity: i64,
+    pub average_fill_price: Option<String>,
+    pub rejection_reason: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct UsPaperOrderRecord {
+    pub id: String,
+    pub client_order_id: String,
+    pub venue_order_id: Option<String>,
+    pub symbol: String,
+    pub side: String,
+    pub order_type: String,
+    pub quantity: i64,
+    pub price: String,
+    pub trigger_price: Option<String>,
+    pub status: String,
+    pub fill_quantity: i64,
+    pub average_fill_price: Option<String>,
+    pub rejection_reason: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 /// Add up a money column in `Decimal`, not in `f64`.
@@ -1539,6 +1836,7 @@ mod tests {
             direction: "YES".to_string(),
             entry_price: "0.65".to_string(),
             size: "10.00".to_string(),
+            quantity: None,
             edge_at_entry: "0.12".to_string(),
             claude_fair_value: "0.77".to_string(),
             confidence: "0.85".to_string(),
@@ -1856,6 +2154,7 @@ mod tests {
                 direction: "YES".to_string(),
                 entry_price: "0.40".to_string(),
                 size: "10".to_string(),
+                quantity: None,
                 edge_at_entry: "0.1".to_string(),
                 claude_fair_value: "0.5".to_string(),
                 confidence: "0.8".to_string(),
