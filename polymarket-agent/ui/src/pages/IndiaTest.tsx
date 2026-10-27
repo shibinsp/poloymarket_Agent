@@ -84,6 +84,19 @@ interface SandboxOrder {
   created_at: string;
 }
 
+const NSE_DEFAULT_PRICES: Record<string, string> = {
+  ITC: "480.00",
+  SBIN: "820.00",
+  TATAMOTORS: "890.00",
+  RELIANCE: "1198.70",
+  ICICIBANK: "1250.00",
+  HDFCBANK: "1650.00",
+  BHARTIARTL: "1680.00",
+  INFY: "1850.00",
+  LT: "3550.00",
+  TCS: "3800.00",
+};
+
 interface SandboxStatus {
   venue_id: string;
   name: string;
@@ -94,6 +107,12 @@ interface SandboxStatus {
   allowlisted_host: string;
   live_trading_allowed: boolean;
   mode_description: string;
+  base_capital_inr?: number;
+  realized_profit_inr?: number;
+  open_positions_cost_inr?: number;
+  available_cash_inr?: number;
+  total_equity_inr?: number;
+  holdings?: Record<string, number>;
   recent_orders: SandboxOrder[];
   watchlist: Instrument[];
 }
@@ -102,7 +121,7 @@ export function IndiaTest() {
   const [activeTab, setActiveTab] = useState<"live" | "sandbox" | "backtest" | "specs">("live");
   
   // Backtest form state
-  const [initialCapital, setInitialCapital] = useState("500000");
+  const [initialCapital, setInitialCapital] = useState("1000");
   const [positionPct, setPositionPct] = useState("0.10");
   const [stopLossPct, setStopLossPct] = useState("0.015");
   const [takeProfitPct, setTakeProfitPct] = useState("0.030");
@@ -114,15 +133,23 @@ export function IndiaTest() {
   const [backtestError, setBacktestError] = useState<string | null>(null);
   const [backtestResult, setBacktestResult] = useState<BacktestResults | null>(null);
 
-  // Sandbox state
+  // Sandbox state (Strictly ₹1,000 INR micro-capital isolation)
   const [sandboxStatus, setSandboxStatus] = useState<SandboxStatus | null>(null);
-  const [orderSymbol, setOrderSymbol] = useState("RELIANCE");
+  const [orderSymbol, setOrderSymbol] = useState("ITC");
   const [orderSide, setOrderSide] = useState<"BUY" | "SELL">("BUY");
-  const [orderQty, setOrderQty] = useState("10");
-  const [orderPrice, setOrderPrice] = useState("2500");
+  const [orderQty, setOrderQty] = useState("1");
+  const [orderPrice, setOrderPrice] = useState("480.00");
   const [orderSubmitting, setOrderSubmitting] = useState(false);
   const [orderError, setOrderError] = useState<string | null>(null);
   const [orderSuccess, setOrderSuccess] = useState<string | null>(null);
+  const [baseCapitalInr, setBaseCapitalInr] = useState<number>(1000.0);
+  const [realizedProfitInr, setRealizedProfitInr] = useState<number>(0.0);
+  const [openPositionsCostInr, setOpenPositionsCostInr] = useState<number>(0.0);
+  const [availableCashInr, setAvailableCashInr] = useState<number>(1000.0);
+  const [totalEquityInr, setTotalEquityInr] = useState<number>(1000.0);
+  const [holdings, setHoldings] = useState<Record<string, number>>({});
+  const [resetting, setResetting] = useState(false);
+  const [resetMsg, setResetMsg] = useState<string | null>(null);
 
   // Compute Realized P&L for Indian sandbox orders
   const indiaPnlMap = useMemo(() => {
@@ -147,11 +174,40 @@ export function IndiaTest() {
       if (res.ok) {
         const data = await res.json();
         setSandboxStatus(data);
+        if (data.base_capital_inr !== undefined) setBaseCapitalInr(Number(data.base_capital_inr));
+        if (data.realized_profit_inr !== undefined) setRealizedProfitInr(Number(data.realized_profit_inr));
+        if (data.open_positions_cost_inr !== undefined) setOpenPositionsCostInr(Number(data.open_positions_cost_inr));
+        if (data.available_cash_inr !== undefined) setAvailableCashInr(Number(data.available_cash_inr));
+        if (data.total_equity_inr !== undefined) setTotalEquityInr(Number(data.total_equity_inr));
+        if (data.holdings) setHoldings(data.holdings);
       }
     } catch (e) {
       console.error("Failed to load sandbox status", e);
     }
   };
+
+  async function handleResetIndiaMarket() {
+    if (!window.confirm("Are you sure you want to reset the Indian Sandbox Market to strictly ₹1,000 initial capital? All previous sandbox orders will be deleted.")) {
+      return;
+    }
+    setResetting(true);
+    setResetMsg(null);
+    setOrderError(null);
+    setOrderSuccess(null);
+    try {
+      const res = await postJson<{ status: string; message: string }>("/api/india/sandbox/reset", {});
+      if (res.ok) {
+        setResetMsg("Indian Market successfully reset to ₹1,000 INR initial capital! Sandbox orders cleared.");
+        loadSandboxStatus();
+      } else {
+        setOrderError(res.error.kind === "http" ? res.error.message : "Failed to reset Indian sandbox market");
+      }
+    } catch (err: unknown) {
+      setOrderError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setResetting(false);
+    }
+  }
 
   useEffect(() => {
     loadSandboxStatus();
@@ -581,6 +637,95 @@ export function IndiaTest() {
       {/* Tab 2: Upstox Sandbox Adapter */}
       {activeTab === "sandbox" && (
         <>
+          {/* Strictly Isolated Capital Allocation Banner & Reset Button */}
+          <div style={{
+            background: "linear-gradient(135deg, rgba(30, 41, 59, 0.9) 0%, rgba(15, 23, 42, 0.95) 100%)",
+            border: "1px solid rgba(16, 185, 129, 0.3)",
+            borderRadius: "10px",
+            padding: "18px",
+            marginBottom: "20px",
+            boxShadow: "0 4px 16px rgba(0, 0, 0, 0.3)"
+          }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: "12px", marginBottom: "16px" }}>
+              <div>
+                <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                  <span style={{ fontSize: "20px" }}>🇮🇳</span>
+                  <h3 style={{ margin: 0, fontSize: "17px", fontWeight: "800", color: "#fff" }}>
+                    Strictly Isolated Indian Market Sandbox (₹1,000 INR Allocation)
+                  </h3>
+                  <Badge tone="good">Strict Isolation Active</Badge>
+                </div>
+                <p style={{ margin: "6px 0 0", fontSize: "13px", color: "#94a3b8" }}>
+                  Trades start with strictly <strong>₹1,000.00 INR</strong>. Profits from closed trades compound directly back into trading cash. <strong>US Market funds ($5.00 USD) are completely isolated and never used.</strong>
+                </p>
+              </div>
+
+              <button
+                onClick={handleResetIndiaMarket}
+                disabled={resetting}
+                style={{
+                  padding: "8px 16px",
+                  background: "linear-gradient(135deg, #ef4444 0%, #dc2626 100%)",
+                  color: "#fff",
+                  border: "none",
+                  borderRadius: "6px",
+                  fontWeight: "700",
+                  fontSize: "12px",
+                  cursor: resetting ? "not-allowed" : "pointer",
+                  boxShadow: "0 2px 8px rgba(239, 68, 68, 0.3)",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "6px"
+                }}
+              >
+                🔄 {resetting ? "Resetting..." : "Reset to ₹1,000 Base"}
+              </button>
+            </div>
+
+            {resetMsg && (
+              <div style={{ marginBottom: "16px", padding: "10px 14px", background: "rgba(34, 197, 94, 0.15)", border: "1px solid rgba(34, 197, 94, 0.3)", borderRadius: "6px", color: "#4ade80", fontSize: "13px" }}>
+                ✓ {resetMsg}
+              </div>
+            )}
+
+            {/* Micro Capital Stat Tiles */}
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: "14px" }}>
+              <div style={{ padding: "14px", background: "rgba(15, 23, 42, 0.7)", borderRadius: "8px", border: "1px solid rgba(255, 255, 255, 0.08)" }}>
+                <div style={{ fontSize: "11px", color: "#94a3b8", fontWeight: "600", textTransform: "uppercase" }}>Initial Seed Capital</div>
+                <div style={{ fontSize: "20px", fontWeight: "800", color: "#fff", marginTop: "4px" }}>₹{baseCapitalInr.toLocaleString("en-IN", { minimumFractionDigits: 2 })} INR</div>
+                <div style={{ fontSize: "11px", color: "#64748b", marginTop: "2px" }}>Fixed base allocation</div>
+              </div>
+
+              <div style={{ padding: "14px", background: "rgba(15, 23, 42, 0.7)", borderRadius: "8px", border: "1px solid rgba(255, 255, 255, 0.08)" }}>
+                <div style={{ fontSize: "11px", color: "#94a3b8", fontWeight: "600", textTransform: "uppercase" }}>Realized Profit (Compounded)</div>
+                <div style={{ fontSize: "20px", fontWeight: "800", color: realizedProfitInr >= 0 ? "#4ade80" : "#f87171", marginTop: "4px" }}>
+                  {realizedProfitInr >= 0 ? `+₹${realizedProfitInr.toFixed(2)}` : `-₹${Math.abs(realizedProfitInr).toFixed(2)}`} INR
+                </div>
+                <div style={{ fontSize: "11px", color: "#64748b", marginTop: "2px" }}>Available to re-trade</div>
+              </div>
+
+              <div style={{ padding: "14px", background: "rgba(15, 23, 42, 0.7)", borderRadius: "8px", border: "1px solid rgba(59, 130, 246, 0.3)" }}>
+                <div style={{ fontSize: "11px", color: "#60a5fa", fontWeight: "700", textTransform: "uppercase" }}>Available Trading Cash</div>
+                <div style={{ fontSize: "22px", fontWeight: "800", color: "#38bdf8", marginTop: "4px" }}>₹{availableCashInr.toFixed(2)} INR</div>
+                <div style={{ fontSize: "11px", color: "#93c5fd", marginTop: "2px" }}>Budget limit for BUY orders</div>
+              </div>
+
+              <div style={{ padding: "14px", background: "rgba(15, 23, 42, 0.7)", borderRadius: "8px", border: "1px solid rgba(255, 255, 255, 0.08)" }}>
+                <div style={{ fontSize: "11px", color: "#94a3b8", fontWeight: "600", textTransform: "uppercase" }}>Tied Up in Open Shares</div>
+                <div style={{ fontSize: "20px", fontWeight: "800", color: "#facc15", marginTop: "4px" }}>₹{openPositionsCostInr.toFixed(2)} INR</div>
+                <div style={{ fontSize: "11px", color: "#64748b", marginTop: "2px" }}>
+                  {Object.entries(holdings).filter(([_, q]) => Number(q) > 0).map(([s, q]) => `${q}x ${s}`).join(", ") || "No open positions"}
+                </div>
+              </div>
+
+              <div style={{ padding: "14px", background: "rgba(15, 23, 42, 0.7)", borderRadius: "8px", border: "1px solid rgba(34, 197, 94, 0.2)" }}>
+                <div style={{ fontSize: "11px", color: "#4ade80", fontWeight: "600", textTransform: "uppercase" }}>Total Indian Equity</div>
+                <div style={{ fontSize: "20px", fontWeight: "800", color: "#4ade80", marginTop: "4px" }}>₹{totalEquityInr.toFixed(2)} INR</div>
+                <div style={{ fontSize: "11px", color: "#64748b", marginTop: "2px" }}>Cash + Open Positions</div>
+              </div>
+            </div>
+          </div>
+
           <Card title="Upstox Sandbox Venue Status">
             <div className="grid grid--tiles">
               <StatTile
@@ -617,14 +762,20 @@ export function IndiaTest() {
                   </label>
                   <select
                     value={orderSymbol}
-                    onChange={(e) => setOrderSymbol(e.target.value)}
+                    onChange={(e) => {
+                      const sym = e.target.value;
+                      setOrderSymbol(sym);
+                      if (NSE_DEFAULT_PRICES[sym]) {
+                        setOrderPrice(NSE_DEFAULT_PRICES[sym]);
+                      }
+                    }}
                     style={{ width: "100%", padding: "0.4rem", borderRadius: "4px", border: "1px solid var(--border)", background: "var(--surface)" }}
                   >
                     {sandboxStatus?.watchlist.map((inst) => (
                       <option key={inst.symbol} value={inst.symbol}>
                         {inst.symbol} — {inst.name}
                       </option>
-                    )) ?? <option value="RELIANCE">RELIANCE</option>}
+                    )) ?? <option value="ITC">ITC</option>}
                   </select>
                 </div>
                 <div>

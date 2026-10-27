@@ -43,7 +43,7 @@ max_position_pct = 1.0               # Allow up to 100% allocation for micro $5.
 max_total_exposure_pct = 1.0         # Full exposure cap for micro-capital trading
 max_positions_per_category = 3
 min_position_usd = 1.0
-india_capital_allocation_inr = 100000.0   # INR: ₹100,000 isolated paper/sandbox allocation
+india_capital_allocation_inr = 1000.0     # INR: ₹1,000 isolated paper/sandbox allocation
 us_capital_allocation_usd = 5.0          # USD: strictly $5.00 initial capital for US equities
 
 

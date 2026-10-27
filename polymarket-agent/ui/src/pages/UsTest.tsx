@@ -606,7 +606,7 @@ export function UsTest() {
                   <Badge tone="good">Strict Isolation Active</Badge>
                 </div>
                 <p style={{ margin: "6px 0 0", fontSize: "13px", color: "#94a3b8" }}>
-                  Trades start with strictly <strong>$5.00 USD</strong>. Profits from closed trades compound directly back into trading cash. <strong>Indian Market funds (₹100,000 INR) are completely isolated and never used.</strong>
+                  Trades start with strictly <strong>$5.00 USD</strong>. Profits from closed trades compound directly back into trading cash. <strong>Indian Market funds (₹1,000 INR) are completely isolated and never used.</strong>
                 </p>
               </div>
 

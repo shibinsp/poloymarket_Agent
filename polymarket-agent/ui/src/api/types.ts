@@ -279,6 +279,12 @@ export interface IndiaSandboxStatusResponse {
   currency_symbol: string;
   timezone: string;
   trading_hours: string;
+  base_capital_inr?: number;
+  realized_profit_inr?: number;
+  open_positions_cost_inr?: number;
+  available_cash_inr?: number;
+  total_equity_inr?: number;
+  holdings?: Record<string, number>;
   recent_orders: MarketOrderRecord[];
 }
 
@@ -289,6 +295,12 @@ export interface UsPaperStatusResponse {
   currency_symbol: string;
   timezone: string;
   trading_hours: string;
+  base_capital_usd?: number;
+  realized_profit_usd?: number;
+  open_positions_cost_usd?: number;
+  available_cash_usd?: number;
+  total_equity_usd?: number;
+  holdings?: Record<string, number>;
   recent_orders: MarketOrderRecord[];
 }
 

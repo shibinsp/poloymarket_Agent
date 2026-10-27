@@ -1346,6 +1346,15 @@ impl Store {
             .context("Failed to clear US paper orders")?;
         Ok(())
     }
+
+    /// Clear all India sandbox orders to reset the market to initial ₹1,000 capital.
+    pub async fn clear_india_sandbox_orders(&self) -> Result<()> {
+        sqlx::query("DELETE FROM india_sandbox_orders")
+            .execute(&self.pool)
+            .await
+            .context("Failed to clear India sandbox orders")?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]

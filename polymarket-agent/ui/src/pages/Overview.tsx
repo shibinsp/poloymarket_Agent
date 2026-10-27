@@ -78,12 +78,16 @@ export function Overview() {
   const ordered = cycles.data ? cyclesAscending(cycles.data) : [];
   const latest = ordered.at(-1) ?? null;
 
-  const indiaBaseInr = 100000;
-  const indiaCurrentInr = indiaBaseInr + indiaProfitInr;
+  const indiaBaseInr = india.data?.base_capital_inr ? Number(india.data.base_capital_inr) : 1000;
+  const indiaProfit = india.data?.realized_profit_inr !== undefined ? Number(india.data.realized_profit_inr) : indiaProfitInr;
+  const indiaCurrentInr = indiaBaseInr + indiaProfit;
   const indiaUsdEquivalent = indiaCurrentInr / 86.5;
+  const indiaProfitPct = indiaBaseInr > 0 ? (indiaProfit / indiaBaseInr) * 100 : 0;
 
-  const usBaseUsd = 5.0;
-  const usCurrentUsd = usBaseUsd + usProfitUsd;
+  const usBaseUsd = us.data?.base_capital_usd ? Number(us.data.base_capital_usd) : 5.0;
+  const usProfit = us.data?.realized_profit_usd !== undefined ? Number(us.data.realized_profit_usd) : usProfitUsd;
+  const usCurrentUsd = usBaseUsd + usProfit;
+  const usInrEquivalent = usCurrentUsd * 86.5;
 
   const baseBankroll = num(latest?.bankroll) ?? 1161.07;
   const currentBankroll = usCurrentUsd + indiaUsdEquivalent;
@@ -146,9 +150,12 @@ export function Overview() {
             <div style={{ fontSize: "24px", fontWeight: "700", color: "var(--text-primary)", fontVariantNumeric: "tabular-nums" }}>
               {moneyInr(indiaCurrentInr)}
             </div>
-            <div style={{ fontSize: "12px", marginTop: "4px", color: indiaProfitInr >= 0 ? "var(--status-good)" : "var(--status-critical)" }}>
-              P&L: <strong>{indiaProfitInr >= 0 ? `+₹${indiaProfitInr.toFixed(2)}` : `-₹${Math.abs(indiaProfitInr).toFixed(2)}`}</strong>
-              <span style={{ color: "var(--text-muted)", marginLeft: "6px" }}>(Cap: ₹5,000)</span>
+            <div style={{ fontSize: "12px", marginTop: "4px", color: indiaProfit >= 0 ? "var(--status-good)" : "var(--status-critical)" }}>
+              P&L: <strong>{indiaProfit >= 0 ? `+₹${indiaProfit.toFixed(2)}` : `-₹${Math.abs(indiaProfit).toFixed(2)}`}</strong> ({indiaProfitPct >= 0 ? "+" : ""}{indiaProfitPct.toFixed(2)}%)
+              <span style={{ color: "var(--text-muted)", marginLeft: "6px" }}>(Base: ₹{indiaBaseInr.toLocaleString("en-IN")})</span>
+            </div>
+            <div style={{ fontSize: "11px", color: "var(--text-muted)", marginTop: "2px" }}>
+              USD Value: ${indiaUsdEquivalent.toFixed(2)} · {indiaCount} {indiaCount === 1 ? "order" : "orders"}
             </div>
             <div style={{ marginTop: "10px", fontSize: "12px" }}>
               <Link to="/india">Manage India Sandbox & Charts →</Link>
@@ -164,9 +171,12 @@ export function Overview() {
             <div style={{ fontSize: "24px", fontWeight: "700", color: "var(--text-primary)", fontVariantNumeric: "tabular-nums" }}>
               {money(usCurrentUsd)}
             </div>
-            <div style={{ fontSize: "12px", marginTop: "4px", color: usProfitUsd >= 0 ? "var(--status-good)" : "var(--status-critical)" }}>
-              P&L: <strong>{usProfitUsd >= 0 ? `+$${usProfitUsd.toFixed(2)}` : `-$${Math.abs(usProfitUsd).toFixed(2)}`}</strong>
-              <span style={{ color: "var(--text-muted)", marginLeft: "6px" }}>(Cap: $5.00)</span>
+            <div style={{ fontSize: "12px", marginTop: "4px", color: usProfit >= 0 ? "var(--status-good)" : "var(--status-critical)" }}>
+              P&L: <strong>{usProfit >= 0 ? `+$${usProfit.toFixed(2)}` : `-$${Math.abs(usProfit).toFixed(2)}`}</strong>
+              <span style={{ color: "var(--text-muted)", marginLeft: "6px" }}>(Base: ${usBaseUsd.toFixed(2)})</span>
+            </div>
+            <div style={{ fontSize: "11px", color: "var(--text-muted)", marginTop: "2px" }}>
+              INR Value: ₹{usInrEquivalent.toFixed(0)} · {usCount} {usCount === 1 ? "order" : "orders"}
             </div>
             <div style={{ marginTop: "10px", fontSize: "12px" }}>
               <Link to="/us">Manage US Paper & Charts →</Link>

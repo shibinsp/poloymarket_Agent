@@ -46,7 +46,7 @@ impl Default for MockSandboxState {
         prices.insert("TATAMOTORS".to_string(), dec!(950.00));
 
         Self {
-            cash: dec!(100000.00), // Default ₹1,00,000 sandbox margin
+            cash: dec!(1000.00), // Default ₹1,000 sandbox margin
             positions: HashMap::new(),
             orders: HashMap::new(),
             prices,

@@ -191,6 +191,10 @@ fn build_router(state: DashboardState) -> Router {
             "/api/india/sandbox/order",
             post(india_sandbox_order_handler),
         )
+        .route(
+            "/api/india/sandbox/reset",
+            post(india_sandbox_reset_handler),
+        )
         .route("/api/india/chart", get(india_chart_handler))
         .route("/api/us/watchlist", get(us_watchlist_handler))
         .route("/api/us/chart", get(us_chart_handler))
@@ -740,13 +744,96 @@ async fn india_backtest_run_handler(
     Json(serde_json::to_value(&result).unwrap_or_default()).into_response()
 }
 
+/// Unified accounting for India Sandbox (NSE Cash Equities).
+/// Starting capital defaults to strictly ₹1,000 INR (configured via `india_capital_allocation_inr`).
+/// Profit from sold positions is compounded back into `available_cash`.
+/// US market money ($5.00 base) is completely isolated by architecture and cannot be mixed here.
+fn compute_india_sandbox_accounting(
+    base_capital: Decimal,
+    orders: &[crate::db::store::IndiaSandboxOrderRecord],
+) -> (
+    Decimal,
+    Decimal,
+    Decimal,
+    std::collections::HashMap<String, Decimal>,
+) {
+    use std::str::FromStr;
+    let mut realized_profit = Decimal::ZERO;
+    let mut open_positions_cost = Decimal::ZERO;
+    let mut holdings: std::collections::HashMap<String, Vec<(Decimal, Decimal)>> =
+        std::collections::HashMap::new();
+
+    for o in orders.iter().rev() {
+        if !o.status.eq_ignore_ascii_case("FILLED")
+            && !o.status.eq_ignore_ascii_case("ACKNOWLEDGED")
+        {
+            continue;
+        }
+        let qty = Decimal::from(o.fill_quantity);
+        if qty.is_zero() {
+            continue;
+        }
+        let fill_price = o
+            .average_fill_price
+            .as_deref()
+            .and_then(|p| Decimal::from_str(p).ok())
+            .unwrap_or_else(|| Decimal::from_str(&o.price).unwrap_or(Decimal::ZERO));
+
+        if o.side.eq_ignore_ascii_case("BUY") {
+            holdings
+                .entry(o.symbol.to_uppercase())
+                .or_default()
+                .push((fill_price, qty));
+        } else if o.side.eq_ignore_ascii_case("SELL") {
+            if let Some(buys) = holdings.get_mut(&o.symbol.to_uppercase()) {
+                let mut remaining_to_sell = qty;
+                while remaining_to_sell > Decimal::ZERO && !buys.is_empty() {
+                    let (buy_p, buy_q) = buys.pop().unwrap();
+                    if buy_q <= remaining_to_sell {
+                        realized_profit += (fill_price - buy_p) * buy_q;
+                        remaining_to_sell -= buy_q;
+                    } else {
+                        realized_profit += (fill_price - buy_p) * remaining_to_sell;
+                        buys.push((buy_p, buy_q - remaining_to_sell));
+                        remaining_to_sell = Decimal::ZERO;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut current_quantities: std::collections::HashMap<String, Decimal> =
+        std::collections::HashMap::new();
+    for (sym, buys) in holdings.iter() {
+        for (p, q) in buys {
+            open_positions_cost += *p * *q;
+            *current_quantities.entry(sym.clone()).or_default() += *q;
+        }
+    }
+
+    let available_cash = (base_capital + realized_profit - open_positions_cost).max(Decimal::ZERO);
+    (
+        realized_profit,
+        open_positions_cost,
+        available_cash,
+        current_quantities,
+    )
+}
+
 async fn india_sandbox_status_handler(State(state): State<DashboardState>) -> impl IntoResponse {
     let recent_orders = state
         .store
-        .get_india_sandbox_orders(20)
+        .get_india_sandbox_orders(100)
         .await
         .unwrap_or_default();
     let watchlist = crate::india::instruments::nse_watchlist();
+    let base_capital = state
+        .risk
+        .india_capital_allocation_inr
+        .unwrap_or(rust_decimal_macros::dec!(1000.0));
+
+    let (realized_profit, open_positions_cost, available_cash, holdings) =
+        compute_india_sandbox_accounting(base_capital, &recent_orders);
 
     let resp = serde_json::json!({
         "venue_id": "upstox_sandbox",
@@ -758,11 +845,49 @@ async fn india_sandbox_status_handler(State(state): State<DashboardState>) -> im
         "allowlisted_host": "api.upstox.com",
         "live_trading_allowed": false,
         "mode_description": "Strictly sandboxed execution and simulation. Real-money live order placement is blocked by construction.",
+        "base_capital_inr": base_capital,
+        "realized_profit_inr": realized_profit,
+        "open_positions_cost_inr": open_positions_cost,
+        "available_cash_inr": available_cash,
+        "total_equity_inr": base_capital + realized_profit,
+        "holdings": holdings,
         "recent_orders": recent_orders,
         "watchlist": watchlist,
     });
 
     Json(resp)
+}
+
+async fn india_sandbox_reset_handler(State(state): State<DashboardState>) -> impl IntoResponse {
+    let base_capital = state
+        .risk
+        .india_capital_allocation_inr
+        .unwrap_or(rust_decimal_macros::dec!(1000.0));
+    match state.store.clear_india_sandbox_orders().await {
+        Ok(_) => {
+            info!("India sandbox orders cleared - reset to ₹1,000 base capital");
+            Json(serde_json::json!({
+                "status": "success",
+                "message": "Indian market sandbox orders reset successfully. Starting capital reset to ₹1,000 INR.",
+                "base_capital_inr": base_capital,
+                "available_cash_inr": base_capital,
+                "realized_profit_inr": 0.0,
+                "open_positions_cost_inr": 0.0,
+                "total_equity_inr": base_capital
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            warn!("Failed to clear India sandbox orders: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    serde_json::json!({ "error": format!("Failed to reset India sandbox orders: {e}") }),
+                ),
+            )
+                .into_response()
+        }
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -824,13 +949,76 @@ async fn india_sandbox_order_handler(
             .into_response();
     }
 
-    let price_str = req.price.unwrap_or(Decimal::ZERO).to_string();
+    let base_price = crate::india::chart::get_company_info(&req.symbol).2;
+    let order_price = match req.price {
+        Some(p) if p > Decimal::ZERO => p,
+        _ => base_price,
+    };
+    let price_str = order_price.to_string();
+
+    let base_capital = state
+        .risk
+        .india_capital_allocation_inr
+        .unwrap_or(rust_decimal_macros::dec!(1000.0));
+    let all_orders = state
+        .store
+        .get_india_sandbox_orders(500)
+        .await
+        .unwrap_or_default();
+    let (realized_profit, _open_positions_cost, available_cash, holdings) =
+        compute_india_sandbox_accounting(base_capital, &all_orders);
+
+    let is_buy = req.side.eq_ignore_ascii_case("BUY");
+    let is_sell = req.side.eq_ignore_ascii_case("SELL");
+
+    if is_buy {
+        let order_cost = order_price * Decimal::from(req.quantity);
+        if order_cost > available_cash {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "Insufficient Indian market cash. Indian trading is strictly restricted to initial ₹{:.2} capital + realized profits. Available cash: ₹{:.2}, but order cost is ₹{:.2}. US market funds ($) are completely isolated and cannot be used.",
+                        base_capital,
+                        available_cash,
+                        order_cost
+                    ),
+                    "available_cash_inr": available_cash,
+                    "order_cost_inr": order_cost,
+                    "base_capital_inr": base_capital,
+                    "realized_profit_inr": realized_profit,
+                })),
+            )
+                .into_response();
+        }
+    } else if is_sell {
+        let held_qty = holdings
+            .get(&req.symbol.to_uppercase())
+            .cloned()
+            .unwrap_or(Decimal::ZERO);
+        if Decimal::from(req.quantity) > held_qty {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "Cannot sell {} shares of {}: currently held {} shares in Indian sandbox portfolio.",
+                        req.quantity,
+                        req.symbol.to_uppercase(),
+                        held_qty
+                    ),
+                    "held_quantity": held_qty,
+                    "requested_quantity": req.quantity,
+                })),
+            )
+                .into_response();
+        }
+    }
 
     let order_record = crate::db::store::IndiaSandboxOrderRecord {
         id: format!("ord-{}", uuid::Uuid::new_v4().simple()),
         client_order_id: client_order_id.clone(),
         venue_order_id: Some(format!("UPSTOX-SBX-{}", uuid::Uuid::new_v4().simple())),
-        symbol: req.symbol.clone(),
+        symbol: req.symbol.to_uppercase(),
         side: req.side.to_uppercase(),
         order_type: req.order_type.to_uppercase(),
         quantity: req.quantity,
@@ -1574,35 +1762,19 @@ async fn combined_portfolio_handler(State(state): State<DashboardState>) -> impl
         us_realized_usd += pnl;
     }
 
-    // Compute India sandbox realized P&L
+    // Compute India sandbox realized P&L using unified accounting (₹1,000 base + compounded profits)
     let india_orders = state
         .store
         .get_india_sandbox_orders(100)
         .await
         .unwrap_or_default();
-    let mut india_buys: std::collections::HashMap<String, Vec<(Decimal, Decimal)>> =
-        std::collections::HashMap::new();
-    for o in india_orders.iter().rev() {
-        let fill_price = o
-            .average_fill_price
-            .as_deref()
-            .and_then(|p| Decimal::from_str(p).ok())
-            .unwrap_or_else(|| Decimal::from_str(&o.price).unwrap_or(Decimal::ZERO));
-        let qty = Decimal::from(o.quantity);
-        if o.side.eq_ignore_ascii_case("BUY") {
-            india_buys
-                .entry(o.symbol.clone())
-                .or_default()
-                .push((fill_price, qty));
-        } else if o.side.eq_ignore_ascii_case("SELL") {
-            if let Some(buys) = india_buys.get_mut(&o.symbol) {
-                if let Some((buy_p, buy_q)) = buys.pop() {
-                    let match_q = qty.min(buy_q);
-                    india_realized_inr += (fill_price - buy_p) * match_q;
-                }
-            }
-        }
-    }
+    let india_base_capital = state
+        .risk
+        .india_capital_allocation_inr
+        .unwrap_or(rust_decimal_macros::dec!(1000.0));
+    let (india_sandbox_realized_profit, _in_open_cost, _in_cash, _in_holdings) =
+        compute_india_sandbox_accounting(india_base_capital, &india_orders);
+    india_realized_inr += india_sandbox_realized_profit;
 
     // Compute US paper realized P&L using unified accounting ($5.00 base + compounded profits)
     let us_orders = state
@@ -1625,12 +1797,7 @@ async fn combined_portfolio_handler(State(state): State<DashboardState>) -> impl
         .await
         .unwrap_or(Decimal::ZERO);
 
-    let india_equity_inr = state
-        .risk
-        .india_capital_allocation_inr
-        .unwrap_or(rust_decimal_macros::dec!(100000.0))
-        + india_realized_inr
-        + india_unrealized_inr;
+    let india_equity_inr = india_base_capital + india_realized_inr + india_unrealized_inr;
     let us_equity_usd = us_base_capital + us_realized_usd + us_unrealized_usd;
 
     let summary = crate::market::fx::CombinedPortfolioSummary::calculate(
