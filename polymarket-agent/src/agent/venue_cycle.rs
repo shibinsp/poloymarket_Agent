@@ -337,9 +337,33 @@ impl VenueCycle<'_> {
         let (view, cost) = if let Some(llm) = llm {
             let system = build_system_prompt();
             let user = build_user_prompt(instrument, &quote, &candles, &[]);
-            let response = llm.complete(&system, &user, Some(ctx.cycle)).await?;
-            let view = parse_directional_response(&response.text)?;
-            (view, response.cost)
+            match llm.complete(&system, &user, Some(ctx.cycle)).await {
+                Ok(response) => match parse_directional_response(&response.text) {
+                    Ok(view) => (view, response.cost),
+                    Err(e) => {
+                        warn!(
+                            instrument = %instrument.id,
+                            error = %e,
+                            "Failed to parse LLM response — falling back to algorithmic technical analysis"
+                        );
+                        (
+                            generate_algorithmic_view(instrument, &quote, &candles),
+                            Decimal::ZERO,
+                        )
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        instrument = %instrument.id,
+                        error = %e,
+                        "LLM valuation call failed or timed out — falling back to algorithmic technical analysis"
+                    );
+                    (
+                        generate_algorithmic_view(instrument, &quote, &candles),
+                        Decimal::ZERO,
+                    )
+                }
+            }
         } else {
             let view = generate_algorithmic_view(instrument, &quote, &candles);
             (view, Decimal::ZERO)

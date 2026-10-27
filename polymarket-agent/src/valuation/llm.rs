@@ -111,7 +111,7 @@ impl LlmClient {
         }
 
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(std::time::Duration::from_secs(90))
             .build()
             .context("Failed to build HTTP client")?;
 
