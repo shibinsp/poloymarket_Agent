@@ -74,7 +74,10 @@ impl Venue for UpstoxSandboxVenue {
                 if filter.symbols.is_empty() {
                     true
                 } else {
-                    filter.symbols.iter().any(|s| s.eq_ignore_ascii_case(inst.symbol()))
+                    filter
+                        .symbols
+                        .iter()
+                        .any(|s| s.eq_ignore_ascii_case(inst.symbol()))
                 }
             })
             .collect();
@@ -105,14 +108,19 @@ impl Venue for UpstoxSandboxVenue {
         _interval: CandleInterval,
         limit: usize,
     ) -> Result<Vec<Candle>> {
-        let base_price = self.client.get_quote(&id.symbol).await.unwrap_or(dec!(1000.00));
-        let count = limit.min(50).max(25);
+        let base_price = self
+            .client
+            .get_quote(&id.symbol)
+            .await
+            .unwrap_or(dec!(1000.00));
+        let count = limit.clamp(25, 50);
         let mut bars = Vec::with_capacity(count);
         let now = Utc::now();
         for i in 0..count {
             let offset_hours = (count - 1 - i) as i64;
             let ts = now - chrono::Duration::hours(offset_hours);
-            let factor = Decimal::from_f64_retain(1.0 + (i as f64 - 10.0) * 0.0012).unwrap_or(Decimal::ONE);
+            let factor =
+                Decimal::from_f64_retain(1.0 + (i as f64 - 10.0) * 0.0012).unwrap_or(Decimal::ONE);
             let close = (base_price * factor).round_dp(2);
             let open = (close - dec!(0.50)).max(dec!(0.05));
             let high = close + dec!(1.50);
@@ -186,7 +194,9 @@ impl Venue for UpstoxSandboxVenue {
                     let filled_qty = Decimal::from(rec.filled_quantity.unwrap_or(0));
                     let state = match rec.status.to_ascii_lowercase().as_str() {
                         "complete" => OrderState::Filled,
-                        "rejected" => OrderState::Rejected(rec.status_message.unwrap_or_else(|| "Rejected".to_string())),
+                        "rejected" => OrderState::Rejected(
+                            rec.status_message.unwrap_or_else(|| "Rejected".to_string()),
+                        ),
                         "cancelled" => OrderState::Cancelled,
                         _ => OrderState::Accepted,
                     };

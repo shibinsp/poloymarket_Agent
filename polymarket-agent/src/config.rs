@@ -1307,7 +1307,7 @@ mod tests {
             .expect("config/default.toml should exist");
         let config: AppConfig = toml::from_str(&contents).expect("should parse");
         assert_eq!(config.agent.mode, AgentMode::Paper);
-        assert_eq!(config.agent.cycle_interval_seconds, 600);
+        assert_eq!(config.agent.cycle_interval_seconds, 60);
         assert_eq!(config.scanning.max_markets, 1000);
         assert_eq!(config.polymarket.chain_id, 137);
         assert_eq!(config.agent.max_sleep_seconds, 3600);

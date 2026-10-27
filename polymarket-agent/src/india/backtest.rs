@@ -61,10 +61,10 @@ impl Default for NseBacktestConfig {
             slow_sma_period: 15,
             rsi_period: 14,
             rsi_buy_threshold: dec!(40.0),
-            stop_loss_pct: dec!(0.015),          // 1.5% stop loss
-            take_profit_pct: dec!(0.030),        // 3.0% take profit
-            train_split_pct: dec!(0.60),         // 60% train
-            val_split_pct: dec!(0.20),           // 20% validation, 20% test
+            stop_loss_pct: dec!(0.015),   // 1.5% stop loss
+            take_profit_pct: dec!(0.030), // 3.0% take profit
+            train_split_pct: dec!(0.60),  // 60% train
+            val_split_pct: dec!(0.20),    // 20% validation, 20% test
             cost_config: IndianCostConfig::default(),
         }
     }
@@ -142,7 +142,10 @@ pub fn parse_and_validate_csv(csv_content: &str) -> Result<Vec<NseCandle>> {
         }
 
         // Check header
-        if line_idx == 0 || line.to_ascii_lowercase().starts_with("timestamp") || line.to_ascii_lowercase().starts_with("date") {
+        if line_idx == 0
+            || line.to_ascii_lowercase().starts_with("timestamp")
+            || line.to_ascii_lowercase().starts_with("date")
+        {
             continue;
         }
 
@@ -153,26 +156,47 @@ pub fn parse_and_validate_csv(csv_content: &str) -> Result<Vec<NseCandle>> {
 
         let ts_raw = fields[0];
         let symbol = fields[1].to_uppercase();
-        let open = Decimal::from_str(fields[2]).with_context(|| format!("Line {}: Invalid open price {}", line_idx + 1, fields[2]))?;
-        let high = Decimal::from_str(fields[3]).with_context(|| format!("Line {}: Invalid high price {}", line_idx + 1, fields[3]))?;
-        let low = Decimal::from_str(fields[4]).with_context(|| format!("Line {}: Invalid low price {}", line_idx + 1, fields[4]))?;
-        let close = Decimal::from_str(fields[5]).with_context(|| format!("Line {}: Invalid close price {}", line_idx + 1, fields[5]))?;
-        let volume = Decimal::from_str(fields[6]).with_context(|| format!("Line {}: Invalid volume {}", line_idx + 1, fields[6]))?;
+        let open = Decimal::from_str(fields[2])
+            .with_context(|| format!("Line {}: Invalid open price {}", line_idx + 1, fields[2]))?;
+        let high = Decimal::from_str(fields[3])
+            .with_context(|| format!("Line {}: Invalid high price {}", line_idx + 1, fields[3]))?;
+        let low = Decimal::from_str(fields[4])
+            .with_context(|| format!("Line {}: Invalid low price {}", line_idx + 1, fields[4]))?;
+        let close = Decimal::from_str(fields[5])
+            .with_context(|| format!("Line {}: Invalid close price {}", line_idx + 1, fields[5]))?;
+        let volume = Decimal::from_str(fields[6])
+            .with_context(|| format!("Line {}: Invalid volume {}", line_idx + 1, fields[6]))?;
 
         // Geometry checks
-        if open <= Decimal::ZERO || high <= Decimal::ZERO || low <= Decimal::ZERO || close <= Decimal::ZERO {
+        if open <= Decimal::ZERO
+            || high <= Decimal::ZERO
+            || low <= Decimal::ZERO
+            || close <= Decimal::ZERO
+        {
             bail!("Line {}: Prices must be strictly positive", line_idx + 1);
         }
         if volume < Decimal::ZERO {
             bail!("Line {}: Volume must be non-negative", line_idx + 1);
         }
         if high < low || high < open || high < close || low > open || low > close {
-            bail!("Line {}: Inconsistent OHLC candle geometry (H: {}, L: {}, O: {}, C: {})", line_idx + 1, high, low, open, close);
+            bail!(
+                "Line {}: Inconsistent OHLC candle geometry (H: {}, L: {}, O: {}, C: {})",
+                line_idx + 1,
+                high,
+                low,
+                open,
+                close
+            );
         }
 
         // Parse timestamp
-        let timestamp = parse_timestamp(ts_raw)
-            .with_context(|| format!("Line {}: Could not parse timestamp '{}'", line_idx + 1, ts_raw))?;
+        let timestamp = parse_timestamp(ts_raw).with_context(|| {
+            format!(
+                "Line {}: Could not parse timestamp '{}'",
+                line_idx + 1,
+                ts_raw
+            )
+        })?;
 
         // Chronological monotonic check per symbol
         if let Some(prev) = last_ts_by_symbol.get(&symbol) {
@@ -234,15 +258,25 @@ fn parse_timestamp(raw: &str) -> Result<DateTime<Utc>> {
 }
 
 /// Run an end-to-end historical backtest with zero look-ahead bias.
-pub fn run_backtest(candles: &[NseCandle], config: &NseBacktestConfig) -> Result<NseBacktestResults> {
+pub fn run_backtest(
+    candles: &[NseCandle],
+    config: &NseBacktestConfig,
+) -> Result<NseBacktestResults> {
     if candles.len() < config.slow_sma_period + 2 {
-        bail!("Insufficient candle data (found {}, need at least {})", candles.len(), config.slow_sma_period + 2);
+        bail!(
+            "Insufficient candle data (found {}, need at least {})",
+            candles.len(),
+            config.slow_sma_period + 2
+        );
     }
 
     // Group candles by symbol and sort chronologically
     let mut by_symbol: HashMap<String, Vec<NseCandle>> = HashMap::new();
     for c in candles {
-        by_symbol.entry(c.symbol.clone()).or_default().push(c.clone());
+        by_symbol
+            .entry(c.symbol.clone())
+            .or_default()
+            .push(c.clone());
     }
     for list in by_symbol.values_mut() {
         list.sort_by_key(|c| c.timestamp);
@@ -262,7 +296,9 @@ pub fn run_backtest(candles: &[NseCandle], config: &NseBacktestConfig) -> Result
     // Multi-bar simulation: iterate across all timestamps
     // We assume single-symbol or primary symbol timeline
     let primary_symbol = &first_candle.symbol;
-    let timeline = by_symbol.get(primary_symbol).context("Primary symbol not found")?;
+    let timeline = by_symbol
+        .get(primary_symbol)
+        .context("Primary symbol not found")?;
 
     let mut pending_signal: Option<Side> = None;
     let mut high_water_mark = initial_capital;
@@ -275,15 +311,24 @@ pub fn run_backtest(candles: &[NseCandle], config: &NseBacktestConfig) -> Result
         if let Some(signal) = pending_signal.take() {
             if signal == Side::Buy && open_position.is_none() {
                 // Execute Buy at current bar OPEN with spread and slippage
-                let execution_price = current_bar.open * (Decimal::ONE + config.spread_bps + config.slippage_bps);
+                let execution_price =
+                    current_bar.open * (Decimal::ONE + config.spread_bps + config.slippage_bps);
                 let max_notional = initial_capital * config.max_position_pct;
                 let available_to_spend = cash.min(max_notional);
 
                 if available_to_spend >= execution_price {
                     // Whole shares only!
-                    let shares = (available_to_spend / execution_price).floor().to_string().parse::<i64>().unwrap_or(0);
+                    let shares = (available_to_spend / execution_price)
+                        .floor()
+                        .to_string()
+                        .parse::<i64>()
+                        .unwrap_or(0);
                     // Volume participation cap
-                    let max_shares_by_vol = (current_bar.volume * config.volume_limit_pct).floor().to_string().parse::<i64>().unwrap_or(shares);
+                    let max_shares_by_vol = (current_bar.volume * config.volume_limit_pct)
+                        .floor()
+                        .to_string()
+                        .parse::<i64>()
+                        .unwrap_or(shares);
                     let shares = shares.min(max_shares_by_vol);
 
                     if shares >= 1 {
@@ -315,7 +360,8 @@ pub fn run_backtest(candles: &[NseCandle], config: &NseBacktestConfig) -> Result
             } else if signal == Side::Sell && open_position.is_some() {
                 // Exit executed at current bar OPEN
                 let mut pos = open_position.take().unwrap();
-                let exit_price = current_bar.open * (Decimal::ONE - config.spread_bps - config.slippage_bps);
+                let exit_price =
+                    current_bar.open * (Decimal::ONE - config.spread_bps - config.slippage_bps);
                 let trade_value = exit_price * Decimal::from(pos.shares);
                 let exit_costs = config.cost_config.calculate(trade_value, Side::Sell);
                 let total_payout = trade_value - exit_costs.total;
@@ -435,7 +481,11 @@ pub fn run_backtest(candles: &[NseCandle], config: &NseBacktestConfig) -> Result
             let slow_sma = compute_sma(slice, config.slow_sma_period);
             let rsi = compute_rsi(slice, config.rsi_period);
 
-            if open_position.is_none() && fast_sma > slow_sma && rsi > config.rsi_buy_threshold && rsi < dec!(70.0) {
+            if open_position.is_none()
+                && fast_sma > slow_sma
+                && rsi > config.rsi_buy_threshold
+                && rsi < dec!(70.0)
+            {
                 pending_signal = Some(Side::Buy);
             } else if open_position.is_some() && fast_sma < slow_sma {
                 pending_signal = Some(Side::Sell);
@@ -475,25 +525,77 @@ pub fn run_backtest(candles: &[NseCandle], config: &NseBacktestConfig) -> Result
         unrealized_pnl = (last_close - p.entry_price) * Decimal::from(p.shares);
     }
 
-    let final_equity = equity_curve.last().map(|e| e.total_equity).unwrap_or(initial_capital);
+    let final_equity = equity_curve
+        .last()
+        .map(|e| e.total_equity)
+        .unwrap_or(initial_capital);
     let net_profit = final_equity - initial_capital;
     let realized_pnl: Decimal = completed_trades.iter().map(|t| t.net_pnl).sum();
 
     let total_costs: Decimal = completed_trades.iter().map(|t| t.total_costs).sum();
-    let total_stt: Decimal = completed_trades.iter().map(|t| t.entry_costs.stt + t.exit_costs.as_ref().map(|c| c.stt).unwrap_or(Decimal::ZERO)).sum();
-    let total_brokerage: Decimal = completed_trades.iter().map(|t| t.entry_costs.brokerage + t.exit_costs.as_ref().map(|c| c.brokerage).unwrap_or(Decimal::ZERO)).sum();
-    let total_gst: Decimal = completed_trades.iter().map(|t| t.entry_costs.gst + t.exit_costs.as_ref().map(|c| c.gst).unwrap_or(Decimal::ZERO)).sum();
-    let total_stamp_duty: Decimal = completed_trades.iter().map(|t| t.entry_costs.stamp_duty).sum();
-    let total_exchange_charges: Decimal = completed_trades.iter().map(|t| t.entry_costs.exchange_charges + t.exit_costs.as_ref().map(|c| c.exchange_charges).unwrap_or(Decimal::ZERO)).sum();
+    let total_stt: Decimal = completed_trades
+        .iter()
+        .map(|t| {
+            t.entry_costs.stt
+                + t.exit_costs
+                    .as_ref()
+                    .map(|c| c.stt)
+                    .unwrap_or(Decimal::ZERO)
+        })
+        .sum();
+    let total_brokerage: Decimal = completed_trades
+        .iter()
+        .map(|t| {
+            t.entry_costs.brokerage
+                + t.exit_costs
+                    .as_ref()
+                    .map(|c| c.brokerage)
+                    .unwrap_or(Decimal::ZERO)
+        })
+        .sum();
+    let total_gst: Decimal = completed_trades
+        .iter()
+        .map(|t| {
+            t.entry_costs.gst
+                + t.exit_costs
+                    .as_ref()
+                    .map(|c| c.gst)
+                    .unwrap_or(Decimal::ZERO)
+        })
+        .sum();
+    let total_stamp_duty: Decimal = completed_trades
+        .iter()
+        .map(|t| t.entry_costs.stamp_duty)
+        .sum();
+    let total_exchange_charges: Decimal = completed_trades
+        .iter()
+        .map(|t| {
+            t.entry_costs.exchange_charges
+                + t.exit_costs
+                    .as_ref()
+                    .map(|c| c.exchange_charges)
+                    .unwrap_or(Decimal::ZERO)
+        })
+        .sum();
 
     let roi_pct = (net_profit / initial_capital).round_dp(4);
 
-    let max_drawdown_pct = equity_curve.iter().map(|e| e.drawdown_pct).max().unwrap_or(Decimal::ZERO);
+    let max_drawdown_pct = equity_curve
+        .iter()
+        .map(|e| e.drawdown_pct)
+        .max()
+        .unwrap_or(Decimal::ZERO);
     let max_drawdown_inr = (initial_capital * max_drawdown_pct).round_dp(2);
 
     let total_trades = completed_trades.len();
-    let winning_trades = completed_trades.iter().filter(|t| t.net_pnl > Decimal::ZERO).count();
-    let losing_trades = completed_trades.iter().filter(|t| t.net_pnl <= Decimal::ZERO).count();
+    let winning_trades = completed_trades
+        .iter()
+        .filter(|t| t.net_pnl > Decimal::ZERO)
+        .count();
+    let losing_trades = completed_trades
+        .iter()
+        .filter(|t| t.net_pnl <= Decimal::ZERO)
+        .count();
 
     let win_rate_pct = if total_trades > 0 {
         (Decimal::from(winning_trades) / Decimal::from(total_trades) * dec!(100.0)).round_dp(2)
@@ -501,8 +603,16 @@ pub fn run_backtest(candles: &[NseCandle], config: &NseBacktestConfig) -> Result
         Decimal::ZERO
     };
 
-    let gross_wins: Decimal = completed_trades.iter().filter(|t| t.net_pnl > Decimal::ZERO).map(|t| t.net_pnl).sum();
-    let gross_losses: Decimal = completed_trades.iter().filter(|t| t.net_pnl < Decimal::ZERO).map(|t| t.net_pnl.abs()).sum();
+    let gross_wins: Decimal = completed_trades
+        .iter()
+        .filter(|t| t.net_pnl > Decimal::ZERO)
+        .map(|t| t.net_pnl)
+        .sum();
+    let gross_losses: Decimal = completed_trades
+        .iter()
+        .filter(|t| t.net_pnl < Decimal::ZERO)
+        .map(|t| t.net_pnl.abs())
+        .sum();
 
     let profit_factor = if gross_losses > Decimal::ZERO {
         (gross_wins / gross_losses).round_dp(2)
@@ -518,7 +628,10 @@ pub fn run_backtest(candles: &[NseCandle], config: &NseBacktestConfig) -> Result
         Decimal::ZERO
     };
 
-    let last_benchmark = equity_curve.last().map(|e| e.benchmark_equity).unwrap_or(initial_capital);
+    let last_benchmark = equity_curve
+        .last()
+        .map(|e| e.benchmark_equity)
+        .unwrap_or(initial_capital);
     let benchmark_return_pct = ((last_benchmark - initial_capital) / initial_capital).round_dp(4);
 
     Ok(NseBacktestResults {
@@ -587,14 +700,18 @@ mod tests {
 
     fn generate_synthetic_candles() -> Vec<NseCandle> {
         let mut candles = Vec::new();
-        let base_date = NaiveDateTime::parse_from_str("2026-01-01 09:15:00", "%Y-%m-%d %H:%M:%S").unwrap();
+        let base_date =
+            NaiveDateTime::parse_from_str("2026-01-01 09:15:00", "%Y-%m-%d %H:%M:%S").unwrap();
         let kolkata = chrono_tz::Asia::Kolkata;
         use chrono::TimeZone;
 
         let mut price = dec!(2500.0);
         for i in 0..50 {
             let naive = base_date + chrono::Duration::days(i);
-            let ts = kolkata.from_local_datetime(&naive).unwrap().with_timezone(&Utc);
+            let ts = kolkata
+                .from_local_datetime(&naive)
+                .unwrap()
+                .with_timezone(&Utc);
 
             // Alternate wave pattern
             let delta = if i % 2 == 0 { dec!(25.0) } else { dec!(-15.0) };

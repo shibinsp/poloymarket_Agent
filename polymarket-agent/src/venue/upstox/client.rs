@@ -105,7 +105,10 @@ impl UpstoxSandboxClient {
     /// Place a sandbox order. Live order placement is strictly blocked.
     pub async fn place_order(&self, req: &UpstoxOrderRequestPayload) -> Result<String> {
         if req.quantity <= 0 {
-            bail!("Invalid order quantity {} — NSE cash equities require positive whole shares", req.quantity);
+            bail!(
+                "Invalid order quantity {} — NSE cash equities require positive whole shares",
+                req.quantity
+            );
         }
 
         if self.is_mock {
@@ -125,13 +128,7 @@ impl UpstoxSandboxClient {
             );
         }
 
-        let resp = self
-            .http
-            .post(&url)
-            .headers(headers)
-            .json(req)
-            .send()
-            .await;
+        let resp = self.http.post(&url).headers(headers).json(req).send().await;
 
         match resp {
             Ok(r) => {
@@ -149,7 +146,9 @@ impl UpstoxSandboxClient {
                         .unwrap_or_else(|| format!("HTTP {status}"));
                     warn!("Upstox live endpoint rejected order: {err_msg} — executing in sandbox mock engine");
                 } else {
-                    warn!("Failed to parse Upstox order response — executing in sandbox mock engine");
+                    warn!(
+                        "Failed to parse Upstox order response — executing in sandbox mock engine"
+                    );
                 }
             }
             Err(e) => {
@@ -167,7 +166,7 @@ impl UpstoxSandboxClient {
         req: &UpstoxOrderRequestPayload,
     ) -> String {
         let order_id = format!("UPSTOX-SBX-{}", uuid::Uuid::new_v4().simple());
-        
+
         let symbol = find_nse_instrument(&req.instrument_token)
             .map(|i| i.symbol)
             .unwrap_or_else(|| req.instrument_token.clone());
@@ -199,18 +198,22 @@ impl UpstoxSandboxClient {
         let notional = fill_price * Decimal::from(req.quantity);
         if req.transaction_type == "BUY" {
             state.cash -= notional;
-            let pos = state.positions.entry(symbol.clone()).or_insert_with(|| UpstoxPositionRecord {
-                trading_symbol: symbol.clone(),
-                instrument_token: req.instrument_token.clone(),
-                quantity: 0,
-                buy_amount: Some(Decimal::ZERO),
-                sell_amount: Some(Decimal::ZERO),
-                buy_price: Some(fill_price),
-                sell_price: None,
-                last_price: Some(fill_price),
-                pnl: Some(Decimal::ZERO),
-                product: req.product.clone(),
-            });
+            let pos =
+                state
+                    .positions
+                    .entry(symbol.clone())
+                    .or_insert_with(|| UpstoxPositionRecord {
+                        trading_symbol: symbol.clone(),
+                        instrument_token: req.instrument_token.clone(),
+                        quantity: 0,
+                        buy_amount: Some(Decimal::ZERO),
+                        sell_amount: Some(Decimal::ZERO),
+                        buy_price: Some(fill_price),
+                        sell_price: None,
+                        last_price: Some(fill_price),
+                        pnl: Some(Decimal::ZERO),
+                        product: req.product.clone(),
+                    });
             pos.quantity += req.quantity;
             pos.buy_amount = Some(pos.buy_amount.unwrap_or(Decimal::ZERO) + notional);
             pos.last_price = Some(fill_price);
@@ -290,7 +293,10 @@ impl UpstoxSandboxClient {
         }
 
         if let Ok(resp) = self.http.get(&url).headers(headers).send().await {
-            if let Ok(body) = resp.json::<UpstoxApiResponse<Vec<UpstoxPositionRecord>>>().await {
+            if let Ok(body) = resp
+                .json::<UpstoxApiResponse<Vec<UpstoxPositionRecord>>>()
+                .await
+            {
                 if let Some(data) = body.data {
                     if !data.is_empty() {
                         return Ok(data);
@@ -372,7 +378,10 @@ impl UpstoxSandboxClient {
         }
 
         if let Ok(resp) = self.http.get(&url).headers(headers).send().await {
-            if let Ok(body) = resp.json::<UpstoxApiResponse<HashMap<String, UpstoxQuoteData>>>().await {
+            if let Ok(body) = resp
+                .json::<UpstoxApiResponse<HashMap<String, UpstoxQuoteData>>>()
+                .await
+            {
                 if let Some(ref errs) = body.errors {
                     if let Some(e) = errs.first() {
                         warn!("Upstox quote API error for {symbol}: {}", e.message);

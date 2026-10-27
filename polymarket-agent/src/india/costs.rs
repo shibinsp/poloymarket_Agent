@@ -40,15 +40,15 @@ pub struct IndianCostConfig {
 impl Default for IndianCostConfig {
     fn default() -> Self {
         Self {
-            brokerage_rate: dec!(0.0005),           // 0.05%
-            max_brokerage_per_order: dec!(20.0),    // Upstox standard ₹20 cap
-            stt_buy_rate: dec!(0.001),              // 0.1% Delivery
-            stt_sell_rate: dec!(0.001),             // 0.1% Delivery
+            brokerage_rate: dec!(0.0005),            // 0.05%
+            max_brokerage_per_order: dec!(20.0),     // Upstox standard ₹20 cap
+            stt_buy_rate: dec!(0.001),               // 0.1% Delivery
+            stt_sell_rate: dec!(0.001),              // 0.1% Delivery
             exchange_turnover_rate: dec!(0.0000297), // 0.00297% NSE
-            sebi_rate: dec!(0.000001),              // ₹10 / crore
-            stamp_duty_buy_rate: dec!(0.00015),     // 0.015% on Buy
-            gst_rate: dec!(0.18),                   // 18% GST
-            ipft_rate: dec!(0.000001),              // 0.0001% IPFT
+            sebi_rate: dec!(0.000001),               // ₹10 / crore
+            stamp_duty_buy_rate: dec!(0.00015),      // 0.015% on Buy
+            gst_rate: dec!(0.18),                    // 18% GST
+            ipft_rate: dec!(0.000001),               // 0.0001% IPFT
         }
     }
 }

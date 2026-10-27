@@ -95,7 +95,7 @@ mod tests {
         let tcs = find_nse_instrument("TCS").unwrap();
         let inst = tcs.to_venue_instrument(&VenueId::new("upstox_sandbox"));
         assert_eq!(inst.quote_ccy, "INR");
-        assert_eq!(inst.fractional, false);
+        assert!(!inst.fractional);
         assert_eq!(inst.min_qty, Some(dec!(1.0)));
         assert_eq!(inst.tick_size, Some(dec!(0.05)));
     }

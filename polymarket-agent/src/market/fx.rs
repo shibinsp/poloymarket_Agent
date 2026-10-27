@@ -70,6 +70,7 @@ pub struct CombinedPortfolioSummary {
 }
 
 impl CombinedPortfolioSummary {
+    #[allow(clippy::too_many_arguments)]
     pub fn calculate(
         fx: &FxRate,
         india_equity_inr: Decimal,
@@ -153,16 +154,16 @@ mod tests {
             dec!(800000.0), // ₹8,00,000 = $10,000
             dec!(16000.0),  // ₹16,000 realized
             dec!(0.0),
-            dec!(1000.0),   // ₹1,000 costs
-            dec!(10000.0),  // $10,000
-            dec!(500.0),    // $500 realized
+            dec!(1000.0),  // ₹1,000 costs
+            dec!(10000.0), // $10,000
+            dec!(500.0),   // $500 realized
             dec!(0.0),
-            dec!(20.0),     // $20 costs
+            dec!(20.0), // $20 costs
         );
 
         assert_eq!(summary.india_net_pnl_inr, dec!(15000.0)); // ₹15,000
-        assert_eq!(summary.us_net_pnl_usd, dec!(480.0));      // $480
-        // Combined equity: $10,000 + $10,000 = $20,000
+        assert_eq!(summary.us_net_pnl_usd, dec!(480.0)); // $480
+                                                         // Combined equity: $10,000 + $10,000 = $20,000
         assert_eq!(summary.combined_equity_usd, dec!(20000.00));
         assert_eq!(summary.combined_equity_inr, dec!(1600000.00));
     }

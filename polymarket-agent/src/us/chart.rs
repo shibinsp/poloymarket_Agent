@@ -107,22 +107,102 @@ pub struct UsChartResponse {
 /// Get company metadata for top US watchlist symbols.
 pub fn get_us_company_info(symbol: &str) -> (&'static str, &'static str, &'static str, Decimal) {
     match symbol.to_uppercase().as_str() {
-        "SPY" => ("SPDR S&P 500 ETF Trust", "NYSE Arca", "Index ETF | S&P 500 Benchmark", dec!(585.40)),
-        "QQQ" => ("Invesco QQQ Trust", "NASDAQ", "Index ETF | Nasdaq-100 Growth", dec!(496.20)),
-        "AAPL" => ("Apple Inc.", "NASDAQ", "Large Cap | Consumer Tech & Ecosystem", dec!(232.50)),
-        "NVDA" => ("NVIDIA Corp.", "NASDAQ", "Mega Cap | AI Compute & Semiconductors", dec!(142.80)),
-        "MSFT" => ("Microsoft Corp.", "NASDAQ", "Mega Cap | Enterprise Cloud & AI", dec!(428.10)),
-        "AMZN" => ("Amazon.com Inc.", "NASDAQ", "Mega Cap | E-Commerce & AWS Cloud", dec!(186.30)),
-        "TSLA" => ("Tesla Inc.", "NASDAQ", "Large Cap | EV, Autonomous & Energy", dec!(218.40)),
-        "META" => ("Meta Platforms Inc.", "NASDAQ", "Mega Cap | Social Tech, Meta & AI", dec!(578.90)),
-        "GOOGL" => ("Alphabet Inc.", "NASDAQ", "Mega Cap | Search, Advertising & Cloud", dec!(166.70)),
-        "SIRI" => ("Sirius XM Holdings Inc.", "NASDAQ", "Mid Cap | Satellite Radio & Media", dec!(27.28)),
-        "NOK" => ("Nokia Corporation ADR", "NYSE", "Tech | 5G & Network Infrastructure", dec!(8.73)),
-        "LCID" => ("Lucid Group Inc.", "NASDAQ", "Consumer Cyclical | Electric Vehicles", dec!(3.51)),
-        "PLUG" => ("Plug Power Inc.", "NASDAQ", "Clean Energy | Hydrogen Fuel Cells", dec!(1.40)),
-        "NIO" => ("NIO Inc. ADR", "NYSE", "Auto Manufacturers | Electric Vehicles", dec!(3.27)),
-        "SOFI" => ("SoFi Technologies Inc.", "NASDAQ", "Financial Tech | Digital Banking", dec!(14.52)),
-        _ => ("US Listed Equity", "NASDAQ", "Cash Equities | Regular Hours", dec!(150.00)),
+        "SPY" => (
+            "SPDR S&P 500 ETF Trust",
+            "NYSE Arca",
+            "Index ETF | S&P 500 Benchmark",
+            dec!(585.40),
+        ),
+        "QQQ" => (
+            "Invesco QQQ Trust",
+            "NASDAQ",
+            "Index ETF | Nasdaq-100 Growth",
+            dec!(496.20),
+        ),
+        "AAPL" => (
+            "Apple Inc.",
+            "NASDAQ",
+            "Large Cap | Consumer Tech & Ecosystem",
+            dec!(232.50),
+        ),
+        "NVDA" => (
+            "NVIDIA Corp.",
+            "NASDAQ",
+            "Mega Cap | AI Compute & Semiconductors",
+            dec!(142.80),
+        ),
+        "MSFT" => (
+            "Microsoft Corp.",
+            "NASDAQ",
+            "Mega Cap | Enterprise Cloud & AI",
+            dec!(428.10),
+        ),
+        "AMZN" => (
+            "Amazon.com Inc.",
+            "NASDAQ",
+            "Mega Cap | E-Commerce & AWS Cloud",
+            dec!(186.30),
+        ),
+        "TSLA" => (
+            "Tesla Inc.",
+            "NASDAQ",
+            "Large Cap | EV, Autonomous & Energy",
+            dec!(218.40),
+        ),
+        "META" => (
+            "Meta Platforms Inc.",
+            "NASDAQ",
+            "Mega Cap | Social Tech, Meta & AI",
+            dec!(578.90),
+        ),
+        "GOOGL" => (
+            "Alphabet Inc.",
+            "NASDAQ",
+            "Mega Cap | Search, Advertising & Cloud",
+            dec!(166.70),
+        ),
+        "SIRI" => (
+            "Sirius XM Holdings Inc.",
+            "NASDAQ",
+            "Mid Cap | Satellite Radio & Media",
+            dec!(27.28),
+        ),
+        "NOK" => (
+            "Nokia Corporation ADR",
+            "NYSE",
+            "Tech | 5G & Network Infrastructure",
+            dec!(8.73),
+        ),
+        "LCID" => (
+            "Lucid Group Inc.",
+            "NASDAQ",
+            "Consumer Cyclical | Electric Vehicles",
+            dec!(3.51),
+        ),
+        "PLUG" => (
+            "Plug Power Inc.",
+            "NASDAQ",
+            "Clean Energy | Hydrogen Fuel Cells",
+            dec!(1.40),
+        ),
+        "NIO" => (
+            "NIO Inc. ADR",
+            "NYSE",
+            "Auto Manufacturers | Electric Vehicles",
+            dec!(3.27),
+        ),
+        "SOFI" => (
+            "SoFi Technologies Inc.",
+            "NASDAQ",
+            "Financial Tech | Digital Banking",
+            dec!(14.52),
+        ),
+        _ => (
+            "US Listed Equity",
+            "NASDAQ",
+            "Cash Equities | Regular Hours",
+            dec!(150.00),
+        ),
     }
 }
 
@@ -169,7 +249,8 @@ pub fn generate_us_chart(
 
         // Smooth wave with realistic intraday trend
         let angle = (i as f64) * 0.11;
-        let wave = (angle.sin() * 0.005) + ((angle * 0.6).cos() * 0.0035) + ((i as f64) * drift_pattern);
+        let wave =
+            (angle.sin() * 0.005) + ((angle * 0.6).cos() * 0.0035) + ((i as f64) * drift_pattern);
         let wave_dec = Decimal::from_f64_retain(wave).unwrap_or(Decimal::ZERO);
 
         let open = current;
@@ -208,11 +289,18 @@ pub fn generate_us_chart(
     let mut trade_markers = Vec::new();
     let symbol_upper = symbol.to_uppercase();
 
-    for ord in orders.iter().filter(|o| o.symbol.eq_ignore_ascii_case(&symbol_upper)) {
+    for ord in orders
+        .iter()
+        .filter(|o| o.symbol.eq_ignore_ascii_case(&symbol_upper))
+    {
         let price = ord.price.parse::<Decimal>().unwrap_or(current_price);
         let shares_dec = Decimal::from(ord.quantity);
         let val = price * shares_dec;
-        let side = if ord.side.eq_ignore_ascii_case("BUY") { Side::Buy } else { Side::Sell };
+        let side = if ord.side.eq_ignore_ascii_case("BUY") {
+            Side::Buy
+        } else {
+            Side::Sell
+        };
         let cost = cost_cfg.calculate(val, shares_dec, side);
 
         trade_markers.push(ChartTradeMarker {
@@ -231,9 +319,8 @@ pub fn generate_us_chart(
         });
     }
 
-
     // Build itemized detailed trades
-    let detailed_trades = build_detailed_trades(&symbol_upper, &trade_markers, &name);
+    let detailed_trades = build_detailed_trades(&symbol_upper, &trade_markers, name);
     let summary = summarize_detailed_trades(&detailed_trades);
 
     UsChartResponse {
@@ -259,7 +346,11 @@ pub fn generate_us_chart(
 }
 
 /// Matches buys with sells to compute exact realized profit, fees, and duration.
-fn build_detailed_trades(symbol: &str, markers: &[ChartTradeMarker], company_name: &str) -> Vec<DetailedTradeRecord> {
+fn build_detailed_trades(
+    symbol: &str,
+    markers: &[ChartTradeMarker],
+    company_name: &str,
+) -> Vec<DetailedTradeRecord> {
     let mut records = Vec::new();
     let mut buys: Vec<&ChartTradeMarker> = markers.iter().filter(|m| m.side == "BUY").collect();
     let sells: Vec<&ChartTradeMarker> = markers.iter().filter(|m| m.side == "SELL").collect();

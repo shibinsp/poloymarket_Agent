@@ -11,6 +11,7 @@ use polymarket_agent::monitoring;
 use polymarket_agent::monitoring::alerts::{AlertLevel, AnomalyKind};
 use polymarket_agent::monitoring::dashboard::{spawn_dashboard, DashboardState};
 use polymarket_agent::monitoring::logger;
+use rust_decimal_macros::dec;
 
 /// Exit (so the supervisor restarts us) after this many back-to-back cycle failures.
 const MAX_CONSECUTIVE_CYCLE_FAILURES: u32 = 5;
@@ -124,12 +125,12 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
     println!("   Daily API budget: ${}", config.agent.daily_api_budget);
     println!(
         "   Min edge threshold: {}%",
-        config.valuation.min_edge_threshold * rust_decimal_macros::dec!(100)
+        config.valuation.min_edge_threshold * dec!(100)
     );
     println!("   Kelly fraction: {}", config.risk.kelly_fraction);
     println!(
         "   Max position: {}%",
-        config.risk.max_position_pct * rust_decimal_macros::dec!(100)
+        config.risk.max_position_pct * dec!(100)
     );
     println!("   ✅ Configuration valid\n");
 

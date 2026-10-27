@@ -6,7 +6,9 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 use polymarket_agent::market::fx::{CombinedPortfolioSummary, FxRate};
-use polymarket_agent::us::backtest::{parse_and_validate_us_csv, run_us_backtest, UsBacktestConfig};
+use polymarket_agent::us::backtest::{
+    parse_and_validate_us_csv, run_us_backtest, UsBacktestConfig,
+};
 use polymarket_agent::us::costs::UsCostConfig;
 use polymarket_agent::us::instruments::{find_us_instrument, us_watchlist};
 use polymarket_agent::venue::session::TradingSession;
@@ -15,7 +17,7 @@ use polymarket_agent::venue::types::{Side, VenueId};
 #[test]
 fn test_us_watchlist_instruments_and_venue_mapping() {
     let list = us_watchlist();
-    assert_eq!(list.len(), 6, "Expected 6 liquid US symbols");
+    assert_eq!(list.len(), 15, "Expected 15 liquid US symbols");
 
     let spy = find_us_instrument("SPY").expect("SPY must exist");
     assert_eq!(spy.exchange, "NYSE");
@@ -23,7 +25,7 @@ fn test_us_watchlist_instruments_and_venue_mapping() {
 
     let inst = spy.to_venue_instrument(&VenueId::new("alpaca"));
     assert_eq!(inst.quote_ccy, "USD");
-    assert_eq!(inst.fractional, true);
+    assert!(inst.fractional);
     assert_eq!(inst.min_qty, Some(dec!(0.001)));
 }
 
@@ -38,7 +40,10 @@ fn test_us_statutory_and_regulatory_fees() {
     assert_eq!(buy_costs.sec_fee, Decimal::ZERO);
     assert_eq!(buy_costs.finra_taf, Decimal::ZERO);
     assert_eq!(buy_costs.commission, Decimal::ZERO);
-    assert!(buy_costs.total > Decimal::ZERO, "Spread & slippage must be accounted for");
+    assert!(
+        buy_costs.total > Decimal::ZERO,
+        "Spread & slippage must be accounted for"
+    );
 
     // Sell side: SEC Section 31 ($27.80/million) and FINRA TAF ($0.000166/sh) apply
     let sell_costs = config.calculate(notional, shares, Side::Sell);
@@ -60,27 +65,39 @@ fn test_us_exchange_holidays_and_early_closes() {
         .with_ymd_and_hms(2026, 1, 19, 11, 0, 0)
         .unwrap()
         .with_timezone(&Utc);
-    assert!(!session.is_open_at(mlk_day), "US market must be closed on MLK Day");
+    assert!(
+        !session.is_open_at(mlk_day),
+        "US market must be closed on MLK Day"
+    );
 
     // Regular day 2026-01-20 11:00 ET -> open
     let regular_day = et
         .with_ymd_and_hms(2026, 1, 20, 11, 0, 0)
         .unwrap()
         .with_timezone(&Utc);
-    assert!(session.is_open_at(regular_day), "US market must be open on regular trading day");
+    assert!(
+        session.is_open_at(regular_day),
+        "US market must be open on regular trading day"
+    );
 
     // Early close day (Black Friday 2026-11-27): closes at 13:00 ET
     let black_friday_noon = et
         .with_ymd_and_hms(2026, 11, 27, 12, 0, 0)
         .unwrap()
         .with_timezone(&Utc);
-    assert!(session.is_open_at(black_friday_noon), "Must be open at 12:00 on Black Friday");
+    assert!(
+        session.is_open_at(black_friday_noon),
+        "Must be open at 12:00 on Black Friday"
+    );
 
     let black_friday_afternoon = et
         .with_ymd_and_hms(2026, 11, 27, 13, 30, 0)
         .unwrap()
         .with_timezone(&Utc);
-    assert!(!session.is_open_at(black_friday_afternoon), "Must be closed at 13:30 on Black Friday (early close 13:00)");
+    assert!(
+        !session.is_open_at(black_friday_afternoon),
+        "Must be closed at 13:30 on Black Friday (early close 13:00)"
+    );
 }
 
 #[test]
@@ -93,23 +110,38 @@ fn test_intraday_entry_cutoff_and_square_off() {
         .with_ymd_and_hms(2026, 1, 20, 15, 15, 0)
         .unwrap()
         .with_timezone(&Utc);
-    assert!(session.entry_permitted_at(t_1515, 30), "Entries should be permitted 45m before close");
-    assert!(!session.is_intraday_exit_due(t_1515, 15), "Square-off should not be due 45m before close");
+    assert!(
+        session.entry_permitted_at(t_1515, 30),
+        "Entries should be permitted 45m before close"
+    );
+    assert!(
+        !session.is_intraday_exit_due(t_1515, 15),
+        "Square-off should not be due 45m before close"
+    );
 
     // 15:35 ET (25 minutes before 16:00 close): entries blocked (cutoff is 30m), square-off not yet due (15m)
     let t_1535 = et
         .with_ymd_and_hms(2026, 1, 20, 15, 35, 0)
         .unwrap()
         .with_timezone(&Utc);
-    assert!(!session.entry_permitted_at(t_1535, 30), "Entries must be blocked within 30m of close");
-    assert!(!session.is_intraday_exit_due(t_1535, 15), "Square-off not due at 15:35");
+    assert!(
+        !session.entry_permitted_at(t_1535, 30),
+        "Entries must be blocked within 30m of close"
+    );
+    assert!(
+        !session.is_intraday_exit_due(t_1535, 15),
+        "Square-off not due at 15:35"
+    );
 
     // 15:50 ET (10 minutes before 16:00 close): square-off exit is due
     let t_1550 = et
         .with_ymd_and_hms(2026, 1, 20, 15, 50, 0)
         .unwrap()
         .with_timezone(&Utc);
-    assert!(session.is_intraday_exit_due(t_1550, 15), "Square-off exit must be triggered within 15m of close");
+    assert!(
+        session.is_intraday_exit_due(t_1550, 15),
+        "Square-off exit must be triggered within 15m of close"
+    );
 }
 
 #[test]
@@ -134,11 +166,11 @@ fn test_explicit_timestamped_fx_conversion() {
         dec!(500000.0), // India equity ₹5,00,000
         dec!(12000.0),  // Realized ₹12,000
         dec!(0.0),
-        dec!(800.0),    // Costs ₹800
-        dec!(10000.0),  // US equity $10,000
-        dec!(450.0),    // Realized $450
+        dec!(800.0),   // Costs ₹800
+        dec!(10000.0), // US equity $10,000
+        dec!(450.0),   // Realized $450
         dec!(0.0),
-        dec!(15.0),     // Costs $15
+        dec!(15.0), // Costs $15
     );
 
     assert_eq!(summary.india_net_pnl_inr, dec!(11200.0));
@@ -160,5 +192,8 @@ fn test_us_backtest_simulation_with_zero_lookahead() {
     assert_eq!(results.initial_capital, dec!(100000.0));
     assert!(results.final_equity > Decimal::ZERO);
     assert!(results.equity_curve.len() >= 35);
-    assert_eq!(results.total_trades, results.winning_trades + results.losing_trades);
+    assert_eq!(
+        results.total_trades,
+        results.winning_trades + results.losing_trades
+    );
 }

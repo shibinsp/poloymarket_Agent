@@ -376,8 +376,6 @@ impl TradingSession {
             let (session_date, effective_end) = if window.wraps_midnight() {
                 if time >= window.start {
                     (today + Duration::days(1), window.end)
-                } else if time < window.end {
-                    (today, window.end)
                 } else {
                     (today, window.end)
                 }

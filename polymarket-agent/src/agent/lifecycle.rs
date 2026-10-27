@@ -431,31 +431,9 @@ impl Agent {
     /// the wrong direction on the control that bounds the worst case.
     async fn account_equity(&self, venue_equity: Option<Decimal>) -> Option<Decimal> {
         if !self.venues.is_empty() {
-            if let Some(eq) = venue_equity {
-                return Some(eq);
-            }
-            // In paper mode, do not halt the autonomous agent if an external sandbox/paper endpoint
-            // is transiently unreachable or an expired token causes venue reconciliation to return None.
-            // Gracefully fall back to internal paper balance/mark.
-            if self.config.agent.mode == crate::config::AgentMode::Paper {
-                let cash = self.current_balance().await;
-                let cost_basis = fills::unrealized_exposure(&self.store)
-                    .await
-                    .unwrap_or(Decimal::ZERO);
-                let marked = self.store.total_unrealized_pnl().await.unwrap_or(Decimal::ZERO);
-                let paper_eq = cash + cost_basis + marked;
-                let fallback = if paper_eq > Decimal::ZERO {
-                    paper_eq
-                } else {
-                    self.config.agent.initial_paper_balance
-                };
-                warn!(
-                    fallback_equity = %fallback,
-                    "Venues reported incomplete equity in paper mode; falling back to simulated paper mark to prevent false circuit breaker halt"
-                );
-                return Some(fallback);
-            }
-            return None;
+            // A venue that would not report is already flagged Unverified by
+            // the reconciler; if *none* would, there is no equity to speak of.
+            return venue_equity;
         }
 
         // Legacy Polymarket-only path.

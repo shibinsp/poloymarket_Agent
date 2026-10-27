@@ -36,11 +36,11 @@ impl Default for UsCostConfig {
         Self {
             commission_per_share: Decimal::ZERO,
             min_commission: Decimal::ZERO,
-            sec_fee_rate: dec!(0.0000278),     // $27.80 per million (SEC FY24/25 rate)
+            sec_fee_rate: dec!(0.0000278), // $27.80 per million (SEC FY24/25 rate)
             finra_taf_per_share: dec!(0.000166), // FINRA TAF rate per share
-            finra_taf_max: dec!(8.30),          // $8.30 maximum per trade
-            half_spread_pct: dec!(0.0001),      // 0.01% typical spread for SPY/AAPL
-            slippage_pct: dec!(0.0002),         // 0.02% conservative slippage
+            finra_taf_max: dec!(8.30),     // $8.30 maximum per trade
+            half_spread_pct: dec!(0.0001), // 0.01% typical spread for SPY/AAPL
+            slippage_pct: dec!(0.0002),    // 0.02% conservative slippage
         }
     }
 }
@@ -61,7 +61,12 @@ pub struct UsTransactionCosts {
 
 impl UsCostConfig {
     /// Compute all statutory, regulatory and execution costs for a US trade.
-    pub fn calculate(&self, trade_value: Decimal, shares: Decimal, side: Side) -> UsTransactionCosts {
+    pub fn calculate(
+        &self,
+        trade_value: Decimal,
+        shares: Decimal,
+        side: Side,
+    ) -> UsTransactionCosts {
         if trade_value <= Decimal::ZERO || shares <= Decimal::ZERO {
             return UsTransactionCosts {
                 trade_value: Decimal::ZERO,
@@ -117,7 +122,8 @@ impl UsCostConfig {
         let estimated_slippage_cost = trade_value * self.slippage_pct;
 
         let total_regulatory_fees = sec_fee + finra_taf;
-        let total = commission + total_regulatory_fees + estimated_spread_cost + estimated_slippage_cost;
+        let total =
+            commission + total_regulatory_fees + estimated_spread_cost + estimated_slippage_cost;
 
         UsTransactionCosts {
             trade_value,

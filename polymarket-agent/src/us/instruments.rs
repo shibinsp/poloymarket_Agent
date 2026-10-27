@@ -75,9 +75,7 @@ pub fn us_watchlist() -> Vec<UsInstrument> {
 /// Lookup a US instrument by symbol.
 pub fn find_us_instrument(query: &str) -> Option<UsInstrument> {
     let q = query.trim().to_uppercase();
-    us_watchlist()
-        .into_iter()
-        .find(|inst| inst.symbol == q)
+    us_watchlist().into_iter().find(|inst| inst.symbol == q)
 }
 
 #[cfg(test)]
@@ -98,7 +96,7 @@ mod tests {
         let aapl = find_us_instrument("AAPL").unwrap();
         let inst = aapl.to_venue_instrument(&VenueId::new("alpaca"));
         assert_eq!(inst.quote_ccy, "USD");
-        assert_eq!(inst.fractional, true);
+        assert!(inst.fractional);
         assert_eq!(inst.tick_size, Some(dec!(0.01)));
     }
 }

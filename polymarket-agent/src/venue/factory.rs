@@ -313,9 +313,10 @@ fn build_upstox(
         );
     }
 
-    let token = secrets.upstox_sandbox_token.clone().map(|s| {
-        crate::config::SecretString::from(s.expose_secret().to_string())
-    });
+    let token = secrets
+        .upstox_sandbox_token
+        .clone()
+        .map(|s| crate::config::SecretString::from(s.expose_secret().to_string()));
 
     let client = crate::venue::upstox::client::UpstoxSandboxClient::new(token)?;
     Ok(crate::venue::upstox::UpstoxSandboxVenue::new(client))
@@ -715,7 +716,10 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
         let config = config_with(vec![venue]);
         let registry = build_registry(&config, &Secrets::default(), None).unwrap();
         assert_eq!(registry.len(), 1);
-        assert_eq!(registry.all().next().unwrap().id().as_str(), "upstox_sandbox");
+        assert_eq!(
+            registry.all().next().unwrap().id().as_str(),
+            "upstox_sandbox"
+        );
     }
 
     #[test]

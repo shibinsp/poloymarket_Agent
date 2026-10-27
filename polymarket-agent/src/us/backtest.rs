@@ -61,10 +61,10 @@ impl Default for UsBacktestConfig {
             slow_sma_period: 15,
             rsi_period: 14,
             rsi_buy_threshold: dec!(40.0),
-            stop_loss_pct: dec!(0.015),          // 1.5% stop loss
-            take_profit_pct: dec!(0.030),        // 3.0% take profit
-            train_split_pct: dec!(0.60),         // 60% train
-            val_split_pct: dec!(0.20),           // 20% validation, 20% test
+            stop_loss_pct: dec!(0.015),   // 1.5% stop loss
+            take_profit_pct: dec!(0.030), // 3.0% take profit
+            train_split_pct: dec!(0.60),  // 60% train
+            val_split_pct: dec!(0.20),    // 20% validation, 20% test
             cost_config: UsCostConfig::default(),
         }
     }
@@ -193,13 +193,21 @@ pub fn parse_and_validate_us_csv(csv_content: &str) -> Result<Vec<UsCandle>> {
             .with_context(|| format!("Line {}: invalid high price '{}'", line_idx + 1, parts[3]))?;
         let low = Decimal::from_str(parts[4])
             .with_context(|| format!("Line {}: invalid low price '{}'", line_idx + 1, parts[4]))?;
-        let close = Decimal::from_str(parts[5])
-            .with_context(|| format!("Line {}: invalid close price '{}'", line_idx + 1, parts[5]))?;
+        let close = Decimal::from_str(parts[5]).with_context(|| {
+            format!("Line {}: invalid close price '{}'", line_idx + 1, parts[5])
+        })?;
         let volume = Decimal::from_str(parts[6])
             .with_context(|| format!("Line {}: invalid volume '{}'", line_idx + 1, parts[6]))?;
 
-        if open <= Decimal::ZERO || high <= Decimal::ZERO || low <= Decimal::ZERO || close <= Decimal::ZERO {
-            bail!("Line {}: OHLC prices must be strictly positive", line_idx + 1);
+        if open <= Decimal::ZERO
+            || high <= Decimal::ZERO
+            || low <= Decimal::ZERO
+            || close <= Decimal::ZERO
+        {
+            bail!(
+                "Line {}: OHLC prices must be strictly positive",
+                line_idx + 1
+            );
         }
         if high < low || high < open || high < close || low > open || low > close {
             bail!(
@@ -244,14 +252,20 @@ struct OpenPosition {
 }
 
 /// Execute a strict backtest on the provided candles.
-pub fn run_us_backtest(candles: &[UsCandle], config: &UsBacktestConfig) -> Result<UsBacktestResults> {
+pub fn run_us_backtest(
+    candles: &[UsCandle],
+    config: &UsBacktestConfig,
+) -> Result<UsBacktestResults> {
     if candles.is_empty() {
         bail!("Cannot run backtest on empty candles slice");
     }
 
     let mut by_symbol: HashMap<String, Vec<UsCandle>> = HashMap::new();
     for c in candles {
-        by_symbol.entry(c.symbol.clone()).or_default().push(c.clone());
+        by_symbol
+            .entry(c.symbol.clone())
+            .or_default()
+            .push(c.clone());
     }
 
     for (sym, list) in &mut by_symbol {
@@ -298,10 +312,17 @@ pub fn run_us_backtest(candles: &[UsCandle], config: &UsBacktestConfig) -> Resul
         // 1. Execute any pending orders generated at bar t-1 close using bar t open
         let mut executed_orders = Vec::new();
         for (sym, side, target_cash, _gen_ts) in pending_orders.drain(..) {
-            if let Some(candle) = by_symbol.get(&sym).and_then(|list| list.iter().find(|c| c.timestamp == ts)) {
+            if let Some(candle) = by_symbol
+                .get(&sym)
+                .and_then(|list| list.iter().find(|c| c.timestamp == ts))
+            {
                 let execution_price = match side {
-                    Side::Buy => candle.open * (Decimal::ONE + config.spread_bps + config.slippage_bps),
-                    Side::Sell => candle.open * (Decimal::ONE - config.spread_bps - config.slippage_bps),
+                    Side::Buy => {
+                        candle.open * (Decimal::ONE + config.spread_bps + config.slippage_bps)
+                    }
+                    Side::Sell => {
+                        candle.open * (Decimal::ONE - config.spread_bps - config.slippage_bps)
+                    }
                 };
 
                 let execution_price = execution_price.round_dp(2);
@@ -322,10 +343,15 @@ pub fn run_us_backtest(candles: &[UsCandle], config: &UsBacktestConfig) -> Resul
                         if total_outflow <= cash {
                             cash -= total_outflow;
                             total_commission += costs.commission;
-                            total_spread_slippage_cost += costs.estimated_spread_cost + costs.estimated_slippage_cost;
+                            total_spread_slippage_cost +=
+                                costs.estimated_spread_cost + costs.estimated_slippage_cost;
 
-                            let stop_price = (execution_price * (Decimal::ONE - config.stop_loss_pct)).round_dp(2);
-                            let target_price = (execution_price * (Decimal::ONE + config.take_profit_pct)).round_dp(2);
+                            let stop_price = (execution_price
+                                * (Decimal::ONE - config.stop_loss_pct))
+                                .round_dp(2);
+                            let target_price = (execution_price
+                                * (Decimal::ONE + config.take_profit_pct))
+                                .round_dp(2);
 
                             positions.insert(
                                 sym.clone(),
@@ -349,7 +375,10 @@ pub fn run_us_backtest(candles: &[UsCandle], config: &UsBacktestConfig) -> Resul
         // 2. Evaluate exits for currently held positions against current bar t high/low
         let mut closed_symbols = Vec::new();
         for (sym, pos) in &positions {
-            if let Some(candle) = by_symbol.get(sym).and_then(|list| list.iter().find(|c| c.timestamp == ts)) {
+            if let Some(candle) = by_symbol
+                .get(sym)
+                .and_then(|list| list.iter().find(|c| c.timestamp == ts))
+            {
                 let mut triggered_exit = None;
 
                 // Stop loss checked first (conservative)
@@ -365,9 +394,14 @@ pub fn run_us_backtest(candles: &[UsCandle], config: &UsBacktestConfig) -> Resul
                 }
 
                 if let Some((raw_exit_price, reason)) = triggered_exit {
-                    let exit_price = (raw_exit_price * (Decimal::ONE - config.spread_bps - config.slippage_bps)).round_dp(2);
+                    let exit_price = (raw_exit_price
+                        * (Decimal::ONE - config.spread_bps - config.slippage_bps))
+                        .round_dp(2);
                     let trade_val = pos.shares * exit_price;
-                    let exit_costs = config.cost_config.calculate(trade_val, pos.shares, Side::Sell);
+                    let exit_costs =
+                        config
+                            .cost_config
+                            .calculate(trade_val, pos.shares, Side::Sell);
                     let net_inflow = trade_val - exit_costs.total;
 
                     cash += net_inflow;
@@ -375,7 +409,8 @@ pub fn run_us_backtest(candles: &[UsCandle], config: &UsBacktestConfig) -> Resul
                     total_sec_fees += exit_costs.sec_fee;
                     total_finra_taf += exit_costs.finra_taf;
                     total_commission += exit_costs.commission;
-                    total_spread_slippage_cost += exit_costs.estimated_spread_cost + exit_costs.estimated_slippage_cost;
+                    total_spread_slippage_cost +=
+                        exit_costs.estimated_spread_cost + exit_costs.estimated_slippage_cost;
 
                     let gross_pnl = (exit_price - pos.entry_price) * pos.shares;
                     let trade_total_costs = pos.entry_costs.total + exit_costs.total;
@@ -409,7 +444,10 @@ pub fn run_us_backtest(candles: &[UsCandle], config: &UsBacktestConfig) -> Resul
         // 3. Mark to market equity at bar t close
         let mut position_market_value = Decimal::ZERO;
         for (sym, pos) in &positions {
-            if let Some(candle) = by_symbol.get(sym).and_then(|list| list.iter().find(|c| c.timestamp == ts)) {
+            if let Some(candle) = by_symbol
+                .get(sym)
+                .and_then(|list| list.iter().find(|c| c.timestamp == ts))
+            {
                 position_market_value += pos.shares * candle.close;
             }
         }
@@ -481,7 +519,11 @@ pub fn run_us_backtest(candles: &[UsCandle], config: &UsBacktestConfig) -> Resul
                 let last_close = sub_bars[n - 1].close;
 
                 // Testable Signal: Bullish Moving Average alignment + Healthy RSI (oversold recovery)
-                if fast_sma > slow_sma && last_close >= fast_sma && rsi >= config.rsi_buy_threshold && rsi <= dec!(70.0) {
+                if fast_sma > slow_sma
+                    && last_close >= fast_sma
+                    && rsi >= config.rsi_buy_threshold
+                    && rsi <= dec!(70.0)
+                {
                     let target_position_cash = (total_portfolio_equity * config.max_position_pct)
                         .min(max_exposure - current_exposure)
                         .min(cash);
@@ -503,8 +545,14 @@ pub fn run_us_backtest(candles: &[UsCandle], config: &UsBacktestConfig) -> Resul
     };
 
     let total_trades = completed_trades.len();
-    let winning_trades = completed_trades.iter().filter(|t| t.net_pnl > Decimal::ZERO).count();
-    let losing_trades = completed_trades.iter().filter(|t| t.net_pnl < Decimal::ZERO).count();
+    let winning_trades = completed_trades
+        .iter()
+        .filter(|t| t.net_pnl > Decimal::ZERO)
+        .count();
+    let losing_trades = completed_trades
+        .iter()
+        .filter(|t| t.net_pnl < Decimal::ZERO)
+        .count();
 
     let win_rate_pct = if total_trades > 0 {
         (Decimal::from(winning_trades) / Decimal::from(total_trades) * dec!(100.0)).round_dp(2)
@@ -512,8 +560,16 @@ pub fn run_us_backtest(candles: &[UsCandle], config: &UsBacktestConfig) -> Resul
         Decimal::ZERO
     };
 
-    let gross_gains: Decimal = completed_trades.iter().filter(|t| t.net_pnl > Decimal::ZERO).map(|t| t.net_pnl).sum();
-    let gross_losses: Decimal = completed_trades.iter().filter(|t| t.net_pnl < Decimal::ZERO).map(|t| t.net_pnl.abs()).sum();
+    let gross_gains: Decimal = completed_trades
+        .iter()
+        .filter(|t| t.net_pnl > Decimal::ZERO)
+        .map(|t| t.net_pnl)
+        .sum();
+    let gross_losses: Decimal = completed_trades
+        .iter()
+        .filter(|t| t.net_pnl < Decimal::ZERO)
+        .map(|t| t.net_pnl.abs())
+        .sum();
 
     let profit_factor = if gross_losses > Decimal::ZERO {
         (gross_gains / gross_losses).round_dp(2)
@@ -532,11 +588,16 @@ pub fn run_us_backtest(candles: &[UsCandle], config: &UsBacktestConfig) -> Resul
         Decimal::ZERO
     };
 
-    let total_costs = total_sec_fees + total_finra_taf + total_commission + total_spread_slippage_cost;
+    let total_costs =
+        total_sec_fees + total_finra_taf + total_commission + total_spread_slippage_cost;
 
-    let final_benchmark_equity = equity_curve.last().map(|e| e.benchmark_equity).unwrap_or(config.initial_capital_usd);
+    let final_benchmark_equity = equity_curve
+        .last()
+        .map(|e| e.benchmark_equity)
+        .unwrap_or(config.initial_capital_usd);
     let benchmark_return_pct = if config.initial_capital_usd > Decimal::ZERO {
-        ((final_benchmark_equity - config.initial_capital_usd) / config.initial_capital_usd).round_dp(4)
+        ((final_benchmark_equity - config.initial_capital_usd) / config.initial_capital_usd)
+            .round_dp(4)
     } else {
         Decimal::ZERO
     };
@@ -614,9 +675,7 @@ mod tests {
             let h = p + dec!(3.0);
             let l = p - dec!(2.0);
             let c = p + dec!(1.0);
-            lines.push(format!(
-                "{date_str} 16:00:00,SPY,{o},{h},{l},{c},1500000"
-            ));
+            lines.push(format!("{date_str} 16:00:00,SPY,{o},{h},{l},{c},1500000"));
         }
         lines.join("\n")
     }

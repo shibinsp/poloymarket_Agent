@@ -1228,10 +1228,7 @@ impl Store {
     }
 
     /// Upsert an Indian sandbox order record.
-    pub async fn save_india_sandbox_order(
-        &self,
-        order: &IndiaSandboxOrderRecord,
-    ) -> Result<()> {
+    pub async fn save_india_sandbox_order(&self, order: &IndiaSandboxOrderRecord) -> Result<()> {
         sqlx::query(
             "INSERT INTO india_sandbox_orders (
                 id, client_order_id, venue_order_id, symbol, side, order_type,
@@ -1268,7 +1265,10 @@ impl Store {
     }
 
     /// Get recent Indian sandbox orders.
-    pub async fn get_india_sandbox_orders(&self, limit: i64) -> Result<Vec<IndiaSandboxOrderRecord>> {
+    pub async fn get_india_sandbox_orders(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<IndiaSandboxOrderRecord>> {
         let rows = sqlx::query_as::<_, IndiaSandboxOrderRecord>(
             "SELECT id, client_order_id, venue_order_id, symbol, side, order_type,
                     quantity, price, trigger_price, status, fill_quantity, average_fill_price,

@@ -108,17 +108,57 @@ pub struct NseChartResponse {
 /// Get company metadata for the top NSE watchlist symbols.
 pub fn get_company_info(symbol: &str) -> (&'static str, &'static str, Decimal) {
     match symbol.to_uppercase().as_str() {
-        "RELIANCE" => ("Reliance Industries Ltd", "Large Cap | Energy & Refineries", dec!(1198.70)),
-        "TCS" => ("Tata Consultancy Services Ltd", "Large Cap | IT Services & Consulting", dec!(3800.00)),
-        "INFY" => ("Infosys Ltd", "Large Cap | IT Consulting & Software", dec!(1850.00)),
-        "HDFCBANK" => ("HDFC Bank Ltd", "Large Cap | Private Sector Banking", dec!(1650.00)),
-        "ICICIBANK" => ("ICICI Bank Ltd", "Large Cap | Private Sector Banking", dec!(1250.00)),
-        "SBIN" => ("State Bank of India", "Large Cap | Public Sector Banking", dec!(820.00)),
-        "BHARTIARTL" => ("Bharti Airtel Ltd", "Large Cap | Telecommunications", dec!(1680.00)),
+        "RELIANCE" => (
+            "Reliance Industries Ltd",
+            "Large Cap | Energy & Refineries",
+            dec!(1198.70),
+        ),
+        "TCS" => (
+            "Tata Consultancy Services Ltd",
+            "Large Cap | IT Services & Consulting",
+            dec!(3800.00),
+        ),
+        "INFY" => (
+            "Infosys Ltd",
+            "Large Cap | IT Consulting & Software",
+            dec!(1850.00),
+        ),
+        "HDFCBANK" => (
+            "HDFC Bank Ltd",
+            "Large Cap | Private Sector Banking",
+            dec!(1650.00),
+        ),
+        "ICICIBANK" => (
+            "ICICI Bank Ltd",
+            "Large Cap | Private Sector Banking",
+            dec!(1250.00),
+        ),
+        "SBIN" => (
+            "State Bank of India",
+            "Large Cap | Public Sector Banking",
+            dec!(820.00),
+        ),
+        "BHARTIARTL" => (
+            "Bharti Airtel Ltd",
+            "Large Cap | Telecommunications",
+            dec!(1680.00),
+        ),
         "ITC" => ("ITC Ltd", "Large Cap | FMCG & Diversified", dec!(480.00)),
-        "LT" => ("Larsen & Toubro Ltd", "Large Cap | Engineering & Infrastructure", dec!(3550.00)),
-        "TATAMOTORS" => ("Tata Motors Ltd", "Large Cap | Automobiles & EV", dec!(890.00)),
-        _ => ("NSE Listed Equity", "Equities | Cash Segment", dec!(1000.00)),
+        "LT" => (
+            "Larsen & Toubro Ltd",
+            "Large Cap | Engineering & Infrastructure",
+            dec!(3550.00),
+        ),
+        "TATAMOTORS" => (
+            "Tata Motors Ltd",
+            "Large Cap | Automobiles & EV",
+            dec!(890.00),
+        ),
+        _ => (
+            "NSE Listed Equity",
+            "Equities | Cash Segment",
+            dec!(1000.00),
+        ),
     }
 }
 
@@ -133,10 +173,10 @@ pub fn generate_nse_chart(
 
     // Determine bar count and timeframe
     let (bar_count, step_minutes, drift_pattern) = match range {
-        "1W" => (35, 60, 0.002), // 5 days * 7 hours
-        "1M" => (22, 1440, 0.004), // 22 trading days
+        "1W" => (35, 60, 0.002),    // 5 days * 7 hours
+        "1M" => (22, 1440, 0.004),  // 22 trading days
         "1Y" => (52, 10080, 0.008), // 52 weeks
-        _ => (75, 5, 0.0006), // 1D: 75 bars of 5-min intervals (09:15 to 15:30)
+        _ => (75, 5, 0.0006),       // 1D: 75 bars of 5-min intervals (09:15 to 15:30)
     };
 
     let now = Utc::now();
@@ -165,7 +205,8 @@ pub fn generate_nse_chart(
 
         // Sine wave with upward momentum to mimic the user's uploaded chart
         let angle = (i as f64) * 0.12;
-        let wave = (angle.sin() * 0.006) + ((angle * 0.5).cos() * 0.004) + ((i as f64) * drift_pattern);
+        let wave =
+            (angle.sin() * 0.006) + ((angle * 0.5).cos() * 0.004) + ((i as f64) * drift_pattern);
         let wave_dec = Decimal::from_f64_retain(wave).unwrap_or(Decimal::ZERO);
 
         let open = current;
@@ -204,10 +245,17 @@ pub fn generate_nse_chart(
     let mut trade_markers = Vec::new();
     let symbol_upper = symbol.to_uppercase();
 
-    for ord in orders.iter().filter(|o| o.symbol.eq_ignore_ascii_case(&symbol_upper)) {
+    for ord in orders
+        .iter()
+        .filter(|o| o.symbol.eq_ignore_ascii_case(&symbol_upper))
+    {
         let price = ord.price.parse::<Decimal>().unwrap_or(current_price);
         let val = price * Decimal::from(ord.quantity);
-        let side = if ord.side.eq_ignore_ascii_case("BUY") { Side::Buy } else { Side::Sell };
+        let side = if ord.side.eq_ignore_ascii_case("BUY") {
+            Side::Buy
+        } else {
+            Side::Sell
+        };
         let cost = cost_cfg.calculate(val, side);
 
         trade_markers.push(ChartTradeMarker {
@@ -271,7 +319,7 @@ pub fn generate_nse_chart(
     }
 
     // Build itemized detailed trades
-    let detailed_trades = build_detailed_trades(&symbol_upper, &trade_markers, &name);
+    let detailed_trades = build_detailed_trades(&symbol_upper, &trade_markers, name);
     let summary = summarize_detailed_trades(&detailed_trades);
 
     NseChartResponse {
@@ -297,7 +345,11 @@ pub fn generate_nse_chart(
 }
 
 /// Matches buys with sells to compute exact realized profit, taxes, and duration.
-fn build_detailed_trades(symbol: &str, markers: &[ChartTradeMarker], company_name: &str) -> Vec<DetailedTradeRecord> {
+fn build_detailed_trades(
+    symbol: &str,
+    markers: &[ChartTradeMarker],
+    company_name: &str,
+) -> Vec<DetailedTradeRecord> {
     let mut records = Vec::new();
     let mut buys: Vec<&ChartTradeMarker> = markers.iter().filter(|m| m.side == "BUY").collect();
     let sells: Vec<&ChartTradeMarker> = markers.iter().filter(|m| m.side == "SELL").collect();

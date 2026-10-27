@@ -51,6 +51,7 @@ pub struct DashboardState {
 }
 
 impl DashboardState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Store,
         health: HealthState,
@@ -155,9 +156,7 @@ fn resolve_bind(bind: &str, has_token: bool, mode: AgentMode) -> Result<String> 
 }
 
 fn is_loopback(bind: &str) -> bool {
-    bind == "0.0.0.0"
-        || bind == "::"
-        || bind.eq_ignore_ascii_case("localhost")
+    bind.eq_ignore_ascii_case("localhost")
         || bind
             .parse::<IpAddr>()
             .map(|ip| ip.is_loopback())
@@ -179,10 +178,19 @@ fn build_router(state: DashboardState) -> Router {
         .route("/api/risk", get(risk_handler))
         .route("/api/halt", get(halt_status_handler))
         .route("/api/india/watchlist", get(india_watchlist_handler))
-        .route("/api/india/backtest/history", get(india_backtest_history_handler))
-        .route("/api/india/sandbox/status", get(india_sandbox_status_handler))
+        .route(
+            "/api/india/backtest/history",
+            get(india_backtest_history_handler),
+        )
+        .route(
+            "/api/india/sandbox/status",
+            get(india_sandbox_status_handler),
+        )
         .route("/api/india/backtest/run", post(india_backtest_run_handler))
-        .route("/api/india/sandbox/order", post(india_sandbox_order_handler))
+        .route(
+            "/api/india/sandbox/order",
+            post(india_sandbox_order_handler),
+        )
         .route("/api/india/chart", get(india_chart_handler))
         .route("/api/us/watchlist", get(us_watchlist_handler))
         .route("/api/us/chart", get(us_chart_handler))
@@ -649,8 +657,12 @@ async fn india_backtest_run_handler(
     let content_res = if let Some(content) = req.csv_content {
         Ok(content)
     } else {
-        let path = req.csv_path.as_deref().unwrap_or("data/nse_sample_data.csv");
-        std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("Failed to read CSV at {path}: {e}"))
+        let path = req
+            .csv_path
+            .as_deref()
+            .unwrap_or("data/nse_sample_data.csv");
+        std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("Failed to read CSV at {path}: {e}"))
     };
 
     let csv_content = match content_res {
@@ -696,9 +708,12 @@ async fn india_backtest_run_handler(
     }
 
     let run_name = req.name.unwrap_or_else(|| {
-        format!("Backtest {}", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"))
+        format!(
+            "Backtest {}",
+            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")
+        )
     });
-    
+
     let result = match run_backtest(&candles, &config) {
         Ok(r) => r,
         Err(e) => {
@@ -902,7 +917,8 @@ async fn us_backtest_run_handler(
         Ok(content)
     } else {
         let path = req.csv_path.as_deref().unwrap_or("data/us_sample_data.csv");
-        std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("Failed to read CSV at {path}: {e}"))
+        std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("Failed to read CSV at {path}: {e}"))
     };
 
     let csv_content = match content_res {
@@ -942,7 +958,10 @@ async fn us_backtest_run_handler(
     }
 
     let run_name = req.name.unwrap_or_else(|| {
-        format!("US Backtest {}", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"))
+        format!(
+            "US Backtest {}",
+            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")
+        )
     });
 
     let result = match run_us_backtest(&candles, &config) {
@@ -980,11 +999,17 @@ async fn us_backtest_run_handler(
 fn compute_us_paper_accounting(
     base_capital: Decimal,
     orders: &[crate::db::store::UsPaperOrderRecord],
-) -> (Decimal, Decimal, Decimal, std::collections::HashMap<String, Decimal>) {
+) -> (
+    Decimal,
+    Decimal,
+    Decimal,
+    std::collections::HashMap<String, Decimal>,
+) {
     use std::str::FromStr;
     let mut realized_profit = Decimal::ZERO;
     let mut open_positions_cost = Decimal::ZERO;
-    let mut holdings: std::collections::HashMap<String, Vec<(Decimal, Decimal)>> = std::collections::HashMap::new();
+    let mut holdings: std::collections::HashMap<String, Vec<(Decimal, Decimal)>> =
+        std::collections::HashMap::new();
 
     for o in orders.iter().rev() {
         // In real-world market trading, only FILLED orders execute and produce holdings/PnL.
@@ -1003,7 +1028,10 @@ fn compute_us_paper_accounting(
             .unwrap_or_else(|| Decimal::from_str(&o.price).unwrap_or(Decimal::ZERO));
 
         if o.side.eq_ignore_ascii_case("BUY") {
-            holdings.entry(o.symbol.to_uppercase()).or_default().push((fill_price, qty));
+            holdings
+                .entry(o.symbol.to_uppercase())
+                .or_default()
+                .push((fill_price, qty));
         } else if o.side.eq_ignore_ascii_case("SELL") {
             if let Some(buys) = holdings.get_mut(&o.symbol.to_uppercase()) {
                 let mut remaining_to_sell = qty;
@@ -1022,7 +1050,8 @@ fn compute_us_paper_accounting(
         }
     }
 
-    let mut current_quantities: std::collections::HashMap<String, Decimal> = std::collections::HashMap::new();
+    let mut current_quantities: std::collections::HashMap<String, Decimal> =
+        std::collections::HashMap::new();
     for (sym, buys) in holdings.iter() {
         for (p, q) in buys {
             open_positions_cost += *p * *q;
@@ -1031,7 +1060,12 @@ fn compute_us_paper_accounting(
     }
 
     let available_cash = (base_capital + realized_profit - open_positions_cost).max(Decimal::ZERO);
-    (realized_profit, open_positions_cost, available_cash, current_quantities)
+    (
+        realized_profit,
+        open_positions_cost,
+        available_cash,
+        current_quantities,
+    )
 }
 
 async fn us_paper_status_handler(State(state): State<DashboardState>) -> impl IntoResponse {
@@ -1041,11 +1075,15 @@ async fn us_paper_status_handler(State(state): State<DashboardState>) -> impl In
         .await
         .unwrap_or_default();
     let watchlist = crate::us::instruments::us_watchlist();
-    let base_capital = state.risk.us_capital_allocation_usd.unwrap_or(rust_decimal_macros::dec!(5.0));
+    let base_capital = state
+        .risk
+        .us_capital_allocation_usd
+        .unwrap_or(rust_decimal_macros::dec!(5.0));
 
     use std::str::FromStr;
     let mut alpaca_live_account = None;
-    let mut real_positions: std::collections::HashMap<String, Decimal> = std::collections::HashMap::new();
+    let mut real_positions: std::collections::HashMap<String, Decimal> =
+        std::collections::HashMap::new();
 
     let alpaca_key = std::env::var("ALPACA_API_KEY_ID").ok();
     let alpaca_secret = std::env::var("ALPACA_API_SECRET_KEY").ok();
@@ -1061,7 +1099,10 @@ async fn us_paper_status_handler(State(state): State<DashboardState>) -> impl In
             {
                 if let Ok(val) = resp.json::<serde_json::Value>().await {
                     let cash_val = val.get("cash").and_then(|v| v.as_str()).unwrap_or("5.00");
-                    let port_val = val.get("portfolio_value").and_then(|v| v.as_str()).unwrap_or("5.00");
+                    let port_val = val
+                        .get("portfolio_value")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("5.00");
                     alpaca_live_account = Some(serde_json::json!({
                         "connected": true,
                         "account_number": val.get("account_number").and_then(|v| v.as_str()).unwrap_or("PA3QRQ8D4"),
@@ -1083,7 +1124,10 @@ async fn us_paper_status_handler(State(state): State<DashboardState>) -> impl In
             {
                 if let Ok(positions) = resp.json::<Vec<serde_json::Value>>().await {
                     for p in positions {
-                        if let (Some(sym), Some(q_str)) = (p.get("symbol").and_then(|v| v.as_str()), p.get("qty").and_then(|v| v.as_str())) {
+                        if let (Some(sym), Some(q_str)) = (
+                            p.get("symbol").and_then(|v| v.as_str()),
+                            p.get("qty").and_then(|v| v.as_str()),
+                        ) {
                             if let Ok(q) = Decimal::from_str(q_str) {
                                 real_positions.insert(sym.to_string(), q);
                             }
@@ -1104,16 +1148,31 @@ async fn us_paper_status_handler(State(state): State<DashboardState>) -> impl In
                     for ao in &alpaca_orders {
                         let a_id = ao.get("id").and_then(|v| v.as_str());
                         let a_client_id = ao.get("client_order_id").and_then(|v| v.as_str());
-                        let a_status = ao.get("status").and_then(|v| v.as_str()).unwrap_or("NEW").to_uppercase();
-                        let a_fill_qty = ao.get("filled_qty").and_then(|v| v.as_str()).and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
-                        let a_fill_price = ao.get("filled_avg_price").and_then(|v| v.as_str()).map(|s| s.to_string());
+                        let a_status = ao
+                            .get("status")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("NEW")
+                            .to_uppercase();
+                        let a_fill_qty = ao
+                            .get("filled_qty")
+                            .and_then(|v| v.as_str())
+                            .and_then(|v| v.parse::<i64>().ok())
+                            .unwrap_or(0);
+                        let a_fill_price = ao
+                            .get("filled_avg_price")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
 
                         if let Some(pos) = recent_orders.iter_mut().position(|ro| {
-                            (a_id.is_some() && ro.venue_order_id.as_deref() == a_id) ||
-                            (a_client_id.is_some() && ro.client_order_id == a_client_id.unwrap())
+                            (a_id.is_some() && ro.venue_order_id.as_deref() == a_id)
+                                || (a_client_id.is_some()
+                                    && ro.client_order_id == a_client_id.unwrap())
                         }) {
                             let ro = &mut recent_orders[pos];
-                            if ro.status != a_status || ro.fill_quantity != a_fill_qty || ro.average_fill_price != a_fill_price {
+                            if ro.status != a_status
+                                || ro.fill_quantity != a_fill_qty
+                                || ro.average_fill_price != a_fill_price
+                            {
                                 ro.status = a_status.clone();
                                 ro.fill_quantity = a_fill_qty;
                                 if a_fill_price.is_some() {
@@ -1207,8 +1266,11 @@ async fn us_paper_reset_handler(State(state): State<DashboardState>) -> impl Int
             warn!("Failed to clear US paper orders: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("Failed to reset US paper orders: {e}") })),
-            ).into_response()
+                Json(
+                    serde_json::json!({ "error": format!("Failed to reset US paper orders: {e}") }),
+                ),
+            )
+                .into_response()
         }
     }
 }
@@ -1257,8 +1319,15 @@ async fn us_paper_order_handler(
     };
     let price_str = order_price.to_string();
 
-    let base_capital = state.risk.us_capital_allocation_usd.unwrap_or(rust_decimal_macros::dec!(5.0));
-    let all_orders = state.store.get_us_paper_orders(500).await.unwrap_or_default();
+    let base_capital = state
+        .risk
+        .us_capital_allocation_usd
+        .unwrap_or(rust_decimal_macros::dec!(5.0));
+    let all_orders = state
+        .store
+        .get_us_paper_orders(500)
+        .await
+        .unwrap_or_default();
     let (realized_profit, _open_positions_cost, available_cash, holdings) =
         compute_us_paper_accounting(base_capital, &all_orders);
 
@@ -1289,12 +1358,18 @@ async fn us_paper_order_handler(
         }
     } else if is_sell {
         use std::str::FromStr;
-        let mut held_qty = holdings.get(&req.symbol.to_uppercase()).cloned().unwrap_or(Decimal::ZERO);
+        let mut held_qty = holdings
+            .get(&req.symbol.to_uppercase())
+            .cloned()
+            .unwrap_or(Decimal::ZERO);
         if held_qty.is_zero() {
             if let (Some(k), Some(s)) = (&alpaca_key, &alpaca_secret) {
                 let client = reqwest::Client::new();
                 if let Ok(resp) = client
-                    .get(format!("https://paper-api.alpaca.markets/v2/positions/{}", req.symbol.to_uppercase()))
+                    .get(format!(
+                        "https://paper-api.alpaca.markets/v2/positions/{}",
+                        req.symbol.to_uppercase()
+                    ))
                     .header("APCA-API-KEY-ID", k)
                     .header("APCA-API-SECRET-KEY", s)
                     .send()
@@ -1364,7 +1439,11 @@ async fn us_paper_order_handler(
                         if let Some(st) = v.get("status").and_then(|st| st.as_str()) {
                             order_status = st.to_uppercase();
                         }
-                        if let Some(fq) = v.get("filled_qty").and_then(|fq| fq.as_str()).and_then(|fq| fq.parse::<i64>().ok()) {
+                        if let Some(fq) = v
+                            .get("filled_qty")
+                            .and_then(|fq| fq.as_str())
+                            .and_then(|fq| fq.parse::<i64>().ok())
+                        {
                             fill_qty = fq;
                         }
                         if let Some(ap) = v.get("filled_avg_price").and_then(|ap| ap.as_str()) {
@@ -1374,10 +1453,17 @@ async fn us_paper_order_handler(
 
                     // For market orders, poll Alpaca after 600ms to capture immediate fill at NBBO
                     if let Some(ref vid) = venue_order_id {
-                        if is_market && (order_status == "ACCEPTED" || order_status == "PENDING_NEW" || order_status == "NEW") {
+                        if is_market
+                            && (order_status == "ACCEPTED"
+                                || order_status == "PENDING_NEW"
+                                || order_status == "NEW")
+                        {
                             tokio::time::sleep(std::time::Duration::from_millis(600)).await;
                             if let Ok(resp) = client
-                                .get(format!("https://paper-api.alpaca.markets/v2/orders/{}", vid))
+                                .get(format!(
+                                    "https://paper-api.alpaca.markets/v2/orders/{}",
+                                    vid
+                                ))
                                 .header("APCA-API-KEY-ID", &k)
                                 .header("APCA-API-SECRET-KEY", &s)
                                 .send()
@@ -1387,10 +1473,16 @@ async fn us_paper_order_handler(
                                     if let Some(st) = v.get("status").and_then(|st| st.as_str()) {
                                         order_status = st.to_uppercase();
                                     }
-                                    if let Some(fq) = v.get("filled_qty").and_then(|fq| fq.as_str()).and_then(|fq| fq.parse::<i64>().ok()) {
+                                    if let Some(fq) = v
+                                        .get("filled_qty")
+                                        .and_then(|fq| fq.as_str())
+                                        .and_then(|fq| fq.parse::<i64>().ok())
+                                    {
                                         fill_qty = fq;
                                     }
-                                    if let Some(ap) = v.get("filled_avg_price").and_then(|ap| ap.as_str()) {
+                                    if let Some(ap) =
+                                        v.get("filled_avg_price").and_then(|ap| ap.as_str())
+                                    {
                                         avg_fill_price = Some(ap.to_string());
                                     }
                                 }
@@ -1461,7 +1553,11 @@ async fn fx_rate_handler() -> impl IntoResponse {
 async fn combined_portfolio_handler(State(state): State<DashboardState>) -> impl IntoResponse {
     use std::str::FromStr;
     let fx = crate::market::fx::get_current_fx_rate();
-    let _trades = state.store.get_open_venue_trades().await.unwrap_or_default();
+    let _trades = state
+        .store
+        .get_open_venue_trades()
+        .await
+        .unwrap_or_default();
 
     let india_unrealized_inr = Decimal::ZERO;
     let us_unrealized_usd = Decimal::ZERO;
@@ -1470,20 +1566,34 @@ async fn combined_portfolio_handler(State(state): State<DashboardState>) -> impl
     let mut india_realized_inr = Decimal::ZERO;
     let mut us_realized_usd = Decimal::ZERO;
     for rt in &resolved_trades {
-        let pnl = rt.pnl.as_deref().and_then(|p| Decimal::from_str(p).ok()).unwrap_or(Decimal::ZERO);
+        let pnl = rt
+            .pnl
+            .as_deref()
+            .and_then(|p| Decimal::from_str(p).ok())
+            .unwrap_or(Decimal::ZERO);
         us_realized_usd += pnl;
     }
 
     // Compute India sandbox realized P&L
-    let india_orders = state.store.get_india_sandbox_orders(100).await.unwrap_or_default();
-    let mut india_buys: std::collections::HashMap<String, Vec<(Decimal, Decimal)>> = std::collections::HashMap::new();
+    let india_orders = state
+        .store
+        .get_india_sandbox_orders(100)
+        .await
+        .unwrap_or_default();
+    let mut india_buys: std::collections::HashMap<String, Vec<(Decimal, Decimal)>> =
+        std::collections::HashMap::new();
     for o in india_orders.iter().rev() {
-        let fill_price = o.average_fill_price.as_deref()
+        let fill_price = o
+            .average_fill_price
+            .as_deref()
             .and_then(|p| Decimal::from_str(p).ok())
             .unwrap_or_else(|| Decimal::from_str(&o.price).unwrap_or(Decimal::ZERO));
         let qty = Decimal::from(o.quantity);
         if o.side.eq_ignore_ascii_case("BUY") {
-            india_buys.entry(o.symbol.clone()).or_default().push((fill_price, qty));
+            india_buys
+                .entry(o.symbol.clone())
+                .or_default()
+                .push((fill_price, qty));
         } else if o.side.eq_ignore_ascii_case("SELL") {
             if let Some(buys) = india_buys.get_mut(&o.symbol) {
                 if let Some((buy_p, buy_q)) = buys.pop() {
@@ -1495,14 +1605,25 @@ async fn combined_portfolio_handler(State(state): State<DashboardState>) -> impl
     }
 
     // Compute US paper realized P&L using unified accounting ($5.00 base + compounded profits)
-    let us_orders = state.store.get_us_paper_orders(100).await.unwrap_or_default();
-    let us_base_capital = state.risk.us_capital_allocation_usd.unwrap_or(rust_decimal_macros::dec!(5.0));
+    let us_orders = state
+        .store
+        .get_us_paper_orders(100)
+        .await
+        .unwrap_or_default();
+    let us_base_capital = state
+        .risk
+        .us_capital_allocation_usd
+        .unwrap_or(rust_decimal_macros::dec!(5.0));
     let (us_paper_realized_profit, _us_open_cost, _us_cash, _us_holdings) =
         compute_us_paper_accounting(us_base_capital, &us_orders);
     us_realized_usd += us_paper_realized_profit;
 
     let india_costs_inr = Decimal::ZERO;
-    let us_costs_usd = state.store.get_total_api_cost().await.unwrap_or(Decimal::ZERO);
+    let us_costs_usd = state
+        .store
+        .get_total_api_cost()
+        .await
+        .unwrap_or(Decimal::ZERO);
 
     let india_equity_inr = state
         .risk
@@ -1510,9 +1631,7 @@ async fn combined_portfolio_handler(State(state): State<DashboardState>) -> impl
         .unwrap_or(rust_decimal_macros::dec!(100000.0))
         + india_realized_inr
         + india_unrealized_inr;
-    let us_equity_usd = us_base_capital
-        + us_realized_usd
-        + us_unrealized_usd;
+    let us_equity_usd = us_base_capital + us_realized_usd + us_unrealized_usd;
 
     let summary = crate::market::fx::CombinedPortfolioSummary::calculate(
         &fx,
@@ -1549,8 +1668,14 @@ async fn intraday_status_handler(State(state): State<DashboardState>) -> impl In
     let ist = chrono_tz::Asia::Kolkata;
     let et = chrono_tz::America::New_York;
 
-    let now_ist = now.with_timezone(&ist).format("%Y-%m-%d %H:%M:%S IST").to_string();
-    let now_et = now.with_timezone(&et).format("%Y-%m-%d %H:%M:%S ET").to_string();
+    let now_ist = now
+        .with_timezone(&ist)
+        .format("%Y-%m-%d %H:%M:%S IST")
+        .to_string();
+    let now_et = now
+        .with_timezone(&et)
+        .format("%Y-%m-%d %H:%M:%S ET")
+        .to_string();
 
     let fx = crate::market::fx::get_current_fx_rate();
 
@@ -1610,7 +1735,9 @@ async fn emergency_stop_handler(
     Json(req): Json<EmergencyStopRequest>,
 ) -> impl IntoResponse {
     if req.stop {
-        let reason = req.reason.unwrap_or_else(|| "Operator triggered account-wide emergency stop".to_string());
+        let reason = req
+            .reason
+            .unwrap_or_else(|| "Operator triggered account-wide emergency stop".to_string());
         state.kill_switch.trip(crate::agent::kill_switch::Halt::new(
             crate::agent::kill_switch::HaltSource::Api,
             crate::risk::circuit_breaker::HaltScope::UntilResume,
