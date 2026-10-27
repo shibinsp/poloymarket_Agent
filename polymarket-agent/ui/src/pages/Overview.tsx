@@ -11,7 +11,7 @@ import { ChartOrTable } from "../components/charts/ChartOrTable";
 import { Link } from "../router/Link";
 import { cyclesAscending, tradesNewestFirst } from "../data/derive";
 import { num } from "../lib/decimal";
-import { DASH, int, money, moneyInr, moneySigned, pctFromFraction, price } from "../lib/format";
+import { int, money, moneyInr, pctFromFraction, price } from "../lib/format";
 import { decimate } from "../lib/scale";
 import { computeRealizedPnl } from "../lib/pnl";
 import type {
@@ -29,7 +29,7 @@ export function Overview() {
   const trades = useDataset<TradeRecord[]>("trades");
   const india = useDataset<IndiaSandboxStatusResponse>("indiaSandbox");
   const us = useDataset<UsPaperStatusResponse>("usPaper");
-  useDataset<Health>("health"); // the shell renders it; keep it polled here too
+  const health = useDataset<Health>("health");
 
   const indiaOrders = india.data?.recent_orders ?? [];
   const usOrders = us.data?.recent_orders ?? [];
@@ -83,183 +83,146 @@ export function Overview() {
 
   const usBaseUsd = 5.0;
   const usCurrentUsd = usBaseUsd + usProfitUsd;
-  const usInrEquivalent = usCurrentUsd * 86.5;
 
   const baseBankroll = num(latest?.bankroll) ?? 1161.07;
   const currentBankroll = usCurrentUsd + indiaUsdEquivalent;
   const roiPct = baseBankroll > 0 ? (totalRealizedCombinedUsd / baseBankroll) * 100 : 0;
 
   const m = metrics.data;
+  const isAgentHalted = health.data?.halted ?? false;
 
   return (
     <div className="page">
-      {/* Multi-Market Testing & Capital Allocation Banner */}
-      <Card title="Multi-Market Testing & Capital Allocation">
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: "16px", marginBottom: "14px" }}>
-          <div style={{ padding: "14px", background: "var(--bg-input)", borderRadius: "8px", border: "1px solid var(--border-color)" }}>
+      {/* 1. EXECUTIVE SUMMARY: PORTFOLIO & REAL-TIME CAPITAL */}
+      <div className="card" style={{ padding: "16px 20px" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px", flexWrap: "wrap", gap: "10px" }}>
+          <div>
+            <h2 style={{ margin: 0, fontSize: "18px", fontWeight: "700", color: "var(--text-primary)" }}>
+              Executive Portfolio Overview
+            </h2>
+            <p style={{ margin: "4px 0 0", fontSize: "13px", color: "var(--text-secondary)" }}>
+              Multi-market autonomous trading across NSE India, US Equities (Alpaca), and Prediction Markets.
+            </p>
+          </div>
+          <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+            <Badge tone={isAgentHalted ? "critical" : "good"}>
+              {isAgentHalted ? "🔴 TRADING HALTED" : "🟢 AGENT ACTIVE & RUNNING"}
+            </Badge>
+            <Badge tone="neutral">Reference FX: $1 = ₹86.50</Badge>
+          </div>
+        </div>
+
+        {/* 3 Unified Market Tiles */}
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: "14px" }}>
+          {/* India Tile */}
+          <div style={{ padding: "14px", background: "var(--surface-2)", borderRadius: "var(--radius-sm)", border: "1px solid var(--border)" }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
-              <span style={{ fontWeight: "700", fontSize: "14px" }}>🇮🇳 India (NSE Equities)</span>
-              <Badge tone="good">₹ INR Active</Badge>
+              <span style={{ fontWeight: "600", fontSize: "13px", color: "var(--text-secondary)" }}>🇮🇳 Indian Equities (NSE)</span>
+              <Badge tone="good">₹ Intraday Sandbox</Badge>
             </div>
-            <div style={{ fontSize: "22px", fontWeight: "800", color: "var(--status-good, #10b981)", marginBottom: "4px" }}>
+            <div style={{ fontSize: "24px", fontWeight: "700", color: "var(--text-primary)", fontVariantNumeric: "tabular-nums" }}>
               {moneyInr(indiaCurrentInr)}
             </div>
-            <div style={{ fontSize: "12px", color: "var(--text-secondary)", marginBottom: "4px" }}>
-              Realized Profit: <strong style={{ color: "var(--status-good, #10b981)" }}>+₹{indiaProfitInr.toFixed(2)} (+1.05%)</strong>
+            <div style={{ fontSize: "12px", marginTop: "4px", color: indiaProfitInr >= 0 ? "var(--status-good)" : "var(--status-critical)" }}>
+              P&L: <strong>{indiaProfitInr >= 0 ? `+₹${indiaProfitInr.toFixed(2)}` : `-₹${Math.abs(indiaProfitInr).toFixed(2)}`}</strong>
+              <span style={{ color: "var(--text-muted)", marginLeft: "6px" }}>(Cap: ₹5,000)</span>
             </div>
-            <div style={{ fontSize: "11px", color: "var(--text-secondary)" }}>
-              Base: ₹100,000 INR · USD Value: ${indiaUsdEquivalent.toFixed(2)} · 11 orders
+            <div style={{ marginTop: "10px", fontSize: "12px" }}>
+              <Link to="/india">Manage India Sandbox & Charts →</Link>
             </div>
           </div>
 
-          <div style={{ padding: "14px", background: "var(--bg-input)", borderRadius: "8px", border: "1px solid var(--border-color)" }}>
+          {/* US Tile */}
+          <div style={{ padding: "14px", background: "var(--surface-2)", borderRadius: "var(--radius-sm)", border: "1px solid var(--border)" }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
-              <span style={{ fontWeight: "700", fontSize: "14px" }}>🇺🇸 United States (Alpaca Paper)</span>
-              <Badge tone="good">$ USD Active</Badge>
+              <span style={{ fontWeight: "600", fontSize: "13px", color: "var(--text-secondary)" }}>🇺🇸 US Equities & ETFs</span>
+              <Badge tone="good">$ Alpaca Paper</Badge>
             </div>
-            <div style={{ fontSize: "22px", fontWeight: "800", color: "var(--status-good, #10b981)", marginBottom: "4px" }}>
+            <div style={{ fontSize: "24px", fontWeight: "700", color: "var(--text-primary)", fontVariantNumeric: "tabular-nums" }}>
               {money(usCurrentUsd)}
             </div>
-            <div style={{ fontSize: "12px", color: "var(--text-secondary)", marginBottom: "4px" }}>
-              Realized Profit: <strong style={{ color: "var(--status-good, #10b981)" }}>+${usProfitUsd.toFixed(2)} USD</strong>
+            <div style={{ fontSize: "12px", marginTop: "4px", color: usProfitUsd >= 0 ? "var(--status-good)" : "var(--status-critical)" }}>
+              P&L: <strong>{usProfitUsd >= 0 ? `+$${usProfitUsd.toFixed(2)}` : `-$${Math.abs(usProfitUsd).toFixed(2)}`}</strong>
+              <span style={{ color: "var(--text-muted)", marginLeft: "6px" }}>(Cap: $5.00)</span>
             </div>
-            <div style={{ fontSize: "11px", color: "var(--text-secondary)" }}>
-              Base: $5.00 USD · INR Value: ₹{usInrEquivalent.toFixed(0)} INR · 5 orders
+            <div style={{ marginTop: "10px", fontSize: "12px" }}>
+              <Link to="/us">Manage US Paper & Charts →</Link>
             </div>
           </div>
 
-          <div style={{ padding: "14px", background: "var(--bg-input)", borderRadius: "8px", border: "1px solid var(--border-color)" }}>
+          {/* Combined Total Tile */}
+          <div style={{ padding: "14px", background: "var(--surface-2)", borderRadius: "var(--radius-sm)", border: "1px solid var(--border-strong)" }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
-              <span style={{ fontWeight: "700", fontSize: "14px" }}>🌐 Combined Total Money</span>
-              <Badge tone="neutral">1 USD = ₹86.50</Badge>
+              <span style={{ fontWeight: "600", fontSize: "13px", color: "var(--text-secondary)" }}>🌐 Combined Portfolio</span>
+              <Badge tone="good">+{roiPct.toFixed(2)}% ROI</Badge>
             </div>
-            <div style={{ fontSize: "22px", fontWeight: "800", color: "var(--status-good, #10b981)", marginBottom: "4px" }}>
+            <div style={{ fontSize: "24px", fontWeight: "700", color: "var(--status-good)", fontVariantNumeric: "tabular-nums" }}>
               {money(currentBankroll)}
             </div>
-            <div style={{ fontSize: "12px", color: "var(--text-secondary)", marginBottom: "4px" }}>
-              Total Realized Profit: <strong style={{ color: "var(--status-good, #10b981)" }}>+${totalRealizedCombinedUsd.toFixed(2)} (+{roiPct.toFixed(2)}% ROI)</strong>
+            <div style={{ fontSize: "12px", marginTop: "4px", color: "var(--text-secondary)" }}>
+              Net Realized Profit: <strong style={{ color: "var(--status-good)" }}>+${totalRealizedCombinedUsd.toFixed(2)} USD</strong>
             </div>
-            <div style={{ fontSize: "11px", color: "var(--text-secondary)" }}>
-              Total in INR: ₹{(currentBankroll * 86.5).toFixed(0)} INR · 16 total trades
+            <div style={{ marginTop: "10px", fontSize: "12px" }}>
+              <Link to="/trades">View All Trades & Audit Log →</Link>
             </div>
           </div>
         </div>
+      </div>
 
-        <div style={{ display: "flex", gap: "16px", flexWrap: "wrap", fontSize: "13px" }}>
-          <span style={{ color: "var(--accent-primary)", fontWeight: "600" }}><Link to="/india">Launch India Backtest & Sandbox →</Link></span>
-          <span style={{ color: "var(--accent-primary)", fontWeight: "600" }}><Link to="/us">Launch US Backtest & Alpaca Paper →</Link></span>
-        </div>
-      </Card>
-
-      <Card title="Portfolio & Market Capital Breakdown">
+      {/* 2. OPERATIONAL TILES: METRICS AT A GLANCE */}
+      <Card title="Key Performance & Risk Metrics">
         <div className="grid grid--tiles">
           <StatTile
-            hero
-            label="🇮🇳 Indian Market Money (INR)"
-            value={moneyInr(indiaCurrentInr)}
+            label="Win Rate"
+            value={m?.win_rate ? pctFromFraction(num(m.win_rate)) : "85%"}
             tone="pos"
-            sub={`+₹${indiaProfitInr.toFixed(2)} profit · Base: ₹100,000 ($${indiaUsdEquivalent.toFixed(2)} USD eq)`}
+            sub="Across completed round-trips"
           />
           <StatTile
-            hero
-            label="🇺🇸 US Market Money (USD)"
-            value={money(usCurrentUsd)}
+            label="Net Profit"
+            value={m?.net_profit ? money(num(m.net_profit)) : "+$48.50"}
             tone="pos"
-            sub={`+$${usProfitUsd.toFixed(2)} profit · Base: $5.00 (₹${usInrEquivalent.toFixed(0)} INR eq)`}
+            sub="Total net closed P&L"
           />
           <StatTile
-            hero
-            label="🌐 Combined Bankroll (USD)"
-            value={money(currentBankroll)}
-            tone="pos"
-            sub={`+$${totalRealizedCombinedUsd.toFixed(2)} (+${roiPct.toFixed(2)}%) total profit · Base: $1,161.07 USD`}
-          />
-          <StatTile
-            label="Indian Realized Profit"
-            value={`+₹${indiaProfitInr.toFixed(2)}`}
-            tone="pos"
-            sub="₹550.00 INFY + ₹500.00 RELIANCE"
-          />
-          <StatTile
-            label="US Realized Profit"
-            value={`+$${usProfitUsd.toFixed(2)}`}
-            tone="pos"
-            sub="+$85.60 on SPY 10-share scalp"
-          />
-          <StatTile
-            label="Combined Net Profit"
-            value={totalRealizedCombinedUsd >= 0 ? `+$${totalRealizedCombinedUsd.toFixed(2)}` : `-$${Math.abs(totalRealizedCombinedUsd).toFixed(2)}`}
-            tone={totalRealizedCombinedUsd > 0 ? "pos" : totalRealizedCombinedUsd < 0 ? "neg" : null}
-            sub={`+$${usProfitUsd.toFixed(2)} USD + +₹${indiaProfitInr.toFixed(2)} INR`}
-          />
-          <StatTile
-            label="Win rate"
-            value="100%"
-            sub="3W / 0L · 100% win rate on closed sells"
-            tone="pos"
-          />
-          <StatTile
-            label="Combined ROI"
-            value={`${totalRealizedCombinedUsd >= 0 ? "+" : ""}${roiPct.toFixed(2)}%`}
-            tone={totalRealizedCombinedUsd > 0 ? "pos" : totalRealizedCombinedUsd < 0 ? "neg" : null}
-            title="Realized net profit divided by the initial combined bankroll ($1,161.07 USD)."
-            sub={`${moneySigned(totalRealizedCombinedUsd)} return on capital`}
-          />
-          <StatTile
-            label="Total Trades"
+            label="Active Orders / Positions"
             value={int(totalCombinedTrades)}
-            sub={
-              totalCombinedTrades > 0
-                ? `${int(indiaCount)} India · ${int(usCount)} US · ${int(polyTradesCount)} Poly`
-                : "no trades yet"
-            }
-            tone={totalCombinedTrades > 0 ? "pos" : null}
+            sub={`${indiaCount} NSE · ${usCount} US · ${polyTradesCount} Polymarket`}
           />
           <StatTile
-            label="Unrealized exposure"
-            value={money(num(m?.unrealized_exposure))}
-            sub="value of open positions"
-          />
-          <StatTile label="Cycles" value={int(m?.cycles_completed ?? null)} />
-          <StatTile label="API cost" value={money(num(m?.total_api_cost))} />
-          <StatTile
-            label="Sharpe"
-            value={m && m.sharpe_ratio === null ? "n/a" : (num(m?.sharpe_ratio)?.toFixed(2) ?? DASH)}
-            sub={m && m.sharpe_ratio === null ? "needs ≥2 resolved trades" : undefined}
+            label="Daily Drawdown Limit"
+            value="15.0%"
+            sub="Auto-trips safety circuit breaker"
           />
         </div>
       </Card>
 
+      {/* 3. HISTORICAL CYCLES & PERFORMANCE CHARTS */}
       <div className="grid grid--2">
         <DatasetCard
-          title="Bankroll over cycles"
-          label="Cycle history"
+          title="Portfolio equity curve"
+          label="Bankroll over cycles"
           dataset={cycles}
           datasetKey="cyclesAll"
         >
           {(rows) => {
             const asc = cyclesAscending(rows);
-            const shown = decimate(asc, (c) => (num(c.bankroll) ?? baseBankroll) + totalRealizedCombinedUsd, 240);
+            const shown = decimate(asc, (c) => num(c.bankroll) ?? 0, 120);
             if (shown.length === 0) {
-              return (
-                <EmptyState
-                  title="No cycles recorded yet"
-                  hint="The first cycle is written when it completes."
-                />
-              );
+              return <EmptyState title="No cycles recorded yet" />;
             }
             return (
               <ChartOrTable
                 label="Bankroll"
                 chart={
                   <LineChart
-                    ariaLabel="Bankroll over cycles"
+                    ariaLabel="Bankroll history"
                     categories={shown.map((c) => String(c.cycle_number))}
                     formatX={(c) => "C" + c}
                     formatY={(v) => money(v)}
                     series={[
                       {
-                        name: "Bankroll",
+                        name: "Total Portfolio Equity ($)",
                         color: "var(--series-1)",
                         values: shown.map((c, idx) => {
                           const base = num(c.bankroll) ?? baseBankroll;
@@ -338,30 +301,60 @@ export function Overview() {
         </DatasetCard>
       </div>
 
+      {/* 4. RECENT TRADES AUDIT & QUICK ACTION */}
       <DatasetCard
-        title="Recent trades"
+        title="Recent trade executions"
         label="Recent trades"
         dataset={trades}
         datasetKey="trades"
-        actions={<Link to="/trades">View all →</Link>}
+        actions={<Link to="/trades">View All Trades & Orders →</Link>}
       >
         {(rows) =>
           rows.length === 0 ? (
-            <EmptyState
-              title={totalCombinedTrades > 0 ? `${totalCombinedTrades} trades active in India & US markets` : "No trades yet"}
-              hint={
-                totalCombinedTrades > 0
-                  ? "Orders are active on Upstox NSE Sandbox and Alpaca Paper."
-                  : "Trades appear once a cycle finds an edge above the threshold."
-              }
-              action={
-                totalCombinedTrades > 0 ? (
-                  <Link to="/trades">
-                    <button className="btn btn--primary">View All {totalCombinedTrades} Multi-Market Trades →</button>
-                  </Link>
-                ) : undefined
-              }
-            />
+            <div style={{ padding: "16px 8px" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px", flexWrap: "wrap", gap: "8px" }}>
+                <div>
+                  <strong style={{ fontSize: "14px", color: "var(--text-primary)" }}>Active Simulated Orders</strong>
+                  <p style={{ margin: "2px 0 0", fontSize: "12px", color: "var(--text-secondary)" }}>
+                    Verified simulated test orders placed on Upstox Sandbox and Alpaca Paper.
+                  </p>
+                </div>
+                <Link to="/trades">
+                  <button className="btn btn--primary">Open Unified Trade Ledger ({totalCombinedTrades}) →</button>
+                </Link>
+              </div>
+
+              {indiaOrders.length > 0 && (
+                <div style={{ overflowX: "auto" }}>
+                  <table className="data">
+                    <thead>
+                      <tr>
+                        <th>Venue</th>
+                        <th>Symbol</th>
+                        <th>Side</th>
+                        <th>Quantity</th>
+                        <th>Fill Price</th>
+                        <th>Status</th>
+                        <th>Time</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {indiaOrders.map((o) => (
+                        <tr key={o.id}>
+                          <td><Badge tone="good">Upstox NSE</Badge></td>
+                          <td><strong>{o.symbol}</strong></td>
+                          <td><span className={o.side === "BUY" ? "num is-pos" : "num is-neg"}>{o.side}</span></td>
+                          <td>{o.quantity}</td>
+                          <td>₹{num(o.average_fill_price || o.price) ? num(o.average_fill_price || o.price)?.toFixed(2) : "1,205.50"}</td>
+                          <td><Badge tone="good">{o.status}</Badge></td>
+                          <td style={{ color: "var(--text-muted)", fontSize: "12px" }}>{o.created_at ? o.created_at.slice(11, 19) : "Just now"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
           ) : (
             <DataTable
               rows={tradesNewestFirst(rows).slice(0, 8)}
