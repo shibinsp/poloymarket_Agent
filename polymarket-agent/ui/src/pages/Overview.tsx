@@ -7,6 +7,7 @@ import { Badge, tradeStatusTone } from "../components/ui/Badge";
 import { DataTable } from "../components/ui/DataTable";
 import { LineChart } from "../components/charts/LineChart";
 import { ColumnChart } from "../components/charts/ColumnChart";
+import { DonutChart } from "../components/charts/DonutChart";
 import { ChartOrTable } from "../components/charts/ChartOrTable";
 import { Link } from "../router/Link";
 import { cyclesAscending, tradesNewestFirst } from "../data/derive";
@@ -90,6 +91,28 @@ export function Overview() {
 
   const m = metrics.data;
   const isAgentHalted = health.data?.halted ?? false;
+
+  // Capital Distribution for Donut Chart
+  const capitalSegments = [
+    {
+      label: "NSE Equities (INR)",
+      value: indiaUsdEquivalent,
+      color: "var(--series-1)",
+      sublabel: `₹${indiaCurrentInr.toLocaleString("en-IN")}`,
+    },
+    {
+      label: "US Equities (USD)",
+      value: usCurrentUsd,
+      color: "var(--series-2)",
+      sublabel: `$${usCurrentUsd.toFixed(2)}`,
+    },
+    {
+      label: "Polymarket Cash",
+      value: Math.max(0, baseBankroll - indiaUsdEquivalent - usCurrentUsd),
+      color: "var(--series-3)",
+      sublabel: `$${Math.max(0, baseBankroll - indiaUsdEquivalent - usCurrentUsd).toFixed(2)}`,
+    },
+  ];
 
   return (
     <div className="page">
@@ -197,8 +220,19 @@ export function Overview() {
         </div>
       </Card>
 
-      {/* 3. HISTORICAL CYCLES & PERFORMANCE CHARTS */}
+      {/* 3. CHARTS ROW: PIE / DONUT + EQUITY CURVE */}
       <div className="grid grid--2">
+        {/* Pie / Donut Chart Card */}
+        <Card title="Capital Allocation by Asset Class">
+          <DonutChart
+            ariaLabel="Asset Class Capital Allocation"
+            segments={capitalSegments}
+            centerLabel="Total Bankroll"
+            centerValue={money(currentBankroll)}
+          />
+        </Card>
+
+        {/* Portfolio Equity Curve */}
         <DatasetCard
           title="Portfolio equity curve"
           label="Bankroll over cycles"
@@ -254,54 +288,55 @@ export function Overview() {
             );
           }}
         </DatasetCard>
-
-        <DatasetCard
-          title="Trades placed per cycle"
-          label="Cycle history"
-          dataset={cycles}
-          datasetKey="cyclesAll"
-        >
-          {(rows) => {
-            const asc = cyclesAscending(rows);
-            const shown = decimate(asc, (c) => c.trades_placed, 120);
-            if (shown.length === 0) {
-              return <EmptyState title="No cycles recorded yet" />;
-            }
-            return (
-              <ChartOrTable
-                label="Trades placed"
-                chart={
-                  <ColumnChart
-                    ariaLabel="Trades placed per cycle"
-                    categories={shown.map((c) => String(c.cycle_number))}
-                    formatX={(c) => "C" + c}
-                    formatY={(v) => int(v)}
-                    series={[
-                      {
-                        name: "Trades placed",
-                        color: "var(--series-1)",
-                        values: shown.map((c) => c.trades_placed),
-                      },
-                    ]}
-                  />
-                }
-                table={
-                  <DataTable
-                    rows={[...asc].reverse().slice(0, 100)}
-                    rowKey={(c) => String(c.id ?? c.cycle_number)}
-                    columns={[
-                      { key: "c", header: "Cycle", numeric: true, render: (c) => int(c.cycle_number) },
-                      { key: "t", header: "Trades", numeric: true, render: (c) => int(c.trades_placed) },
-                    ]}
-                  />
-                }
-              />
-            );
-          }}
-        </DatasetCard>
       </div>
 
-      {/* 4. RECENT TRADES AUDIT & QUICK ACTION */}
+      {/* 4. ACTIVITY & CYCLE HISTOGRAM */}
+      <DatasetCard
+        title="Trades placed per cycle"
+        label="Cycle history"
+        dataset={cycles}
+        datasetKey="cyclesAll"
+      >
+        {(rows) => {
+          const asc = cyclesAscending(rows);
+          const shown = decimate(asc, (c) => c.trades_placed, 120);
+          if (shown.length === 0) {
+            return <EmptyState title="No cycles recorded yet" />;
+          }
+          return (
+            <ChartOrTable
+              label="Trades placed"
+              chart={
+                <ColumnChart
+                  ariaLabel="Trades placed per cycle"
+                  categories={shown.map((c) => String(c.cycle_number))}
+                  formatX={(c) => "C" + c}
+                  formatY={(v) => int(v)}
+                  series={[
+                    {
+                      name: "Trades placed",
+                      color: "var(--series-1)",
+                      values: shown.map((c) => c.trades_placed),
+                    },
+                  ]}
+                />
+              }
+              table={
+                <DataTable
+                  rows={[...asc].reverse().slice(0, 100)}
+                  rowKey={(c) => String(c.id ?? c.cycle_number)}
+                  columns={[
+                    { key: "c", header: "Cycle", numeric: true, render: (c) => int(c.cycle_number) },
+                    { key: "t", header: "Trades", numeric: true, render: (c) => int(c.trades_placed) },
+                  ]}
+                />
+              }
+            />
+          );
+        }}
+      </DatasetCard>
+
+      {/* 5. RECENT TRADES AUDIT & QUICK ACTION */}
       <DatasetCard
         title="Recent trade executions"
         label="Recent trades"
@@ -314,9 +349,9 @@ export function Overview() {
             <div style={{ padding: "16px 8px" }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px", flexWrap: "wrap", gap: "8px" }}>
                 <div>
-                  <strong style={{ fontSize: "14px", color: "var(--text-primary)" }}>Active Simulated Orders</strong>
+                  <strong style={{ fontSize: "14px", color: "var(--text-primary)" }}>Active Orders & Executions</strong>
                   <p style={{ margin: "2px 0 0", fontSize: "12px", color: "var(--text-secondary)" }}>
-                    Verified simulated test orders placed on Upstox Sandbox and Alpaca Paper.
+                    Verified orders placed on Upstox Sandbox and Alpaca Paper.
                   </p>
                 </div>
                 <Link to="/trades">
