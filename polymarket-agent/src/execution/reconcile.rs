@@ -265,25 +265,6 @@ impl StateReconciler<'_> {
             entry.0 += trade.quantity;
         }
 
-        // Also account for US paper orders on Alpaca
-        if venue_id == "alpaca" {
-            if let Ok(paper_orders) = self.store.get_us_paper_orders(500).await {
-                for po in paper_orders {
-                    if po.status.eq_ignore_ascii_case("FILLED") {
-                        let key = po.symbol.to_ascii_uppercase();
-                        let entry = local_qty
-                            .entry(key)
-                            .or_insert((Decimal::ZERO, AssetClass::Equity));
-                        let qty = Decimal::from(po.fill_quantity);
-                        if po.side.eq_ignore_ascii_case("BUY") {
-                            entry.0 += qty;
-                        } else if po.side.eq_ignore_ascii_case("SELL") {
-                            entry.0 -= qty;
-                        }
-                    }
-                }
-            }
-        }
 
         let mut venue_qty: HashMap<String, Decimal> = HashMap::new();
         for pos in &venue_positions {

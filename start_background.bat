@@ -10,7 +10,7 @@ echo.
 tasklist /FI "IMAGENAME eq polymarket-agent.exe" 2>nul | find /I "polymarket-agent.exe" >nul
 if not errorlevel 1 (
     echo [INFO] Polymarket Agent is ALREADY running in the background!
-    echo [INFO] Web Dashboard: http://127.0.0.1:8080
+    echo [INFO] Web Dashboard: http://127.0.0.1:8088
     echo [INFO] Log file: polymarket-agent\agent.log
     echo.
     goto end
@@ -24,7 +24,7 @@ tasklist /FI "IMAGENAME eq polymarket-agent.exe" 2>nul | find /I "polymarket-age
 if not errorlevel 1 (
     echo [SUCCESS] Agent is now running in the background!
     echo [INFO] It will continue running even after you close this terminal window.
-    echo [INFO] Web Dashboard: http://127.0.0.1:8080
+    echo [INFO] Web Dashboard: http://127.0.0.1:8088
     echo [INFO] Live output log: %~dp0polymarket-agent\agent.log
     echo [INFO] To stop it anytime, run: stop_background.bat
 ) else (

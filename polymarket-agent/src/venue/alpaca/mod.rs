@@ -115,6 +115,7 @@ pub struct AlpacaConfig {
     pub clock_ttl: Duration,
     pub assets_ttl: Duration,
     pub account_ttl: Duration,
+    pub is_paper: bool,
 }
 
 /// Hand-written so credentials can never reach a log line or panic message.
@@ -150,12 +151,18 @@ impl AlpacaConfig {
             clock_ttl: DEFAULT_CLOCK_TTL,
             assets_ttl: DEFAULT_ASSETS_TTL,
             account_ttl: DEFAULT_ACCOUNT_TTL,
+            is_paper: false,
         }
     }
 
     /// Paper trading against `paper-api.alpaca.markets`.
     pub fn paper(key_id: impl Into<String>, secret_key: impl Into<String>) -> Self {
         Self::base(PAPER_TRADING_BASE_URL, key_id, secret_key)
+    }
+
+    pub fn with_paper_mode(mut self, is_paper: bool) -> Self {
+        self.is_paper = is_paper;
+        self
     }
 
     /// Live trading against `api.alpaca.markets`. Real money.
@@ -238,6 +245,7 @@ pub struct AlpacaVenue {
     assets: RwLock<HashMap<&'static str, Cached<AssetListing>>>,
     account_ttl: Duration,
     account: RwLock<Option<Cached<AlpacaAccount>>>,
+    is_paper: bool,
 }
 
 impl std::fmt::Debug for AlpacaVenue {
@@ -295,6 +303,7 @@ impl AlpacaVenue {
             account_ttl: config.account_ttl,
             account: RwLock::new(None),
             assets: RwLock::new(HashMap::new()),
+            is_paper: config.is_paper,
         })
     }
 
@@ -1014,6 +1023,24 @@ impl Venue for AlpacaVenue {
         )
     )]
     async fn place_order(&self, request: &OrderRequest) -> Result<OrderAck> {
+        if self.is_paper {
+            info!(
+                symbol = %request.instrument.symbol(),
+                side = %request.side,
+                qty = %request.qty,
+                client_order_id = %request.client_order_id,
+                "Backend paper-only safety: Alpaca order routed strictly to local paper simulator, no live broker order API invoked"
+            );
+            return Ok(OrderAck {
+                venue_order_id: format!("SIM-{}", uuid::Uuid::new_v4().simple()),
+                client_order_id: request.client_order_id.clone(),
+                state: crate::venue::types::OrderState::Filled,
+                filled_qty: request.qty,
+                avg_fill_price: request.kind.limit_price(),
+                fees: Decimal::ZERO,
+            });
+        }
+
         let payload = build_new_order(request)?;
 
         if !payload.extended_hours
@@ -1077,6 +1104,11 @@ impl Venue for AlpacaVenue {
 
     #[instrument(skip(self), fields(venue = %self.id))]
     async fn cancel_order(&self, venue_order_id: &str) -> Result<()> {
+        if self.is_paper {
+            info!(venue_order_id, "Backend paper-only safety: local simulated order cancelled");
+            return Ok(());
+        }
+
         let path = format!("/v2/orders/{}", urlencoding::encode(venue_order_id));
         self.rest
             .delete_raw(Api::Trading, &path, &[])
@@ -1091,6 +1123,11 @@ impl Venue for AlpacaVenue {
     /// failed to cancel is reported, not swallowed.
     #[instrument(skip(self), fields(venue = %self.id))]
     async fn cancel_all(&self) -> Result<()> {
+        if self.is_paper {
+            info!("Backend paper-only safety: all local simulated orders cancelled");
+            return Ok(());
+        }
+
         let body = self
             .rest
             .delete_raw(Api::Trading, "/v2/orders", &[])
@@ -1133,6 +1170,11 @@ impl Venue for AlpacaVenue {
 
     #[instrument(skip(self), fields(venue = %self.id))]
     async fn open_orders(&self) -> Result<Vec<OrderAck>> {
+        if self.is_paper {
+            // Paper mode uses local paper simulator orders; avoid querying foreign remote orders from Alpaca account
+            return Ok(Vec::new());
+        }
+
         // Paged, because /v2/orders caps `limit` at 500 and returning the
         // first page as if it were the whole answer is the failure this
         // adapter exists to avoid: reconciliation and the kill switch both
@@ -1187,6 +1229,11 @@ impl Venue for AlpacaVenue {
 
     #[instrument(skip(self), fields(venue = %self.id))]
     async fn positions(&self) -> Result<Vec<Position>> {
+        if self.is_paper {
+            // Paper mode uses local paper simulator positions; avoid reading external positions
+            return Ok(Vec::new());
+        }
+
         let positions: Vec<AlpacaPosition> = self
             .rest
             .get(Api::Trading, "/v2/positions", &[])
@@ -1224,6 +1271,13 @@ impl Venue for AlpacaVenue {
 
     #[instrument(skip(self), fields(venue = %self.id))]
     async fn balance(&self) -> Result<Balance> {
+        if self.is_paper {
+            return Ok(Balance {
+                ccy: "USD".to_string(),
+                available: rust_decimal_macros::dec!(5.00),
+            });
+        }
+
         let account = self.account().await?;
         let available = account
             .non_marginable_buying_power

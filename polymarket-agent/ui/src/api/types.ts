@@ -279,12 +279,21 @@ export interface IndiaSandboxStatusResponse {
   currency_symbol: string;
   timezone: string;
   trading_hours: string;
-  base_capital_inr?: number;
-  realized_profit_inr?: number;
-  open_positions_cost_inr?: number;
-  available_cash_inr?: number;
-  total_equity_inr?: number;
-  holdings?: Record<string, number>;
+  base_capital_inr?: number | string;
+  realized_profit_inr?: number | string;
+  open_positions_cost_inr?: number | string;
+  available_cash_inr?: number | string;
+  total_equity_inr?: number | string;
+  holdings?: Record<string, number | string>;
+  upstox_feed?: {
+    authorized: boolean;
+    connected: boolean;
+    feed_mode: string;
+    symbols_subscribed: string[];
+    last_tick_time: string | null;
+    live_prices: Record<string, { price: number | string; time: string; source: string; change_pct: number | string }>;
+  };
+  safety_guarantee?: string;
   recent_orders: MarketOrderRecord[];
 }
 

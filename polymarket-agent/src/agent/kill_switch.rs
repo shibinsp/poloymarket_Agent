@@ -24,7 +24,7 @@ use std::sync::Mutex;
 
 use chrono::{DateTime, NaiveDate, Utc};
 
-use crate::risk::circuit_breaker::HaltScope;
+pub use crate::risk::circuit_breaker::HaltScope;
 
 /// Who stopped the agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,6 +273,7 @@ impl KillSwitch {
         self.tripped.store(false, Ordering::Release);
         self.handled.store(false, Ordering::Release);
         drop(current);
+        self.trips.send_modify(|v| *v += 1);
 
         match std::fs::remove_file(&self.halt_file) {
             Ok(()) => Ok(was),

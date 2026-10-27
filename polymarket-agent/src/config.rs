@@ -812,7 +812,8 @@ impl Secrets {
             binance_us_secret_key: secret_env("BINANCE_US_SECRET_KEY"),
             upstox_api_key: secret_env("UPSTOX_API_KEY"),
             upstox_api_secret: secret_env("UPSTOX_API_SECRET"),
-            upstox_sandbox_token: secret_env("UPSTOX_SANDBOX_TOKEN"),
+            upstox_sandbox_token: secret_env("UPSTOX_ACCESS_TOKEN")
+                .or_else(|| secret_env("UPSTOX_SANDBOX_TOKEN")),
         }
     }
 }

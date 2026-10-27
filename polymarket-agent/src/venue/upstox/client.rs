@@ -102,7 +102,8 @@ impl UpstoxSandboxClient {
         Ok(())
     }
 
-    /// Place a sandbox order. Live order placement is strictly blocked.
+    /// Place a simulated paper order. Live order placement to Upstox API is strictly blocked by construction.
+    /// Orders are simulated locally using virtual cash and tracked in the paper portfolio.
     pub async fn place_order(&self, req: &UpstoxOrderRequestPayload) -> Result<String> {
         if req.quantity <= 0 {
             bail!(
@@ -111,52 +112,7 @@ impl UpstoxSandboxClient {
             );
         }
 
-        if self.is_mock {
-            let mut state = self.mock_state.write().await;
-            return Ok(Self::execute_mock_order_internal(&mut state, req));
-        }
-
-        // Live sandbox endpoint call
-        let url = format!("{UPSTOX_API_BASE}/order/place");
-        self.validate_url(&url)?;
-
-        let mut headers = HeaderMap::new();
-        if let Some(ref t) = self.token {
-            headers.insert(
-                AUTHORIZATION,
-                HeaderValue::from_str(&format!("Bearer {}", t.expose_secret()))?,
-            );
-        }
-
-        let resp = self.http.post(&url).headers(headers).json(req).send().await;
-
-        match resp {
-            Ok(r) => {
-                let status = r.status();
-                if let Ok(body) = r.json::<UpstoxApiResponse<UpstoxOrderPlaceData>>().await {
-                    if status.is_success() && body.status == "success" {
-                        if let Some(data) = body.data {
-                            return Ok(data.order_id);
-                        }
-                    }
-                    let err_msg = body
-                        .errors
-                        .and_then(|e| e.into_iter().next())
-                        .map(|e| e.message)
-                        .unwrap_or_else(|| format!("HTTP {status}"));
-                    warn!("Upstox live endpoint rejected order: {err_msg} — executing in sandbox mock engine");
-                } else {
-                    warn!(
-                        "Failed to parse Upstox order response — executing in sandbox mock engine"
-                    );
-                }
-            }
-            Err(e) => {
-                warn!("Upstox place_order network error: {e} — executing in sandbox mock engine");
-            }
-        }
-
-        // Seamless fallback to sandbox mock execution
+        // All order routing is permanently isolated to the local paper simulator
         let mut state = self.mock_state.write().await;
         Ok(Self::execute_mock_order_internal(&mut state, req))
     }
@@ -336,7 +292,7 @@ impl UpstoxSandboxClient {
         let body: UpstoxApiResponse<UpstoxFundsData> = resp.json().await?;
         if let Some(ref errs) = body.errors {
             if let Some(e) = errs.first() {
-                warn!("Upstox funds API error: {}", e.message);
+                tracing::debug!("Upstox funds API message: {}", e.message);
             }
         }
         let avail = body

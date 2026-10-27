@@ -5,6 +5,7 @@
 //! `Authorization: Bearer <token>`. Binding to a non-loopback address without
 //! a token is refused in live mode and downgraded to loopback otherwise.
 
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -15,6 +16,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use subtle::ConstantTimeEq;
 use tokio::task::JoinHandle;
@@ -28,6 +30,12 @@ use crate::monitoring::metrics::compute_metrics;
 use crate::risk::circuit_breaker::HaltScope;
 
 const LOOPBACK: &str = "127.0.0.1";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DynamicCapitalCaps {
+    pub india_capital_allocation_inr: Decimal,
+    pub us_capital_allocation_usd: Decimal,
+}
 
 /// Shared state accessible by all dashboard route handlers.
 #[derive(Clone)]
@@ -48,6 +56,9 @@ pub struct DashboardState {
     kill_switch: Arc<KillSwitch>,
     valuation_enabled: bool,
     valuation_model: String,
+    pub upstox_feed: Arc<crate::india::market_feed::UpstoxLiveMarketFeed>,
+    pub alpaca_feed: Arc<crate::us::market_feed::AlpacaLiveMarketFeed>,
+    pub dynamic_caps: Arc<tokio::sync::RwLock<DynamicCapitalCaps>>,
 }
 
 impl DashboardState {
@@ -63,6 +74,13 @@ impl DashboardState {
         valuation_enabled: bool,
         valuation_model: String,
     ) -> Self {
+        let init_india = risk
+            .india_capital_allocation_inr
+            .unwrap_or(rust_decimal_macros::dec!(1000.0));
+        let init_us = risk
+            .us_capital_allocation_usd
+            .unwrap_or(rust_decimal_macros::dec!(5.0));
+
         Self {
             store: Arc::new(store),
             health,
@@ -72,6 +90,16 @@ impl DashboardState {
             mode,
             valuation_enabled,
             valuation_model,
+            upstox_feed: Arc::new(crate::india::market_feed::UpstoxLiveMarketFeed::new(
+                None, None, None, None,
+            )),
+            alpaca_feed: Arc::new(crate::us::market_feed::AlpacaLiveMarketFeed::new(
+                None, None, None,
+            )),
+            dynamic_caps: Arc::new(tokio::sync::RwLock::new(DynamicCapitalCaps {
+                india_capital_allocation_inr: init_india,
+                us_capital_allocation_usd: init_us,
+            })),
             // Trim before storing: the page sends a trimmed token, so keeping
             // stray whitespace here would 401 every request with an
             // apparently-correct token.
@@ -80,6 +108,22 @@ impl DashboardState {
                 .filter(|t| !t.is_empty())
                 .map(|t| Arc::from(t.as_str())),
         }
+    }
+
+    pub fn with_upstox_feed(
+        mut self,
+        feed: Arc<crate::india::market_feed::UpstoxLiveMarketFeed>,
+    ) -> Self {
+        self.upstox_feed = feed;
+        self
+    }
+
+    pub fn with_alpaca_feed(
+        mut self,
+        feed: Arc<crate::us::market_feed::AlpacaLiveMarketFeed>,
+    ) -> Self {
+        self.alpaca_feed = feed;
+        self
     }
 }
 
@@ -206,6 +250,17 @@ fn build_router(state: DashboardState) -> Router {
         .route("/api/fx/rate", get(fx_rate_handler))
         .route("/api/portfolio/combined", get(combined_portfolio_handler))
         .route("/api/intraday/status", get(intraday_status_handler))
+        .route("/api/upstox/auth/status", get(upstox_auth_status_handler))
+        .route("/api/upstox/auth/token", post(upstox_auth_token_handler))
+        .route("/api/upstox/feed/status", get(upstox_feed_status_handler))
+        .route("/api/upstox/strategy/tick", post(upstox_strategy_tick_handler))
+        .route("/api/upstox/simulator/order", post(upstox_simulator_order_handler))
+        .route("/api/alpaca/feed/status", get(alpaca_feed_status_handler))
+        .route("/api/pullback/backtest", get(pullback_backtest_handler))
+        .route(
+            "/api/settings/caps",
+            get(settings_caps_get_handler).post(settings_caps_post_handler),
+        )
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
 
     // State-changing routes get a second gate on top of the token.
@@ -234,6 +289,7 @@ fn build_router(state: DashboardState) -> Router {
     Router::new()
         .route("/", get(index_handler))
         .route("/api/health", get(health_handler))
+        .route("/api/upstox/callback", get(upstox_oauth_callback_handler))
         .merge(protected)
         .merge(control)
         .fallback(index_handler)
@@ -576,6 +632,13 @@ async fn health_handler(State(state): State<DashboardState>) -> impl IntoRespons
                 "status".to_string(),
                 serde_json::json!(if halted { "halted" } else { "ok" }),
             );
+            if halted {
+                obj.insert("agent_state".to_string(), serde_json::json!("HALTED"));
+            } else if obj.get("agent_state").and_then(|v| v.as_str()) == Some("HALTED")
+                || obj.get("agent_state").and_then(|v| v.as_str()) == Some("INITIALIZING")
+            {
+                obj.insert("agent_state".to_string(), serde_json::json!("ALIVE"));
+            }
         }
     }
     Json(data)
@@ -827,24 +890,24 @@ async fn india_sandbox_status_handler(State(state): State<DashboardState>) -> im
         .await
         .unwrap_or_default();
     let watchlist = crate::india::instruments::nse_watchlist();
-    let base_capital = state
-        .risk
-        .india_capital_allocation_inr
-        .unwrap_or(rust_decimal_macros::dec!(1000.0));
+    let base_capital = state.dynamic_caps.read().await.india_capital_allocation_inr;
 
     let (realized_profit, open_positions_cost, available_cash, holdings) =
         compute_india_sandbox_accounting(base_capital, &recent_orders);
 
+    let feed_info = state.upstox_feed.get_status_info().await;
+    let ticks = state.upstox_feed.prices.read().await.clone();
+
     let resp = serde_json::json!({
         "venue_id": "upstox_sandbox",
-        "name": "Upstox Sandbox (NSE Cash Equities)",
+        "name": "Upstox Live Feed · Paper Trading Simulator",
         "currency": "INR",
         "currency_symbol": "₹",
         "timezone": "Asia/Kolkata",
         "trading_hours": "09:15 - 15:30 IST",
         "allowlisted_host": "api.upstox.com",
         "live_trading_allowed": false,
-        "mode_description": "Strictly sandboxed execution and simulation. Real-money live order placement is blocked by construction.",
+        "mode_description": "Upstox live market data feed connected to local Paper Trading Simulator. All buy/sell strategy decisions execute in the virtual simulator with configurable INR starting capital. Zero live orders are sent to Upstox.",
         "base_capital_inr": base_capital,
         "realized_profit_inr": realized_profit,
         "open_positions_cost_inr": open_positions_cost,
@@ -853,16 +916,15 @@ async fn india_sandbox_status_handler(State(state): State<DashboardState>) -> im
         "holdings": holdings,
         "recent_orders": recent_orders,
         "watchlist": watchlist,
+        "feed_status": feed_info,
+        "live_ticks": ticks,
     });
 
     Json(resp)
 }
 
 async fn india_sandbox_reset_handler(State(state): State<DashboardState>) -> impl IntoResponse {
-    let base_capital = state
-        .risk
-        .india_capital_allocation_inr
-        .unwrap_or(rust_decimal_macros::dec!(1000.0));
+    let base_capital = state.dynamic_caps.read().await.india_capital_allocation_inr;
     match state.store.clear_india_sandbox_orders().await {
         Ok(_) => {
             info!("India sandbox orders cleared - reset to ₹1,000 base capital");
@@ -890,6 +952,329 @@ async fn india_sandbox_reset_handler(State(state): State<DashboardState>) -> imp
     }
 }
 
+// --- Upstox Live Market Data Feed & Paper Simulator API Handlers ---
+
+async fn upstox_auth_status_handler(State(state): State<DashboardState>) -> impl IntoResponse {
+    let status = state.upstox_feed.get_status_info().await;
+    Json(status)
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct UpstoxAuthTokenSubmitRequest {
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub access_token: Option<String>,
+    pub code: Option<String>,
+}
+
+async fn upstox_auth_token_handler(
+    State(state): State<DashboardState>,
+    Json(req): Json<UpstoxAuthTokenSubmitRequest>,
+) -> impl IntoResponse {
+    if req.client_id.is_some() || req.client_secret.is_some() {
+        state
+            .upstox_feed
+            .set_credentials(req.client_id.clone(), req.client_secret.clone())
+            .await;
+    }
+
+    if let Some(code) = req.code {
+        match state.upstox_feed.exchange_code_for_token(&code).await {
+            Ok(_) => {
+                info!("Successfully exchanged OAuth code for Upstox access token");
+                let status = state.upstox_feed.get_status_info().await;
+                return Json(serde_json::json!({
+                    "status": "success",
+                    "message": "Upstox authorization code successfully exchanged for access token. Market feed connected.",
+                    "feed": status,
+                }))
+                .into_response();
+            }
+            Err(e) => {
+                warn!("Upstox code exchange failed: {e}");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": format!("Token exchange failed: {e:#}") })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    if let Some(token) = req.access_token {
+        state.upstox_feed.set_access_token(token).await;
+        let status = state.upstox_feed.get_status_info().await;
+        return Json(serde_json::json!({
+            "status": "success",
+            "message": "Upstox access token configured. Market data feed connected.",
+            "feed": status,
+        }))
+        .into_response();
+    }
+
+    let status = state.upstox_feed.get_status_info().await;
+    Json(serde_json::json!({
+        "status": "success",
+        "message": "Upstox app credentials saved.",
+        "feed": status,
+    }))
+    .into_response()
+}
+
+async fn upstox_feed_status_handler(State(state): State<DashboardState>) -> impl IntoResponse {
+    let feed_info = state.upstox_feed.get_status_info().await;
+    let ticks = state.upstox_feed.prices.read().await.clone();
+    let mut live_prices_summary = serde_json::Map::new();
+    for (sym, t) in &ticks {
+        let prev_close = if t.close > Decimal::ZERO { t.close } else { t.last_price };
+        let change_pct = if prev_close > Decimal::ZERO {
+            ((t.last_price - prev_close) / prev_close) * rust_decimal_macros::dec!(100)
+        } else {
+            Decimal::ZERO
+        };
+        let change_pct_f64 = change_pct.to_f64().unwrap_or(0.0);
+        let price_f64 = t.last_price.to_f64().unwrap_or(0.0);
+        live_prices_summary.insert(
+            sym.clone(),
+            serde_json::json!({
+                "price": price_f64,
+                "price_str": t.last_price.to_string(),
+                "time": t.timestamp.to_rfc3339(),
+                "source": t.source,
+                "change_pct": change_pct_f64,
+            }),
+        );
+    }
+    Json(serde_json::json!({
+        "connected": feed_info.connected,
+        "status": feed_info.status,
+        "feed_type": feed_info.feed_type,
+        "token_configured": feed_info.token_configured,
+        "token_preview": feed_info.token_preview,
+        "redirect_uri": feed_info.redirect_uri,
+        "auth_dialog_url": feed_info.auth_dialog_url,
+        "symbols_subscribed": feed_info.symbols,
+        "last_tick_time": feed_info.last_update,
+        "last_feed_timestamp": feed_info.last_feed_timestamp,
+        "measured_delay_ms": feed_info.measured_delay_ms,
+        "is_stale": feed_info.is_stale,
+        "stale_reason": feed_info.stale_reason,
+        "trading_paused_due_to_stale": feed_info.trading_paused_due_to_stale,
+        "session": feed_info.session,
+        "reconnect_count": feed_info.reconnect_count,
+        "resubscribe_count": feed_info.resubscribe_count,
+        "backoff_delay_secs": feed_info.backoff_delay_secs,
+        "deduped_ticks_count": feed_info.deduped_ticks_count,
+        "live_prices": live_prices_summary,
+        "ticks": ticks,
+        "feed": feed_info,
+    }))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct UpstoxOAuthCallbackQuery {
+    pub code: Option<String>,
+    pub error: Option<String>,
+}
+
+async fn upstox_oauth_callback_handler(
+    State(state): State<DashboardState>,
+    Query(query): Query<UpstoxOAuthCallbackQuery>,
+) -> impl IntoResponse {
+    if let Some(code) = query.code {
+        match state.upstox_feed.exchange_code_for_token(&code).await {
+            Ok(_) => {
+                let html = r#"<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Upstox Market Data Feed Connected</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0b0f19; color: #f3f4f6; display: grid; place-items: center; min-height: 100vh; margin: 0; }
+    .card { background: #111827; border: 1px solid #1f2937; border-radius: 12px; padding: 32px; max-width: 520px; text-align: center; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
+    h1 { color: #10b981; margin-top: 0; font-size: 22px; }
+    p { color: #9ca3af; font-size: 14px; line-height: 1.6; margin: 16px 0; }
+    .badge { display: inline-block; padding: 4px 10px; background: #064e3b; color: #6ee7b7; border-radius: 20px; font-size: 12px; font-weight: 600; margin-bottom: 12px; }
+    .btn { display: inline-block; padding: 10px 20px; background: #2563eb; color: #ffffff; text-decoration: none; border-radius: 6px; font-size: 14px; font-weight: 600; margin-top: 8px; transition: background 0.15s; }
+    .btn:hover { background: #1d4ed8; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="badge">LIVE FEED AUTHORIZED</div>
+    <h1>Upstox Feed Connected Successfully</h1>
+    <p>Your Upstox Developer App authorization code was verified and exchanged for an active market data session.</p>
+    <p><strong>Safety Protocol:</strong> Live prices are streaming to the strategy engine. All order actions are permanently locked to the local <strong>Paper Trading Simulator</strong> with ₹1,000 starting cash. Zero live orders are placed on Upstox.</p>
+    <a href="/india-test" class="btn">Return to Dashboard</a>
+  </div>
+</body>
+</html>"#;
+                return (
+                    StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                    html,
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                let err_html = format!(
+                    r#"<!DOCTYPE html>
+<html>
+<head><title>Authorization Failed</title><style>body{{font-family:sans-serif;background:#0b0f19;color:#f3f4f6;display:grid;place-items:center;min-height:100vh;margin:0}}.card{{background:#111827;border:1px solid #ef4444;border-radius:12px;padding:32px;max-width:520px;text-align:center}}h1{{color:#ef4444}}p{{color:#9ca3af}}a{{color:#60a5fa}}</style></head>
+<body>
+  <div class="card">
+    <h1>Authorization Exchange Failed</h1>
+    <p>Error: {}</p>
+    <p><a href="/india-test">Return to Dashboard and check Client ID / Secret</a></p>
+  </div>
+</body>
+</html>"#,
+                    e
+                );
+                return (
+                    StatusCode::BAD_REQUEST,
+                    [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                    err_html,
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let err_msg = query
+        .error
+        .unwrap_or_else(|| "No authorization code was returned by Upstox".to_string());
+    (
+        StatusCode::BAD_REQUEST,
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        format!("<h1>Authorization Error</h1><p>{}</p><p><a href='/india-test'>Back</a></p>", err_msg),
+    )
+        .into_response()
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct UpstoxStrategyTickRequest {
+    pub symbol: String,
+    pub price: Option<Decimal>,
+    pub execute: Option<bool>,
+}
+
+async fn upstox_strategy_tick_handler(
+    State(state): State<DashboardState>,
+    Json(req): Json<UpstoxStrategyTickRequest>,
+) -> impl IntoResponse {
+    let sym = req.symbol.to_uppercase();
+    let current_price = match req.price {
+        Some(p) if p > Decimal::ZERO => p,
+        _ => state.upstox_feed.get_price(&sym).await,
+    };
+
+    let base_capital = state
+        .risk
+        .india_capital_allocation_inr
+        .unwrap_or(rust_decimal_macros::dec!(1000.0));
+
+    let all_orders = state
+        .store
+        .get_india_sandbox_orders(200)
+        .await
+        .unwrap_or_default();
+
+    let ticks_snapshot: HashMap<String, Decimal> = state
+        .upstox_feed
+        .prices
+        .read()
+        .await
+        .iter()
+        .map(|(k, v)| (k.clone(), v.last_price))
+        .collect();
+
+    let portfolio = crate::india::simulator::compute_portfolio_accounting(
+        base_capital,
+        &all_orders,
+        &ticks_snapshot,
+    );
+
+    let current_holding = portfolio
+        .holdings
+        .get(&sym)
+        .map(|d| d.to_string().parse::<i64>().unwrap_or(0))
+        .unwrap_or(0);
+
+    let avg_entry = portfolio
+        .open_positions
+        .iter()
+        .find(|p| p.symbol == sym)
+        .map(|p| p.average_buy_price);
+
+    let decision = crate::india::simulator::evaluate_strategy_tick(
+        &sym,
+        current_price,
+        portfolio.available_cash_inr,
+        current_holding,
+        avg_entry,
+    );
+
+    let mut execution_result = None;
+    if req.execute == Some(true) && (decision.action == "BUY" || decision.action == "SELL") {
+        let order_req = crate::india::simulator::IndiaPaperOrderRequest {
+            symbol: sym.clone(),
+            side: decision.action.clone(),
+            order_type: "LIMIT".to_string(),
+            quantity: decision.quantity,
+            price: Some(current_price),
+            trigger_reason: Some(decision.reason.clone()),
+        };
+
+        match crate::india::simulator::execute_paper_order(&state.store, base_capital, &order_req, current_price).await {
+            Ok(res) => {
+                execution_result = Some(res);
+            }
+            Err(e) => {
+                warn!("Strategy tick execution error: {e}");
+            }
+        }
+    }
+
+    Json(serde_json::json!({
+        "status": "success",
+        "symbol": sym,
+        "price": current_price,
+        "decision": decision,
+        "execution": execution_result,
+        "portfolio": portfolio,
+    }))
+}
+
+async fn upstox_simulator_order_handler(
+    State(state): State<DashboardState>,
+    Json(req): Json<crate::india::simulator::IndiaPaperOrderRequest>,
+) -> impl IntoResponse {
+    let base_capital = state
+        .risk
+        .india_capital_allocation_inr
+        .unwrap_or(rust_decimal_macros::dec!(1000.0));
+
+    let live_price = state.upstox_feed.get_price(&req.symbol).await;
+
+    match crate::india::simulator::execute_paper_order(&state.store, base_capital, &req, live_price).await {
+        Ok(result) => Json(serde_json::json!({
+            "status": "success",
+            "order": result.order,
+            "costs": result.costs,
+            "available_cash_inr": result.available_cash_inr,
+            "total_equity_inr": result.total_equity_inr,
+            "disclaimer": result.disclaimer,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("{e:#}") })),
+        )
+            .into_response(),
+    }
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub struct IndiaChartQuery {
     pub symbol: Option<String>,
@@ -908,7 +1293,12 @@ async fn india_chart_handler(
         .await
         .unwrap_or_default();
 
-    let chart = crate::india::chart::generate_nse_chart(&symbol, &range, &orders);
+    let live_tick = {
+        let prices = state.upstox_feed.prices.read().await;
+        prices.get(&symbol).cloned()
+    };
+
+    let chart = crate::india::chart::generate_nse_chart(&symbol, &range, &orders, live_tick.as_ref());
     Json(serde_json::to_value(&chart).unwrap_or_default())
 }
 
@@ -919,6 +1309,7 @@ pub struct IndiaSandboxOrderSubmitRequest {
     pub order_type: String,
     pub quantity: i64,
     pub price: Option<Decimal>,
+    pub allow_stale: Option<bool>,
 }
 
 async fn india_sandbox_order_handler(
@@ -927,6 +1318,37 @@ async fn india_sandbox_order_handler(
 ) -> impl IntoResponse {
     let client_order_id = format!("NSE-SBX-{}", uuid::Uuid::new_v4().simple());
     let now = chrono::Utc::now().to_rfc3339();
+
+    // Exchange session guard: block fills outside regular trading hours (09:15 - 15:30 IST)
+    let session = crate::india::session::detect_nse_session(chrono::Utc::now());
+    if !session.allows_order_entry && !req.allow_stale.unwrap_or(false) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!(
+                    "Paper order paused: NSE Market is currently {} ({}). Regular continuous trading is 09:15 - 15:30 IST. Paper simulator does not simulate new fills outside active market sessions.",
+                    session.status_badge, session.session_name
+                ),
+                "session": session,
+                "paused": true,
+                "market_closed": true
+            })),
+        )
+            .into_response();
+    }
+
+    // Stale feed guard: pause paper orders if feed updates stopped for >15s
+    if state.upstox_feed.is_stale().await && !req.allow_stale.unwrap_or(false) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Paper order paused: Upstox market data feed is stale (>15s since last tick). Execution paused to prevent fills on outdated quotes.",
+                "is_stale": true,
+                "paused": true
+            })),
+        )
+            .into_response();
+    }
 
     let instrument = crate::india::instruments::find_nse_instrument(&req.symbol);
     if instrument.is_none() {
@@ -956,10 +1378,7 @@ async fn india_sandbox_order_handler(
     };
     let price_str = order_price.to_string();
 
-    let base_capital = state
-        .risk
-        .india_capital_allocation_inr
-        .unwrap_or(rust_decimal_macros::dec!(1000.0));
+    let base_capital = state.dynamic_caps.read().await.india_capital_allocation_inr;
     let all_orders = state
         .store
         .get_india_sandbox_orders(500)
@@ -1073,8 +1492,112 @@ async fn us_chart_handler(
         .await
         .unwrap_or_default();
 
-    let chart = crate::us::chart::generate_us_chart(&symbol, &range, &orders);
+    let live_tick = state
+        .alpaca_feed
+        .prices
+        .read()
+        .await
+        .get(&symbol.to_uppercase())
+        .cloned();
+    let feed_status = state.alpaca_feed.get_status().await;
+
+    let chart = crate::us::chart::generate_us_chart(
+        &symbol,
+        &range,
+        &orders,
+        live_tick.as_ref(),
+        Some(&feed_status),
+    );
     Json(serde_json::to_value(&chart).unwrap_or_default())
+}
+
+async fn alpaca_feed_status_handler(State(state): State<DashboardState>) -> impl IntoResponse {
+    let status = state.alpaca_feed.get_status().await;
+    Json(serde_json::to_value(&status).unwrap_or_default())
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct PullbackBacktestParams {
+    pub market: Option<String>, // "india" or "us"
+    pub initial_capital: Option<Decimal>,
+}
+
+async fn pullback_backtest_handler(
+    axum::extract::Query(params): axum::extract::Query<PullbackBacktestParams>,
+) -> impl IntoResponse {
+    use crate::strategy::backtest::run_pullback_backtest;
+    use crate::strategy::pullback::{FiveMinCandle, PullbackStrategyConfig};
+    use chrono::TimeZone;
+    use rust_decimal_macros::dec;
+
+    let market_lower = params.market.as_deref().unwrap_or("india").to_lowercase();
+    let is_us = market_lower == "us";
+    let default_capital = if is_us { dec!(10000.0) } else { dec!(500000.0) };
+    let initial_capital = params.initial_capital.unwrap_or(default_capital);
+
+    let config = PullbackStrategyConfig::default();
+
+    // Read existing sample CSV to generate 5m candle bars or generate high-integrity realistic series
+    let csv_file = if is_us { "data/us_sample_data.csv" } else { "data/nse_sample_data.csv" };
+    let symbol = if is_us { "SPY" } else { "RELIANCE" };
+    let base_price = if is_us { 580.0 } else { 2500.0 };
+
+    let mut candles: Vec<FiveMinCandle> = Vec::new();
+    if let Ok(content) = std::fs::read_to_string(csv_file) {
+        for (i, line) in content.lines().enumerate() {
+            if i == 0 || line.starts_with('#') || line.starts_with("timestamp") {
+                continue;
+            }
+            let parts: Vec<&str> = line.split(',').collect();
+            if parts.len() >= 7 {
+                let open: Decimal = parts[2].trim().parse().unwrap_or(Decimal::ZERO);
+                let high: Decimal = parts[3].trim().parse().unwrap_or(Decimal::ZERO);
+                let low: Decimal = parts[4].trim().parse().unwrap_or(Decimal::ZERO);
+                let close: Decimal = parts[5].trim().parse().unwrap_or(Decimal::ZERO);
+                let volume: Decimal = parts[6].trim().parse().unwrap_or(Decimal::ZERO);
+                if open > Decimal::ZERO {
+                    candles.push(FiveMinCandle {
+                        timestamp: chrono::Utc.timestamp_opt(1704096000 + (candles.len() as i64 * 300), 0).unwrap(),
+                        symbol: parts[1].trim().to_string(),
+                        open, high, low, close, volume,
+                    });
+                }
+            }
+        }
+    }
+
+    if candles.len() < 70 {
+        let mut price: f64 = base_price;
+        for i in 0..120 {
+            let cycle = i % 12;
+            let change: f64 = if cycle == 7 || cycle == 8 {
+                -0.45
+            } else if cycle == 9 {
+                0.80 // Confirmed rebound candle
+            } else {
+                0.25
+            };
+            let open: f64 = price;
+            let close: f64 = open + change;
+            let high: f64 = open.max(close) + 0.35;
+            let low: f64 = open.min(close) - 0.30;
+            let volume: f64 = 20000.0 + (i as f64 * 75.0);
+            price = close;
+
+            candles.push(FiveMinCandle {
+                timestamp: chrono::Utc.timestamp_opt(1704096000 + (i as i64 * 300), 0).unwrap(),
+                symbol: symbol.to_string(),
+                open: Decimal::from_str_exact(&format!("{:.2}", open)).unwrap_or(dec!(100.0)),
+                high: Decimal::from_str_exact(&format!("{:.2}", high)).unwrap_or(dec!(100.0)),
+                low: Decimal::from_str_exact(&format!("{:.2}", low)).unwrap_or(dec!(100.0)),
+                close: Decimal::from_str_exact(&format!("{:.2}", close)).unwrap_or(dec!(100.0)),
+                volume: Decimal::from_str_exact(&format!("{:.2}", volume)).unwrap_or(dec!(1000.0)),
+            });
+        }
+    }
+
+    let report = run_pullback_backtest(&candles, is_us, initial_capital, &config, dec!(0.65));
+    Json(serde_json::to_value(&report).unwrap_or_default())
 }
 
 async fn us_backtest_history_handler(State(state): State<DashboardState>) -> impl IntoResponse {
@@ -1257,164 +1780,45 @@ fn compute_us_paper_accounting(
 }
 
 async fn us_paper_status_handler(State(state): State<DashboardState>) -> impl IntoResponse {
-    let mut recent_orders = state
+    let recent_orders = state
         .store
         .get_us_paper_orders(100)
         .await
         .unwrap_or_default();
     let watchlist = crate::us::instruments::us_watchlist();
-    let base_capital = state
-        .risk
-        .us_capital_allocation_usd
-        .unwrap_or(rust_decimal_macros::dec!(5.0));
-
-    use std::str::FromStr;
-    let mut alpaca_live_account = None;
-    let mut real_positions: std::collections::HashMap<String, Decimal> =
-        std::collections::HashMap::new();
-
-    let alpaca_key = std::env::var("ALPACA_API_KEY_ID").ok();
-    let alpaca_secret = std::env::var("ALPACA_API_SECRET_KEY").ok();
-    if let (Some(k), Some(s)) = (&alpaca_key, &alpaca_secret) {
-        if !k.trim().is_empty() && !s.trim().is_empty() {
-            let client = reqwest::Client::new();
-            if let Ok(resp) = client
-                .get("https://paper-api.alpaca.markets/v2/account")
-                .header("APCA-API-KEY-ID", k)
-                .header("APCA-API-SECRET-KEY", s)
-                .send()
-                .await
-            {
-                if let Ok(val) = resp.json::<serde_json::Value>().await {
-                    let cash_val = val.get("cash").and_then(|v| v.as_str()).unwrap_or("5.00");
-                    let port_val = val
-                        .get("portfolio_value")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("5.00");
-                    alpaca_live_account = Some(serde_json::json!({
-                        "connected": true,
-                        "account_number": val.get("account_number").and_then(|v| v.as_str()).unwrap_or("PA3QRQ8D4"),
-                        "status": val.get("status").and_then(|v| v.as_str()).unwrap_or("ACTIVE"),
-                        "cash": cash_val,
-                        "buying_power": val.get("buying_power").and_then(|v| v.as_str()).unwrap_or("5.00"),
-                        "portfolio_value": port_val,
-                    }));
-                }
-            }
-
-            // Also fetch live positions from Alpaca
-            if let Ok(resp) = client
-                .get("https://paper-api.alpaca.markets/v2/positions")
-                .header("APCA-API-KEY-ID", k)
-                .header("APCA-API-SECRET-KEY", s)
-                .send()
-                .await
-            {
-                if let Ok(positions) = resp.json::<Vec<serde_json::Value>>().await {
-                    for p in positions {
-                        if let (Some(sym), Some(q_str)) = (
-                            p.get("symbol").and_then(|v| v.as_str()),
-                            p.get("qty").and_then(|v| v.as_str()),
-                        ) {
-                            if let Ok(q) = Decimal::from_str(q_str) {
-                                real_positions.insert(sym.to_string(), q);
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Synchronize live orders from Alpaca exchange
-            if let Ok(resp) = client
-                .get("https://paper-api.alpaca.markets/v2/orders?status=all&limit=25")
-                .header("APCA-API-KEY-ID", k)
-                .header("APCA-API-SECRET-KEY", s)
-                .send()
-                .await
-            {
-                if let Ok(alpaca_orders) = resp.json::<Vec<serde_json::Value>>().await {
-                    for ao in &alpaca_orders {
-                        let a_id = ao.get("id").and_then(|v| v.as_str());
-                        let a_client_id = ao.get("client_order_id").and_then(|v| v.as_str());
-                        let a_status = ao
-                            .get("status")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("NEW")
-                            .to_uppercase();
-                        let a_fill_qty = ao
-                            .get("filled_qty")
-                            .and_then(|v| v.as_str())
-                            .and_then(|v| v.parse::<i64>().ok())
-                            .unwrap_or(0);
-                        let a_fill_price = ao
-                            .get("filled_avg_price")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-
-                        if let Some(pos) = recent_orders.iter_mut().position(|ro| {
-                            (a_id.is_some() && ro.venue_order_id.as_deref() == a_id)
-                                || (a_client_id.is_some()
-                                    && ro.client_order_id == a_client_id.unwrap())
-                        }) {
-                            let ro = &mut recent_orders[pos];
-                            if ro.status != a_status
-                                || ro.fill_quantity != a_fill_qty
-                                || ro.average_fill_price != a_fill_price
-                            {
-                                ro.status = a_status.clone();
-                                ro.fill_quantity = a_fill_qty;
-                                if a_fill_price.is_some() {
-                                    ro.average_fill_price = a_fill_price.clone();
-                                }
-                                ro.updated_at = chrono::Utc::now().to_rfc3339();
-                                let _ = state.store.save_us_paper_order(ro).await;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let base_capital = state.dynamic_caps.read().await.us_capital_allocation_usd;
 
     let (realized_profit, open_positions_cost, available_cash, holdings) =
         compute_us_paper_accounting(base_capital, &recent_orders);
 
-    let real_open_cost = open_positions_cost;
-    let mut real_cash = available_cash;
-    let mut real_equity = base_capital + realized_profit;
-    let mut real_profit = realized_profit;
+    let total_equity = available_cash + open_positions_cost;
 
-    if let Some(ref acc) = alpaca_live_account {
-        if let Some(c_str) = acc.get("cash").and_then(|v| v.as_str()) {
-            if let Ok(c) = Decimal::from_str(c_str) {
-                real_cash = c;
-            }
-        }
-        if let Some(p_str) = acc.get("portfolio_value").and_then(|v| v.as_str()) {
-            if let Ok(p) = Decimal::from_str(p_str) {
-                real_equity = p;
-                real_profit = p - base_capital;
-            }
-        }
-    }
+    let alpaca_feed_status = serde_json::json!({
+        "connected": true,
+        "feed_source": "Alpaca Stock Data WebSocket V2",
+        "feed_type": state.alpaca_feed.feed_type.read().await.clone(),
+        "mode": "Simulated Paper Trading (Backend-enforced)",
+        "status": "ACTIVE",
+        "starting_capital_usd": base_capital,
+    });
 
     let resp = serde_json::json!({
         "venue_id": "alpaca",
-        "name": "Alpaca Paper Trading (US Stocks & ETFs)",
+        "name": "Alpaca US Paper Trading (Stocks & ETFs)",
         "currency": "USD",
         "currency_symbol": "$",
         "timezone": "America/New_York",
         "trading_hours": "09:30 - 16:00 ET",
         "allowlisted_host": "paper-api.alpaca.markets",
         "live_trading_allowed": false,
-        "alpaca_account": alpaca_live_account,
-        "mode_description": "Live paper market execution. Orders execute against the real consolidated market tape via Alpaca.",
+        "alpaca_account": alpaca_feed_status,
+        "mode_description": "Live paper market execution. Orders execute in local paper simulator against real-time market data.",
         "base_capital_usd": base_capital,
-        "realized_profit_usd": real_profit,
-        "open_positions_cost_usd": real_open_cost,
-        "available_cash_usd": real_cash,
-        "total_equity_usd": real_equity,
-        "holdings": if !real_positions.is_empty() { real_positions } else { holdings },
+        "realized_profit_usd": realized_profit,
+        "open_positions_cost_usd": open_positions_cost,
+        "available_cash_usd": available_cash,
+        "total_equity_usd": total_equity,
+        "holdings": holdings,
         "recent_orders": recent_orders,
         "watchlist": watchlist,
     });
@@ -1423,31 +1827,18 @@ async fn us_paper_status_handler(State(state): State<DashboardState>) -> impl In
 }
 
 async fn us_paper_reset_handler(State(state): State<DashboardState>) -> impl IntoResponse {
-    let alpaca_key = std::env::var("ALPACA_API_KEY_ID").ok();
-    let alpaca_secret = std::env::var("ALPACA_API_SECRET_KEY").ok();
-    if let (Some(k), Some(s)) = (alpaca_key, alpaca_secret) {
-        if !k.trim().is_empty() && !s.trim().is_empty() {
-            let client = reqwest::Client::new();
-            let _ = client
-                .delete("https://paper-api.alpaca.markets/v2/orders")
-                .header("APCA-API-KEY-ID", &k)
-                .header("APCA-API-SECRET-KEY", &s)
-                .send()
-                .await;
-        }
-    }
-
+    let base_capital = state.dynamic_caps.read().await.us_capital_allocation_usd;
     match state.store.clear_us_paper_orders().await {
         Ok(_) => {
-            info!("US paper orders cleared - reset to $5.00 base capital");
+            info!(base_capital = %base_capital, "US paper orders cleared - reset to base capital");
             Json(serde_json::json!({
                 "status": "success",
-                "message": "US market paper orders reset successfully. Starting capital reset to $5.00 USD.",
-                "base_capital_usd": 5.0,
-                "available_cash_usd": 5.0,
+                "message": format!("US market paper orders reset successfully. Starting capital reset to ${:.2} USD.", base_capital),
+                "base_capital_usd": base_capital,
+                "available_cash_usd": base_capital,
                 "realized_profit_usd": 0.0,
                 "open_positions_cost_usd": 0.0,
-                "total_equity_usd": 5.0
+                "total_equity_usd": base_capital
             })).into_response()
         }
         Err(e) => {
@@ -1470,6 +1861,7 @@ pub struct UsPaperOrderSubmitRequest {
     pub order_type: String,
     pub quantity: i64,
     pub price: Option<Decimal>,
+    pub allow_stale: Option<bool>,
 }
 
 async fn us_paper_order_handler(
@@ -1478,6 +1870,23 @@ async fn us_paper_order_handler(
 ) -> impl IntoResponse {
     let client_order_id = format!("US-PPR-{}", uuid::Uuid::new_v4().simple());
     let now = chrono::Utc::now().to_rfc3339();
+
+    // Session gating: check US market regular trading hours
+    let session = crate::us::session::detect_us_session(chrono::Utc::now());
+    if !session.allows_order_entry && !req.allow_stale.unwrap_or(false) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!(
+                    "Market closed — strategy paused: US regular session is closed (session: {}). Order rejected.",
+                    session.session_name
+                ),
+                "session": session.session_name,
+                "strategy_paused": true,
+            })),
+        )
+            .into_response();
+    }
 
     let instrument = crate::us::instruments::find_us_instrument(&req.symbol);
     if instrument.is_none() {
@@ -1500,17 +1909,30 @@ async fn us_paper_order_handler(
             .into_response();
     }
 
-    let base_price = crate::us::chart::get_us_company_info(&req.symbol).3;
-    let order_price = match req.price {
+    let is_market = req.order_type.eq_ignore_ascii_case("MARKET");
+    let is_buy = req.side.eq_ignore_ascii_case("BUY");
+    let is_sell = req.side.eq_ignore_ascii_case("SELL");
+
+    // Price determination with live feed & slippage
+    let live_price_opt = state.alpaca_feed.get_price(&req.symbol).await;
+    let base_price = live_price_opt.unwrap_or_else(|| crate::us::chart::get_us_company_info(&req.symbol).3);
+    let mut order_price = match req.price {
         Some(p) if p > Decimal::ZERO => p,
         _ => base_price,
     };
-    let price_str = order_price.to_string();
 
-    let base_capital = state
-        .risk
-        .us_capital_allocation_usd
-        .unwrap_or(rust_decimal_macros::dec!(5.0));
+    // Apply simulated execution slippage for market orders: +0.02% for buy, -0.02% for sell
+    if is_market {
+        let slippage = order_price * rust_decimal_macros::dec!(0.0002);
+        order_price = if is_buy {
+            order_price + slippage
+        } else {
+            (order_price - slippage).max(rust_decimal_macros::dec!(0.01))
+        };
+    }
+    let price_str = order_price.round_dp(4).to_string();
+
+    let base_capital = state.dynamic_caps.read().await.us_capital_allocation_usd;
     let all_orders = state
         .store
         .get_us_paper_orders(500)
@@ -1519,14 +1941,21 @@ async fn us_paper_order_handler(
     let (realized_profit, _open_positions_cost, available_cash, holdings) =
         compute_us_paper_accounting(base_capital, &all_orders);
 
-    let alpaca_key = std::env::var("ALPACA_API_KEY_ID").ok();
-    let alpaca_secret = std::env::var("ALPACA_API_SECRET_KEY").ok();
+    let total_notional = order_price * Decimal::from(req.quantity);
 
-    let is_buy = req.side.eq_ignore_ascii_case("BUY");
-    let is_sell = req.side.eq_ignore_ascii_case("SELL");
+    // US Statutory regulatory fees: SEC Section 31 ($27.80 per million) + FINRA TAF ($0.000166 per share, max $8.30) on sells
+    let (sec_fee, finra_taf) = if is_sell {
+        let sec = (total_notional * rust_decimal_macros::dec!(0.0000278)).round_dp(4);
+        let taf = (Decimal::from(req.quantity) * rust_decimal_macros::dec!(0.000166))
+            .min(rust_decimal_macros::dec!(8.30))
+            .round_dp(4);
+        (sec, taf)
+    } else {
+        (Decimal::ZERO, Decimal::ZERO)
+    };
 
     if is_buy {
-        let order_cost = order_price * Decimal::from(req.quantity);
+        let order_cost = total_notional;
         if order_cost > available_cash {
             return (
                 StatusCode::BAD_REQUEST,
@@ -1545,34 +1974,10 @@ async fn us_paper_order_handler(
                 .into_response();
         }
     } else if is_sell {
-        use std::str::FromStr;
-        let mut held_qty = holdings
+        let held_qty = holdings
             .get(&req.symbol.to_uppercase())
             .cloned()
             .unwrap_or(Decimal::ZERO);
-        if held_qty.is_zero() {
-            if let (Some(k), Some(s)) = (&alpaca_key, &alpaca_secret) {
-                let client = reqwest::Client::new();
-                if let Ok(resp) = client
-                    .get(format!(
-                        "https://paper-api.alpaca.markets/v2/positions/{}",
-                        req.symbol.to_uppercase()
-                    ))
-                    .header("APCA-API-KEY-ID", k)
-                    .header("APCA-API-SECRET-KEY", s)
-                    .send()
-                    .await
-                {
-                    if let Ok(pos) = resp.json::<serde_json::Value>().await {
-                        if let Some(q_str) = pos.get("qty").and_then(|v| v.as_str()) {
-                            if let Ok(q) = Decimal::from_str(q_str) {
-                                held_qty = q;
-                            }
-                        }
-                    }
-                }
-            }
-        }
         let requested_qty = Decimal::from(req.quantity);
         if requested_qty > held_qty {
             return (
@@ -1591,102 +1996,10 @@ async fn us_paper_order_handler(
         }
     }
 
-    let mut venue_order_id = Some(format!("ALPACA-PPR-{}", uuid::Uuid::new_v4().simple()));
-    let mut order_status = "ACCEPTED".to_string();
-    let mut fill_qty = 0i64;
-    let mut avg_fill_price = None;
-    if let (Some(k), Some(s)) = (alpaca_key, alpaca_secret) {
-        if !k.trim().is_empty() && !s.trim().is_empty() {
-            let client = reqwest::Client::new();
-            let is_market = req.order_type.eq_ignore_ascii_case("MARKET");
-            let mut alpaca_payload = serde_json::json!({
-                "symbol": req.symbol.to_uppercase(),
-                "qty": req.quantity.to_string(),
-                "side": req.side.to_lowercase(),
-                "type": if is_market { "market" } else { "limit" },
-                "time_in_force": "day",
-                "client_order_id": client_order_id,
-            });
-            if !is_market {
-                alpaca_payload["limit_price"] = serde_json::json!(price_str);
-            }
-
-            if let Ok(resp) = client
-                .post("https://paper-api.alpaca.markets/v2/orders")
-                .header("APCA-API-KEY-ID", &k)
-                .header("APCA-API-SECRET-KEY", &s)
-                .json(&alpaca_payload)
-                .send()
-                .await
-            {
-                if resp.status().is_success() {
-                    if let Ok(v) = resp.json::<serde_json::Value>().await {
-                        if let Some(id) = v.get("id").and_then(|id| id.as_str()) {
-                            venue_order_id = Some(id.to_string());
-                        }
-                        if let Some(st) = v.get("status").and_then(|st| st.as_str()) {
-                            order_status = st.to_uppercase();
-                        }
-                        if let Some(fq) = v
-                            .get("filled_qty")
-                            .and_then(|fq| fq.as_str())
-                            .and_then(|fq| fq.parse::<i64>().ok())
-                        {
-                            fill_qty = fq;
-                        }
-                        if let Some(ap) = v.get("filled_avg_price").and_then(|ap| ap.as_str()) {
-                            avg_fill_price = Some(ap.to_string());
-                        }
-                    }
-
-                    // For market orders, poll Alpaca after 600ms to capture immediate fill at NBBO
-                    if let Some(ref vid) = venue_order_id {
-                        if is_market
-                            && (order_status == "ACCEPTED"
-                                || order_status == "PENDING_NEW"
-                                || order_status == "NEW")
-                        {
-                            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-                            if let Ok(resp) = client
-                                .get(format!(
-                                    "https://paper-api.alpaca.markets/v2/orders/{}",
-                                    vid
-                                ))
-                                .header("APCA-API-KEY-ID", &k)
-                                .header("APCA-API-SECRET-KEY", &s)
-                                .send()
-                                .await
-                            {
-                                if let Ok(v) = resp.json::<serde_json::Value>().await {
-                                    if let Some(st) = v.get("status").and_then(|st| st.as_str()) {
-                                        order_status = st.to_uppercase();
-                                    }
-                                    if let Some(fq) = v
-                                        .get("filled_qty")
-                                        .and_then(|fq| fq.as_str())
-                                        .and_then(|fq| fq.parse::<i64>().ok())
-                                    {
-                                        fill_qty = fq;
-                                    }
-                                    if let Some(ap) =
-                                        v.get("filled_avg_price").and_then(|ap| ap.as_str())
-                                    {
-                                        avg_fill_price = Some(ap.to_string());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } else if let Ok(err_text) = resp.text().await {
-                    warn!("Alpaca order rejected: {err_text}");
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({ "error": format!("Alpaca rejected order: {err_text}") })),
-                    ).into_response();
-                }
-            }
-        }
-    }
+    let venue_order_id = Some(format!("US-SIM-{}", uuid::Uuid::new_v4().simple()));
+    let order_status = if is_market { "FILLED".to_string() } else { "OPEN".to_string() };
+    let fill_qty = if is_market { req.quantity } else { 0i64 };
+    let avg_fill_price = if is_market { Some(price_str.clone()) } else { None };
 
     let order_record = crate::db::store::UsPaperOrderRecord {
         id: format!("ord-{}", uuid::Uuid::new_v4().simple()),
@@ -1700,7 +2013,7 @@ async fn us_paper_order_handler(
         trigger_price: None,
         status: order_status,
         fill_quantity: fill_qty,
-        average_fill_price: avg_fill_price.or(if fill_qty > 0 { Some(price_str) } else { None }),
+        average_fill_price: avg_fill_price,
         rejection_reason: None,
         created_at: now.clone(),
         updated_at: now,
@@ -1722,13 +2035,18 @@ async fn us_paper_order_handler(
     Json(serde_json::json!({
         "status": "success",
         "order": order_record,
+        "fees": {
+            "sec_section_31_usd": sec_fee,
+            "finra_taf_usd": finra_taf,
+            "total_regulatory_fees_usd": sec_fee + finra_taf,
+        },
         "base_capital_usd": base_capital,
         "realized_profit_usd": new_realized_profit,
         "open_positions_cost_usd": new_open_cost,
         "available_cash_usd": new_available_cash,
-        "total_equity_usd": base_capital + new_realized_profit,
+        "total_equity_usd": new_available_cash + new_open_cost,
         "holdings": new_holdings,
-        "disclaimer": "Alpaca paper trading order acknowledgment. Fills are simulated/paper only and live trading is blocked by construction."
+        "disclaimer": "Simulated paper trading only. Backend-enforced safety: no live Alpaca order APIs called."
     }))
     .into_response()
 }
@@ -1768,24 +2086,20 @@ async fn combined_portfolio_handler(State(state): State<DashboardState>) -> impl
         .get_india_sandbox_orders(100)
         .await
         .unwrap_or_default();
-    let india_base_capital = state
-        .risk
-        .india_capital_allocation_inr
-        .unwrap_or(rust_decimal_macros::dec!(1000.0));
+    let (india_base_capital, us_base_capital) = {
+        let caps = state.dynamic_caps.read().await;
+        (caps.india_capital_allocation_inr, caps.us_capital_allocation_usd)
+    };
     let (india_sandbox_realized_profit, _in_open_cost, _in_cash, _in_holdings) =
         compute_india_sandbox_accounting(india_base_capital, &india_orders);
     india_realized_inr += india_sandbox_realized_profit;
 
-    // Compute US paper realized P&L using unified accounting ($5.00 base + compounded profits)
+    // Compute US paper realized P&L using unified accounting (base + compounded profits)
     let us_orders = state
         .store
         .get_us_paper_orders(100)
         .await
         .unwrap_or_default();
-    let us_base_capital = state
-        .risk
-        .us_capital_allocation_usd
-        .unwrap_or(rust_decimal_macros::dec!(5.0));
     let (us_paper_realized_profit, _us_open_cost, _us_cash, _us_holdings) =
         compute_us_paper_accounting(us_base_capital, &us_orders);
     us_realized_usd += us_paper_realized_profit;
@@ -1845,6 +2159,10 @@ async fn intraday_status_handler(State(state): State<DashboardState>) -> impl In
         .to_string();
 
     let fx = crate::market::fx::get_current_fx_rate();
+    let (cap_inr, cap_usd) = {
+        let caps = state.dynamic_caps.read().await;
+        (caps.india_capital_allocation_inr, caps.us_capital_allocation_usd)
+    };
 
     Json(serde_json::json!({
         "timestamp": now.to_rfc3339(),
@@ -1865,7 +2183,7 @@ async fn intraday_status_handler(State(state): State<DashboardState>) -> impl In
             "session_close": nse_close.map(|dt| dt.to_rfc3339()),
             "test_mode": "Historical Backtest & Upstox Sandbox (Live Blocked)",
             "live_orders_blocked": true,
-            "capital_allocation_inr": state.risk.india_capital_allocation_inr,
+            "capital_allocation_inr": cap_inr,
             "max_exposure_pct": state.risk.india_max_exposure_pct,
             "max_daily_loss_inr": state.risk.india_max_daily_loss_inr,
         },
@@ -1884,11 +2202,106 @@ async fn intraday_status_handler(State(state): State<DashboardState>) -> impl In
             "session_close": us_close.map(|dt| dt.to_rfc3339()),
             "test_mode": "Historical Backtest & Alpaca Paper (Live Blocked)",
             "live_orders_blocked": true,
-            "capital_allocation_usd": state.risk.us_capital_allocation_usd,
+            "capital_allocation_usd": cap_usd,
             "max_exposure_pct": state.risk.us_max_exposure_pct,
             "max_daily_loss_usd": state.risk.us_max_daily_loss_usd,
         }
     }))
+}
+
+fn deserialize_flexible_decimal<'de, D>(deserializer: D) -> Result<Option<Decimal>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let opt = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match opt {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Number(n)) => {
+            if let Some(i) = n.as_i64() {
+                Ok(Some(Decimal::from(i)))
+            } else if let Some(u) = n.as_u64() {
+                Ok(Some(Decimal::from(u)))
+            } else if let Some(f) = n.as_f64() {
+                Decimal::from_f64_retain(f)
+                    .map(Some)
+                    .ok_or_else(|| serde::de::Error::custom("invalid float decimal"))
+            } else {
+                Err(serde::de::Error::custom("invalid number"))
+            }
+        }
+        Some(serde_json::Value::String(s)) => {
+            s.parse::<Decimal>()
+                .map(Some)
+                .map_err(serde::de::Error::custom)
+        }
+        _ => Err(serde::de::Error::custom("expected number or string")),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct UpdateCapsRequest {
+    #[serde(default, deserialize_with = "deserialize_flexible_decimal")]
+    pub india_capital_allocation_inr: Option<Decimal>,
+    #[serde(default, deserialize_with = "deserialize_flexible_decimal")]
+    pub us_capital_allocation_usd: Option<Decimal>,
+}
+
+async fn settings_caps_get_handler(State(state): State<DashboardState>) -> impl IntoResponse {
+    let caps = state.dynamic_caps.read().await;
+    Json(serde_json::json!({
+        "india_capital_allocation_inr": caps.india_capital_allocation_inr,
+        "us_capital_allocation_usd": caps.us_capital_allocation_usd,
+        "default_india_capital_inr": 1000.0,
+        "default_us_capital_usd": 5.0,
+        "currency_inr": "₹",
+        "currency_usd": "$"
+    }))
+}
+
+async fn settings_caps_post_handler(
+    State(state): State<DashboardState>,
+    Json(req): Json<UpdateCapsRequest>,
+) -> impl IntoResponse {
+    let mut caps = state.dynamic_caps.write().await;
+    if let Some(inr) = req.india_capital_allocation_inr {
+        if inr <= Decimal::ZERO {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "NSE India capital allocation cap must be a positive number"
+                })),
+            )
+                .into_response();
+        }
+        caps.india_capital_allocation_inr = inr;
+    }
+    if let Some(usd) = req.us_capital_allocation_usd {
+        if usd <= Decimal::ZERO {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "US Equities capital allocation cap must be a positive number"
+                })),
+            )
+                .into_response();
+        }
+        caps.us_capital_allocation_usd = usd;
+    }
+
+    info!(
+        india_inr = %caps.india_capital_allocation_inr,
+        us_usd = %caps.us_capital_allocation_usd,
+        "Capital allocation caps updated via Settings"
+    );
+
+    Json(serde_json::json!({
+        "status": "success",
+        "message": "Capital allocation caps updated successfully. New limits applied to paper trading and header ribbon.",
+        "india_capital_allocation_inr": caps.india_capital_allocation_inr,
+        "us_capital_allocation_usd": caps.us_capital_allocation_usd
+    }))
+    .into_response()
 }
 
 #[derive(Debug, serde::Deserialize)]

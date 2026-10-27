@@ -51,6 +51,7 @@ impl From<AgentModeArg> for AgentMode {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let args = CliArgs::parse();
 
     let (mut config, secrets) = AppConfig::load()?;
@@ -405,6 +406,41 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
     let kill_switch = std::sync::Arc::new(polymarket_agent::agent::kill_switch::KillSwitch::new(
         config.database.halt_file(),
     ));
+    // Start in standby mode: agent cycles only begin when operator clicks "Start Agent" in the UI
+    kill_switch.trip(polymarket_agent::agent::kill_switch::Halt::new(
+        polymarket_agent::agent::kill_switch::HaltSource::Api,
+        polymarket_agent::agent::kill_switch::HaltScope::UntilResume,
+        "Agent in standby mode — press 'Start Agent' in the dashboard to begin trading cycles",
+        chrono::Utc::now(),
+    ));
+
+    let upstox_feed = std::sync::Arc::new(
+        polymarket_agent::india::market_feed::UpstoxLiveMarketFeed::new(
+            secrets
+                .upstox_api_key
+                .as_ref()
+                .map(|k| k.expose_secret().to_string()),
+            secrets
+                .upstox_api_secret
+                .as_ref()
+                .map(|k| k.expose_secret().to_string()),
+            secrets
+                .upstox_sandbox_token
+                .as_ref()
+                .map(|k| k.expose_secret().to_string()),
+            None,
+        ),
+    );
+    upstox_feed.clone().spawn_feed_worker();
+
+    let alpaca_feed = std::sync::Arc::new(
+        polymarket_agent::us::market_feed::AlpacaLiveMarketFeed::new(
+            secrets.alpaca_key_id.as_ref().map(|k| k.expose_secret().to_string()),
+            secrets.alpaca_secret_key.as_ref().map(|k| k.expose_secret().to_string()),
+            None,
+        ),
+    );
+    alpaca_feed.clone().start_streaming();
 
     let dashboard_state = DashboardState::new(
         dashboard_store,
@@ -419,7 +455,9 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
         config.agent.mode,
         secrets.llm_api_key.is_some(),
         config.valuation.model.clone(),
-    );
+    )
+    .with_upstox_feed(upstox_feed)
+    .with_alpaca_feed(alpaca_feed);
     let dashboard_handle = spawn_dashboard(
         dashboard_state,
         &config.monitoring.dashboard_bind,

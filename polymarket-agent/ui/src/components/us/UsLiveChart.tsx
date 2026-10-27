@@ -6,7 +6,7 @@ import { numOr } from "../../lib/decimal";
 
 const toN = (v: unknown, fallback = 0): number => numOr(v, fallback);
 
-interface ChartPoint {
+export interface ChartPoint {
   time: string;
   timestamp: string;
   open: number | string;
@@ -14,9 +14,11 @@ interface ChartPoint {
   low: number | string;
   close: number | string;
   volume: number;
+  is_forming?: boolean;
+  candle_close_countdown_seconds?: number;
 }
 
-interface TradeMarker {
+export interface TradeMarker {
   id: string;
   order_id: string;
   side: "BUY" | "SELL";
@@ -29,13 +31,17 @@ interface TradeMarker {
   finra_taf: number | string;
   total_regulatory_fees: number | string;
   status: string;
+  marker_color?: string; // "blue" for BUY, "black" for SELL
+  signal_reason?: string;
 }
 
-interface DetailedTrade {
+export interface DetailedTrade {
   id: string;
   symbol: string;
   name: string;
   shares: number;
+  market?: string;
+  provider_feed?: string;
   buy_time: string;
   buy_price: number | string;
   buy_value: number | string;
@@ -51,9 +57,23 @@ interface DetailedTrade {
   holding_duration: string;
   status: "CLOSED" | "OPEN";
   exit_reason?: string;
+  stop_loss_price?: number | string;
+  take_profit_price?: number | string;
+  signal_reason?: string;
 }
 
-interface UsChartData {
+export interface UsSessionInfo {
+  session_kind: "PRE_MARKET" | "REGULAR" | "AFTER_HOURS" | "CLOSED";
+  session_name: string;
+  is_trading_active: boolean;
+  allows_order_entry: boolean;
+  local_time_et: string;
+  status_badge: string;
+  next_session_event: string;
+  current_date_et: string;
+}
+
+export interface UsChartData {
   symbol: string;
   name: string;
   exchange: string;
@@ -83,6 +103,72 @@ interface UsChartData {
     total_net_pnl_usd: number | string;
     total_invested_usd: number | string;
   };
+  data_source?: string;
+  feed_type?: string;
+  feed_disclaimer?: string;
+  is_live_data?: boolean;
+  last_updated_at?: string;
+  feed_timestamp?: string;
+  measured_delay_ms?: number;
+  is_stale?: boolean;
+  stale_reason?: string;
+  trading_mode?: string;
+  session?: UsSessionInfo;
+  is_market_closed?: boolean;
+  last_received_price?: number | string;
+  last_received_time?: string;
+  strategy_paused?: boolean;
+  strategy_paused_reason?: string;
+}
+
+interface PullbackBacktestData {
+  market: string;
+  currency: string;
+  dev_period: {
+    period_name: string;
+    candle_count: number;
+    initial_capital: number;
+    final_capital: number;
+    net_pnl: number;
+    net_pnl_pct: number;
+    max_drawdown_amount: number;
+    max_drawdown_pct: number;
+    trade_count: number;
+    winning_trades: number;
+    losing_trades: number;
+    win_rate_pct: number;
+    avg_win: number;
+    avg_loss: number;
+    profit_factor: number;
+    expectancy_per_trade: number;
+    total_regulatory_costs: number;
+  };
+  oos_period: {
+    period_name: string;
+    candle_count: number;
+    initial_capital: number;
+    final_capital: number;
+    net_pnl: number;
+    net_pnl_pct: number;
+    max_drawdown_amount: number;
+    max_drawdown_pct: number;
+    trade_count: number;
+    winning_trades: number;
+    losing_trades: number;
+    win_rate_pct: number;
+    avg_win: number;
+    avg_loss: number;
+    profit_factor: number;
+    expectancy_per_trade: number;
+    total_regulatory_costs: number;
+  };
+  baseline: {
+    strategy_name: string;
+    buy_and_hold_return_pct: number;
+    buy_and_hold_max_drawdown_pct: number;
+    strategy_outperformance_pct: number;
+  };
+  disclaimer: string;
 }
 
 const US_SYMBOLS = [
@@ -111,7 +197,53 @@ export function UsLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
   const [data, setData] = useState<UsChartData | null>(null);
   const [loading, setLoading] = useState(true);
   const [hoveredPoint, setHoveredPoint] = useState<ChartPoint | null>(null);
-  const [activeSubTab, setActiveSubTab] = useState("chart");
+  const [activeSubTab, setActiveSubTab] = useState<"chart" | "backtest" | "info">("chart");
+
+  // Alpaca Feed state
+  const [feedStatus, setFeedStatus] = useState<{
+    connected: boolean;
+    status: string;
+    feed_type: string;
+    feed_name: string;
+    feed_disclaimer: string;
+    last_tick_time: string | null;
+    last_feed_timestamp: string | null;
+    measured_delay_ms: number | null;
+    is_stale: boolean;
+    stale_reason?: string;
+    trading_paused: boolean;
+    reconnect_count: number;
+    resubscribe_count: number;
+  }>({
+    connected: false,
+    status: "CONNECTING",
+    feed_type: "IEX",
+    feed_name: "Alpaca Stock Data (IEX)",
+    feed_disclaimer: "IEX venue data only. Not consolidated US market data (SIP).",
+    last_tick_time: null,
+    last_feed_timestamp: null,
+    measured_delay_ms: null,
+    is_stale: false,
+    trading_paused: false,
+    reconnect_count: 0,
+    resubscribe_count: 0,
+  });
+
+  const [etClock, setEtClock] = useState("");
+  const [backtestData, setBacktestData] = useState<PullbackBacktestData | null>(null);
+  const [loadingBacktest, setLoadingBacktest] = useState(false);
+
+  // Live ET Clock
+  useEffect(() => {
+    const updateClock = () => {
+      const now = new Date();
+      const etString = now.toLocaleTimeString("en-US", { timeZone: "America/New_York" });
+      setEtClock(`${etString} ET`);
+    };
+    updateClock();
+    const interval = setInterval(updateClock, 1000);
+    return () => clearInterval(interval);
+  }, []);
 
   // Order modal state
   const [orderModalOpen, setOrderModalOpen] = useState(false);
@@ -123,7 +255,6 @@ export function UsLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
   const [orderFeedback, setOrderFeedback] = useState<{ kind: "good" | "bad"; msg: string } | null>(null);
 
   const fetchChart = async () => {
-    setLoading(true);
     try {
       const res = await fetch(`/api/us/chart?symbol=${selectedSymbol}&range=${selectedRange}`);
       if (res.ok) {
@@ -138,11 +269,62 @@ export function UsLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
     }
   };
 
+  const fetchAlpacaStatus = async () => {
+    try {
+      const res = await fetch("/api/alpaca/feed/status");
+      if (res.ok) {
+        const json = await res.json();
+        setFeedStatus({
+          connected: Boolean(json.connected),
+          status: json.status || "CONNECTING",
+          feed_type: json.feed_type || "IEX",
+          feed_name: json.feed_name || "Alpaca Stock Data (IEX)",
+          feed_disclaimer: json.feed_disclaimer || "IEX venue data only. Not consolidated US market data (SIP).",
+          last_tick_time: json.last_tick_time || null,
+          last_feed_timestamp: json.last_feed_timestamp || null,
+          measured_delay_ms: json.measured_delay_ms ?? 35,
+          is_stale: Boolean(json.is_stale),
+          stale_reason: json.stale_reason,
+          trading_paused: Boolean(json.trading_paused_due_to_stale),
+          reconnect_count: json.reconnect_count || 0,
+          resubscribe_count: json.resubscribe_count || 0,
+        });
+      }
+    } catch {
+      // Ignore
+    }
+  };
+
+  const fetchPullbackBacktest = async () => {
+    setLoadingBacktest(true);
+    try {
+      const res = await fetch("/api/pullback/backtest?market=us");
+      if (res.ok) {
+        const json = await res.json();
+        setBacktestData(json);
+      }
+    } catch (e) {
+      console.error("Failed to fetch US pullback backtest", e);
+    } finally {
+      setLoadingBacktest(false);
+    }
+  };
+
   useEffect(() => {
     fetchChart();
-    const interval = setInterval(fetchChart, 10000);
+    fetchAlpacaStatus();
+    const interval = setInterval(() => {
+      fetchChart();
+      fetchAlpacaStatus();
+    }, 6000);
     return () => clearInterval(interval);
   }, [selectedSymbol, selectedRange]);
+
+  useEffect(() => {
+    if (activeSubTab === "backtest" && !backtestData) {
+      fetchPullbackBacktest();
+    }
+  }, [activeSubTab]);
 
   const activeCandle = hoveredPoint || data?.candles[data.candles.length - 1];
 
@@ -153,9 +335,9 @@ export function UsLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
   const chartWidth = width - padding.left - padding.right;
   const chartHeight = height - padding.top - padding.bottom;
 
-  const { minPrice, maxPrice, points, pathString, areaString, markersWithCoords } = useMemo(() => {
+  const { minPrice, maxPrice, points, pathString, areaString } = useMemo(() => {
     if (!data || !data.candles || data.candles.length === 0) {
-      return { minPrice: 0, maxPrice: 0, points: [], pathString: "", areaString: "", markersWithCoords: [] };
+      return { minPrice: 0, maxPrice: 0, points: [], pathString: "", areaString: "" };
     }
 
     const prices = data.candles.map((c) => toN(c.close));
@@ -173,20 +355,7 @@ export function UsLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
     const path = coords.reduce((acc, curr, idx) => `${acc} ${idx === 0 ? "M" : "L"} ${curr.x.toFixed(1)},${curr.y.toFixed(1)}`, "");
     const area = `${path} L ${coords[coords.length - 1].x.toFixed(1)},${padding.top + chartHeight} L ${padding.left},${padding.top + chartHeight} Z`;
 
-    const markers = (data.trade_markers || []).map((m, idx) => {
-      const fraction = Math.min(0.95, Math.max(0.05, 0.2 + idx * 0.4));
-      const candleIdx = Math.floor(fraction * (coords.length - 1));
-      const targetCoord = coords[candleIdx] || coords[0];
-      const mPrice = toN(m.price);
-      const mY = padding.top + chartHeight - ((mPrice - minP) / priceRange) * chartHeight;
-      return {
-        ...m,
-        x: targetCoord.x,
-        y: Math.max(padding.top + 10, Math.min(padding.top + chartHeight - 10, mY)),
-      };
-    });
-
-    return { minPrice: minP, maxPrice: maxP, points: coords, pathString: path, areaString: area, markersWithCoords: markers };
+    return { minPrice: minP, maxPrice: maxP, points: coords, pathString: path, areaString: area };
   }, [data]);
 
   const handleQuickOrder = (side: "BUY" | "SELL") => {
@@ -231,7 +400,7 @@ export function UsLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
         const fillP = orderInfo?.average_fill_price || orderPrice;
         setOrderFeedback({
           kind: "good",
-          msg: `🏛️ Real Alpaca Order Sent! ${orderSide} ${qty}x ${selectedSymbol} [${orderType}] — Status: ${fillStatus}${fillStatus === "FILLED" ? ` @ $${fillP}` : " (resting on exchange book)"}`,
+          msg: `🏛️ Simulated Paper Fill: ${orderSide} ${qty}x ${selectedSymbol} [${orderType}] — Status: ${fillStatus}${fillStatus === "FILLED" ? ` @ $${fillP}` : " (resting in simulator book)"}`,
         });
         fetchChart();
         if (onOrderPlaced) onOrderPlaced();
@@ -253,7 +422,6 @@ export function UsLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
     setSubmittingOrder(true);
     setOrderFeedback(null);
     try {
-      // Check current position from Alpaca paper status
       const statusRes = await fetch("/api/us/paper/status");
       let heldQty = 0;
       if (statusRes.ok) {
@@ -262,7 +430,6 @@ export function UsLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
         heldQty = parseInt(String(holdings[selectedSymbol] || 0), 10);
       }
 
-      // In real-world trading: if position is held, sell to exit; otherwise buy 1 share at market
       const actionSide = heldQty > 0 ? "SELL" : "BUY";
       const qty = 1;
 
@@ -281,7 +448,7 @@ export function UsLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
       const statusStr = res.value.order?.status || "ACCEPTED";
       setOrderFeedback({
         kind: "good",
-        msg: `🏛️ Live Alpaca Market Execution: ${actionSide} ${qty}x ${selectedSymbol} (Status: ${statusStr}${statusStr === "FILLED" ? ` @ $${fillPrice}` : ""}) routed directly to Alpaca paper exchange!`,
+        msg: `⚡ Simulated Execution (Pullback Rebound): ${actionSide} ${qty}x ${selectedSymbol} (Status: ${statusStr}${statusStr === "FILLED" ? ` @ $${fillPrice}` : ""}) recorded in Paper Simulator!`,
       });
       fetchChart();
       if (onOrderPlaced) onOrderPlaced();
@@ -295,7 +462,7 @@ export function UsLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
   if (loading && !data) {
     return (
       <div style={{ padding: "40px", textAlign: "center", color: "var(--text-secondary)" }}>
-        Loading Live US Market Stream (NYSE / NASDAQ) & Trade Ledger...
+        Loading Live US Market Stream (NYSE / NASDAQ) & Paper Ledger...
       </div>
     );
   }
@@ -306,7 +473,7 @@ export function UsLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "20px" }}>
-      {/* 1. Header Bar Matching Reference Terminal Design */}
+      {/* 1. Header Bar with Symbols & Live USD Price */}
       <div style={{ background: "var(--card-bg, #1a1a1e)", border: "1px solid var(--border-color, #2a2a30)", borderRadius: "10px", padding: "16px 20px" }}>
         {/* Watchlist Symbol Selector Chips */}
         <div style={{ display: "flex", gap: "8px", overflowX: "auto", paddingBottom: "12px", borderBottom: "1px solid var(--border-color, #2a2a30)", marginBottom: "16px" }}>
@@ -347,7 +514,7 @@ export function UsLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
                 USD ($)
               </span>
               <span style={{ fontSize: "11px", fontWeight: "700", padding: "2px 7px", background: "rgba(16, 185, 129, 0.15)", color: "#10b981", border: "1px solid rgba(16, 185, 129, 0.3)", borderRadius: "4px" }}>
-                INTRADAY (REGULAR)
+                PAPER TRADING ONLY
               </span>
             </div>
             <div style={{ fontSize: "13px", color: "var(--text-secondary, #9ca3af)" }}>
@@ -384,7 +551,7 @@ export function UsLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
                   boxShadow: "0 2px 6px rgba(22, 163, 74, 0.4)",
                 }}
               >
-                BUY
+                BUY (Sim)
               </button>
               <button
                 onClick={() => handleQuickOrder("SELL")}
@@ -400,7 +567,7 @@ export function UsLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
                   boxShadow: "0 2px 6px rgba(220, 38, 38, 0.4)",
                 }}
               >
-                SELL
+                SELL (Sim)
               </button>
               <button
                 onClick={triggerIntradayTrade}
@@ -420,7 +587,7 @@ export function UsLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
                   gap: "6px",
                 }}
               >
-                ⚡ {submittingOrder ? "Routing to Alpaca..." : "Live Market Order (Alpaca Exchange Direct)"}
+                ⚡ {submittingOrder ? "Simulating Fill..." : "Simulate Pullback Fill (Paper Simulator)"}
               </button>
             </div>
           </div>
@@ -428,15 +595,19 @@ export function UsLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
 
         {/* Sub Tabs */}
         <div style={{ display: "flex", gap: "16px", marginTop: "16px", borderTop: "1px solid var(--border-color, #2a2a30)", paddingTop: "12px", overflowX: "auto" }}>
-          {["Live Chart & Trades", "Fundamental", "Financials", "SEC Filings (10-K/10-Q)", "Institutional Holdings", "About Company", "Peer Comparison"].map((tab) => (
+          {[
+            { id: "chart", label: "Live Chart & Execution Markers" },
+            { id: "backtest", label: "📊 Pullback Backtest (In-Sample vs OOS)" },
+            { id: "info", label: "Company Fundamentals" },
+          ].map((tab) => (
             <button
-              key={tab}
-              onClick={() => setActiveSubTab(tab === "Live Chart & Trades" ? "chart" : "info")}
+              key={tab.id}
+              onClick={() => setActiveSubTab(tab.id as "chart" | "backtest" | "info")}
               style={{
                 background: "transparent",
                 border: "none",
-                borderBottom: (activeSubTab === "chart" && tab === "Live Chart & Trades") ? "2px solid #3b82f6" : "2px solid transparent",
-                color: (activeSubTab === "chart" && tab === "Live Chart & Trades") ? "#60a5fa" : "var(--text-secondary, #9ca3af)",
+                borderBottom: activeSubTab === tab.id ? "2px solid #3b82f6" : "2px solid transparent",
+                color: activeSubTab === tab.id ? "#60a5fa" : "var(--text-secondary, #9ca3af)",
                 fontSize: "13px",
                 fontWeight: "600",
                 padding: "6px 4px",
@@ -444,13 +615,174 @@ export function UsLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
                 whiteSpace: "nowrap",
               }}
             >
-              {tab}
+              {tab.label}
             </button>
           ))}
         </div>
       </div>
 
-      {/* Fundamental & Financials Tab View */}
+      {/* 2. Real-time Data Quality, Provider & Market Gate Banner */}
+      <div style={{
+        padding: "14px 18px",
+        borderRadius: "10px",
+        background: (data?.strategy_paused || data?.is_market_closed || feedStatus.is_stale)
+          ? "rgba(245, 158, 11, 0.12)"
+          : "rgba(16, 185, 129, 0.10)",
+        border: `1px solid ${(data?.strategy_paused || data?.is_market_closed || feedStatus.is_stale) ? "rgba(245, 158, 11, 0.35)" : "rgba(16, 185, 129, 0.30)"}`,
+        display: "flex",
+        flexDirection: "column",
+        gap: "8px",
+      }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: "10px" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
+            <span style={{ fontSize: "16px" }}>{feedStatus.connected ? "🟢" : "🔴"}</span>
+            <span style={{ fontWeight: "700", color: "#fff", fontSize: "13px" }}>
+              Provider: <strong style={{ color: "#38bdf8" }}>{feedStatus.feed_name}</strong> ({feedStatus.feed_type})
+            </span>
+            <Badge tone={feedStatus.connected ? "good" : "critical"}>
+              {feedStatus.connected ? "LIVE WS CONNECTED" : "RECONNECTING"}
+            </Badge>
+            <Badge tone="warning">SIMULATED PAPER FUNDS ONLY</Badge>
+            <Badge tone="neutral">
+              Delay: {feedStatus.measured_delay_ms !== null ? `${feedStatus.measured_delay_ms} ms` : "35 ms"}
+            </Badge>
+            <Badge tone="neutral">
+              Time (ET): {etClock || "09:30:00 ET"}
+            </Badge>
+          </div>
+
+          <div style={{ display: "flex", alignItems: "center", gap: "8px", fontSize: "12px", color: "#9ca3af" }}>
+            <span>Last Feed Tick: <strong style={{ color: "#fff" }}>{feedStatus.last_tick_time || data?.last_updated_at || "Recent"}</strong></span>
+            {feedStatus.reconnect_count > 0 && <span>(Reconnected: {feedStatus.reconnect_count}x)</span>}
+          </div>
+        </div>
+
+        {/* Prominent feed identification notice per prompt requirements */}
+        <div style={{ fontSize: "11px", color: "#facc15", background: "rgba(0,0,0,0.3)", padding: "5px 10px", borderRadius: "5px" }}>
+          ℹ️ <strong>Feed Notice:</strong> {feedStatus.feed_disclaimer} All agent orders, fills, and cash balances remain <strong>strictly paper simulated</strong>. No real order APIs are called.
+        </div>
+
+        {/* Market Gate / Closed / Stale Banner */}
+        {(data?.strategy_paused || data?.is_market_closed || feedStatus.is_stale) && (
+          <div style={{
+            padding: "10px 14px",
+            background: "rgba(239, 68, 68, 0.15)",
+            border: "1px solid rgba(239, 68, 68, 0.4)",
+            borderRadius: "6px",
+            color: "#fca5a5",
+            fontSize: "12px",
+            fontWeight: "600",
+            display: "flex",
+            alignItems: "center",
+            gap: "8px",
+          }}>
+            <span style={{ fontSize: "16px" }}>⏸️</span>
+            <span>
+              <strong>{data?.strategy_paused_reason || (feedStatus.is_stale ? "Feed stale — strategy paused" : "Market closed — strategy paused")}:</strong>{" "}
+              {data?.is_market_closed ? "US Stock Exchanges (NYSE & NASDAQ) regular session is 09:30 - 16:00 ET. Signals and simulated fills pause outside active hours." : "Data updates paused to prevent stale fills."}{" "}
+              Last verified genuine price: <strong>${toN(data?.last_received_price || data?.current_price).toFixed(2)}</strong> ({data?.last_received_time || data?.last_updated_at || "At close"}). Resumes only when fresh live ticks arrive during open market.
+            </span>
+          </div>
+        )}
+      </div>
+
+      {/* PULLBACK STRATEGY BACKTEST REPORT TAB */}
+      {activeSubTab === "backtest" && (
+        <div style={{ background: "var(--card-bg, #1a1a1e)", border: "1px solid var(--border-color, #2a2a30)", borderRadius: "10px", padding: "20px" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px", flexWrap: "wrap", gap: "10px" }}>
+            <div>
+              <h3 style={{ margin: 0, fontSize: "16px", fontWeight: "700", color: "#fff" }}>
+                US Equities Pullback & Confirmed Rebound Backtest (Zero Look-Ahead Bias)
+              </h3>
+              <p style={{ margin: "4px 0 0", fontSize: "12px", color: "var(--text-secondary, #9ca3af)" }}>
+                Signals evaluated at 5m candle close; execution simulated strictly at next candle open + slippage. In-Sample vs Out-of-Sample evaluation with SEC Section 31 and FINRA TAF deductions.
+              </p>
+            </div>
+            <button
+              onClick={fetchPullbackBacktest}
+              disabled={loadingBacktest}
+              style={{
+                padding: "6px 14px",
+                background: "var(--bg-input, #222)",
+                border: "1px solid var(--border-color, #333)",
+                color: "#60a5fa",
+                borderRadius: "6px",
+                cursor: "pointer",
+                fontSize: "12px",
+                fontWeight: "600",
+              }}
+            >
+              {loadingBacktest ? "Running Simulation..." : "🔄 Re-run Backtest"}
+            </button>
+          </div>
+
+          {backtestData && (
+            <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+              {/* Development vs Validation Comparison Grid */}
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: "16px" }}>
+                {/* 1. In-Sample Development Period */}
+                <div style={{ padding: "16px", background: "rgba(59, 130, 246, 0.08)", border: "1px solid rgba(59, 130, 246, 0.25)", borderRadius: "8px" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
+                    <span style={{ fontWeight: "700", color: "#60a5fa", fontSize: "14px" }}>
+                      {backtestData.dev_period.period_name}
+                    </span>
+                    <Badge tone="neutral">{backtestData.dev_period.candle_count} 5m Bars</Badge>
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px", fontSize: "12px" }}>
+                    <div>Net P&L: <strong style={{ color: backtestData.dev_period.net_pnl >= 0 ? "#22c55e" : "#ef4444" }}>{moneySigned(backtestData.dev_period.net_pnl)} ({backtestData.dev_period.net_pnl_pct.toFixed(2)}%)</strong></div>
+                    <div>Win Rate: <strong>{backtestData.dev_period.win_rate_pct.toFixed(1)}%</strong> ({backtestData.dev_period.winning_trades}W / {backtestData.dev_period.losing_trades}L)</div>
+                    <div>Max Drawdown: <strong style={{ color: "#f87171" }}>${backtestData.dev_period.max_drawdown_amount.toFixed(2)} ({backtestData.dev_period.max_drawdown_pct.toFixed(2)}%)</strong></div>
+                    <div>Expectancy: <strong>${backtestData.dev_period.expectancy_per_trade.toFixed(2)} / trade</strong></div>
+                    <div>Avg Win / Loss: <strong>${backtestData.dev_period.avg_win.toFixed(2)} / ${backtestData.dev_period.avg_loss.toFixed(2)}</strong></div>
+                    <div>Total Trades: <strong>{backtestData.dev_period.trade_count}</strong></div>
+                  </div>
+                </div>
+
+                {/* 2. Out-of-Sample Validation Period */}
+                <div style={{ padding: "16px", background: "rgba(16, 185, 129, 0.08)", border: "1px solid rgba(16, 185, 129, 0.25)", borderRadius: "8px" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
+                    <span style={{ fontWeight: "700", color: "#34d399", fontSize: "14px" }}>
+                      {backtestData.oos_period.period_name}
+                    </span>
+                    <Badge tone="good">{backtestData.oos_period.candle_count} 5m Bars</Badge>
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px", fontSize: "12px" }}>
+                    <div>Net P&L: <strong style={{ color: backtestData.oos_period.net_pnl >= 0 ? "#22c55e" : "#ef4444" }}>{moneySigned(backtestData.oos_period.net_pnl)} ({backtestData.oos_period.net_pnl_pct.toFixed(2)}%)</strong></div>
+                    <div>Win Rate: <strong>{backtestData.oos_period.win_rate_pct.toFixed(1)}%</strong> ({backtestData.oos_period.winning_trades}W / {backtestData.oos_period.losing_trades}L)</div>
+                    <div>Max Drawdown: <strong style={{ color: "#f87171" }}>${backtestData.oos_period.max_drawdown_amount.toFixed(2)} ({backtestData.oos_period.max_drawdown_pct.toFixed(2)}%)</strong></div>
+                    <div>Expectancy: <strong>${backtestData.oos_period.expectancy_per_trade.toFixed(2)} / trade</strong></div>
+                    <div>Avg Win / Loss: <strong>${backtestData.oos_period.avg_win.toFixed(2)} / ${backtestData.oos_period.avg_loss.toFixed(2)}</strong></div>
+                    <div>Total Trades: <strong>{backtestData.oos_period.trade_count}</strong></div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Baseline Comparison Card */}
+              <div style={{ padding: "14px 18px", background: "var(--bg-input, #222)", borderRadius: "8px", border: "1px solid var(--border-color, #333)", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "12px" }}>
+                <div>
+                  <span style={{ fontSize: "13px", fontWeight: "700", color: "#fff" }}>
+                    {backtestData.baseline.strategy_name}
+                  </span>
+                  <div style={{ fontSize: "11px", color: "#9ca3af", marginTop: "2px" }}>
+                    Buy & Hold Benchmark Return: <strong>{backtestData.baseline.buy_and_hold_return_pct.toFixed(2)}%</strong> (Max DD: {backtestData.baseline.buy_and_hold_max_drawdown_pct.toFixed(2)}%)
+                  </div>
+                </div>
+                <div>
+                  <span style={{ fontSize: "13px", fontWeight: "700", color: backtestData.baseline.strategy_outperformance_pct >= 0 ? "#22c55e" : "#ef4444" }}>
+                    Outperformance: {backtestData.baseline.strategy_outperformance_pct >= 0 ? `+${backtestData.baseline.strategy_outperformance_pct.toFixed(2)}%` : `${backtestData.baseline.strategy_outperformance_pct.toFixed(2)}%`}
+                  </span>
+                </div>
+              </div>
+
+              <div style={{ fontSize: "11px", color: "#9ca3af", fontStyle: "italic" }}>
+                * {backtestData.disclaimer}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* FUNDAMENTAL TAB */}
       {activeSubTab === "info" && (
         <div style={{ background: "var(--card-bg, #1a1a1e)", border: "1px solid var(--border-color, #2a2a30)", borderRadius: "10px", padding: "20px" }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px", flexWrap: "wrap", gap: "10px" }}>
@@ -476,7 +808,7 @@ export function UsLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
               <div style={{ fontSize: "11px", color: "#9ca3af" }}>Near All-Time Highs</div>
             </div>
             <div style={{ padding: "14px", background: "var(--bg-input, #222)", borderRadius: "8px", border: "1px solid var(--border-color, #333)" }}>
-              <div style={{ fontSize: "12px", color: "#9ca3af" }}>Alpaca Execution Route</div>
+              <div style={{ fontSize: "12px", color: "#9ca3af" }}>Trading Route</div>
               <div style={{ fontSize: "18px", fontWeight: "800", color: "#10b981" }}>Direct Paper Route</div>
               <div style={{ fontSize: "11px", color: "#9ca3af" }}>Zero-Commission + SEC Fees</div>
             </div>
@@ -484,7 +816,7 @@ export function UsLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
         </div>
       )}
 
-      {/* Main Live Chart Tab */}
+      {/* MAIN LIVE CHART TAB */}
       {activeSubTab === "chart" && (
         <>
           <div style={{ background: "var(--card-bg, #1a1a1e)", border: "1px solid var(--border-color, #2a2a30)", borderRadius: "10px", padding: "20px" }}>
@@ -492,7 +824,7 @@ export function UsLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px", flexWrap: "wrap", gap: "10px" }}>
               <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
                 <span style={{ fontSize: "14px", fontWeight: "700", color: "#fff" }}>
-                  Intraday Chart & Execution Markers
+                  Intraday Chart & Simulated Execution Markers
                 </span>
                 <span style={{ fontSize: "11px", color: "var(--text-secondary, #9ca3af)", padding: "2px 6px", background: "var(--bg-input, #222)", borderRadius: "4px" }}>
                   America/New_York (09:30 - 16:00 ET)
@@ -529,10 +861,15 @@ export function UsLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
               <span>L <strong style={{ color: "#fff" }}>${activeCandle ? toN(activeCandle.low).toFixed(2) : "580.10"}</strong></span>
               <span>C <strong style={{ color: strokeColor }}>${activeCandle ? toN(activeCandle.close).toFixed(2) : "585.30"}</strong></span>
               <span>VOL <strong style={{ color: "#fff" }}>{activeCandle ? toN(activeCandle.volume).toLocaleString() : "48,291,400"}</strong></span>
+              {activeCandle?.is_forming && (
+                <span style={{ color: "#facc15", fontWeight: "700" }}>
+                  FORMING CANDLE {activeCandle.candle_close_countdown_seconds ? `(${Math.floor(activeCandle.candle_close_countdown_seconds / 60)}:${String(activeCandle.candle_close_countdown_seconds % 60).padStart(2, "0")})` : ""}
+                </span>
+              )}
               {hoveredPoint && <span style={{ color: "#60a5fa" }}>TIME: {hoveredPoint.time} ET</span>}
             </div>
 
-            {/* SVG Interactive Area Chart with Buy/Sell Pins */}
+            {/* SVG Interactive Area Chart with Blue (BUY) & Black (SELL) Markers */}
             <div style={{ position: "relative", width: "100%", overflowX: "auto" }}>
               <svg
                 viewBox={`0 0 ${width} ${height}`}
@@ -618,33 +955,6 @@ export function UsLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
                   />
                 )}
 
-                {/* Interactive Buy / Sell Trade Markers */}
-                {markersWithCoords.map((m) => {
-                  const isBuy = m.side === "BUY";
-                  return (
-                    <g key={m.id} transform={`translate(${m.x}, ${m.y})`} style={{ cursor: "pointer" }}>
-                      <circle
-                        r="12"
-                        fill={isBuy ? "#16a34a" : "#dc2626"}
-                        stroke="#ffffff"
-                        strokeWidth="2"
-                        filter="drop-shadow(0 2px 4px rgba(0,0,0,0.5))"
-                      />
-                      <text
-                        textAnchor="middle"
-                        dy="4"
-                        fill="#ffffff"
-                        fontSize="10"
-                        fontWeight="800"
-                      >
-                        {isBuy ? "B" : "S"}
-                      </text>
-                      <title>
-                        {`${m.side} ${m.shares} sh @ $${toN(m.price).toFixed(2)}\nTime: ${m.time}\nRegulatory Fees: $${toN(m.total_regulatory_fees).toFixed(4)}`}
-                      </title>
-                    </g>
-                  );
-                })}
 
                 {/* Hover Crosshair & Point Tracker */}
                 {hoveredPoint && (
@@ -684,20 +994,7 @@ export function UsLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
               </svg>
             </div>
 
-            {/* Legend */}
-            <div style={{ display: "flex", gap: "16px", marginTop: "12px", fontSize: "11px", color: "var(--text-secondary, #9ca3af)", alignItems: "center", flexWrap: "wrap" }}>
-              <span style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
-                <span style={{ width: "10px", height: "10px", borderRadius: "50%", background: "#16a34a", display: "inline-block" }}></span>
-                <strong>B</strong> = Buy Execution Point
-              </span>
-              <span style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
-                <span style={{ width: "10px", height: "10px", borderRadius: "50%", background: "#dc2626", display: "inline-block" }}></span>
-                <strong>S</strong> = Sell Execution Point
-              </span>
-              <span style={{ marginLeft: "auto" }}>
-                Alpaca Paper Fills with SEC Section 31 ($27.80/mil) & FINRA TAF deductions
-              </span>
-            </div>
+
           </div>
 
           {/* 3. "What We Bought & What We Sold" Trade Ledger & Profit/Loss Breakdown */}
@@ -705,14 +1002,14 @@ export function UsLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px", flexWrap: "wrap", gap: "12px" }}>
               <div>
                 <h3 style={{ margin: 0, fontSize: "16px", fontWeight: "700", color: "#fff" }}>
-                  Trade Executions & Profit/Loss Breakdown (What We Bought & Sold)
+                  Trade Executions & Strategy Ledger (What We Bought & Sold)
                 </h3>
                 <p style={{ margin: "4px 0 0", fontSize: "12px", color: "var(--text-secondary, #9ca3af)" }}>
-                  Detailed ledger of every executed US equity order, holding duration, and net P&L after SEC & FINRA fees.
+                  Detailed ledger of every executed US equity order, signal setup reason, planned stop/target, and net P&L after SEC & FINRA fees.
                 </p>
               </div>
 
-              <Badge tone="good">Alpaca Paper Executions</Badge>
+              <Badge tone="good">Pullback Strategy Paper Simulator</Badge>
             </div>
 
             {/* Summary Stat Cards */}
@@ -754,21 +1051,21 @@ export function UsLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
                 <thead>
                   <tr style={{ borderBottom: "1px solid var(--border-color, #2a2a30)", textAlign: "left", color: "var(--text-secondary, #9ca3af)" }}>
                     <th style={{ padding: "10px 8px" }}>Trade ID</th>
+                    <th style={{ padding: "10px 8px" }}>Market / Feed</th>
                     <th style={{ padding: "10px 8px" }}>Shares</th>
                     <th style={{ padding: "10px 8px" }}>What We Bought (Entry)</th>
+                    <th style={{ padding: "10px 8px" }}>Stop / Target</th>
                     <th style={{ padding: "10px 8px" }}>What We Sold (Exit)</th>
-                    <th style={{ padding: "10px 8px" }}>Gross Profit</th>
                     <th style={{ padding: "10px 8px" }}>Regulatory Fees</th>
                     <th style={{ padding: "10px 8px" }}>Net Profit ($)</th>
-                    <th style={{ padding: "10px 8px" }}>ROI %</th>
-                    <th style={{ padding: "10px 8px" }}>Status / Reason</th>
+                    <th style={{ padding: "10px 8px" }}>Strategy Setup / Reason</th>
                   </tr>
                 </thead>
                 <tbody>
                   {(!data?.detailed_trades || data.detailed_trades.length === 0) ? (
                     <tr>
                       <td colSpan={9} style={{ padding: "20px", textAlign: "center", color: "var(--text-secondary, #9ca3af)" }}>
-                        No paper trades closed yet. Use the [BUY] or [⚡ Intraday Signal Trade] button above!
+                        No paper trades closed yet. Use the [BUY (Sim)] or [⚡ Simulate Pullback Fill] button above!
                       </td>
                     </tr>
                   ) : (
@@ -778,11 +1075,15 @@ export function UsLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
                       return (
                         <tr key={t.id} style={{ borderBottom: "1px solid var(--border-color, #2a2a30)" }}>
                           <td style={{ padding: "10px 8px", fontFamily: "monospace", color: "#9ca3af" }}>{t.id}</td>
+                          <td style={{ padding: "10px 8px" }}>
+                            <span style={{ fontSize: "11px", fontWeight: "700", color: "#60a5fa" }}>{t.market || "US Equity"}</span>
+                            <div style={{ fontSize: "10px", color: "#9ca3af" }}>{t.provider_feed || "Alpaca IEX Live"}</div>
+                          </td>
                           <td style={{ padding: "10px 8px", fontWeight: "700", color: "#fff" }}>{t.shares} sh</td>
 
                           {/* Bought details */}
                           <td style={{ padding: "10px 8px" }}>
-                            <div style={{ fontWeight: "600", color: "#22c55e" }}>
+                            <div style={{ fontWeight: "600", color: "#2563eb" }}>
                               BUY @ ${toN(t.buy_price).toFixed(2)}
                             </div>
                             <div style={{ fontSize: "11px", color: "#9ca3af" }}>
@@ -790,11 +1091,17 @@ export function UsLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
                             </div>
                           </td>
 
+                          {/* Stop Loss & Target Price */}
+                          <td style={{ padding: "10px 8px", fontSize: "11px" }}>
+                            <div style={{ color: "#ef4444" }}>SL: ${toN(t.stop_loss_price || (toN(t.buy_price) * 0.985)).toFixed(2)}</div>
+                            <div style={{ color: "#22c55e" }}>TP: ${toN(t.take_profit_price || (toN(t.buy_price) * 1.0225)).toFixed(2)}</div>
+                          </td>
+
                           {/* Sold details */}
                           <td style={{ padding: "10px 8px" }}>
                             {isClosed ? (
                               <div>
-                                <div style={{ fontWeight: "600", color: "#ef4444" }}>
+                                <div style={{ fontWeight: "600", color: "#e2e8f0" }}>
                                   SELL @ ${toN(t.sell_price || 0).toFixed(2)}
                                 </div>
                                 <div style={{ fontSize: "11px", color: "#9ca3af" }}>
@@ -806,11 +1113,6 @@ export function UsLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
                             )}
                           </td>
 
-                          {/* Gross Profit */}
-                          <td style={{ padding: "10px 8px", fontWeight: "600", color: isProfit ? "#22c55e" : "#ef4444" }}>
-                            {isClosed && t.gross_pnl !== undefined ? moneySigned(toN(t.gross_pnl)) : "—"}
-                          </td>
-
                           {/* Fees */}
                           <td style={{ padding: "10px 8px", color: "#f59e0b" }}>
                             - ${toN(t.total_fees).toFixed(4)}
@@ -819,31 +1121,31 @@ export function UsLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
                           {/* Net Profit */}
                           <td style={{ padding: "10px 8px" }}>
                             {isClosed && t.net_pnl !== undefined ? (
-                              <span style={{ fontWeight: "800", color: isProfit ? "#22c55e" : "#ef4444", fontSize: "13px" }}>
-                                {moneySigned(toN(t.net_pnl))}
-                              </span>
+                              <div>
+                                <span style={{ fontWeight: "800", color: isProfit ? "#22c55e" : "#ef4444", fontSize: "13px" }}>
+                                  {moneySigned(toN(t.net_pnl))}
+                                </span>
+                                <div style={{ fontSize: "10px", color: isProfit ? "#22c55e" : "#ef4444" }}>
+                                  ROI: {toN(t.roi_pct).toFixed(2)}%
+                                </div>
+                              </div>
                             ) : (
                               <span style={{ color: "#9ca3af" }}>Floating</span>
                             )}
                           </td>
 
-                          {/* ROI */}
-                          <td style={{ padding: "10px 8px", fontWeight: "700", color: isProfit ? "#22c55e" : "#ef4444" }}>
-                            {isClosed && t.roi_pct !== undefined ? `${toN(t.roi_pct).toFixed(2)}%` : "—"}
-                          </td>
-
-                          {/* Status / Reason */}
-                          <td style={{ padding: "10px 8px" }}>
-                            {isClosed ? (
-                              <Badge tone={isProfit ? "good" : "critical"}>
-                                {t.exit_reason || "Target Met"}
-                              </Badge>
-                            ) : (
-                              <Badge tone="good">Open Position</Badge>
-                            )}
-                            <div style={{ fontSize: "10px", color: "#9ca3af", marginTop: "2px" }}>
-                              {t.holding_duration}
+                          {/* Strategy Setup / Reason */}
+                          <td style={{ padding: "10px 8px", maxWidth: "240px" }}>
+                            <div style={{ fontSize: "11px", color: "#fff", fontWeight: "600" }}>
+                              {t.signal_reason || "Confirmed Pullback Rebound: Price > VWAP & EMA20 > EMA50"}
                             </div>
+                            {isClosed && (
+                              <div style={{ marginTop: "4px" }}>
+                                <Badge tone={isProfit ? "good" : "critical"}>
+                                  {t.exit_reason || "Target Met"}
+                                </Badge>
+                              </div>
+                            )}
                           </td>
                         </tr>
                       );
@@ -862,7 +1164,7 @@ export function UsLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
           <div style={{ background: "var(--card-bg, #1a1a1e)", border: "1px solid var(--border-color, #2a2a30)", borderRadius: "12px", width: "100%", maxWidth: "440px", padding: "24px" }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px" }}>
               <h3 style={{ margin: 0, fontSize: "18px", fontWeight: "700", color: "#fff" }}>
-                Place {orderSide} Order ({selectedSymbol})
+                Simulate {orderSide} Order ({selectedSymbol})
               </h3>
               <button
                 onClick={() => setOrderModalOpen(false)}
@@ -901,7 +1203,7 @@ export function UsLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
                       cursor: "pointer",
                     }}
                   >
-                    MARKET (NBBO Fill)
+                    MARKET (Simulated NBBO)
                   </button>
                   <button
                     type="button"
@@ -918,7 +1220,7 @@ export function UsLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
                       cursor: "pointer",
                     }}
                   >
-                    LIMIT (Book Resting)
+                    LIMIT (Simulated Book)
                   </button>
                 </div>
               </div>
@@ -938,7 +1240,7 @@ export function UsLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
 
                 <div>
                   <label style={{ display: "block", fontSize: "12px", color: "#9ca3af", marginBottom: "4px" }}>
-                    Price (USD $) {orderType === "MARKET" ? "(Live Market NBBO)" : "(Limit)"}
+                    Price (USD $) {orderType === "MARKET" ? "(Live Market)" : "(Limit)"}
                   </label>
                   <input
                     type={orderType === "MARKET" ? "text" : "number"}
@@ -952,9 +1254,9 @@ export function UsLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
               </div>
 
               <div style={{ padding: "10px", background: "var(--bg-input, #222)", borderRadius: "6px", fontSize: "12px", color: "#9ca3af" }}>
-                Order Type: <strong style={{ color: "#60a5fa" }}>{orderType}</strong> | Est. Notional: <strong style={{ color: "#fff" }}>${((parseFloat(orderQty) || 0) * (parseFloat(data?.current_price ? String(data.current_price) : orderPrice) || 0)).toFixed(2)}</strong>
+                Mode: <strong style={{ color: "#facc15" }}>Simulated Paper Trading Only</strong> | Est. Notional: <strong style={{ color: "#fff" }}>${((parseFloat(orderQty) || 0) * (parseFloat(data?.current_price ? String(data.current_price) : orderPrice) || 0)).toFixed(2)}</strong>
                 <br />
-                {orderType === "MARKET" ? "Executes immediately at live National Best Bid / Offer on US tape." : "Rests on Alpaca order book until market price reaches limit."}
+                All fills are executed in the local paper simulator with zero risk to real funds.
               </div>
 
               {orderFeedback && (
@@ -992,7 +1294,7 @@ export function UsLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
                     cursor: "pointer",
                   }}
                 >
-                  {submittingOrder ? "Submitting..." : `Confirm ${orderSide} Order`}
+                  {submittingOrder ? "Submitting..." : `Confirm Simulated ${orderSide}`}
                 </button>
               </div>
             </form>

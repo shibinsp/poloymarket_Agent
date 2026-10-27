@@ -51,16 +51,19 @@ impl NseInstrument {
     }
 }
 
-/// Standard curated watchlist of top liquid NSE cash equities.
+/// Standard curated watchlist of top liquid NSE cash equities matching Upstox Pro watchlist.
 pub fn nse_watchlist() -> Vec<NseInstrument> {
     vec![
         NseInstrument::new("RELIANCE", "INE002A01018", "Reliance Industries Ltd"),
-        NseInstrument::new("TCS", "INE467B01029", "Tata Consultancy Services Ltd"),
-        NseInstrument::new("INFY", "INE009A01021", "Infosys Ltd"),
         NseInstrument::new("HDFCBANK", "INE040A01034", "HDFC Bank Ltd"),
+        NseInstrument::new("TCS", "INE467B01029", "Tata Consultancy Services Ltd"),
+        NseInstrument::new("BHARTIARTL", "INE397D01024", "Bharti Airtel Ltd"),
         NseInstrument::new("ICICIBANK", "INE090A01021", "ICICI Bank Ltd"),
         NseInstrument::new("SBIN", "INE062A01020", "State Bank of India"),
-        NseInstrument::new("BHARTIARTL", "INE397D01024", "Bharti Airtel Ltd"),
+        NseInstrument::new("INFY", "INE009A01021", "Infosys Ltd"),
+        NseInstrument::new("LICI", "INE115A01015", "Life Insurance Corporation of India"),
+        NseInstrument::new("HINDUNILVR", "INE030A01027", "Hindustan Unilever Ltd"),
+        NseInstrument::new("BAJFINANCE", "INE296A01024", "Bajaj Finance Ltd"),
         NseInstrument::new("ITC", "INE154A01025", "ITC Ltd"),
         NseInstrument::new("LT", "INE018A01030", "Larsen & Toubro Ltd"),
         NseInstrument::new("TATAMOTORS", "INE155A01022", "Tata Motors Ltd"),
@@ -82,7 +85,7 @@ mod tests {
     #[test]
     fn watchlist_has_verified_keys() {
         let list = nse_watchlist();
-        assert_eq!(list.len(), 10);
+        assert_eq!(list.len(), 13);
         let rel = find_nse_instrument("RELIANCE").unwrap();
         assert_eq!(rel.isin, "INE002A01018");
         assert_eq!(rel.upstox_key, "NSE_EQ|INE002A01018");

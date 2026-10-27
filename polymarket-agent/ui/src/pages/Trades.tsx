@@ -419,6 +419,142 @@ export function Trades() {
         </button>
       </div>
 
+      {/* Upstox Live Feed & Local Paper Trading Simulator Dashboard */}
+      {(marketFilter === "INDIA" || marketFilter === "ALL") && (
+        <Card title="🇮🇳 Upstox Live Market Data → Strategy → Local Paper Simulator">
+          <div
+            style={{
+              display: "flex",
+              flexWrap: "wrap",
+              gap: "14px",
+              alignItems: "center",
+              marginBottom: "14px",
+              padding: "12px 16px",
+              borderRadius: "8px",
+              background: "rgba(255,255,255,0.03)",
+              border: "1px solid rgba(255,255,255,0.08)",
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+              <span
+                style={{
+                  width: "10px",
+                  height: "10px",
+                  borderRadius: "50%",
+                  background: india.data?.upstox_feed?.connected ? "#10b981" : "#f59e0b",
+                  display: "inline-block",
+                  boxShadow: india.data?.upstox_feed?.connected ? "0 0 8px #10b981" : "0 0 8px #f59e0b",
+                }}
+              />
+              <span style={{ fontWeight: 600, fontSize: "13px" }}>
+                Upstox Feed:{" "}
+                {india.data?.upstox_feed?.connected
+                  ? "Live WebSocket / Quote Stream"
+                  : india.data?.upstox_feed?.authorized
+                    ? "Connecting to Upstox Stream..."
+                    : "Live Drift Simulator Active"}
+              </span>
+            </div>
+            <div style={{ fontSize: "12px", color: "var(--text-secondary)" }}>
+              Subscribed: {india.data?.upstox_feed?.symbols_subscribed?.slice(0, 6).join(", ") || "ITC, SBIN, RELIANCE, INFY, TATAMOTORS, TCS"}
+            </div>
+            <div style={{ marginLeft: "auto", display: "flex", gap: "8px", alignItems: "center" }}>
+              <Badge tone="good">100% Paper Simulator · Zero Live Orders</Badge>
+              <a
+                href="#/india-test"
+                onClick={() => {
+                  if (!window.location.hash.includes("india-test")) {
+                    window.location.href = "/india-test";
+                  }
+                }}
+                className="btn"
+                style={{ fontSize: "11px", padding: "3px 8px", textDecoration: "none" }}
+              >
+                Strategy Evaluator ↗
+              </a>
+            </div>
+          </div>
+
+          {/* Real-time Ticker Ribbon */}
+          {india.data?.upstox_feed?.live_prices && Object.keys(india.data.upstox_feed.live_prices).length > 0 && (
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))",
+                gap: "8px",
+                marginBottom: "14px",
+              }}
+            >
+              {Object.entries(india.data.upstox_feed.live_prices).slice(0, 5).map(([sym, item]) => {
+                const chg = Number(item?.change_pct ?? 0);
+                const isUp = chg >= 0;
+                const itemPrice = Number(item?.price ?? 0);
+                return (
+                  <div
+                    key={sym}
+                    style={{
+                      padding: "8px 10px",
+                      borderRadius: "6px",
+                      background: "rgba(15, 23, 42, 0.6)",
+                      border: "1px solid rgba(255, 255, 255, 0.06)",
+                    }}
+                  >
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      <span style={{ fontSize: "11px", fontWeight: "700", color: "#fff" }}>{sym}</span>
+                      <span style={{ fontSize: "10px", fontWeight: "600", color: isUp ? "#4ade80" : "#f87171" }}>
+                        {isUp ? `+${chg.toFixed(2)}%` : `${chg.toFixed(2)}%`}
+                      </span>
+                    </div>
+                    <div style={{ fontSize: "13px", fontWeight: "800", color: "#38bdf8", marginTop: "2px" }}>
+                      ₹{itemPrice.toFixed(2)}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          <div
+            className="grid grid--tiles"
+            style={{ gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))" }}
+          >
+            <StatTile
+              label="Virtual Indian Cash"
+              value={`₹${Number(india.data?.available_cash_inr ?? 1000).toFixed(2)}`}
+              sub="Starting capital: ₹1,000.00 locked"
+              tone={Number(india.data?.available_cash_inr ?? 0) > 0 ? "pos" : null}
+            />
+            <StatTile
+              label="Virtual Total Equity"
+              value={`₹${Number(india.data?.total_equity_inr ?? 1000).toFixed(2)}`}
+              sub="Cash + Open Holdings mark-to-market"
+              tone={Number(india.data?.total_equity_inr ?? 1000) >= 1000 ? "pos" : "neg"}
+            />
+            <StatTile
+              label="Open Virtual Positions"
+              value={`₹${Number(india.data?.open_positions_cost_inr ?? 0).toFixed(2)}`}
+              sub={
+                Object.keys(india.data?.holdings ?? {}).length > 0
+                  ? Object.entries(india.data?.holdings ?? {})
+                      .map(([sym, qty]) => `${sym}: ${qty}sh`)
+                      .join(", ")
+                  : "No open positions"
+              }
+            />
+            <StatTile
+              label="Realized P&L (Post-Sale)"
+              value={
+                indiaProfitInr >= 0
+                  ? `+₹${indiaProfitInr.toFixed(2)}`
+                  : `-₹${Math.abs(indiaProfitInr).toFixed(2)}`
+              }
+              sub="Saved in SQLite (survives restarts)"
+              tone={indiaProfitInr > 0 ? "pos" : null}
+            />
+          </div>
+        </Card>
+      )}
+
       {/* Filters Card */}
       <Card title="Filters & Search">
         <div className="filters">

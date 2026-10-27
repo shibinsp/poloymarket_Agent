@@ -28,7 +28,7 @@ categories = ["weather", "sports", "crypto", "politics"]
 # edge-justifies-cost gate will both treat calls as free.
 provider = "openai_compatible"
 base_url = "https://integrate.api.nvidia.com/v1"
-model = "minimaxai/minimax-m3.1-flash"
+model = "meta/llama-3.2-11b-vision-instruct"
 max_tokens = 4096
 # input_price_per_million = 3.00
 # output_price_per_million = 15.00
@@ -91,7 +91,7 @@ max_retries = 3
 log_level = "info"
 discord_enabled = false
 daily_summary_hour = 9
-dashboard_port = 8080
+dashboard_port = 8088
 dashboard_bind = "127.0.0.1"          # set DASHBOARD_TOKEN in the env before binding anywhere else
 
 [polymarket]
@@ -179,7 +179,7 @@ fee_pct = 0.0025
 id = "upstox_sandbox"
 kind = "upstox_sandbox"
 enabled = true
-symbols = ["RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK"]
+symbols = ["ITC", "SBIN", "TATAMOTORS", "RELIANCE", "INFY", "HDFCBANK", "ICICIBANK", "TCS"]
 fee_pct = 0.001
 
 [sizing_continuous]

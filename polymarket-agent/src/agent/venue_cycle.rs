@@ -58,6 +58,7 @@ pub struct VenueCycle<'a> {
 
 impl VenueCycle<'_> {
     /// Cash currently committed to open continuous positions.
+    #[allow(dead_code)]
     async fn open_venue_notional(&self) -> Result<Decimal> {
         Ok(self
             .store
@@ -166,8 +167,16 @@ impl VenueCycle<'_> {
         // eight cycles with no layer objecting. The legacy path has had this
         // via PortfolioManager since the beginning.
         let mut balances: HashMap<String, Option<Decimal>> = HashMap::new();
-        let mut open_notional = self.open_venue_notional().await?;
-        let mut open_positions = self.store.get_open_venue_trades().await?.len();
+        let all_open_trades = self.store.get_open_venue_trades().await?;
+        let mut venue_notional: HashMap<String, Decimal> = HashMap::new();
+        let mut venue_positions: HashMap<String, usize> = HashMap::new();
+        for trade in &all_open_trades {
+            let cost = trade.quantity * trade.avg_fill_price.unwrap_or(trade.entry_price);
+            *venue_notional
+                .entry(trade.venue_id.clone())
+                .or_insert(Decimal::ZERO) += cost;
+            *venue_positions.entry(trade.venue_id.clone()).or_insert(0) += 1;
+        }
 
         let ctx = CycleContext { now, state, cycle };
         let instruments = self.registry.list_tradeable_instruments(now, &filter).await;
@@ -236,21 +245,28 @@ impl VenueCycle<'_> {
                 continue;
             }
 
+            let venue_key = venue.id().to_string();
+            let cur_notional = venue_notional
+                .get(&venue_key)
+                .copied()
+                .unwrap_or(Decimal::ZERO);
+            let cur_positions = venue_positions.get(&venue_key).copied().unwrap_or(0);
+
             if let Some(reason) =
-                portfolio_block(open_notional, open_positions, bankroll, &self.config.risk)
+                portfolio_block(cur_notional, cur_positions, bankroll, &self.config.risk)
             {
                 info!(
                     venue = %venue.id(),
-                    open_notional = %open_notional,
-                    open_positions,
+                    open_notional = %cur_notional,
+                    open_positions = cur_positions,
                     reason,
-                    "No further entries this cycle"
+                    "No further entries for venue this cycle"
                 );
-                break;
+                continue;
             }
 
             match self
-                .evaluate_instrument(venue, self.llm, &instrument, &ctx, bankroll, open_notional)
+                .evaluate_instrument(venue, self.llm, &instrument, &ctx, bankroll, cur_notional)
                 .await
             {
                 Ok(EvaluationResult {
@@ -267,8 +283,10 @@ impl VenueCycle<'_> {
                         outcome.orders_placed += 1;
                         // Count it immediately: the cap has to hold within a
                         // cycle, not just between them.
-                        open_notional += notional;
-                        open_positions += 1;
+                        *venue_notional
+                            .entry(venue_key.clone())
+                            .or_insert(Decimal::ZERO) += notional;
+                        *venue_positions.entry(venue_key).or_insert(0) += 1;
                     }
                 }
                 Err(e) => warn!(
@@ -637,6 +655,35 @@ impl VenueCycle<'_> {
                 venue_order_id: ack.map(|a| a.venue_order_id.clone()),
             })
             .await?;
+
+        if venue.id().as_str().contains("upstox") || instrument.quote_ccy == "INR" {
+            let sbx_order = crate::db::store::IndiaSandboxOrderRecord {
+                id: format!("ord-{}", Uuid::new_v4().simple()),
+                client_order_id: client_order_id.clone(),
+                venue_order_id: ack.map(|a| a.venue_order_id.clone()),
+                symbol: instrument.symbol().to_string(),
+                side: "BUY".to_string(),
+                order_type: "LIMIT".to_string(),
+                quantity: qty.to_string().parse::<i64>().unwrap_or(1),
+                price: limit_price.to_string(),
+                trigger_price: None,
+                status: if filled_qty > Decimal::ZERO {
+                    "FILLED".to_string()
+                } else {
+                    "ACKNOWLEDGED".to_string()
+                },
+                fill_quantity: if filled_qty > Decimal::ZERO {
+                    filled_qty.to_string().parse::<i64>().unwrap_or(1)
+                } else {
+                    qty.to_string().parse::<i64>().unwrap_or(1)
+                },
+                average_fill_price: Some(fill_price.to_string()),
+                rejection_reason: None,
+                created_at: ctx.now.to_rfc3339(),
+                updated_at: ctx.now.to_rfc3339(),
+            };
+            let _ = self.store.save_india_sandbox_order(&sbx_order).await;
+        }
 
         // Write the forecast down so it can be scored when the position
         // closes. Nothing on the venue path did this, which left the paper

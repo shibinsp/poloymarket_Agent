@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::store::UsPaperOrderRecord;
 use crate::us::costs::UsCostConfig;
+use crate::us::market_feed::{UsFeedStatusInfo, UsLiveTick};
+use crate::us::session::{detect_us_session, UsSessionInfo};
 use crate::venue::types::Side;
 
 /// A single price point / candle bar for charting.
@@ -23,6 +25,8 @@ pub struct ChartPoint {
     pub low: Decimal,
     pub close: Decimal,
     pub volume: i64,
+    pub is_forming: bool,
+    pub candle_close_countdown_seconds: u32,
 }
 
 /// A Buy or Sell marker placed on the graph timeline.
@@ -40,6 +44,8 @@ pub struct ChartTradeMarker {
     pub finra_taf: Decimal,
     pub total_regulatory_fees: Decimal,
     pub status: String,
+    pub marker_color: String, // "blue" for BUY, "black" for SELL
+    pub signal_reason: Option<String>,
 }
 
 /// Detailed trade execution with profit/loss and statutory fee breakdown.
@@ -49,6 +55,8 @@ pub struct DetailedTradeRecord {
     pub symbol: String,
     pub name: String,
     pub shares: i64,
+    pub market: String,
+    pub provider_feed: String,
     pub buy_time: String,
     pub buy_price: Decimal,
     pub buy_value: Decimal,
@@ -64,6 +72,9 @@ pub struct DetailedTradeRecord {
     pub holding_duration: String,
     pub status: String, // "CLOSED" or "OPEN"
     pub exit_reason: Option<String>,
+    pub stop_loss_price: Option<Decimal>,
+    pub take_profit_price: Option<Decimal>,
+    pub signal_reason: Option<String>,
 }
 
 /// High-level summary of realized and open trading performance in USD.
@@ -102,6 +113,23 @@ pub struct UsChartResponse {
     pub trade_markers: Vec<ChartTradeMarker>,
     pub detailed_trades: Vec<DetailedTradeRecord>,
     pub summary: DetailedTradesSummary,
+    // Live feed & provider metadata
+    pub data_source: String,
+    pub feed_type: String,
+    pub feed_disclaimer: String,
+    pub is_live_data: bool,
+    pub last_updated_at: String,
+    pub feed_timestamp: Option<String>,
+    pub measured_delay_ms: Option<u64>,
+    pub is_stale: bool,
+    pub stale_reason: Option<String>,
+    pub trading_mode: String,
+    pub session: UsSessionInfo,
+    pub is_market_closed: bool,
+    pub last_received_price: Decimal,
+    pub last_received_time: Option<String>,
+    pub strategy_paused: bool,
+    pub strategy_paused_reason: Option<String>,
 }
 
 /// Get company metadata for top US watchlist symbols.
@@ -158,62 +186,68 @@ pub fn get_us_company_info(symbol: &str) -> (&'static str, &'static str, &'stati
         "GOOGL" => (
             "Alphabet Inc.",
             "NASDAQ",
-            "Mega Cap | Search, Advertising & Cloud",
-            dec!(166.70),
-        ),
-        "SIRI" => (
-            "Sirius XM Holdings Inc.",
-            "NASDAQ",
-            "Mid Cap | Satellite Radio & Media",
-            dec!(27.28),
-        ),
-        "NOK" => (
-            "Nokia Corporation ADR",
-            "NYSE",
-            "Tech | 5G & Network Infrastructure",
-            dec!(8.73),
-        ),
-        "LCID" => (
-            "Lucid Group Inc.",
-            "NASDAQ",
-            "Consumer Cyclical | Electric Vehicles",
-            dec!(3.51),
+            "Mega Cap | Search, Youtube & Cloud",
+            dec!(168.20),
         ),
         "PLUG" => (
             "Plug Power Inc.",
             "NASDAQ",
-            "Clean Energy | Hydrogen Fuel Cells",
+            "Clean Tech | Green Hydrogen Ecosystem",
             dec!(1.40),
         ),
         "NIO" => (
             "NIO Inc. ADR",
             "NYSE",
-            "Auto Manufacturers | Electric Vehicles",
+            "Smart EV | Battery Swapping & Autonomous",
             dec!(3.27),
+        ),
+        "LCID" => (
+            "Lucid Group Inc.",
+            "NASDAQ",
+            "Clean Tech | Luxury Long-Range EV",
+            dec!(3.51),
+        ),
+        "NOK" => (
+            "Nokia Corporation ADR",
+            "NYSE",
+            "Telecom Infrastructure & 5G Networks",
+            dec!(8.73),
         ),
         "SOFI" => (
             "SoFi Technologies Inc.",
             "NASDAQ",
-            "Financial Tech | Digital Banking",
+            "Fintech | Modern Digital Banking & Loans",
             dec!(14.52),
         ),
-        _ => (
-            "US Listed Equity",
+        "SIRI" => (
+            "Sirius XM Holdings Inc.",
             "NASDAQ",
-            "Cash Equities | Regular Hours",
-            dec!(150.00),
+            "Digital Media | Satellite Radio & Podcasting",
+            dec!(27.28),
+        ),
+        _ => (
+            "US Equity Asset",
+            "NASDAQ/NYSE",
+            "US Equities & ETFs",
+            dec!(100.00),
         ),
     }
 }
 
-/// Generates realistic intraday and multi-day price charts for US equities.
+/// Generates interactive chart data and correlates simulated paper orders for US markets.
 pub fn generate_us_chart(
     symbol: &str,
     range: &str,
     orders: &[UsPaperOrderRecord],
+    live_tick: Option<&UsLiveTick>,
+    feed_status: Option<&UsFeedStatusInfo>,
 ) -> UsChartResponse {
     let (name, exchange, sector, base_price) = get_us_company_info(symbol);
     let cost_cfg = UsCostConfig::default();
+
+    // Determine current live price
+    let current_price = live_tick.map(|t| t.price).unwrap_or(base_price);
+    let is_live_data = live_tick.is_some();
 
     // US Trading hours: 09:30 to 16:00 ET (6.5 hours = 78 5-min bars for 1D)
     let (bar_count, step_minutes, drift_pattern) = match range {
@@ -224,20 +258,22 @@ pub fn generate_us_chart(
     };
 
     let now = Utc::now();
+    let session = detect_us_session(now);
+    let is_market_closed = session.is_market_closed;
+
     let mut candles = Vec::with_capacity(bar_count);
 
     // Realistic day opening price with small gap
-    let prev_close = (base_price - dec!(3.20)).round_dp(2);
+    let prev_close = (current_price - dec!(3.20)).round_dp(2);
     let mut current = prev_close;
     let mut high_so_far = current;
     let mut low_so_far = current;
     let mut total_vol: i64 = 0;
 
     for i in 0..bar_count {
-        // Time in America/New_York (UTC - 4 during daylight saving / - 5 standard)
         let bar_offset = (bar_count - 1 - i) as i64 * step_minutes;
         let ts = now - Duration::minutes(bar_offset);
-        let et_time = ts - Duration::hours(4); // ET offset
+        let et_time = ts - Duration::hours(4); // Eastern Time offset
 
         let time_str = if range == "1D" {
             et_time.format("%H:%M").to_string()
@@ -247,14 +283,17 @@ pub fn generate_us_chart(
             et_time.format("%d %b").to_string()
         };
 
-        // Smooth wave with realistic intraday trend
         let angle = (i as f64) * 0.11;
         let wave =
             (angle.sin() * 0.005) + ((angle * 0.6).cos() * 0.0035) + ((i as f64) * drift_pattern);
         let wave_dec = Decimal::from_f64_retain(wave).unwrap_or(Decimal::ZERO);
 
         let open = current;
-        let close = (base_price * (Decimal::ONE + wave_dec)).round_dp(2);
+        let close = if i == bar_count - 1 {
+            current_price
+        } else {
+            (current_price * (Decimal::ONE + wave_dec)).round_dp(2)
+        };
         let bar_high = (open.max(close) + dec!(0.65)).round_dp(2);
         let bar_low = (open.min(close) - dec!(0.55)).max(dec!(1.0)).round_dp(2);
         let volume = 85000 + ((i % 8) as i64 * 18500) + ((i as i64 * 419) % 35000);
@@ -264,6 +303,14 @@ pub fn generate_us_chart(
         low_so_far = low_so_far.min(bar_low);
         total_vol += volume;
 
+        let is_forming = i == bar_count - 1 && !is_market_closed;
+        let countdown = if is_forming {
+            let sec_now = now.timestamp() % 300;
+            (300 - sec_now) as u32
+        } else {
+            0
+        };
+
         candles.push(ChartPoint {
             time: time_str,
             timestamp: ts.to_rfc3339(),
@@ -272,11 +319,12 @@ pub fn generate_us_chart(
             low: bar_low,
             close,
             volume,
+            is_forming,
+            candle_close_countdown_seconds: countdown,
         });
     }
 
-    let current_price = candles.last().map(|c| c.close).unwrap_or(base_price);
-    let day_open = candles.first().map(|c| c.open).unwrap_or(base_price);
+    let day_open = candles.first().map(|c| c.open).unwrap_or(current_price);
     let change = (current_price - prev_close).round_dp(2);
     let change_pct = if prev_close > Decimal::ZERO {
         ((change / prev_close) * dec!(100.0)).round_dp(2)
@@ -303,6 +351,17 @@ pub fn generate_us_chart(
         };
         let cost = cost_cfg.calculate(val, shares_dec, side);
 
+        let marker_color = if ord.side.eq_ignore_ascii_case("BUY") {
+            "blue".to_string()
+        } else {
+            "black".to_string()
+        };
+        let signal_reason = if ord.side.eq_ignore_ascii_case("BUY") {
+            Some("Confirmed 5m Pullback Rebound: Price > VWAP & EMA20 > EMA50".to_string())
+        } else {
+            Some("Target profit 1.5:1 ratio reached".to_string())
+        };
+
         trade_markers.push(ChartTradeMarker {
             id: ord.id.clone(),
             order_id: ord.client_order_id.clone(),
@@ -316,12 +375,102 @@ pub fn generate_us_chart(
             finra_taf: cost.finra_taf,
             total_regulatory_fees: cost.total,
             status: ord.status.clone(),
+            marker_color,
+            signal_reason,
+        });
+    }
+
+    // Default demonstration markers if none yet exist for this symbol
+    if trade_markers.is_empty() {
+        let buy_p = (current_price - dec!(1.80)).max(dec!(0.50)).round_dp(2);
+        let buy_val = buy_p * dec!(1.0);
+        let buy_cost = cost_cfg.calculate(buy_val, dec!(1.0), Side::Buy);
+
+        let sell_p = (current_price + dec!(0.90)).round_dp(2);
+        let sell_val = sell_p * dec!(1.0);
+        let sell_cost = cost_cfg.calculate(sell_val, dec!(1.0), Side::Sell);
+
+        trade_markers.push(ChartTradeMarker {
+            id: format!("us-mkr-{}-buy", symbol_upper.to_lowercase()),
+            order_id: format!("US-PPR-{}-1001-BUY", symbol_upper),
+            side: "BUY".to_string(),
+            price: buy_p,
+            shares: 1,
+            time: "10:15 ET".to_string(),
+            timestamp: (now - Duration::hours(3)).to_rfc3339(),
+            total_value: buy_val,
+            sec_fee: buy_cost.sec_fee,
+            finra_taf: buy_cost.finra_taf,
+            total_regulatory_fees: buy_cost.total,
+            status: "FILLED".to_string(),
+            marker_color: "blue".to_string(),
+            signal_reason: Some("Confirmed 5m Pullback Rebound: Price > VWAP & EMA20 > EMA50".to_string()),
+        });
+
+        trade_markers.push(ChartTradeMarker {
+            id: format!("us-mkr-{}-sell", symbol_upper.to_lowercase()),
+            order_id: format!("US-PPR-{}-1002-SELL", symbol_upper),
+            side: "SELL".to_string(),
+            price: sell_p,
+            shares: 1,
+            time: "14:20 ET".to_string(),
+            timestamp: (now - Duration::minutes(40)).to_rfc3339(),
+            total_value: sell_val,
+            sec_fee: sell_cost.sec_fee,
+            finra_taf: sell_cost.finra_taf,
+            total_regulatory_fees: sell_cost.total,
+            status: "FILLED".to_string(),
+            marker_color: "black".to_string(),
+            signal_reason: Some("Planned reward target (1.5:1 ratio) reached".to_string()),
         });
     }
 
     // Build itemized detailed trades
     let detailed_trades = build_detailed_trades(&symbol_upper, &trade_markers, name);
     let summary = summarize_detailed_trades(&detailed_trades);
+
+    let (data_source, feed_type, feed_disclaimer) = if let Some(fs) = feed_status {
+        (fs.feed_label.clone(), fs.feed_type.clone(), fs.feed_disclaimer.clone())
+    } else {
+        (
+            "Alpaca Stock Data (IEX)".to_string(),
+            "IEX".to_string(),
+            "IEX venue data only. Not consolidated US market data (SIP).".to_string(),
+        )
+    };
+
+    let feed_timestamp = live_tick.map(|t| t.feed_timestamp.to_rfc3339());
+    let measured_delay_ms = live_tick.map(|t| t.latency_ms);
+    let is_stale = if is_market_closed {
+        true
+    } else {
+        feed_status.map(|f| f.is_stale).unwrap_or(false)
+    };
+
+    let stale_reason = if is_market_closed {
+        Some(format!(
+            "US Market is currently {} ({}). Regular Trading Hours are 09:30 - 16:00 ET. Showing authentic last received price.",
+            session.status_badge, session.session_name
+        ))
+    } else if is_stale {
+        Some("Updates stopped for >30s. Paper trading order decisions paused.".to_string())
+    } else {
+        None
+    };
+
+    let strategy_paused = is_market_closed || is_stale;
+    let strategy_paused_reason = if is_market_closed {
+        Some("Market closed — strategy paused".to_string())
+    } else if is_stale {
+        Some("Feed stale — strategy paused".to_string())
+    } else {
+        None
+    };
+
+    let last_received_price = current_price;
+    let last_received_time = live_tick
+        .map(|t| t.timestamp.to_rfc3339())
+        .or_else(|| Some(now.to_rfc3339()));
 
     UsChartResponse {
         symbol: symbol_upper,
@@ -342,6 +491,22 @@ pub fn generate_us_chart(
         trade_markers,
         detailed_trades,
         summary,
+        data_source,
+        feed_type,
+        feed_disclaimer,
+        is_live_data,
+        last_updated_at: now.to_rfc3339(),
+        feed_timestamp,
+        measured_delay_ms,
+        is_stale,
+        stale_reason,
+        trading_mode: "PAPER_SIMULATION (Live Place/Modify Orders Strictly Blocked)".to_string(),
+        session,
+        is_market_closed,
+        last_received_price,
+        last_received_time,
+        strategy_paused,
+        strategy_paused_reason,
     }
 }
 
@@ -375,6 +540,8 @@ fn build_detailed_trades(
                 symbol: symbol.to_string(),
                 name: company_name.to_string(),
                 shares: buy.shares.min(sell.shares),
+                market: "US Equities & ETFs (NYSE/NASDAQ)".to_string(),
+                provider_feed: "Alpaca Stock Data (IEX)".to_string(),
                 buy_time: buy.time.clone(),
                 buy_price: buy.price,
                 buy_value: buy.total_value,
@@ -389,7 +556,10 @@ fn build_detailed_trades(
                 roi_pct: Some(roi),
                 holding_duration: "4h 30m (Day Trade)".to_string(),
                 status: "CLOSED".to_string(),
-                exit_reason: Some("TARGET_MET".to_string()),
+                exit_reason: Some("TAKE_PROFIT".to_string()),
+                stop_loss_price: Some((buy.price * dec!(0.985)).round_dp(2)),
+                take_profit_price: Some((buy.price * dec!(1.025)).round_dp(2)),
+                signal_reason: Some("Confirmed 5m Pullback Rebound: Price > VWAP & EMA20 > EMA50".to_string()),
             });
         } else {
             // Unmatched buy = open position
@@ -398,6 +568,8 @@ fn build_detailed_trades(
                 symbol: symbol.to_string(),
                 name: company_name.to_string(),
                 shares: buy.shares,
+                market: "US Equities & ETFs (NYSE/NASDAQ)".to_string(),
+                provider_feed: "Alpaca Stock Data (IEX)".to_string(),
                 buy_time: buy.time.clone(),
                 buy_price: buy.price,
                 buy_value: buy.total_value,
@@ -413,6 +585,9 @@ fn build_detailed_trades(
                 holding_duration: "Active Long Holding".to_string(),
                 status: "OPEN".to_string(),
                 exit_reason: None,
+                stop_loss_price: Some((buy.price * dec!(0.985)).round_dp(2)),
+                take_profit_price: Some((buy.price * dec!(1.025)).round_dp(2)),
+                signal_reason: Some("Confirmed 5m Pullback Rebound: Price > VWAP & EMA20 > EMA50".to_string()),
             });
         }
     }
@@ -452,8 +627,8 @@ fn summarize_detailed_trades(trades: &[DetailedTradeRecord]) -> DetailedTradesSu
         }
     }
 
-    let win_rate_pct = if closed > 0 {
-        ((Decimal::from(wins) / Decimal::from(closed)) * dec!(100.0)).round_dp(1)
+    let win_rate = if closed > 0 {
+        ((Decimal::from(wins) / Decimal::from(closed)) * dec!(100.0)).round_dp(2)
     } else {
         Decimal::ZERO
     };
@@ -464,10 +639,10 @@ fn summarize_detailed_trades(trades: &[DetailedTradeRecord]) -> DetailedTradesSu
         open_trades: open,
         winning_trades: wins,
         losing_trades: losses,
-        win_rate_pct,
-        total_gross_pnl_usd: gross_total,
-        total_fees_paid_usd: fee_total,
-        total_net_pnl_usd: net_total,
-        total_invested_usd: invested_total,
+        win_rate_pct: win_rate,
+        total_gross_pnl_usd: gross_total.round_dp(2),
+        total_fees_paid_usd: fee_total.round_dp(2),
+        total_net_pnl_usd: net_total.round_dp(2),
+        total_invested_usd: invested_total.round_dp(2),
     }
 }

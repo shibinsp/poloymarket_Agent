@@ -246,9 +246,9 @@ export const dataStore = {
   },
 
   /** Manual refresh: everything subscribed, or one dataset. */
-  refresh(key?: DatasetKey): void {
+  async refresh(key?: DatasetKey): Promise<void> {
     const keys = key ? [key] : activeKeys();
-    for (const k of keys) void fetchOne(k, true);
+    await Promise.all(keys.map((k) => fetchOne(k, true)));
     // Reset the chain so the next automatic tick is a full interval away.
     schedule();
   },

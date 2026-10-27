@@ -11,6 +11,7 @@ pub mod json_decimal;
 pub mod market;
 pub mod monitoring;
 pub mod risk;
+pub mod strategy;
 pub mod us;
 pub mod valuation;
 pub mod venue;

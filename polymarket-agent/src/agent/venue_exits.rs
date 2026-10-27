@@ -454,6 +454,27 @@ impl VenueExits<'_> {
                 reason = reason.as_str(),
                 "Position closed"
             );
+
+            if venue.id().as_str().contains("upstox") || trade.venue_id.contains("upstox") {
+                let sbx_order = crate::db::store::IndiaSandboxOrderRecord {
+                    id: format!("ord-{}", Uuid::new_v4().simple()),
+                    client_order_id: client_order_id.clone(),
+                    venue_order_id: Some(ack.venue_order_id.clone()),
+                    symbol: trade.symbol.clone(),
+                    side: "SELL".to_string(),
+                    order_type: "LIMIT".to_string(),
+                    quantity: request.qty.to_string().parse::<i64>().unwrap_or(1),
+                    price: limit_price.to_string(),
+                    trigger_price: None,
+                    status: state.to_string(),
+                    fill_quantity: ack.filled_qty.to_string().parse::<i64>().unwrap_or(1),
+                    average_fill_price: Some(exit_price.to_string()),
+                    rejection_reason: None,
+                    created_at: Utc::now().to_rfc3339(),
+                    updated_at: Utc::now().to_rfc3339(),
+                };
+                let _ = self.store.save_india_sandbox_order(&sbx_order).await;
+            }
         }
 
         Ok(())

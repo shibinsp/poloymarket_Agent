@@ -45,9 +45,14 @@ export function MarketSessionRibbon() {
     }
     load();
     const interval = setInterval(load, 15000);
+    const onCapsUpdated = () => {
+      load();
+    };
+    window.addEventListener("caps-updated", onCapsUpdated);
     return () => {
       active = false;
       clearInterval(interval);
+      window.removeEventListener("caps-updated", onCapsUpdated);
     };
   }, []);
 

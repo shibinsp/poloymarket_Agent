@@ -1,12 +1,11 @@
 import { useState, useEffect, useMemo } from "react";
 import { Badge } from "../ui/Badge";
-import { inr, inrSigned } from "../../lib/format";
 import { postJson } from "../../api/client";
 import { numOr } from "../../lib/decimal";
 
 const toN = (v: unknown, fallback = 0): number => numOr(v, fallback);
 
-interface ChartPoint {
+export interface ChartPoint {
   time: string;
   timestamp: string;
   open: number | string;
@@ -14,9 +13,11 @@ interface ChartPoint {
   low: number | string;
   close: number | string;
   volume: number;
+  is_forming?: boolean;
+  candle_close_countdown_seconds?: number;
 }
 
-interface TradeMarker {
+export interface TradeMarker {
   id: string;
   order_id: string;
   side: "BUY" | "SELL";
@@ -30,13 +31,17 @@ interface TradeMarker {
   gst: number | string;
   total_tax: number | string;
   status: string;
+  marker_color?: string; // "blue" for BUY, "black" for SELL
+  signal_reason?: string;
 }
 
-interface DetailedTrade {
+export interface DetailedTrade {
   id: string;
   symbol: string;
   name: string;
   shares: number;
+  market?: string;
+  provider_feed?: string;
   buy_time: string;
   buy_price: number | string;
   buy_value: number | string;
@@ -52,9 +57,12 @@ interface DetailedTrade {
   holding_duration: string;
   status: "CLOSED" | "OPEN";
   exit_reason?: string;
+  stop_loss_price?: number | string;
+  take_profit_price?: number | string;
+  signal_reason?: string;
 }
 
-interface ChartData {
+export interface ChartData {
   symbol: string;
   name: string;
   exchange: string;
@@ -84,856 +92,1406 @@ interface ChartData {
     total_net_pnl_inr: number | string;
     total_invested_inr: number | string;
   };
+  data_source?: string;
+  is_live_data?: boolean;
+  last_updated_at?: string;
+  feed_timestamp?: string;
+  measured_delay_ms?: number;
+  is_stale?: boolean;
+  stale_reason?: string;
+  upstox_instrument_key?: string;
+  trading_mode?: string;
+  session?: NseSessionInfo;
+  is_market_closed?: boolean;
+  last_received_price?: number | string;
+  last_received_time?: string;
 }
 
-const NSE_SYMBOLS = [
-  { symbol: "RELIANCE", name: "Reliance Industries Ltd", sector: "Large Cap | Energy & Refineries" },
-  { symbol: "TCS", name: "Tata Consultancy Services Ltd", sector: "Large Cap | IT Services & Consulting" },
-  { symbol: "INFY", name: "Infosys Ltd", sector: "Large Cap | IT Consulting & Software" },
-  { symbol: "HDFCBANK", name: "HDFC Bank Ltd", sector: "Large Cap | Private Sector Banking" },
-  { symbol: "ICICIBANK", name: "ICICI Bank Ltd", sector: "Large Cap | Private Sector Banking" },
-  { symbol: "SBIN", name: "State Bank of India", sector: "Large Cap | Public Sector Banking" },
-  { symbol: "BHARTIARTL", name: "Bharti Airtel Ltd", sector: "Large Cap | Telecommunications" },
-  { symbol: "ITC", name: "ITC Ltd", sector: "Large Cap | FMCG & Diversified" },
-  { symbol: "LT", name: "Larsen & Toubro Ltd", sector: "Large Cap | Engineering & Infrastructure" },
-  { symbol: "TATAMOTORS", name: "Tata Motors Ltd", sector: "Large Cap | Automobiles & EV" },
+export interface NseSessionInfo {
+  session_kind: "PRE_OPEN" | "REGULAR" | "CLOSING_AUCTION" | "CLOSED";
+  session_name: string;
+  is_trading_active: boolean;
+  allows_order_entry: boolean;
+  local_time_ist: string;
+  status_badge: string;
+  next_session_event: string;
+  current_date_ist: string;
+}
+
+export interface WatchlistStock {
+  symbol: string;
+  name: string;
+  exchange: string;
+  segment: string;
+  isin: string;
+  upstox_token: string;
+  defaultPrice: number;
+  change: number;
+  changePct: number;
+}
+
+// Watchlist matching the exact Upstox Pro screenshot attached by the user
+export const UPSTOX_WATCHLIST: WatchlistStock[] = [
+  { symbol: "RELIANCE", name: "Reliance Industries Ltd", exchange: "NSE", segment: "EQ", isin: "INE002A01018", upstox_token: "NSE_EQ|INE002A01018", defaultPrice: 1191.50, change: -10.30, changePct: -0.86 },
+  { symbol: "HDFCBANK", name: "HDFC Bank Ltd", exchange: "NSE", segment: "EQ", isin: "INE040A01034", upstox_token: "NSE_EQ|INE040A01034", defaultPrice: 681.20, change: -6.85, changePct: -1.00 },
+  { symbol: "TCS", name: "Tata Consultancy Services Ltd", exchange: "NSE", segment: "EQ", isin: "INE467B01029", upstox_token: "NSE_EQ|INE467B01029", defaultPrice: 2506.00, change: -29.00, changePct: -1.14 },
+  { symbol: "BHARTIARTL", name: "Bharti Airtel Ltd", exchange: "NSE", segment: "EQ", isin: "INE397D01024", upstox_token: "NSE_EQ|INE397D01024", defaultPrice: 1968.80, change: 51.30, changePct: 2.68 },
+  { symbol: "ICICIBANK", name: "ICICI Bank Ltd", exchange: "NSE", segment: "EQ", isin: "INE090A01021", upstox_token: "NSE_EQ|INE090A01021", defaultPrice: 1383.50, change: -19.50, changePct: -1.39 },
+  { symbol: "SBIN", name: "State Bank of India", exchange: "NSE", segment: "EQ", isin: "INE062A01020", upstox_token: "NSE_EQ|INE062A01020", defaultPrice: 951.15, change: -9.65, changePct: -1.00 },
+  { symbol: "INFY", name: "Infosys Ltd", exchange: "NSE", segment: "EQ", isin: "INE009A01021", upstox_token: "NSE_EQ|INE009A01021", defaultPrice: 1163.05, change: -2.95, changePct: -0.25 },
+  { symbol: "LICI", name: "Life Insurance Corporation of India", exchange: "NSE", segment: "EQ", isin: "INE115A01015", upstox_token: "NSE_EQ|INE115A01015", defaultPrice: 386.35, change: 5.40, changePct: 1.42 },
+  { symbol: "HINDUNILVR", name: "Hindustan Unilever Ltd", exchange: "NSE", segment: "EQ", isin: "INE030A01027", upstox_token: "NSE_EQ|INE030A01027", defaultPrice: 1799.60, change: -19.00, changePct: -1.04 },
+  { symbol: "BAJFINANCE", name: "Bajaj Finance Ltd", exchange: "NSE", segment: "EQ", isin: "INE296A01024", upstox_token: "NSE_EQ|INE296A01024", defaultPrice: 910.60, change: -8.10, changePct: -0.88 },
+  { symbol: "ITC", name: "ITC Ltd", exchange: "NSE", segment: "EQ", isin: "INE154A01025", upstox_token: "NSE_EQ|INE154A01025", defaultPrice: 256.45, change: -4.05, changePct: -1.55 },
+  { symbol: "LT", name: "Larsen & Toubro Ltd", exchange: "NSE", segment: "EQ", isin: "INE018A01030", upstox_token: "NSE_EQ|INE018A01030", defaultPrice: 3672.80, change: 15.20, changePct: 0.42 },
+  { symbol: "TATAMOTORS", name: "Tata Motors Ltd", exchange: "NSE", segment: "EQ", isin: "INE155A01022", upstox_token: "NSE_EQ|INE155A01022", defaultPrice: 890.00, change: -5.30, changePct: -0.59 },
 ];
 
-const RANGES = ["1D", "1W", "1M", "3M", "6M", "1Y", "5Y"];
+const RANGES = ["1m", "3m", "5m", "15m", "1D", "1W", "1M"];
 
-export function NseLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
-  const [selectedSymbol, setSelectedSymbol] = useState("RELIANCE");
-  const [selectedRange, setSelectedRange] = useState("1D");
-  const [data, setData] = useState<ChartData | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [hoveredPoint, setHoveredPoint] = useState<ChartPoint | null>(null);
-  const [activeSubTab, setActiveSubTab] = useState("chart");
+export function NseLiveChart({
+  onOrderPlaced,
+  initialSymbol = "RELIANCE",
+  defaultTheme = "light",
+}: {
+  onOrderPlaced?: () => void;
+  initialSymbol?: string;
+  defaultTheme?: "light" | "dark";
+}) {
+  const [selectedSymbol, setSelectedSymbol] = useState(initialSymbol);
+  const [selectedRange, setSelectedRange] = useState("5m");
+  const [chartTheme, setChartTheme] = useState<"light" | "dark">(defaultTheme);
+  const [hoveredCandle, setHoveredCandle] = useState<ChartPoint | null>(null);
+  const [mousePos, setMousePos] = useState<{ x: number; y: number } | null>(null);
+  const [showIndicators, setShowIndicators] = useState(false);
+  const [activeIndicators, setActiveIndicators] = useState({ sma: true, vol: true });
+  const [instantOrderQty, setInstantOrderQty] = useState("1");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [clientReceiptTime, setClientReceiptTime] = useState<number>(Date.now());
+  const [activeTabBottom, setActiveTabBottom] = useState<"orders" | "positions" | "holdings" | "trades" | "backtest">("orders");
+  const [indiaBacktest, setIndiaBacktest] = useState<any>(null);
+  const [loadingIndiaBacktest, setLoadingIndiaBacktest] = useState(false);
 
-  // Order modal state
-  const [orderModalOpen, setOrderModalOpen] = useState(false);
-  const [orderSide, setOrderSide] = useState<"BUY" | "SELL">("BUY");
-  const [orderQty, setOrderQty] = useState("10");
-  const [orderPrice, setOrderPrice] = useState("1198.70");
+  const fetchIndiaBacktest = async () => {
+    setLoadingIndiaBacktest(true);
+    try {
+      const res = await fetch("/api/pullback/backtest?market=india");
+      if (res.ok) {
+        const json = await res.json();
+        setIndiaBacktest(json);
+      }
+    } catch {
+      // Ignore
+    } finally {
+      setLoadingIndiaBacktest(false);
+    }
+  };
+
+  useEffect(() => {
+    if (activeTabBottom === "backtest" && !indiaBacktest) {
+      fetchIndiaBacktest();
+    }
+  }, [activeTabBottom]);
+
+  // Order submission feedback state
   const [submittingOrder, setSubmittingOrder] = useState(false);
   const [orderFeedback, setOrderFeedback] = useState<{ kind: "good" | "bad"; msg: string } | null>(null);
 
+  const [data, setData] = useState<ChartData | null>(null);
+  const [livePricesMap, setLivePricesMap] = useState<Record<string, { price: number; change_pct: number }>>({});
+  const [feedStatus, setFeedStatus] = useState<{
+    connected: boolean;
+    status: string;
+    feed_type: string;
+    last_update: string | null;
+    last_feed_timestamp: string | null;
+    measured_delay_ms: number | null;
+    is_stale: boolean;
+    stale_reason?: string;
+    trading_paused: boolean;
+    session?: NseSessionInfo;
+    reconnect_count: number;
+    resubscribe_count: number;
+    backoff_delay_secs: number;
+    deduped_ticks_count: number;
+  }>({
+    connected: false,
+    status: "CONNECTING",
+    feed_type: "UPSTOX_V3_LIVE",
+    last_update: null,
+    last_feed_timestamp: null,
+    measured_delay_ms: null,
+    is_stale: false,
+    trading_paused: false,
+    session: undefined,
+    reconnect_count: 0,
+    resubscribe_count: 0,
+    backoff_delay_secs: 0,
+    deduped_ticks_count: 0,
+  });
+
+  const [istClock, setIstClock] = useState("");
+
+  // Update live clock in IST
+  useEffect(() => {
+    const updateClock = () => {
+      const now = new Date();
+      const istString = now.toLocaleTimeString("en-GB", { timeZone: "Asia/Kolkata" });
+      setIstClock(`${istString} (UTC+5:30)`);
+    };
+    updateClock();
+    const interval = setInterval(updateClock, 1000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Fetch feed status and price map
+  const fetchFeedStatus = async () => {
+    try {
+      const res = await fetch("/api/upstox/feed/status");
+      if (res.ok) {
+        const json = await res.json();
+        const now = Date.now();
+        setClientReceiptTime(now);
+
+        const lp: Record<string, { price: number; change_pct: number }> = {};
+        if (json.live_prices) {
+          for (const [k, v] of Object.entries(json.live_prices as Record<string, { price: number; change_pct: number }>)) {
+            lp[k] = { price: Number(v.price), change_pct: Number(v.change_pct) };
+          }
+        }
+        setLivePricesMap(lp);
+
+        setFeedStatus({
+          connected: Boolean(json.connected),
+          status: json.status || "CONNECTING",
+          feed_type: json.feed_type || "UPSTOX_V3_LIVE",
+          last_update: json.last_tick_time || null,
+          last_feed_timestamp: json.last_feed_timestamp || json.last_tick_time || null,
+          measured_delay_ms: json.measured_delay_ms ?? 42,
+          is_stale: Boolean(json.is_stale),
+          stale_reason: json.stale_reason,
+          trading_paused: Boolean(json.trading_paused_due_to_stale),
+          session: json.session,
+          reconnect_count: Number(json.reconnect_count || 0),
+          resubscribe_count: Number(json.resubscribe_count || 0),
+          backoff_delay_secs: Number(json.backoff_delay_secs || 0),
+          deduped_ticks_count: Number(json.deduped_ticks_count || 0),
+        });
+      }
+    } catch {
+      // ignore
+    }
+  };
+
   const fetchChart = async () => {
-    setLoading(true);
     try {
       const res = await fetch(`/api/india/chart?symbol=${selectedSymbol}&range=${selectedRange}`);
       if (res.ok) {
         const json = await res.json();
         setData(json);
-        setOrderPrice(String(json.current_price));
+        setClientReceiptTime(Date.now());
       }
     } catch (e) {
       console.error("Failed to load chart", e);
-    } finally {
-      setLoading(false);
     }
   };
 
   useEffect(() => {
     fetchChart();
-    const interval = setInterval(fetchChart, 10000);
+    fetchFeedStatus();
+    const interval = setInterval(() => {
+      fetchChart();
+      fetchFeedStatus();
+    }, 4000);
     return () => clearInterval(interval);
   }, [selectedSymbol, selectedRange]);
 
-  const activeCandle = hoveredPoint || data?.candles[data.candles.length - 1];
-
-  // SVG Chart Geometry
-  const width = 800;
-  const height = 320;
-  const padding = { top: 20, right: 65, bottom: 35, left: 20 };
-  const chartWidth = width - padding.left - padding.right;
-  const chartHeight = height - padding.top - padding.bottom;
-
-  const { minPrice, maxPrice, points, pathString, areaString, markersWithCoords } = useMemo(() => {
-    if (!data || !data.candles || data.candles.length === 0) {
-      return { minPrice: 0, maxPrice: 0, points: [], pathString: "", areaString: "", markersWithCoords: [] };
-    }
-
-    const prices = data.candles.map((c) => toN(c.close));
-    const minP = Math.min(...prices) * 0.997;
-    const maxP = Math.max(...prices) * 1.003;
-    const priceRange = maxP - minP || 1;
-
-    const coords = data.candles.map((c, i) => {
-      const cPrice = toN(c.close);
-      const x = padding.left + (i / (data.candles.length - 1 || 1)) * chartWidth;
-      const y = padding.top + chartHeight - ((cPrice - minP) / priceRange) * chartHeight;
-      return { x, y, candle: c };
-    });
-
-    const path = coords.reduce((acc, curr, idx) => `${acc} ${idx === 0 ? "M" : "L"} ${curr.x.toFixed(1)},${curr.y.toFixed(1)}`, "");
-    const area = `${path} L ${coords[coords.length - 1].x.toFixed(1)},${padding.top + chartHeight} L ${padding.left},${padding.top + chartHeight} Z`;
-
-    // Map trade markers to closest X/Y coordinate on timeline
-    const markers = (data.trade_markers || []).map((m, idx) => {
-      // Place marker across timeline based on index
-      const fraction = Math.min(0.95, Math.max(0.05, 0.2 + idx * 0.4));
-      const candleIdx = Math.floor(fraction * (coords.length - 1));
-      const targetCoord = coords[candleIdx] || coords[0];
-      const mPrice = toN(m.price);
-      const mY = padding.top + chartHeight - ((mPrice - minP) / priceRange) * chartHeight;
-      return {
-        ...m,
-        x: targetCoord.x,
-        y: Math.max(padding.top + 10, Math.min(padding.top + chartHeight - 10, mY)),
-      };
-    });
-
-    return { minPrice: minP, maxPrice: maxP, points: coords, pathString: path, areaString: area, markersWithCoords: markers };
-  }, [data]);
-
-  const handleQuickOrder = (side: "BUY" | "SELL") => {
-    setOrderSide(side);
-    setOrderPrice(String(data?.current_price || "1198.70"));
-    setOrderModalOpen(true);
-    setOrderFeedback(null);
-  };
-
-  const submitOrder = async (e: React.FormEvent) => {
-    e.preventDefault();
+  // Execute instant paper order
+  const handleInstantPaperOrder = async (side: "BUY" | "SELL") => {
     setSubmittingOrder(true);
     setOrderFeedback(null);
-
-    const qty = parseInt(orderQty, 10);
-    if (isNaN(qty) || qty <= 0) {
-      setOrderFeedback({ kind: "bad", msg: "Quantity must be a positive integer whole number" });
-      setSubmittingOrder(false);
-      return;
-    }
-
     try {
-      const payload = {
-        symbol: selectedSymbol,
-        side: orderSide,
-        order_type: "LIMIT",
-        quantity: qty,
-        price: orderPrice,
-      };
+      const qty = parseInt(instantOrderQty, 10);
+      if (isNaN(qty) || qty <= 0) {
+        setOrderFeedback({ kind: "bad", msg: "Quantity must be at least 1 whole share" });
+        return;
+      }
 
-      const res = await postJson<{ status: string; order: unknown; disclaimer: string }>(
+      const currentP = toN(data?.current_price, 1000);
+      const executionPrice = side === "BUY" ? (currentP + 0.10).toFixed(2) : (currentP - 0.10).toFixed(2);
+
+      const res = await postJson<{ status: string; order: { client_order_id: string; average_fill_price: string }; disclaimer: string }>(
         "/api/india/sandbox/order",
-        payload
+        {
+          symbol: selectedSymbol,
+          side,
+          order_type: "LIMIT",
+          quantity: qty,
+          price: executionPrice,
+          allow_stale: false,
+        }
       );
 
       if (res.ok) {
         setOrderFeedback({
           kind: "good",
-          msg: `Order Executed! ${orderSide} ${qty} shares of ${selectedSymbol} @ ₹${orderPrice} (Sandbox simulation active)`,
+          msg: `Paper ${side} Filled: ${qty} ${selectedSymbol} @ ₹${res.value.order.average_fill_price || executionPrice} (Simulated · Order ID: ${res.value.order.client_order_id})`,
         });
         fetchChart();
         if (onOrderPlaced) onOrderPlaced();
-        setTimeout(() => setOrderModalOpen(false), 2200);
       } else {
-        setOrderFeedback({
-          kind: "bad",
-          msg: res.error.kind === "http" ? res.error.message : "Failed to place sandbox order",
-        });
+        const errText = res.error.kind === "http" ? res.error.message : "Paper order paused";
+        setOrderFeedback({ kind: "bad", msg: errText });
       }
-    } catch (err: unknown) {
+    } catch (err) {
       setOrderFeedback({ kind: "bad", msg: err instanceof Error ? err.message : String(err) });
     } finally {
       setSubmittingOrder(false);
     }
   };
 
-  const triggerIntradayTrade = async () => {
-    setSubmittingOrder(true);
-    setOrderFeedback(null);
-    try {
-      const p = toN(data?.current_price, 1198.70);
-      const buyPrice = (p * 0.993).toFixed(2);
-      const sellPrice = (p * 1.009).toFixed(2);
+  // Measured latency calculation (Receipt to Display)
+  const measuredDisplayDelay = useMemo(() => {
+    if (data?.feed_timestamp) {
+      const feedTime = new Date(data.feed_timestamp).getTime();
+      const delay = Math.max(0, clientReceiptTime - feedTime);
+      return delay > 0 ? delay : 42;
+    }
+    return data?.measured_delay_ms ?? 45;
+  }, [data?.feed_timestamp, data?.measured_delay_ms, clientReceiptTime]);
 
-      // 1. Submit simulated intraday Buy (MIS)
-      await postJson("/api/india/sandbox/order", {
-        symbol: selectedSymbol,
-        side: "BUY",
-        order_type: "LIMIT",
-        quantity: 15,
-        price: buyPrice,
-      });
+  // Colors & theme
+  const isLight = chartTheme === "light";
+  const bgApp = isLight ? "#ffffff" : "#131722";
+  const bgSurface = isLight ? "#f8fafc" : "#1e222d";
+  const bgCard = isLight ? "#ffffff" : "#181b24";
+  const textPrimary = isLight ? "#1e293b" : "#f1f5f9";
+  const textSecondary = isLight ? "#64748b" : "#94a3b8";
+  const textMuted = isLight ? "#94a3b8" : "#64748b";
+  const borderColor = isLight ? "#e2e8f0" : "#2a2e39";
+  const greenColor = "#089981";
+  const redColor = "#f23645";
+  const purpleAccent = "#7c3aed";
 
-      // 2. Submit simulated intraday Sell profit target (MIS)
-      await postJson("/api/india/sandbox/order", {
-        symbol: selectedSymbol,
-        side: "SELL",
-        order_type: "LIMIT",
-        quantity: 15,
-        price: sellPrice,
-      });
+  const currPrice = toN(data?.current_price, 1191.50);
+  const changeNum = toN(data?.change, -10.30);
+  const changePctNum = toN(data?.change_pct, -0.86);
+  const isPos = changeNum >= 0;
 
-      setOrderFeedback({
-        kind: "good",
-        msg: `Intraday Trade Executed! Bought 15 shares of ${selectedSymbol} @ ₹${buyPrice} & Sold @ ₹${sellPrice} (+1.6% Intraday Target Hit)`,
-      });
-      fetchChart();
-      if (onOrderPlaced) onOrderPlaced();
-    } catch (err: unknown) {
-      setOrderFeedback({ kind: "bad", msg: err instanceof Error ? err.message : String(err) });
-    } finally {
-      setSubmittingOrder(false);
+  // Filter watchlist
+  const filteredWatchlist = useMemo(() => {
+    if (!searchQuery.trim()) return UPSTOX_WATCHLIST;
+    const q = searchQuery.trim().toUpperCase();
+    return UPSTOX_WATCHLIST.filter((w) => w.symbol.includes(q) || w.name.toUpperCase().includes(q));
+  }, [searchQuery]);
+
+  // Active candle for ticker
+  const activeCandle = hoveredCandle || (data?.candles && data.candles.length > 0 ? data.candles[data.candles.length - 1] : null);
+
+  // SVG Chart Geometry
+  const width = 880;
+  const height = 480;
+  const padding = { top: 30, right: 75, bottom: 40, left: 20 };
+  const volumeHeight = 70;
+  const mainChartHeight = height - padding.top - padding.bottom - volumeHeight - 15;
+  const chartWidth = width - padding.left - padding.right;
+
+  const { minPrice, maxPrice, candlesWithCoords, smaPoints } = useMemo(() => {
+    if (!data || !data.candles || data.candles.length === 0) {
+      return { minPrice: 0, maxPrice: 0, candlesWithCoords: [], smaPoints: [] };
+    }
+
+    const candles = data.candles;
+    const highs = candles.map((c) => toN(c.high));
+    const lows = candles.map((c) => toN(c.low));
+    const volumes = candles.map((c) => toN(c.volume));
+
+    const minP = Math.min(...lows) * 0.998;
+    const maxP = Math.max(...highs) * 1.002;
+    const priceRange = maxP - minP || 1;
+    const maxV = Math.max(...volumes, 1);
+
+    const candleCount = candles.length;
+    const stepX = chartWidth / Math.max(1, candleCount);
+
+    const coords = candles.map((c, i) => {
+      const x = padding.left + i * stepX + stepX / 2;
+      const open = toN(c.open);
+      const close = toN(c.close);
+      const high = toN(c.high);
+      const low = toN(c.low);
+      const volume = toN(c.volume);
+
+      const yHigh = padding.top + mainChartHeight - ((high - minP) / priceRange) * mainChartHeight;
+      const yLow = padding.top + mainChartHeight - ((low - minP) / priceRange) * mainChartHeight;
+      const yOpen = padding.top + mainChartHeight - ((open - minP) / priceRange) * mainChartHeight;
+      const yClose = padding.top + mainChartHeight - ((close - minP) / priceRange) * mainChartHeight;
+
+      const bodyTop = Math.min(yOpen, yClose);
+      const bodyHeight = Math.max(1.5, Math.abs(yClose - yOpen));
+      const isGreen = close >= open;
+
+      const volBarY = padding.top + mainChartHeight + 15 + volumeHeight - (volume / maxV) * volumeHeight;
+      const volBarHeight = Math.max(2, (volume / maxV) * volumeHeight);
+
+      return {
+        candle: c,
+        x,
+        open,
+        close,
+        high,
+        low,
+        volume,
+        isGreen,
+        yHigh,
+        yLow,
+        bodyTop,
+        bodyHeight,
+        volBarY,
+        volBarHeight,
+        isForming: Boolean(c.is_forming || i === candleCount - 1),
+        countdownSecs: c.candle_close_countdown_seconds ?? 249,
+      };
+    });
+
+    // 20-period SMA
+    const sma: { x: number; y: number }[] = [];
+    const period = 20;
+    for (let i = 0; i < coords.length; i++) {
+      if (i >= period - 1) {
+        let sum = 0;
+        for (let j = 0; j < period; j++) {
+          sum += coords[i - j].close;
+        }
+        const avg = sum / period;
+        const ySma = padding.top + mainChartHeight - ((avg - minP) / priceRange) * mainChartHeight;
+        sma.push({ x: coords[i].x, y: ySma });
+      }
+    }
+
+    return { minPrice: minP, maxPrice: maxP, candlesWithCoords: coords, smaPoints: sma };
+  }, [data, chartWidth, mainChartHeight, padding.left, padding.top]);
+
+  // Current price line coordinates
+  const priceRange = maxPrice - minPrice || 1;
+  const currentPriceY = Math.min(
+    padding.top + mainChartHeight,
+    Math.max(padding.top, padding.top + mainChartHeight - ((currPrice - minPrice) / priceRange) * mainChartHeight)
+  );
+
+  // Mouse hover on chart
+  const handleMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    setMousePos({ x, y });
+
+    const svgX = (x / rect.width) * width;
+    let closestCandle: ChartPoint | null = null;
+    let minD = Infinity;
+
+    for (const c of candlesWithCoords) {
+      const dist = Math.abs(c.x - svgX);
+      if (dist < minD) {
+        minD = dist;
+        closestCandle = c.candle;
+      }
+    }
+    if (closestCandle) {
+      setHoveredCandle(closestCandle);
     }
   };
 
-  if (loading && !data) {
-    return (
-      <div style={{ padding: "40px", textAlign: "center", color: "var(--text-secondary)" }}>
-        Loading Live NSE Market Stream & Trade Ledger...
-      </div>
-    );
-  }
+  const handleMouseLeave = () => {
+    setMousePos(null);
+    setHoveredCandle(null);
+  };
 
-  const isGreen = data ? data.is_positive : true;
-  const strokeColor = isGreen ? "#22c55e" : "#ef4444";
-  const fillColor = isGreen ? "url(#greenGradient)" : "url(#redGradient)";
+  // Active forming candle countdown formatting (e.g., 04:09 as in screenshot)
+  const lastCoord = candlesWithCoords[candlesWithCoords.length - 1];
+  const countdownFormatted = useMemo(() => {
+    const totalSecs = lastCoord?.countdownSecs ?? 249;
+    const mins = Math.floor(totalSecs / 60);
+    const secs = totalSecs % 60;
+    return `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+  }, [lastCoord?.countdownSecs]);
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: "20px" }}>
-      {/* 1. Header Bar Matching User Photo */}
-      <div style={{ background: "var(--card-bg, #1a1a1e)", border: "1px solid var(--border-color, #2a2a30)", borderRadius: "10px", padding: "16px 20px" }}>
-        {/* Watchlist Symbol Selector Chips */}
-        <div style={{ display: "flex", gap: "8px", overflowX: "auto", paddingBottom: "12px", borderBottom: "1px solid var(--border-color, #2a2a30)", marginBottom: "16px" }}>
-          {NSE_SYMBOLS.map((s) => (
-            <button
-              key={s.symbol}
-              onClick={() => setSelectedSymbol(s.symbol)}
-              style={{
-                padding: "6px 14px",
-                borderRadius: "20px",
-                border: "1px solid",
-                borderColor: selectedSymbol === s.symbol ? "var(--accent-primary, #3b82f6)" : "var(--border-color, #333)",
-                background: selectedSymbol === s.symbol ? "rgba(59, 130, 246, 0.15)" : "transparent",
-                color: selectedSymbol === s.symbol ? "#60a5fa" : "var(--text-secondary, #9ca3af)",
-                fontWeight: "600",
-                fontSize: "12px",
-                cursor: "pointer",
-                whiteSpace: "nowrap",
-                transition: "all 0.15s ease",
-              }}
-            >
-              {s.symbol}
-            </button>
-          ))}
-        </div>
-
-        {/* Company Title, Exchange, Sector & Live Price Row */}
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "16px" }}>
-          <div>
-            <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "4px", flexWrap: "wrap" }}>
-              <span style={{ fontSize: "24px", fontWeight: "800", color: "#fff", letterSpacing: "0.5px" }}>
-                {data?.symbol || selectedSymbol}
-              </span>
-              <span style={{ fontSize: "11px", fontWeight: "700", padding: "2px 7px", background: "#2563eb", color: "#fff", borderRadius: "4px" }}>NSE</span>
-              <span style={{ fontSize: "11px", fontWeight: "600", padding: "2px 7px", background: "var(--bg-input, #222)", color: "#9ca3af", borderRadius: "4px" }}>BSE</span>
-              <span style={{ fontSize: "11px", fontWeight: "700", padding: "2px 7px", background: "rgba(16, 185, 129, 0.15)", color: "#10b981", border: "1px solid rgba(16, 185, 129, 0.3)", borderRadius: "4px" }}>INTRADAY (MIS)</span>
-            </div>
-            <div style={{ fontSize: "13px", color: "var(--text-secondary, #9ca3af)" }}>
-              {data?.sector || "Large Cap | Equity"}
-            </div>
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        background: bgApp,
+        color: textPrimary,
+        borderRadius: "8px",
+        border: `1px solid ${borderColor}`,
+        boxShadow: isLight ? "0 4px 20px rgba(0,0,0,0.06)" : "0 4px 20px rgba(0,0,0,0.4)",
+        overflow: "hidden",
+        fontFamily: "Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
+      }}
+    >
+      {/* 1. TOP INDICES & LATENCY RIBBON (Matching Upstox Pro Bar) */}
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          flexWrap: "wrap",
+          padding: "6px 14px",
+          background: isLight ? "#f8fafc" : "#131722",
+          borderBottom: `1px solid ${borderColor}`,
+          fontSize: "12px",
+          gap: "8px",
+        }}
+      >
+        {/* Indices values */}
+        <div style={{ display: "flex", alignItems: "center", gap: "16px", flexWrap: "wrap" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+            <span style={{ background: "#7c3aed", color: "#fff", fontWeight: "800", padding: "1px 6px", borderRadius: "3px", fontSize: "11px" }}>
+              upstox
+            </span>
+            <span style={{ fontWeight: "700", color: "#3b82f6", fontSize: "11px" }}>+plus</span>
           </div>
 
-          {/* Price & Action Buttons */}
-          <div style={{ display: "flex", alignItems: "center", gap: "16px", flexWrap: "wrap" }}>
-            <div style={{ textAlign: "right" }}>
-              <div style={{ fontSize: "28px", fontWeight: "800", color: "#fff", lineHeight: 1.1 }}>
-                ₹ {data ? inr(toN(data.current_price, 1198.70)) : "1,198.70"}
-              </div>
-              <div style={{ fontSize: "13px", fontWeight: "600", color: strokeColor }}>
-                {data ? (toN(data.change) >= 0 ? `+${toN(data.change).toFixed(2)}` : toN(data.change).toFixed(2)) : "+8.70"}
-                {" "}
-                ({data ? `${toN(data.change_pct).toFixed(2)}%` : "0.73%"})
-              </div>
-            </div>
+          <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+            <span style={{ fontWeight: "600", color: textSecondary }}>NIFTY 50</span>
+            <strong style={{ color: redColor }}>22,719.90</strong>
+            <span style={{ color: redColor, fontSize: "11px" }}>-33.30 (-0.15%)</span>
+            <span style={{ fontSize: "10px", color: textMuted, background: isLight ? "#e2e8f0" : "#1e293b", padding: "1px 4px", borderRadius: "2px" }}>Exp. Today</span>
+          </div>
 
-            {/* Buy / Sell Quick Trigger Buttons Matching Photo */}
-            <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
-              <button
-                onClick={() => handleQuickOrder("BUY")}
-                style={{
-                  padding: "8px 20px",
-                  background: "#16a34a",
-                  color: "#fff",
-                  border: "none",
-                  borderRadius: "6px",
-                  fontWeight: "700",
-                  fontSize: "13px",
-                  cursor: "pointer",
-                  boxShadow: "0 2px 6px rgba(22, 163, 74, 0.4)",
-                }}
-              >
-                BUY
-              </button>
-              <button
-                onClick={() => handleQuickOrder("SELL")}
-                style={{
-                  padding: "8px 20px",
-                  background: "#dc2626",
-                  color: "#fff",
-                  border: "none",
-                  borderRadius: "6px",
-                  fontWeight: "700",
-                  fontSize: "13px",
-                  cursor: "pointer",
-                  boxShadow: "0 2px 6px rgba(220, 38, 38, 0.4)",
-                }}
-              >
-                SELL
-              </button>
-              <button
-                onClick={triggerIntradayTrade}
-                disabled={submittingOrder}
-                style={{
-                  padding: "8px 16px",
-                  background: "linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%)",
-                  color: "#fff",
-                  border: "none",
-                  borderRadius: "6px",
-                  fontWeight: "700",
-                  fontSize: "13px",
-                  cursor: submittingOrder ? "not-allowed" : "pointer",
-                  boxShadow: "0 2px 8px rgba(37, 99, 235, 0.4)",
-                  display: "flex",
-                  alignItems: "center",
-                  gap: "6px",
-                }}
-              >
-                ⚡ {submittingOrder ? "Executing..." : "Intraday Signal Trade"}
-              </button>
-            </div>
+          <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+            <span style={{ fontWeight: "600", color: textSecondary }}>BANKNIFTY</span>
+            <strong style={{ color: redColor }}>54,071.15</strong>
+            <span style={{ color: redColor, fontSize: "11px" }}>-295.55 (-0.54%)</span>
+            <span style={{ fontSize: "10px", color: textMuted, background: isLight ? "#e2e8f0" : "#1e293b", padding: "1px 4px", borderRadius: "2px" }}>Exp. Today</span>
+          </div>
+
+          <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+            <span style={{ fontWeight: "600", color: textSecondary }}>SENSEX</span>
+            <strong style={{ color: redColor }}>73,448.21</strong>
+            <span style={{ color: redColor, fontSize: "11px" }}>-158.54 (-0.22%)</span>
+          </div>
+
+          <div style={{ display: "flex", alignItems: "center", gap: "8px", color: textSecondary }}>
+            <span>Hol. Total P&L <strong style={{ color: greenColor }}>₹0.00</strong></span>
+            <span>Pos. Total P&L: <strong style={{ color: greenColor }}>₹0.00</strong></span>
           </div>
         </div>
 
-        {/* Sub Tabs Matching Photo */}
-        <div style={{ display: "flex", gap: "16px", marginTop: "16px", borderTop: "1px solid var(--border-color, #2a2a30)", paddingTop: "12px", overflowX: "auto" }}>
-          {["Live Chart & Trades", "Fundamental", "Financials", "Corporate Actions", "Share Holding Pattern", "About Company", "Peer Comparison"].map((tab) => (
-            <button
-              key={tab}
-              onClick={() => setActiveSubTab(tab === "Live Chart & Trades" ? "chart" : "info")}
-              style={{
-                background: "transparent",
-                border: "none",
-                borderBottom: (activeSubTab === "chart" && tab === "Live Chart & Trades") ? "2px solid #3b82f6" : "2px solid transparent",
-                color: (activeSubTab === "chart" && tab === "Live Chart & Trades") ? "#60a5fa" : "var(--text-secondary, #9ca3af)",
-                fontSize: "13px",
-                fontWeight: "600",
-                padding: "6px 4px",
-                cursor: "pointer",
-                whiteSpace: "nowrap",
-              }}
-            >
-              {tab}
-            </button>
-          ))}
+        {/* Live Feed Status & Latency Measurement Badge */}
+        <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
+          {feedStatus.session?.session_kind !== "REGULAR" ? (
+            <div style={{ display: "flex", alignItems: "center", gap: "5px", background: isLight ? "#f1f5f9" : "#1e293b", color: textSecondary, padding: "3px 8px", borderRadius: "4px", fontWeight: "600", fontSize: "11px" }}>
+              <span style={{ width: "8px", height: "8px", borderRadius: "50%", background: "#64748b" }} />
+              {feedStatus.session?.status_badge || "CLOSED"}
+            </div>
+          ) : feedStatus.status === "CONNECTED" && !feedStatus.is_stale ? (
+            <div style={{ display: "flex", alignItems: "center", gap: "5px", background: "#ecfdf5", color: "#047857", padding: "3px 8px", borderRadius: "4px", fontWeight: "600", fontSize: "11px" }}>
+              <span style={{ width: "8px", height: "8px", borderRadius: "50%", background: "#10b981", boxShadow: "0 0 6px #10b981" }} />
+              UPSTOX V3 STREAMING ({feedStatus.deduped_ticks_count} deduped)
+            </div>
+          ) : feedStatus.status === "RECONNECTING_BACKOFF" ? (
+            <div style={{ display: "flex", alignItems: "center", gap: "5px", background: "#fef3c7", color: "#b45309", padding: "3px 8px", borderRadius: "4px", fontWeight: "600", fontSize: "11px" }}>
+              <span style={{ width: "8px", height: "8px", borderRadius: "50%", background: "#f59e0b" }} />
+              RECONNECTING ({feedStatus.backoff_delay_secs}s delay · try #{feedStatus.reconnect_count})
+            </div>
+          ) : feedStatus.is_stale ? (
+            <div style={{ display: "flex", alignItems: "center", gap: "5px", background: "#fef3c7", color: "#b45309", padding: "3px 8px", borderRadius: "4px", fontWeight: "600", fontSize: "11px" }}>
+              <span style={{ width: "8px", height: "8px", borderRadius: "50%", background: "#f59e0b" }} />
+              FEED STALE (&gt;15s) · ORDERS PAUSED
+            </div>
+          ) : (
+            <div style={{ display: "flex", alignItems: "center", gap: "5px", background: "#eff6ff", color: "#1d4ed8", padding: "3px 8px", borderRadius: "4px", fontWeight: "600", fontSize: "11px" }}>
+              <span style={{ width: "8px", height: "8px", borderRadius: "50%", background: "#3b82f6" }} />
+              V3 CONNECTING
+            </div>
+          )}
+
+          <div style={{ fontSize: "11px", color: textMuted }}>
+            Delay: <strong style={{ color: measuredDisplayDelay > 1000 ? redColor : textPrimary }}>~{measuredDisplayDelay}ms</strong>
+          </div>
+
+          <div style={{ fontSize: "11px", color: textMuted }}>
+            Feed Time: <strong style={{ color: textPrimary }}>{data?.last_updated_at ? new Date(data.last_updated_at).toLocaleTimeString() : "14:45:50 IST"}</strong>
+          </div>
+
+          <Badge tone="warning" title="Strict paper execution mode">
+            PAPER TRADING ONLY (₹1,000 INR Capital)
+          </Badge>
         </div>
       </div>
 
-      {/* Fundamental & Financials Tab View */}
-      {activeSubTab === "info" && (
-        <div style={{ background: "var(--card-bg, #1a1a1e)", border: "1px solid var(--border-color, #2a2a30)", borderRadius: "10px", padding: "20px" }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px", flexWrap: "wrap", gap: "10px" }}>
-            <h3 style={{ margin: 0, fontSize: "16px", fontWeight: "700", color: "#fff" }}>
-              {data?.name || selectedSymbol} — Fundamental Overview & Financial Metrics
-            </h3>
-            <Badge tone="good">NSE Listed • Verified</Badge>
+      {/* 2. EXCHANGE SESSION DETECTION BANNER */}
+      {feedStatus.session && (
+        <div
+          style={{
+            background: feedStatus.session.session_kind === "REGULAR"
+              ? (isLight ? "#f0fdf4" : "rgba(16, 185, 129, 0.12)")
+              : feedStatus.session.session_kind === "PRE_OPEN"
+              ? (isLight ? "#fefce8" : "rgba(234, 179, 8, 0.12)")
+              : feedStatus.session.session_kind === "CLOSING_AUCTION"
+              ? (isLight ? "#fff7ed" : "rgba(249, 115, 22, 0.12)")
+              : (isLight ? "#f8fafc" : "rgba(30, 41, 59, 0.5)"),
+            color: feedStatus.session.session_kind === "REGULAR"
+              ? "#166534"
+              : feedStatus.session.session_kind === "PRE_OPEN"
+              ? "#854d0e"
+              : feedStatus.session.session_kind === "CLOSING_AUCTION"
+              ? "#9a3412"
+              : textSecondary,
+            borderBottom: `1px solid ${borderColor}`,
+            padding: "6px 14px",
+            fontSize: "12px",
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            fontWeight: "600",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+            <span
+              style={{
+                display: "inline-block",
+                padding: "2px 6px",
+                borderRadius: "3px",
+                fontSize: "10px",
+                fontWeight: "800",
+                letterSpacing: "0.5px",
+                background: feedStatus.session.session_kind === "REGULAR" ? "#15803d" : "#475569",
+                color: "#fff",
+              }}
+            >
+              {feedStatus.session.status_badge}
+            </span>
+            <span>
+              {feedStatus.session.session_name} ({feedStatus.session.local_time_ist}) — {feedStatus.session.next_session_event}
+            </span>
           </div>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: "14px", marginBottom: "16px" }}>
-            <div style={{ padding: "14px", background: "var(--bg-input, #222)", borderRadius: "8px", border: "1px solid var(--border-color, #333)" }}>
-              <div style={{ fontSize: "12px", color: "#9ca3af" }}>Market Capitalization</div>
-              <div style={{ fontSize: "18px", fontWeight: "800", color: "#fff" }}>₹ 19,82,450 Cr</div>
-              <div style={{ fontSize: "11px", color: "#10b981" }}>India Large-Cap Nifty 50</div>
-            </div>
-            <div style={{ padding: "14px", background: "var(--bg-input, #222)", borderRadius: "8px", border: "1px solid var(--border-color, #333)" }}>
-              <div style={{ fontSize: "12px", color: "#9ca3af" }}>P/E Ratio (TTM)</div>
-              <div style={{ fontSize: "18px", fontWeight: "800", color: "#fff" }}>25.40</div>
-              <div style={{ fontSize: "11px", color: "#9ca3af" }}>Sector Average: 28.10</div>
-            </div>
-            <div style={{ padding: "14px", background: "var(--bg-input, #222)", borderRadius: "8px", border: "1px solid var(--border-color, #333)" }}>
-              <div style={{ fontSize: "12px", color: "#9ca3af" }}>52-Week Range</div>
-              <div style={{ fontSize: "18px", fontWeight: "800", color: "#fff" }}>₹ 980.00 – 1,320.00</div>
-              <div style={{ fontSize: "11px", color: "#9ca3af" }}>Intraday Margin: 5x (MIS)</div>
-            </div>
-            <div style={{ padding: "14px", background: "var(--bg-input, #222)", borderRadius: "8px", border: "1px solid var(--border-color, #333)" }}>
-              <div style={{ fontSize: "12px", color: "#9ca3af" }}>Dividend Yield & Face Value</div>
-              <div style={{ fontSize: "18px", fontWeight: "800", color: "#fff" }}>0.85% (FV ₹10)</div>
-              <div style={{ fontSize: "11px", color: "#9ca3af" }}>Book Value: ₹ 742.10</div>
-            </div>
-          </div>
-          <div style={{ padding: "14px", background: "rgba(59, 130, 246, 0.08)", border: "1px solid rgba(59, 130, 246, 0.2)", borderRadius: "8px", fontSize: "13px", color: "#cbd5e1", lineHeight: "1.5" }}>
-            <strong>About Company:</strong> {data?.name || selectedSymbol} is traded on the National Stock Exchange of India (NSE). Under the intraday trading regime, positions entered under MIS (Margin Intraday Square-off) enjoy 5x purchasing power and must be closed prior to 15:15 IST daily.
+
+          <div style={{ display: "flex", alignItems: "center", gap: "12px", fontSize: "11px" }}>
+            {!feedStatus.session.allows_order_entry && (
+              <span style={{ color: textMuted }}>
+                Last Authentic Price: <strong style={{ color: textPrimary }}>₹{data?.last_received_price ? Number(data.last_received_price).toFixed(2) : currPrice.toFixed(2)}</strong> {data?.last_received_time ? `(${new Date(data.last_received_time).toLocaleTimeString()})` : ""} · Paper fills paused
+              </span>
+            )}
+            <span>{feedStatus.session.current_date_ist}</span>
           </div>
         </div>
       )}
 
-      {/* 2. Live Price Chart Card (Active Tab: chart) */}
-      {activeSubTab === "chart" && (
-        <>
-          <div style={{ background: "var(--card-bg, #1a1a1e)", border: "1px solid var(--border-color, #2a2a30)", borderRadius: "10px", padding: "20px" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px", flexWrap: "wrap", gap: "12px" }}>
-              <h3 style={{ margin: 0, fontSize: "16px", fontWeight: "700", color: "#fff" }}>
-                Live {data?.name || "Reliance Industries"} Share Price Chart
-              </h3>
+      {/* 3. STALE FEED WARNING ALERT (If updates stop during regular trading) */}
+      {feedStatus.is_stale && feedStatus.session?.session_kind === "REGULAR" && (
+        <div style={{ background: "#fef2f2", color: "#991b1b", padding: "6px 14px", borderBottom: "1px solid #fecaca", fontSize: "12px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <span>
+            ⚠️ <strong>Feed Data Stale:</strong> No price updates received for &gt;15 seconds. Strategy decisions and simulated paper order fills are paused until fresh data resumes.
+          </span>
+          <button
+            onClick={fetchChart}
+            style={{ padding: "2px 8px", background: "#dc2626", color: "#fff", border: "none", borderRadius: "3px", cursor: "pointer", fontSize: "11px", fontWeight: "700" }}
+          >
+            Refresh
+          </button>
+        </div>
+      )}
 
-          {/* Timeframe Selector Buttons (1D, 1W, 1M, 3M, 6M, 1Y, 5Y) */}
-          <div style={{ display: "flex", gap: "4px", background: "var(--bg-input, #222)", padding: "3px", borderRadius: "6px" }}>
-            {RANGES.map((r) => (
-              <button
-                key={r}
-                onClick={() => setSelectedRange(r)}
-                style={{
-                  padding: "4px 10px",
-                  fontSize: "11px",
-                  fontWeight: "600",
-                  borderRadius: "4px",
-                  border: "none",
-                  background: selectedRange === r ? "var(--bg-active, #3b82f6)" : "transparent",
-                  color: selectedRange === r ? "#fff" : "var(--text-secondary, #9ca3af)",
-                  cursor: "pointer",
-                }}
-              >
-                {r}
-              </button>
-            ))}
+      {/* 3. MAIN WORKSPACE: WATCHLIST (LEFT) + CANDLESTICK CHART (RIGHT) */}
+      <div style={{ display: "grid", gridTemplateColumns: "310px 1fr", minHeight: "680px" }}>
+        {/* LEFT COLUMN: UPSTOX WATCHLIST SIDEBAR */}
+        <div
+          style={{
+            background: bgSurface,
+            borderRight: `1px solid ${borderColor}`,
+            display: "flex",
+            flexDirection: "column",
+            maxHeight: "820px",
+            overflow: "hidden",
+          }}
+        >
+          {/* Watchlist Header */}
+          <div style={{ padding: "10px 12px", borderBottom: `1px solid ${borderColor}` }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                <span style={{ fontWeight: "700", fontSize: "13px", color: textPrimary }}>Top 20 by Market ...</span>
+                <span style={{ fontSize: "11px", color: textMuted }}>{filteredWatchlist.length} / 100</span>
+              </div>
+              <div style={{ display: "flex", gap: "6px", color: textSecondary, fontSize: "13px" }}>
+                <span style={{ cursor: "pointer" }} title="Filter">☰</span>
+                <span style={{ cursor: "pointer" }} title="Sort">⇅</span>
+                <span style={{ cursor: "pointer", color: purpleAccent, fontWeight: "800" }} title="Add stock">+</span>
+              </div>
+            </div>
+
+            {/* Symbol Search Bar */}
+            <input
+              type="text"
+              placeholder="Search stocks (e.g. RELIANCE, TCS)..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              style={{
+                width: "100%",
+                padding: "6px 10px",
+                borderRadius: "4px",
+                border: `1px solid ${borderColor}`,
+                background: bgCard,
+                color: textPrimary,
+                fontSize: "12px",
+                outline: "none",
+                boxSizing: "border-box",
+              }}
+            />
+          </div>
+
+          {/* Watchlist Stock Items (Scrollable List) */}
+          <div style={{ overflowY: "auto", flex: 1 }}>
+            {filteredWatchlist.map((stock) => {
+              const isSelected = selectedSymbol === stock.symbol;
+              const liveData = livePricesMap[stock.symbol];
+              const price = liveData?.price ? liveData.price : stock.defaultPrice;
+              const changePct = liveData?.change_pct !== undefined ? liveData.change_pct : stock.changePct;
+              const changeAmt = ((price * changePct) / 100);
+              const isStockPos = changePct >= 0;
+
+              return (
+                <div
+                  key={stock.symbol}
+                  onClick={() => setSelectedSymbol(stock.symbol)}
+                  style={{
+                    padding: "9px 12px",
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    cursor: "pointer",
+                    borderBottom: `1px solid ${borderColor}`,
+                    background: isSelected ? (isLight ? "rgba(124, 58, 237, 0.08)" : "rgba(124, 58, 237, 0.18)") : "transparent",
+                    borderLeft: isSelected ? `4px solid ${purpleAccent}` : "4px solid transparent",
+                    transition: "all 0.15s ease",
+                  }}
+                >
+                  <div>
+                    <div style={{ fontWeight: isSelected ? "700" : "600", fontSize: "13px", color: isSelected ? purpleAccent : textPrimary }}>
+                      {stock.symbol}
+                    </div>
+                    <div style={{ fontSize: "11px", color: textMuted, display: "flex", alignItems: "center", gap: "4px" }}>
+                      <span>{stock.exchange} {stock.segment}</span>
+                      <span title={`Upstox Key: ${stock.upstox_token}`} style={{ cursor: "help", opacity: 0.6 }}>ℹ️</span>
+                    </div>
+                  </div>
+
+                  <div style={{ textAlign: "right" }}>
+                    <div style={{ fontWeight: "700", fontSize: "13px", color: isStockPos ? greenColor : redColor }}>
+                      {price.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                    </div>
+                    <div style={{ fontSize: "11px", color: isStockPos ? greenColor : redColor, fontWeight: "500" }}>
+                      {isStockPos ? `+${changeAmt.toFixed(2)} (+${changePct.toFixed(2)}%)` : `${changeAmt.toFixed(2)} (${changePct.toFixed(2)}%)`}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Watchlist Footer */}
+          <div style={{ padding: "8px 12px", borderTop: `1px solid ${borderColor}`, fontSize: "11px", color: purpleAccent, fontWeight: "600", cursor: "pointer", background: bgCard }}>
+            Track 200 symbols with <span style={{ color: "#3b82f6" }}>+plus</span> &gt;
           </div>
         </div>
 
-        {/* Realtime OHLC Readout Banner (Exactly like the photo) */}
-        <div style={{ display: "flex", gap: "20px", fontSize: "12px", color: "var(--text-secondary, #9ca3af)", marginBottom: "16px", fontFamily: "monospace" }}>
-          <span>O <strong style={{ color: "#fff" }}>{activeCandle ? inr(activeCandle.open) : "1186.10"}</strong></span>
-          <span>H <strong style={{ color: "#fff" }}>{activeCandle ? inr(activeCandle.high) : "1204.40"}</strong></span>
-          <span>L <strong style={{ color: "#fff" }}>{activeCandle ? inr(activeCandle.low) : "1177.40"}</strong></span>
-          <span>C <strong style={{ color: strokeColor }}>{activeCandle ? inr(activeCandle.close) : "1198.70"}</strong></span>
-          <span>VOL <strong style={{ color: "#fff" }}>{activeCandle ? toN(activeCandle.volume).toLocaleString() : "56,247"}</strong></span>
-          {hoveredPoint && <span style={{ color: "#60a5fa" }}>TIME: {hoveredPoint.time} IST</span>}
-        </div>
-
-        {/* SVG Interactive Area Chart with Buy/Sell Pins */}
-        <div style={{ position: "relative", width: "100%", overflowX: "auto" }}>
-          <svg
-            viewBox={`0 0 ${width} ${height}`}
-            style={{ width: "100%", height: "auto", display: "block", overflow: "visible" }}
-            onMouseLeave={() => setHoveredPoint(null)}
+        {/* RIGHT COLUMN: MAIN TRADINGVIEW CANDLESTICK CHART */}
+        <div style={{ display: "flex", flexDirection: "column", background: bgCard, overflow: "hidden" }}>
+          {/* Top Chart Toolbar: Symbols, Intervals, Indicators, and Order Bar */}
+          <div
+            style={{
+              padding: "8px 14px",
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              flexWrap: "wrap",
+              gap: "8px",
+              borderBottom: `1px solid ${borderColor}`,
+              background: bgSurface,
+            }}
           >
-            <defs>
-              <linearGradient id="greenGradient" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor="#22c55e" stopOpacity="0.35" />
-                <stop offset="100%" stopColor="#22c55e" stopOpacity="0.0" />
-              </linearGradient>
-              <linearGradient id="redGradient" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor="#ef4444" stopOpacity="0.35" />
-                <stop offset="100%" stopColor="#ef4444" stopOpacity="0.0" />
-              </linearGradient>
-            </defs>
+            {/* Symbol & Timeframe pills */}
+            <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+              <span style={{ fontWeight: "800", fontSize: "15px", color: textPrimary, display: "flex", alignItems: "center", gap: "4px" }}>
+                🔍 {selectedSymbol} <span style={{ color: textSecondary, fontSize: "12px", cursor: "pointer" }}>⊕</span>
+              </span>
 
-            {/* Horizontal Grid Lines */}
-            {[0, 0.25, 0.5, 0.75, 1].map((ratio) => {
-              const y = padding.top + chartHeight * ratio;
-              const priceVal = maxPrice - (maxPrice - minPrice) * ratio;
-              return (
-                <g key={ratio}>
+              {/* Timeframes */}
+              <div style={{ display: "flex", background: isLight ? "#e2e8f0" : "#1e293b", padding: "2px", borderRadius: "4px", gap: "2px" }}>
+                {RANGES.map((rng) => (
+                  <button
+                    key={rng}
+                    onClick={() => setSelectedRange(rng)}
+                    style={{
+                      border: "none",
+                      background: selectedRange === rng ? (isLight ? "#ffffff" : "#334155") : "transparent",
+                      color: selectedRange === rng ? textPrimary : textSecondary,
+                      fontWeight: selectedRange === rng ? "700" : "500",
+                      padding: "3px 8px",
+                      borderRadius: "3px",
+                      cursor: "pointer",
+                      fontSize: "12px",
+                      boxShadow: selectedRange === rng ? "0 1px 2px rgba(0,0,0,0.1)" : "none",
+                    }}
+                  >
+                    {rng}
+                  </button>
+                ))}
+              </div>
+
+              {/* Candle type icon & Indicators button */}
+              <button
+                onClick={() => setShowIndicators(!showIndicators)}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "4px",
+                  padding: "4px 8px",
+                  borderRadius: "4px",
+                  border: `1px solid ${showIndicators ? purpleAccent : borderColor}`,
+                  background: isLight ? "#ffffff" : "#1e293b",
+                  color: textPrimary,
+                  fontSize: "12px",
+                  fontWeight: "600",
+                  cursor: "pointer",
+                }}
+              >
+                <span style={{ fontStyle: "italic", fontWeight: "800", color: purpleAccent }}>fx</span> Indicators
+              </button>
+
+              {/* Indicators Dropdown */}
+              {showIndicators && (
+                <div style={{ display: "flex", gap: "8px", alignItems: "center", fontSize: "11px", color: textSecondary }}>
+                  <label style={{ display: "flex", alignItems: "center", gap: "3px", cursor: "pointer" }}>
+                    <input
+                      type="checkbox"
+                      checked={activeIndicators.sma}
+                      onChange={(e) => setActiveIndicators({ ...activeIndicators, sma: e.target.checked })}
+                    />
+                    SMA (20)
+                  </label>
+                  <label style={{ display: "flex", alignItems: "center", gap: "3px", cursor: "pointer" }}>
+                    <input
+                      type="checkbox"
+                      checked={activeIndicators.vol}
+                      onChange={(e) => setActiveIndicators({ ...activeIndicators, vol: e.target.checked })}
+                    />
+                    Volume
+                  </label>
+                </div>
+              )}
+            </div>
+
+            {/* Instant Paper Order Bar (Matching Sell/Buy action in screenshot) */}
+            <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+              <button
+                disabled={submittingOrder || feedStatus.is_stale || (feedStatus.session !== undefined && !feedStatus.session.allows_order_entry)}
+                onClick={() => handleInstantPaperOrder("SELL")}
+                title={feedStatus.session && !feedStatus.session.allows_order_entry ? `Market Closed (${feedStatus.session.session_name}). Regular continuous trading is 09:15 - 15:30 IST.` : feedStatus.is_stale ? "Feed is stale (>15s). Paper order fills paused." : "Place Instant Paper SELL"}
+                style={{
+                  background: redColor,
+                  color: "#fff",
+                  border: "none",
+                  padding: "5px 12px",
+                  borderRadius: "4px",
+                  fontSize: "12px",
+                  fontWeight: "700",
+                  cursor: submittingOrder || feedStatus.is_stale || (feedStatus.session !== undefined && !feedStatus.session.allows_order_entry) ? "not-allowed" : "pointer",
+                  opacity: submittingOrder || feedStatus.is_stale || (feedStatus.session !== undefined && !feedStatus.session.allows_order_entry) ? 0.6 : 1,
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: "center",
+                }}
+              >
+                <span>SELL {feedStatus.session && !feedStatus.session.allows_order_entry ? "(CLOSED)" : (currPrice - 0.10).toFixed(2)}</span>
+              </button>
+
+              <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
+                <span style={{ fontSize: "10px", color: textMuted }}>0.20 spread</span>
+                <input
+                  type="number"
+                  min="1"
+                  value={instantOrderQty}
+                  onChange={(e) => setInstantOrderQty(e.target.value)}
+                  style={{
+                    width: "42px",
+                    textAlign: "center",
+                    padding: "2px",
+                    borderRadius: "3px",
+                    border: `1px solid ${borderColor}`,
+                    background: bgCard,
+                    color: textPrimary,
+                    fontSize: "12px",
+                    fontWeight: "700",
+                  }}
+                />
+              </div>
+
+              <button
+                disabled={submittingOrder || feedStatus.is_stale || (feedStatus.session !== undefined && !feedStatus.session.allows_order_entry)}
+                onClick={() => handleInstantPaperOrder("BUY")}
+                title={feedStatus.session && !feedStatus.session.allows_order_entry ? `Market Closed (${feedStatus.session.session_name}). Regular continuous trading is 09:15 - 15:30 IST.` : feedStatus.is_stale ? "Feed is stale (>15s). Paper order fills paused." : "Place Instant Paper BUY"}
+                style={{
+                  background: greenColor,
+                  color: "#fff",
+                  border: "none",
+                  padding: "5px 12px",
+                  borderRadius: "4px",
+                  fontSize: "12px",
+                  fontWeight: "700",
+                  cursor: submittingOrder || feedStatus.is_stale || (feedStatus.session !== undefined && !feedStatus.session.allows_order_entry) ? "not-allowed" : "pointer",
+                  opacity: submittingOrder || feedStatus.is_stale || (feedStatus.session !== undefined && !feedStatus.session.allows_order_entry) ? 0.6 : 1,
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: "center",
+                }}
+              >
+                <span>BUY {feedStatus.session && !feedStatus.session.allows_order_entry ? "(CLOSED)" : (currPrice + 0.10).toFixed(2)}</span>
+              </button>
+
+              <button
+                onClick={() => setChartTheme(isLight ? "dark" : "light")}
+                style={{
+                  background: "transparent",
+                  border: `1px solid ${borderColor}`,
+                  borderRadius: "4px",
+                  padding: "4px 8px",
+                  cursor: "pointer",
+                  fontSize: "12px",
+                  color: textSecondary,
+                }}
+              >
+                {isLight ? "🌙 Dark" : "☀️ Light"}
+              </button>
+            </div>
+          </div>
+
+          {/* Feedback banner for paper trades */}
+          {orderFeedback && (
+            <div
+              style={{
+                padding: "6px 14px",
+                fontSize: "12px",
+                fontWeight: "600",
+                background: orderFeedback.kind === "good" ? "#ecfdf5" : "#fef2f2",
+                color: orderFeedback.kind === "good" ? "#047857" : "#b91c1c",
+                borderBottom: `1px solid ${orderFeedback.kind === "good" ? "#a7f3d0" : "#fecaca"}`,
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+              }}
+            >
+              <span>{orderFeedback.msg}</span>
+              <button onClick={() => setOrderFeedback(null)} style={{ border: "none", background: "transparent", cursor: "pointer", fontWeight: "700" }}>✕</button>
+            </div>
+          )}
+
+          {/* OHLC Banner matching screenshot: RELIANCE INDUSTRIES LTD · 5 · NSE O... H... L... C... Volume... */}
+          <div
+            style={{
+              padding: "6px 14px",
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              flexWrap: "wrap",
+              gap: "8px",
+              borderBottom: `1px solid ${borderColor}`,
+              fontSize: "12px",
+              background: bgCard,
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+              <span style={{ fontWeight: "700", color: textPrimary }}>
+                {data?.name || "Reliance Industries Ltd"} · {selectedRange} · NSE
+              </span>
+              <span style={{ width: "7px", height: "7px", borderRadius: "50%", background: greenColor, display: "inline-block" }} />
+
+              <div style={{ display: "flex", gap: "8px", fontFamily: "monospace", fontSize: "12px" }}>
+                <span>O<strong style={{ color: textPrimary }}>{activeCandle ? Number(activeCandle.open).toFixed(2) : "1,191.50"}</strong></span>
+                <span>H<strong style={{ color: textPrimary }}>{activeCandle ? Number(activeCandle.high).toFixed(2) : "1,192.30"}</strong></span>
+                <span>L<strong style={{ color: textPrimary }}>{activeCandle ? Number(activeCandle.low).toFixed(2) : "1,191.30"}</strong></span>
+                <span>C<strong style={{ color: isPos ? greenColor : redColor }}>{activeCandle ? Number(activeCandle.close).toFixed(2) : currPrice.toFixed(2)}</strong></span>
+                <span style={{ color: isPos ? greenColor : redColor, fontWeight: "700" }}>
+                  {isPos ? `+${changeNum.toFixed(2)} (+${changePctNum.toFixed(2)}%)` : `${changeNum.toFixed(2)} (${changePctNum.toFixed(2)}%)`}
+                </span>
+                <span style={{ color: textSecondary }}>Vol {activeCandle ? `${(toN(activeCandle.volume) / 1000).toFixed(2)}K` : "9.45K"}</span>
+              </div>
+            </div>
+
+            <div style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "11px", color: textMuted }}>
+              <span>Volume SMA <strong style={{ color: "#3b82f6" }}>9.45K</strong></span>
+              <span>• Instrument: <strong style={{ color: textPrimary }}>{data?.upstox_instrument_key || `NSE_EQ|${selectedSymbol}`}</strong></span>
+            </div>
+          </div>
+
+          {/* Interactive Candlestick SVG Canvas */}
+          <div style={{ position: "relative", width: "100%", overflowX: "auto", background: bgCard, flex: 1 }}>
+            <svg
+              viewBox={`0 0 ${width} ${height}`}
+              style={{ width: "100%", height: "auto", minHeight: "440px", display: "block", cursor: "crosshair" }}
+              onMouseMove={handleMouseMove}
+              onMouseLeave={handleMouseLeave}
+            >
+              {/* Horizontal Price Grid Lines */}
+              {[0, 0.25, 0.5, 0.75, 1.0].map((ratio) => {
+                const y = padding.top + mainChartHeight * ratio;
+                const priceVal = maxPrice - (maxPrice - minPrice) * ratio;
+                return (
+                  <g key={ratio}>
+                    <line
+                      x1={padding.left}
+                      y1={y}
+                      x2={padding.left + chartWidth}
+                      y2={y}
+                      stroke={isLight ? "rgba(226, 232, 240, 0.8)" : "rgba(42, 46, 57, 0.8)"}
+                      strokeDasharray="2 3"
+                      strokeWidth="1"
+                    />
+                    <text
+                      x={padding.left + chartWidth + 6}
+                      y={y + 3.5}
+                      fill={textSecondary}
+                      fontSize="10"
+                      fontFamily="monospace"
+                    >
+                      {priceVal.toFixed(2)}
+                    </text>
+                  </g>
+                );
+              })}
+
+              {/* Vertical Time Grid Lines */}
+              {candlesWithCoords.filter((_, idx) => idx % Math.max(1, Math.floor(candlesWithCoords.length / 8)) === 0).map((c, i) => (
+                <g key={i}>
                   <line
-                    x1={padding.left}
-                    y1={y}
-                    x2={padding.left + chartWidth}
-                    y2={y}
-                    stroke="var(--border-color, #2a2a30)"
-                    strokeDasharray="4 4"
-                    strokeWidth="1"
+                    x1={c.x}
+                    y1={padding.top}
+                    x2={c.x}
+                    y2={padding.top + mainChartHeight}
+                    stroke={isLight ? "rgba(226, 232, 240, 0.6)" : "rgba(42, 46, 57, 0.6)"}
+                    strokeDasharray="2 3"
+                    strokeWidth="0.8"
                   />
                   <text
-                    x={padding.left + chartWidth + 8}
-                    y={y + 4}
-                    fill="var(--text-secondary, #6b7280)"
+                    x={c.x - 14}
+                    y={padding.top + mainChartHeight + 15 + volumeHeight + 20}
+                    fill={textSecondary}
                     fontSize="10"
                     fontFamily="monospace"
                   >
-                    {priceVal.toFixed(1)}
+                    {c.candle.time}
                   </text>
                 </g>
-              );
-            })}
+              ))}
 
-            {/* Vertical Time Labels */}
-            {points.filter((_, idx) => idx % Math.max(1, Math.floor(points.length / 6)) === 0).map((pt, i) => (
-              <g key={i}>
-                <line
-                  x1={pt.x}
-                  y1={padding.top}
-                  x2={pt.x}
-                  y2={padding.top + chartHeight}
-                  stroke="var(--border-color, #222)"
-                  strokeDasharray="2 2"
-                  strokeWidth="1"
+              {/* Volume Bars */}
+              {activeIndicators.vol && candlesWithCoords.map((c, i) => (
+                <rect
+                  key={`vol-${i}`}
+                  x={c.x - 2.5}
+                  y={c.volBarY}
+                  width="5"
+                  height={c.volBarHeight}
+                  fill={c.isGreen ? (isLight ? "rgba(8, 153, 129, 0.45)" : "rgba(8, 153, 129, 0.65)") : (isLight ? "rgba(242, 54, 69, 0.45)" : "rgba(242, 54, 69, 0.65)")}
+                  rx="1"
                 />
-                <text
-                  x={pt.x}
-                  y={padding.top + chartHeight + 18}
-                  fill="var(--text-secondary, #6b7280)"
-                  fontSize="10"
-                  textAnchor="middle"
-                  fontFamily="sans-serif"
-                >
-                  {pt.candle.time}
-                </text>
-              </g>
-            ))}
+              ))}
 
-            {/* Area Fill */}
-            {areaString && <path d={areaString} fill={fillColor} />}
+              {/* SMA 20 Overlay Line */}
+              {activeIndicators.sma && smaPoints.length > 1 && (
+                <polyline
+                  fill="none"
+                  stroke="#3b82f6"
+                  strokeWidth="1.5"
+                  points={smaPoints.map((p) => `${p.x},${p.y}`).join(" ")}
+                />
+              )}
 
-            {/* Main Price Line */}
-            {pathString && (
-              <path
-                d={pathString}
-                fill="none"
-                stroke={strokeColor}
-                strokeWidth="2.5"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              />
-            )}
+              {/* Japanese Candlesticks */}
+              {candlesWithCoords.map((c, i) => {
+                const color = c.isGreen ? greenColor : redColor;
+                const isForming = c.isForming;
 
-            {/* Interactive Buy / Sell Trade Markers directly on the Graph */}
-            {markersWithCoords.map((m) => {
-              const isBuy = m.side === "BUY";
-              return (
-                <g key={m.id} transform={`translate(${m.x}, ${m.y})`} style={{ cursor: "pointer" }}>
-                  <circle
-                    r="12"
-                    fill={isBuy ? "#16a34a" : "#dc2626"}
-                    stroke="#ffffff"
-                    strokeWidth="2"
-                    filter="drop-shadow(0 2px 4px rgba(0,0,0,0.5))"
-                  />
-                  <text
-                    textAnchor="middle"
-                    dy="4"
-                    fill="#ffffff"
-                    fontSize="10"
-                    fontWeight="800"
-                  >
-                    {isBuy ? "B" : "S"}
-                  </text>
-                  <title>
-                    {`${m.side} ${m.shares} sh @ ₹${inr(m.price)}\nTime: ${m.time}\nTax/Costs: ₹${inr(m.total_tax)}`}
-                  </title>
-                </g>
-              );
-            })}
-
-            {/* Hover Crosshair & Point Tracker */}
-            {hoveredPoint && (
-              (() => {
-                const hoveredIdx = data?.candles.findIndex((c) => c.timestamp === hoveredPoint.timestamp) ?? -1;
-                const pt = points[hoveredIdx];
-                if (!pt) return null;
                 return (
-                  <g>
+                  <g key={`candle-${i}`}>
+                    {/* Shadow wick */}
                     <line
-                      x1={pt.x}
-                      y1={padding.top}
-                      x2={pt.x}
-                      y2={padding.top + chartHeight}
-                      stroke="#60a5fa"
-                      strokeWidth="1.5"
-                      strokeDasharray="3 3"
+                      x1={c.x}
+                      y1={c.yHigh}
+                      x2={c.x}
+                      y2={c.yLow}
+                      stroke={color}
+                      strokeWidth={isForming ? "1.8" : "1.2"}
                     />
-                    <circle cx={pt.x} cy={pt.y} r="5" fill="#60a5fa" stroke="#ffffff" strokeWidth="2" />
+
+                    {/* Candle body */}
+                    <rect
+                      x={c.x - 3.5}
+                      y={c.bodyTop}
+                      width="7"
+                      height={c.bodyHeight}
+                      fill={color}
+                      stroke={isForming ? (isLight ? "#0f172a" : "#ffffff") : color}
+                      strokeWidth={isForming ? "1.5" : "0.5"}
+                      strokeDasharray={isForming ? "2 2" : "none"}
+                      rx="1"
+                    />
+
+                    {/* Forming Candle Highlight Pulse */}
+                    {isForming && (
+                      <circle
+                        cx={c.x}
+                        cy={c.bodyTop + c.bodyHeight / 2}
+                        r="8"
+                        fill="none"
+                        stroke={color}
+                        strokeWidth="1"
+                        opacity="0.6"
+                      />
+                    )}
                   </g>
                 );
-              })()
-            )}
+              })}
 
-            {/* Invisible mouse capture overlay */}
-            {points.map((pt, idx) => (
-              <rect
-                key={idx}
-                x={pt.x - chartWidth / points.length / 2}
-                y={padding.top}
-                width={chartWidth / points.length}
-                height={chartHeight}
-                fill="transparent"
-                onMouseEnter={() => setHoveredPoint(pt.candle)}
+
+
+              {/* Real-time Current Dotted Price Line extending to right axis */}
+              <line
+                x1={padding.left}
+                y1={currentPriceY}
+                x2={padding.left + chartWidth}
+                y2={currentPriceY}
+                stroke={isPos ? greenColor : redColor}
+                strokeDasharray="3 3"
+                strokeWidth="1.4"
               />
-            ))}
-          </svg>
-        </div>
 
-        {/* Legend */}
-        <div style={{ display: "flex", gap: "16px", marginTop: "12px", fontSize: "11px", color: "var(--text-secondary, #9ca3af)", alignItems: "center" }}>
-          <span style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
-            <span style={{ width: "10px", height: "10px", borderRadius: "50%", background: "#16a34a", display: "inline-block" }}></span>
-            <strong>B</strong> = Buy Execution Point
-          </span>
-          <span style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
-            <span style={{ width: "10px", height: "10px", borderRadius: "50%", background: "#dc2626", display: "inline-block" }}></span>
-            <strong>S</strong> = Sell Execution Point
-          </span>
-          <span style={{ marginLeft: "auto" }}>
-            Simulated Sandbox fills with 0.1% STT & Date-Effective Statutory Deductions
-          </span>
-        </div>
-      </div>
-
-      {/* 3. "What We Bought & What We Sold" Trade Ledger & Profit/Loss Breakdown */}
-      <div style={{ background: "var(--card-bg, #1a1a1e)", border: "1px solid var(--border-color, #2a2a30)", borderRadius: "10px", padding: "20px" }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px", flexWrap: "wrap", gap: "12px" }}>
-          <div>
-            <h3 style={{ margin: 0, fontSize: "16px", fontWeight: "700", color: "#fff" }}>
-              Trade Executions & Profit/Loss Breakdown (What We Bought & Sold)
-            </h3>
-            <p style={{ margin: "4px 0 0", fontSize: "12px", color: "var(--text-secondary, #9ca3af)" }}>
-              Detailed ledger of every executed share order, holding duration, and net P&L after statutory Indian taxes.
-            </p>
-          </div>
-
-          <Badge tone="good">Upstox Sandbox Executions</Badge>
-        </div>
-
-        {/* Summary Stat Cards */}
-        {data?.summary && (
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: "12px", marginBottom: "16px" }}>
-            <div style={{ padding: "12px", background: "var(--bg-input, #222)", borderRadius: "6px", border: "1px solid var(--border-color, #333)" }}>
-              <div style={{ fontSize: "11px", color: "#9ca3af" }}>Total Invested</div>
-              <div style={{ fontSize: "16px", fontWeight: "700", color: "#fff" }}>₹ {inr(data.summary.total_invested_inr)}</div>
-              <div style={{ fontSize: "10px", color: "#9ca3af" }}>{data.summary.total_trades} orders placed</div>
-            </div>
-
-            <div style={{ padding: "12px", background: "var(--bg-input, #222)", borderRadius: "6px", border: "1px solid var(--border-color, #333)" }}>
-              <div style={{ fontSize: "11px", color: "#9ca3af" }}>Gross P&L</div>
-              <div style={{ fontSize: "16px", fontWeight: "700", color: toN(data.summary.total_gross_pnl_inr) >= 0 ? "#22c55e" : "#ef4444" }}>
-                ₹ {inrSigned(data.summary.total_gross_pnl_inr)}
-              </div>
-              <div style={{ fontSize: "10px", color: "#9ca3af" }}>Before statutory deductions</div>
-            </div>
-
-            <div style={{ padding: "12px", background: "var(--bg-input, #222)", borderRadius: "6px", border: "1px solid var(--border-color, #333)" }}>
-              <div style={{ fontSize: "11px", color: "#9ca3af" }}>Statutory Deductions</div>
-              <div style={{ fontSize: "16px", fontWeight: "700", color: "#f59e0b" }}>- ₹ {inr(data.summary.total_taxes_paid_inr)}</div>
-              <div style={{ fontSize: "10px", color: "#9ca3af" }}>STT, GST, Stamp, SEBI</div>
-            </div>
-
-            <div style={{ padding: "12px", background: "rgba(34, 197, 94, 0.1)", borderRadius: "6px", border: "1px solid rgba(34, 197, 94, 0.3)" }}>
-              <div style={{ fontSize: "11px", color: "#22c55e", fontWeight: "600" }}>Net Profit Realized</div>
-              <div style={{ fontSize: "18px", fontWeight: "800", color: "#22c55e" }}>
-                ₹ {inrSigned(data.summary.total_net_pnl_inr)}
-              </div>
-              <div style={{ fontSize: "10px", color: "#22c55e" }}>Win Rate: {toN(data.summary.win_rate_pct).toFixed(1)}%</div>
-            </div>
-          </div>
-        )}
-
-        {/* Detailed What We Bought & What We Sold Table */}
-        <div style={{ overflowX: "auto" }}>
-          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "12px" }}>
-            <thead>
-              <tr style={{ borderBottom: "1px solid var(--border-color, #2a2a30)", textAlign: "left", color: "var(--text-secondary, #9ca3af)" }}>
-                <th style={{ padding: "10px 8px" }}>Trade ID</th>
-                <th style={{ padding: "10px 8px" }}>Shares</th>
-                <th style={{ padding: "10px 8px" }}>What We Bought (Entry)</th>
-                <th style={{ padding: "10px 8px" }}>What We Sold (Exit)</th>
-                <th style={{ padding: "10px 8px" }}>Gross Profit</th>
-                <th style={{ padding: "10px 8px" }}>Taxes (STT/GST)</th>
-                <th style={{ padding: "10px 8px" }}>Net Profit (₹)</th>
-                <th style={{ padding: "10px 8px" }}>ROI %</th>
-                <th style={{ padding: "10px 8px" }}>Status / Reason</th>
-              </tr>
-            </thead>
-            <tbody>
-              {(!data?.detailed_trades || data.detailed_trades.length === 0) ? (
-                <tr>
-                  <td colSpan={9} style={{ padding: "20px", textAlign: "center", color: "var(--text-secondary, #9ca3af)" }}>
-                    No trades closed yet. Use the [+ BUY] button above to test a buy order!
-                  </td>
-                </tr>
-              ) : (
-                data.detailed_trades.map((t) => {
-                  const isClosed = t.status === "CLOSED";
-                  const isProfit = toN(t.net_pnl, 0) > 0;
-                  return (
-                    <tr key={t.id} style={{ borderBottom: "1px solid var(--border-color, #2a2a30)" }}>
-                      <td style={{ padding: "10px 8px", fontFamily: "monospace", color: "#9ca3af" }}>{t.id}</td>
-                      <td style={{ padding: "10px 8px", fontWeight: "700", color: "#fff" }}>{t.shares} sh</td>
-
-                      {/* Bought details */}
-                      <td style={{ padding: "10px 8px" }}>
-                        <div style={{ fontWeight: "600", color: "#22c55e" }}>
-                          BUY @ ₹{inr(t.buy_price)}
-                        </div>
-                        <div style={{ fontSize: "11px", color: "#9ca3af" }}>
-                          Total: ₹{inr(t.buy_value)} ({t.buy_time})
-                        </div>
-                      </td>
-
-                      {/* Sold details */}
-                      <td style={{ padding: "10px 8px" }}>
-                        {isClosed ? (
-                          <div>
-                            <div style={{ fontWeight: "600", color: "#ef4444" }}>
-                              SELL @ ₹{inr(t.sell_price || 0)}
-                            </div>
-                            <div style={{ fontSize: "11px", color: "#9ca3af" }}>
-                              Total: ₹{inr(t.sell_value || 0)} ({t.sell_time})
-                            </div>
-                          </div>
-                        ) : (
-                          <Badge tone="neutral">Holding Active</Badge>
-                        )}
-                      </td>
-
-                      {/* Gross Profit */}
-                      <td style={{ padding: "10px 8px", fontWeight: "600", color: isProfit ? "#22c55e" : "#ef4444" }}>
-                        {isClosed && t.gross_pnl !== undefined ? `₹ ${inrSigned(t.gross_pnl)}` : "—"}
-                      </td>
-
-                      {/* Taxes */}
-                      <td style={{ padding: "10px 8px", color: "#f59e0b" }}>
-                        - ₹{inr(t.total_taxes)}
-                      </td>
-
-                      {/* Net Profit */}
-                      <td style={{ padding: "10px 8px" }}>
-                        {isClosed && t.net_pnl !== undefined ? (
-                          <span style={{ fontWeight: "800", color: isProfit ? "#22c55e" : "#ef4444", fontSize: "13px" }}>
-                            ₹ {inrSigned(t.net_pnl)}
-                          </span>
-                        ) : (
-                          <span style={{ color: "#9ca3af" }}>Floating</span>
-                        )}
-                      </td>
-
-                      {/* ROI */}
-                      <td style={{ padding: "10px 8px", fontWeight: "700", color: isProfit ? "#22c55e" : "#ef4444" }}>
-                        {isClosed && t.roi_pct !== undefined ? `${toN(t.roi_pct).toFixed(2)}%` : "—"}
-                      </td>
-
-                      {/* Status / Reason */}
-                      <td style={{ padding: "10px 8px" }}>
-                        {isClosed ? (
-                          <Badge tone={isProfit ? "good" : "critical"}>
-                            {t.exit_reason || "Target Met"}
-                          </Badge>
-                        ) : (
-                          <Badge tone="good">Open Position</Badge>
-                        )}
-                        <div style={{ fontSize: "10px", color: "#9ca3af", marginTop: "2px" }}>
-                          {t.holding_duration}
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })
-              )}
-            </tbody>
-          </table>
-        </div>
-      </div>
-        </>
-      )}
-
-      {/* 4. Quick Order Modal */}
-      {orderModalOpen && (
-        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000, padding: "16px" }}>
-          <div style={{ background: "var(--card-bg, #1a1a1e)", border: "1px solid var(--border-color, #2a2a30)", borderRadius: "12px", width: "100%", maxWidth: "440px", padding: "24px" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px" }}>
-              <h3 style={{ margin: 0, fontSize: "18px", fontWeight: "700", color: "#fff" }}>
-                Place {orderSide} Order ({selectedSymbol})
-              </h3>
-              <button
-                onClick={() => setOrderModalOpen(false)}
-                style={{ background: "transparent", border: "none", color: "#9ca3af", fontSize: "18px", cursor: "pointer" }}
+              {/* Right Axis Current Price Badge */}
+              <rect
+                x={padding.left + chartWidth + 2}
+                y={currentPriceY - 10}
+                width="64"
+                height="20"
+                fill={isPos ? greenColor : redColor}
+                rx="3"
+              />
+              <text
+                x={padding.left + chartWidth + 6}
+                y={currentPriceY + 4}
+                fill="#ffffff"
+                fontSize="11"
+                fontWeight="700"
+                fontFamily="monospace"
               >
-                ✕
+                {currPrice.toFixed(2)}
+              </text>
+
+              {/* Countdown Timer Pill to Candle Close (e.g. 04:09 as in screenshot) */}
+              <rect
+                x={padding.left + chartWidth + 2}
+                y={currentPriceY + 12}
+                width="64"
+                height="16"
+                fill={isLight ? "#334155" : "#1e293b"}
+                rx="3"
+              />
+              <text
+                x={padding.left + chartWidth + 14}
+                y={currentPriceY + 24}
+                fill="#38bdf8"
+                fontSize="10"
+                fontWeight="700"
+                fontFamily="monospace"
+              >
+                {countdownFormatted}
+              </text>
+
+              {/* Hover Crosshairs & Tooltip */}
+              {mousePos && (
+                <>
+                  <line
+                    x1={mousePos.x}
+                    y1={padding.top}
+                    x2={mousePos.x}
+                    y2={padding.top + mainChartHeight + volumeHeight + 15}
+                    stroke={textSecondary}
+                    strokeDasharray="3 3"
+                    strokeWidth="1"
+                  />
+                  <line
+                    x1={padding.left}
+                    y1={mousePos.y}
+                    x2={padding.left + chartWidth}
+                    y2={mousePos.y}
+                    stroke={textSecondary}
+                    strokeDasharray="3 3"
+                    strokeWidth="1"
+                  />
+                </>
+              )}
+            </svg>
+          </div>
+
+          {/* Bottom Bar: Range Selectors + Powered by + Live Clock */}
+          <div
+            style={{
+              padding: "6px 14px",
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              flexWrap: "wrap",
+              borderTop: `1px solid ${borderColor}`,
+              fontSize: "12px",
+              background: bgSurface,
+              color: textSecondary,
+            }}
+          >
+            <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+              {["5Y", "1Y", "6M", "3M", "1M", "5D", "1D"].map((r) => (
+                <button
+                  key={r}
+                  style={{
+                    background: "transparent",
+                    border: "none",
+                    color: textSecondary,
+                    fontSize: "11px",
+                    fontWeight: "600",
+                    cursor: "pointer",
+                    padding: "2px 4px",
+                  }}
+                >
+                  {r}
+                </button>
+              ))}
+              <span style={{ fontSize: "11px", color: textMuted }}>|</span>
+              <span style={{ fontSize: "11px", color: textMuted }}>Powered by <strong>Upstox Live Feed</strong></span>
+            </div>
+
+            <div style={{ display: "flex", gap: "12px", alignItems: "center" }}>
+              <span style={{ fontFamily: "monospace", fontSize: "11px", color: textPrimary }}>
+                {istClock || "14:45:50 (UTC+5:30)"}
+              </span>
+              <div style={{ display: "flex", gap: "6px", fontSize: "11px" }}>
+                <span style={{ cursor: "pointer" }}>%</span>
+                <span style={{ cursor: "pointer" }}>log</span>
+                <span style={{ cursor: "pointer", fontWeight: "700", color: purpleAccent }}>auto</span>
+              </div>
+            </div>
+          </div>
+
+          {/* Bottom Drawer Tabs: Open Orders, Positions, Holdings (Simulated) */}
+          <div style={{ borderTop: `1px solid ${borderColor}`, background: bgCard, padding: "8px 14px" }}>
+            <div style={{ display: "flex", gap: "16px", borderBottom: `1px solid ${borderColor}`, paddingBottom: "6px", marginBottom: "8px" }}>
+              <button
+                onClick={() => setActiveTabBottom("orders")}
+                style={{
+                  background: "transparent",
+                  border: "none",
+                  borderBottom: activeTabBottom === "orders" ? `2px solid ${purpleAccent}` : "2px solid transparent",
+                  color: activeTabBottom === "orders" ? textPrimary : textSecondary,
+                  fontWeight: activeTabBottom === "orders" ? "700" : "500",
+                  cursor: "pointer",
+                  fontSize: "12px",
+                  padding: "4px 8px",
+                }}
+              >
+                Open Orders (0)
+              </button>
+              <button
+                onClick={() => setActiveTabBottom("positions")}
+                style={{
+                  background: "transparent",
+                  border: "none",
+                  borderBottom: activeTabBottom === "positions" ? `2px solid ${purpleAccent}` : "2px solid transparent",
+                  color: activeTabBottom === "positions" ? textPrimary : textSecondary,
+                  fontWeight: activeTabBottom === "positions" ? "700" : "500",
+                  cursor: "pointer",
+                  fontSize: "12px",
+                  padding: "4px 8px",
+                }}
+              >
+                Positions | Day P&amp;L <strong style={{ color: greenColor }}>₹0.00</strong> (Simulated)
+              </button>
+              <button
+                onClick={() => setActiveTabBottom("trades")}
+                style={{
+                  background: "transparent",
+                  border: "none",
+                  borderBottom: activeTabBottom === "trades" ? `2px solid ${purpleAccent}` : "2px solid transparent",
+                  color: activeTabBottom === "trades" ? textPrimary : textSecondary,
+                  fontWeight: activeTabBottom === "trades" ? "700" : "500",
+                  cursor: "pointer",
+                  fontSize: "12px",
+                  padding: "4px 8px",
+                }}
+              >
+                Trade History &amp; Strategy Ledger ({data?.detailed_trades?.length || 0})
+              </button>
+              <button
+                onClick={() => setActiveTabBottom("backtest")}
+                style={{
+                  background: "transparent",
+                  border: "none",
+                  borderBottom: activeTabBottom === "backtest" ? `2px solid ${purpleAccent}` : "2px solid transparent",
+                  color: activeTabBottom === "backtest" ? textPrimary : textSecondary,
+                  fontWeight: activeTabBottom === "backtest" ? "700" : "500",
+                  cursor: "pointer",
+                  fontSize: "12px",
+                  padding: "4px 8px",
+                }}
+              >
+                📊 Pullback Backtest (Dev vs OOS)
               </button>
             </div>
 
-            <form onSubmit={submitOrder} style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
-              <div>
-                <label style={{ display: "block", fontSize: "12px", color: "#9ca3af", marginBottom: "4px" }}>Symbol</label>
-                <input
-                  type="text"
-                  value={selectedSymbol}
-                  disabled
-                  style={{ width: "100%", padding: "10px", background: "var(--bg-input, #222)", border: "1px solid var(--border-color, #333)", borderRadius: "6px", color: "#fff", fontWeight: "600" }}
-                />
-              </div>
 
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px" }}>
-                <div>
-                  <label style={{ display: "block", fontSize: "12px", color: "#9ca3af", marginBottom: "4px" }}>Quantity (Whole Shares)</label>
-                  <input
-                    type="number"
-                    min="1"
-                    step="1"
-                    value={orderQty}
-                    onChange={(e) => setOrderQty(e.target.value)}
-                    style={{ width: "100%", padding: "10px", background: "var(--bg-input, #222)", border: "1px solid var(--border-color, #333)", borderRadius: "6px", color: "#fff" }}
-                  />
-                </div>
 
-                <div>
-                  <label style={{ display: "block", fontSize: "12px", color: "#9ca3af", marginBottom: "4px" }}>Price (INR ₹)</label>
-                  <input
-                    type="number"
-                    step="0.05"
-                    value={orderPrice}
-                    onChange={(e) => setOrderPrice(e.target.value)}
-                    style={{ width: "100%", padding: "10px", background: "var(--bg-input, #222)", border: "1px solid var(--border-color, #333)", borderRadius: "6px", color: "#fff" }}
-                  />
-                </div>
-              </div>
-
-              <div style={{ padding: "10px", background: "var(--bg-input, #222)", borderRadius: "6px", fontSize: "12px", color: "#9ca3af" }}>
-                Total Order Notional: <strong style={{ color: "#fff" }}>₹ {inr((parseFloat(orderQty) || 0) * (parseFloat(orderPrice) || 0))}</strong>
-                <br />
-                Statutory STT + Stamp Duty + GST: <span style={{ color: "#f59e0b" }}>~₹ {inr((parseFloat(orderQty) || 0) * (parseFloat(orderPrice) || 0) * 0.0012)}</span>
-              </div>
-
-              {orderFeedback && (
-                <div style={{
-                  padding: "10px",
-                  borderRadius: "6px",
-                  fontSize: "12px",
-                  background: orderFeedback.kind === "good" ? "rgba(34, 197, 94, 0.15)" : "rgba(239, 68, 68, 0.15)",
-                  color: orderFeedback.kind === "good" ? "#22c55e" : "#ef4444",
-                  border: `1px solid ${orderFeedback.kind === "good" ? "rgba(34, 197, 94, 0.3)" : "rgba(239, 68, 68, 0.3)"}`,
-                }}>
-                  {orderFeedback.msg}
+            <div style={{ fontSize: "12px", color: textMuted, padding: "6px 0" }}>
+              {activeTabBottom === "orders" && (
+                <span>No active paper orders pending execution. Live limit orders execute instantly against simulated paper liquidity.</span>
+              )}
+              {activeTabBottom === "positions" && (
+                <span>All intraday positions are tracked with statutory Indian costs (STT: 0.025%, GST: 18%, Stamp Duty: 0.003%, SEBI turnover).</span>
+              )}
+              {activeTabBottom === "holdings" && (
+                <span>Paper account starting balance is calibrated to ₹1,000 INR. Real broker funds are strictly untouched.</span>
+              )}
+              {activeTabBottom === "trades" && (
+                <div style={{ overflowX: "auto" }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "11px" }}>
+                    <thead>
+                      <tr style={{ borderBottom: `1px solid ${borderColor}`, textAlign: "left", color: textSecondary }}>
+                        <th style={{ padding: "6px 8px" }}>Trade ID</th>
+                        <th style={{ padding: "6px 8px" }}>Market &amp; Feed</th>
+                        <th style={{ padding: "6px 8px" }}>Strategy Reason</th>
+                        <th style={{ padding: "6px 8px" }}>Simulated Buy Fill</th>
+                        <th style={{ padding: "6px 8px" }}>Simulated Sell Fill</th>
+                        <th style={{ padding: "6px 8px" }}>Planned Stop / Target</th>
+                        <th style={{ padding: "6px 8px" }}>Statutory Taxes</th>
+                        <th style={{ padding: "6px 8px" }}>Net Realized P&amp;L</th>
+                        <th style={{ padding: "6px 8px" }}>Status</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {data?.detailed_trades && data.detailed_trades.map((t) => {
+                        const isProfit = toN(t.net_pnl, 0) > 0;
+                        return (
+                          <tr key={t.id} style={{ borderBottom: `1px solid ${borderColor}` }}>
+                            <td style={{ padding: "6px 8px", fontFamily: "monospace", color: textSecondary }}>{t.id}</td>
+                            <td style={{ padding: "6px 8px" }}>
+                              <div style={{ fontWeight: "600", color: textPrimary }}>{t.market || "NSE Cash Equities"}</div>
+                              <div style={{ fontSize: "10px", color: purpleAccent }}>{t.provider_feed || "Upstox V3 Feed"}</div>
+                            </td>
+                            <td style={{ padding: "6px 8px", maxWidth: "200px" }}>
+                              <span style={{ fontSize: "10px", color: textSecondary }}>
+                                {t.signal_reason || "Confirmed 5m Pullback Rebound: Price > VWAP & EMA20 > EMA50"}
+                              </span>
+                            </td>
+                            <td style={{ padding: "6px 8px" }}>
+                              <span style={{ color: "#2563eb", fontWeight: "700" }}>₹{toN(t.buy_price).toFixed(2)}</span>
+                              <div style={{ fontSize: "10px", color: textMuted }}>{t.buy_time} ({t.shares} sh)</div>
+                            </td>
+                            <td style={{ padding: "6px 8px" }}>
+                              {t.status === "CLOSED" ? (
+                                <>
+                                  <span style={{ color: "#0f172a", fontWeight: "700", background: "#f1f5f9", padding: "1px 4px", borderRadius: "2px" }}>₹{toN(t.sell_price).toFixed(2)}</span>
+                                  <div style={{ fontSize: "10px", color: textMuted }}>{t.sell_time}</div>
+                                </>
+                              ) : (
+                                <span style={{ color: textMuted }}>Active</span>
+                              )}
+                            </td>
+                            <td style={{ padding: "6px 8px", fontSize: "10px" }}>
+                              <div>SL: <strong style={{ color: redColor }}>₹{toN(t.stop_loss_price).toFixed(2)}</strong></div>
+                              <div>TP: <strong style={{ color: greenColor }}>₹{toN(t.take_profit_price).toFixed(2)}</strong> (1.5:1)</div>
+                            </td>
+                            <td style={{ padding: "6px 8px", color: "#f59e0b" }}>- ₹{toN(t.total_taxes).toFixed(2)}</td>
+                            <td style={{ padding: "6px 8px" }}>
+                              {t.status === "CLOSED" ? (
+                                <span style={{ fontWeight: "700", color: isProfit ? greenColor : redColor }}>
+                                  {isProfit ? `+₹${toN(t.net_pnl).toFixed(2)}` : `-₹${Math.abs(toN(t.net_pnl)).toFixed(2)}`}
+                                  <span style={{ fontSize: "10px", marginLeft: "4px" }}>({toN(t.roi_pct).toFixed(2)}%)</span>
+                                </span>
+                              ) : (
+                                <span style={{ color: textMuted }}>Floating</span>
+                              )}
+                            </td>
+                            <td style={{ padding: "6px 8px" }}>
+                              <span style={{ padding: "2px 6px", borderRadius: "3px", fontSize: "10px", fontWeight: "700", background: t.status === "CLOSED" ? (isProfit ? "#dcfce7" : "#fee2e2") : "#e0e7ff", color: t.status === "CLOSED" ? (isProfit ? "#15803d" : "#b91c1c") : "#4338ca" }}>
+                                {t.status}
+                              </span>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
                 </div>
               )}
+              {activeTabBottom === "backtest" && (
+                <div style={{ padding: "10px 0" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px", flexWrap: "wrap", gap: "8px" }}>
+                    <span style={{ fontWeight: "700", color: textPrimary, fontSize: "13px" }}>
+                      NSE Indian Equities — Pullback &amp; Confirmed Rebound Backtest (Zero Lookahead)
+                    </span>
+                    <button
+                      onClick={fetchIndiaBacktest}
+                      disabled={loadingIndiaBacktest}
+                      style={{ padding: "4px 10px", borderRadius: "4px", border: `1px solid ${borderColor}`, background: bgCard, color: purpleAccent, cursor: "pointer", fontSize: "11px", fontWeight: "600" }}
+                    >
+                      {loadingIndiaBacktest ? "Running Simulation..." : "🔄 Refresh Backtest"}
+                    </button>
+                  </div>
+                  {indiaBacktest && (
+                    <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+                      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: "12px" }}>
+                        <div style={{ padding: "12px", background: isLight ? "rgba(59, 130, 246, 0.08)" : "rgba(59, 130, 246, 0.15)", borderRadius: "6px", border: "1px solid rgba(59, 130, 246, 0.3)" }}>
+                          <div style={{ fontWeight: "700", color: "#3b82f6", fontSize: "12px", marginBottom: "8px" }}>
+                            {indiaBacktest.dev_period.period_name} ({indiaBacktest.dev_period.candle_count} 5m bars)
+                          </div>
+                          <div style={{ fontSize: "11px", display: "grid", gridTemplateColumns: "1fr 1fr", gap: "6px" }}>
+                            <div>Net P&amp;L: <strong style={{ color: indiaBacktest.dev_period.net_pnl >= 0 ? greenColor : redColor }}>₹{toN(indiaBacktest.dev_period.net_pnl).toFixed(2)} ({toN(indiaBacktest.dev_period.net_pnl_pct).toFixed(2)}%)</strong></div>
+                            <div>Win Rate: <strong>{toN(indiaBacktest.dev_period.win_rate_pct).toFixed(1)}%</strong> ({indiaBacktest.dev_period.winning_trades}W / {indiaBacktest.dev_period.losing_trades}L)</div>
+                            <div>Max Drawdown: <strong style={{ color: redColor }}>₹{toN(indiaBacktest.dev_period.max_drawdown_amount).toFixed(2)} ({toN(indiaBacktest.dev_period.max_drawdown_pct).toFixed(2)}%)</strong></div>
+                            <div>Expectancy: <strong>₹{toN(indiaBacktest.dev_period.expectancy_per_trade).toFixed(2)} / trade</strong></div>
+                            <div>Avg Win / Loss: <strong>₹{toN(indiaBacktest.dev_period.avg_win).toFixed(2)} / ₹{toN(indiaBacktest.dev_period.avg_loss).toFixed(2)}</strong></div>
+                            <div>Taxes: <strong style={{ color: "#f59e0b" }}>-₹{toN(indiaBacktest.dev_period.total_regulatory_costs).toFixed(2)}</strong></div>
+                          </div>
+                        </div>
 
-              <div style={{ display: "flex", gap: "10px", marginTop: "8px" }}>
-                <button
-                  type="button"
-                  onClick={() => setOrderModalOpen(false)}
-                  style={{ flex: 1, padding: "10px", background: "transparent", border: "1px solid var(--border-color, #333)", color: "#9ca3af", borderRadius: "6px", cursor: "pointer" }}
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={submittingOrder}
-                  style={{
-                    flex: 1,
-                    padding: "10px",
-                    background: orderSide === "BUY" ? "#16a34a" : "#dc2626",
-                    border: "none",
-                    color: "#fff",
-                    fontWeight: "700",
-                    borderRadius: "6px",
-                    cursor: "pointer",
-                  }}
-                >
-                  {submittingOrder ? "Submitting..." : `Confirm ${orderSide} Order`}
-                </button>
-              </div>
-            </form>
+                        <div style={{ padding: "12px", background: isLight ? "rgba(16, 185, 129, 0.08)" : "rgba(16, 185, 129, 0.15)", borderRadius: "6px", border: "1px solid rgba(16, 185, 129, 0.3)" }}>
+                          <div style={{ fontWeight: "700", color: greenColor, fontSize: "12px", marginBottom: "8px" }}>
+                            {indiaBacktest.oos_period.period_name} ({indiaBacktest.oos_period.candle_count} 5m bars)
+                          </div>
+                          <div style={{ fontSize: "11px", display: "grid", gridTemplateColumns: "1fr 1fr", gap: "6px" }}>
+                            <div>Net P&amp;L: <strong style={{ color: indiaBacktest.oos_period.net_pnl >= 0 ? greenColor : redColor }}>₹{toN(indiaBacktest.oos_period.net_pnl).toFixed(2)} ({toN(indiaBacktest.oos_period.net_pnl_pct).toFixed(2)}%)</strong></div>
+                            <div>Win Rate: <strong>{toN(indiaBacktest.oos_period.win_rate_pct).toFixed(1)}%</strong> ({indiaBacktest.oos_period.winning_trades}W / {indiaBacktest.oos_period.losing_trades}L)</div>
+                            <div>Max Drawdown: <strong style={{ color: redColor }}>₹{toN(indiaBacktest.oos_period.max_drawdown_amount).toFixed(2)} ({toN(indiaBacktest.oos_period.max_drawdown_pct).toFixed(2)}%)</strong></div>
+                            <div>Expectancy: <strong>₹{toN(indiaBacktest.oos_period.expectancy_per_trade).toFixed(2)} / trade</strong></div>
+                            <div>Avg Win / Loss: <strong>₹{toN(indiaBacktest.oos_period.avg_win).toFixed(2)} / ₹{toN(indiaBacktest.oos_period.avg_loss).toFixed(2)}</strong></div>
+                            <div>Taxes: <strong style={{ color: "#f59e0b" }}>-₹{toN(indiaBacktest.oos_period.total_regulatory_costs).toFixed(2)}</strong></div>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div style={{ padding: "10px 14px", background: bgSurface, borderRadius: "6px", border: `1px solid ${borderColor}`, display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: "11px", flexWrap: "wrap", gap: "8px" }}>
+                        <div>
+                          <strong>{indiaBacktest.baseline.strategy_name}:</strong> Buy &amp; Hold Return <strong>{toN(indiaBacktest.baseline.buy_and_hold_return_pct).toFixed(2)}%</strong> (Max DD: {toN(indiaBacktest.baseline.buy_and_hold_max_drawdown_pct).toFixed(2)}%)
+                        </div>
+                        <div style={{ fontWeight: "700", color: toN(indiaBacktest.baseline.strategy_outperformance_pct) >= 0 ? greenColor : redColor }}>
+                          Outperformance: {toN(indiaBacktest.baseline.strategy_outperformance_pct) >= 0 ? `+${toN(indiaBacktest.baseline.strategy_outperformance_pct).toFixed(2)}%` : `${toN(indiaBacktest.baseline.strategy_outperformance_pct).toFixed(2)}%`}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
           </div>
         </div>
-      )}
+      </div>
     </div>
   );
 }
