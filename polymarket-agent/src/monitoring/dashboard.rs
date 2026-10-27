@@ -253,8 +253,14 @@ fn build_router(state: DashboardState) -> Router {
         .route("/api/upstox/auth/status", get(upstox_auth_status_handler))
         .route("/api/upstox/auth/token", post(upstox_auth_token_handler))
         .route("/api/upstox/feed/status", get(upstox_feed_status_handler))
-        .route("/api/upstox/strategy/tick", post(upstox_strategy_tick_handler))
-        .route("/api/upstox/simulator/order", post(upstox_simulator_order_handler))
+        .route(
+            "/api/upstox/strategy/tick",
+            post(upstox_strategy_tick_handler),
+        )
+        .route(
+            "/api/upstox/simulator/order",
+            post(upstox_simulator_order_handler),
+        )
         .route("/api/alpaca/feed/status", get(alpaca_feed_status_handler))
         .route("/api/pullback/backtest", get(pullback_backtest_handler))
         .route(
@@ -1026,7 +1032,11 @@ async fn upstox_feed_status_handler(State(state): State<DashboardState>) -> impl
     let ticks = state.upstox_feed.prices.read().await.clone();
     let mut live_prices_summary = serde_json::Map::new();
     for (sym, t) in &ticks {
-        let prev_close = if t.close > Decimal::ZERO { t.close } else { t.last_price };
+        let prev_close = if t.close > Decimal::ZERO {
+            t.close
+        } else {
+            t.last_price
+        };
         let change_pct = if prev_close > Decimal::ZERO {
             ((t.last_price - prev_close) / prev_close) * rust_decimal_macros::dec!(100)
         } else {
@@ -1147,7 +1157,10 @@ async fn upstox_oauth_callback_handler(
     (
         StatusCode::BAD_REQUEST,
         [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        format!("<h1>Authorization Error</h1><p>{}</p><p><a href='/india-test'>Back</a></p>", err_msg),
+        format!(
+            "<h1>Authorization Error</h1><p>{}</p><p><a href='/india-test'>Back</a></p>",
+            err_msg
+        ),
     )
         .into_response()
 }
@@ -1226,7 +1239,14 @@ async fn upstox_strategy_tick_handler(
             trigger_reason: Some(decision.reason.clone()),
         };
 
-        match crate::india::simulator::execute_paper_order(&state.store, base_capital, &order_req, current_price).await {
+        match crate::india::simulator::execute_paper_order(
+            &state.store,
+            base_capital,
+            &order_req,
+            current_price,
+        )
+        .await
+        {
             Ok(res) => {
                 execution_result = Some(res);
             }
@@ -1257,7 +1277,9 @@ async fn upstox_simulator_order_handler(
 
     let live_price = state.upstox_feed.get_price(&req.symbol).await;
 
-    match crate::india::simulator::execute_paper_order(&state.store, base_capital, &req, live_price).await {
+    match crate::india::simulator::execute_paper_order(&state.store, base_capital, &req, live_price)
+        .await
+    {
         Ok(result) => Json(serde_json::json!({
             "status": "success",
             "order": result.order,
@@ -1298,7 +1320,8 @@ async fn india_chart_handler(
         prices.get(&symbol).cloned()
     };
 
-    let chart = crate::india::chart::generate_nse_chart(&symbol, &range, &orders, live_tick.as_ref());
+    let chart =
+        crate::india::chart::generate_nse_chart(&symbol, &range, &orders, live_tick.as_ref());
     Json(serde_json::to_value(&chart).unwrap_or_default())
 }
 
@@ -1538,7 +1561,11 @@ async fn pullback_backtest_handler(
     let config = PullbackStrategyConfig::default();
 
     // Read existing sample CSV to generate 5m candle bars or generate high-integrity realistic series
-    let csv_file = if is_us { "data/us_sample_data.csv" } else { "data/nse_sample_data.csv" };
+    let csv_file = if is_us {
+        "data/us_sample_data.csv"
+    } else {
+        "data/nse_sample_data.csv"
+    };
     let symbol = if is_us { "SPY" } else { "RELIANCE" };
     let base_price = if is_us { 580.0 } else { 2500.0 };
 
@@ -1557,9 +1584,15 @@ async fn pullback_backtest_handler(
                 let volume: Decimal = parts[6].trim().parse().unwrap_or(Decimal::ZERO);
                 if open > Decimal::ZERO {
                     candles.push(FiveMinCandle {
-                        timestamp: chrono::Utc.timestamp_opt(1704096000 + (candles.len() as i64 * 300), 0).unwrap(),
+                        timestamp: chrono::Utc
+                            .timestamp_opt(1704096000 + (candles.len() as i64 * 300), 0)
+                            .unwrap(),
                         symbol: parts[1].trim().to_string(),
-                        open, high, low, close, volume,
+                        open,
+                        high,
+                        low,
+                        close,
+                        volume,
                     });
                 }
             }
@@ -1585,7 +1618,9 @@ async fn pullback_backtest_handler(
             price = close;
 
             candles.push(FiveMinCandle {
-                timestamp: chrono::Utc.timestamp_opt(1704096000 + (i as i64 * 300), 0).unwrap(),
+                timestamp: chrono::Utc
+                    .timestamp_opt(1704096000 + (i as i64 * 300), 0)
+                    .unwrap(),
                 symbol: symbol.to_string(),
                 open: Decimal::from_str_exact(&format!("{:.2}", open)).unwrap_or(dec!(100.0)),
                 high: Decimal::from_str_exact(&format!("{:.2}", high)).unwrap_or(dec!(100.0)),
@@ -1915,7 +1950,8 @@ async fn us_paper_order_handler(
 
     // Price determination with live feed & slippage
     let live_price_opt = state.alpaca_feed.get_price(&req.symbol).await;
-    let base_price = live_price_opt.unwrap_or_else(|| crate::us::chart::get_us_company_info(&req.symbol).3);
+    let base_price =
+        live_price_opt.unwrap_or_else(|| crate::us::chart::get_us_company_info(&req.symbol).3);
     let mut order_price = match req.price {
         Some(p) if p > Decimal::ZERO => p,
         _ => base_price,
@@ -1997,9 +2033,17 @@ async fn us_paper_order_handler(
     }
 
     let venue_order_id = Some(format!("US-SIM-{}", uuid::Uuid::new_v4().simple()));
-    let order_status = if is_market { "FILLED".to_string() } else { "OPEN".to_string() };
+    let order_status = if is_market {
+        "FILLED".to_string()
+    } else {
+        "OPEN".to_string()
+    };
     let fill_qty = if is_market { req.quantity } else { 0i64 };
-    let avg_fill_price = if is_market { Some(price_str.clone()) } else { None };
+    let avg_fill_price = if is_market {
+        Some(price_str.clone())
+    } else {
+        None
+    };
 
     let order_record = crate::db::store::UsPaperOrderRecord {
         id: format!("ord-{}", uuid::Uuid::new_v4().simple()),
@@ -2088,7 +2132,10 @@ async fn combined_portfolio_handler(State(state): State<DashboardState>) -> impl
         .unwrap_or_default();
     let (india_base_capital, us_base_capital) = {
         let caps = state.dynamic_caps.read().await;
-        (caps.india_capital_allocation_inr, caps.us_capital_allocation_usd)
+        (
+            caps.india_capital_allocation_inr,
+            caps.us_capital_allocation_usd,
+        )
     };
     let (india_sandbox_realized_profit, _in_open_cost, _in_cash, _in_holdings) =
         compute_india_sandbox_accounting(india_base_capital, &india_orders);
@@ -2161,7 +2208,10 @@ async fn intraday_status_handler(State(state): State<DashboardState>) -> impl In
     let fx = crate::market::fx::get_current_fx_rate();
     let (cap_inr, cap_usd) = {
         let caps = state.dynamic_caps.read().await;
-        (caps.india_capital_allocation_inr, caps.us_capital_allocation_usd)
+        (
+            caps.india_capital_allocation_inr,
+            caps.us_capital_allocation_usd,
+        )
     };
 
     Json(serde_json::json!({
@@ -2230,11 +2280,10 @@ where
                 Err(serde::de::Error::custom("invalid number"))
             }
         }
-        Some(serde_json::Value::String(s)) => {
-            s.parse::<Decimal>()
-                .map(Some)
-                .map_err(serde::de::Error::custom)
-        }
+        Some(serde_json::Value::String(s)) => s
+            .parse::<Decimal>()
+            .map(Some)
+            .map_err(serde::de::Error::custom),
         _ => Err(serde::de::Error::custom("expected number or string")),
     }
 }

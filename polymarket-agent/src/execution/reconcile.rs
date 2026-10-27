@@ -265,7 +265,6 @@ impl StateReconciler<'_> {
             entry.0 += trade.quantity;
         }
 
-
         let mut venue_qty: HashMap<String, Decimal> = HashMap::new();
         for pos in &venue_positions {
             *venue_qty

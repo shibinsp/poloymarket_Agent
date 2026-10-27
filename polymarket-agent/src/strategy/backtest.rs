@@ -196,11 +196,25 @@ pub fn run_pullback_backtest(
         let period_label = if i < dev_count { "DEV" } else { "OOS" };
 
         // 1. Process fills for signals generated at prior bar close (Zero look-ahead)
-        if let Some((SignalAction::Buy { stop_price, target_price, planned_risk_per_share, .. }, _)) = pending_signal.take() {
+        if let Some((
+            SignalAction::Buy {
+                stop_price,
+                target_price,
+                planned_risk_per_share,
+                ..
+            },
+            _,
+        )) = pending_signal.take()
+        {
             if open_position.is_none() {
                 // Fill at next bar open + slippage
                 let fill_price = current_candle.open * (Decimal::ONE + config.slippage_bps);
-                let shares = calculate_position_size(current_cash, fill_price, planned_risk_per_share, config);
+                let shares = calculate_position_size(
+                    current_cash,
+                    fill_price,
+                    planned_risk_per_share,
+                    config,
+                );
 
                 if shares > 0 {
                     let cost = fill_price * Decimal::from(shares);
@@ -330,15 +344,27 @@ pub fn run_pullback_backtest(
             gross_pnl,
             regulatory_fees: fees,
             net_pnl,
-            roi_pct: if !entry_val.is_zero() { (net_pnl / entry_val) * dec!(100.0) } else { Decimal::ZERO },
+            roi_pct: if !entry_val.is_zero() {
+                (net_pnl / entry_val) * dec!(100.0)
+            } else {
+                Decimal::ZERO
+            },
         });
     }
 
     // Helper to compute metrics for a subset of trades
-    let compute_metrics = |period_name: &str, filtered_trades: &[BacktestExecutionTrade], candle_slice: &[FiveMinCandle]| {
+    let compute_metrics = |period_name: &str,
+                           filtered_trades: &[BacktestExecutionTrade],
+                           candle_slice: &[FiveMinCandle]| {
         let count = filtered_trades.len();
-        let winning: Vec<_> = filtered_trades.iter().filter(|t| t.net_pnl > Decimal::ZERO).collect();
-        let losing: Vec<_> = filtered_trades.iter().filter(|t| t.net_pnl <= Decimal::ZERO).collect();
+        let winning: Vec<_> = filtered_trades
+            .iter()
+            .filter(|t| t.net_pnl > Decimal::ZERO)
+            .collect();
+        let losing: Vec<_> = filtered_trades
+            .iter()
+            .filter(|t| t.net_pnl <= Decimal::ZERO)
+            .collect();
 
         let win_count = winning.len();
         let loss_count = losing.len();
@@ -349,8 +375,16 @@ pub fn run_pullback_backtest(
         let win_sum: Decimal = winning.iter().map(|t| t.net_pnl).sum();
         let loss_sum: Decimal = losing.iter().map(|t| t.net_pnl.abs()).sum();
 
-        let avg_win = if win_count > 0 { win_sum / Decimal::from(win_count) } else { Decimal::ZERO };
-        let avg_loss = if loss_count > 0 { loss_sum / Decimal::from(loss_count) } else { Decimal::ZERO };
+        let avg_win = if win_count > 0 {
+            win_sum / Decimal::from(win_count)
+        } else {
+            Decimal::ZERO
+        };
+        let avg_loss = if loss_count > 0 {
+            loss_sum / Decimal::from(loss_count)
+        } else {
+            Decimal::ZERO
+        };
 
         let win_rate_pct = if count > 0 {
             (Decimal::from(win_count) / Decimal::from(count)) * dec!(100.0)
@@ -380,7 +414,11 @@ pub fn run_pullback_backtest(
             initial_capital,
             final_capital: initial_capital + net_pnl,
             net_pnl,
-            net_pnl_pct: if !initial_capital.is_zero() { (net_pnl / initial_capital) * dec!(100.0) } else { Decimal::ZERO },
+            net_pnl_pct: if !initial_capital.is_zero() {
+                (net_pnl / initial_capital) * dec!(100.0)
+            } else {
+                Decimal::ZERO
+            },
             max_drawdown_amount,
             max_drawdown_pct,
             trade_count: count,
@@ -395,11 +433,27 @@ pub fn run_pullback_backtest(
         }
     };
 
-    let dev_trades: Vec<_> = trades.iter().filter(|t| t.period == "DEV").cloned().collect();
-    let oos_trades: Vec<_> = trades.iter().filter(|t| t.period == "OOS").cloned().collect();
+    let dev_trades: Vec<_> = trades
+        .iter()
+        .filter(|t| t.period == "DEV")
+        .cloned()
+        .collect();
+    let oos_trades: Vec<_> = trades
+        .iter()
+        .filter(|t| t.period == "OOS")
+        .cloned()
+        .collect();
 
-    let dev_metrics = compute_metrics("Development (In-Sample)", &dev_trades, &candles[..dev_count]);
-    let oos_metrics = compute_metrics("Validation (Out-of-Sample)", &oos_trades, &candles[dev_count..]);
+    let dev_metrics = compute_metrics(
+        "Development (In-Sample)",
+        &dev_trades,
+        &candles[..dev_count],
+    );
+    let oos_metrics = compute_metrics(
+        "Validation (Out-of-Sample)",
+        &oos_trades,
+        &candles[dev_count..],
+    );
     let overall_metrics = compute_metrics("Full Dataset", &trades, candles);
 
     // Compute Buy & Hold Baseline Return

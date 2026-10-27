@@ -86,10 +86,16 @@ pub struct AlpacaLiveMarketFeed {
 }
 
 impl AlpacaLiveMarketFeed {
-    pub fn new(key_id: Option<String>, secret_key: Option<String>, feed_type: Option<String>) -> Self {
+    pub fn new(
+        key_id: Option<String>,
+        secret_key: Option<String>,
+        feed_type: Option<String>,
+    ) -> Self {
         let env_key = std::env::var("ALPACA_API_KEY_ID").ok();
         let env_secret = std::env::var("ALPACA_API_SECRET_KEY").ok();
-        let env_feed = std::env::var("ALPACA_FEED_TYPE").ok().unwrap_or_else(|| "iex".to_string());
+        let env_feed = std::env::var("ALPACA_FEED_TYPE")
+            .ok()
+            .unwrap_or_else(|| "iex".to_string());
 
         let final_key = key_id.or(env_key);
         let final_secret = secret_key.or(env_secret);
@@ -223,7 +229,13 @@ impl AlpacaLiveMarketFeed {
     }
 
     /// Records an incoming tick from WebSocket and aggregates into 5-minute candles.
-    pub async fn process_trade_tick(&self, symbol: &str, price: Decimal, volume: i64, feed_ts: DateTime<Utc>) {
+    pub async fn process_trade_tick(
+        &self,
+        symbol: &str,
+        price: Decimal,
+        volume: i64,
+        feed_ts: DateTime<Utc>,
+    ) {
         let receipt_now = Utc::now();
         let latency = receipt_now
             .signed_duration_since(feed_ts)
@@ -329,7 +341,8 @@ impl AlpacaLiveMarketFeed {
                             "key": key,
                             "secret": secret
                         });
-                        if let Err(e) = write.send(Message::Text(auth_msg.to_string().into())).await {
+                        if let Err(e) = write.send(Message::Text(auth_msg.to_string().into())).await
+                        {
                             warn!(error = %e, "Failed to send Alpaca auth");
                             continue;
                         }
@@ -356,7 +369,8 @@ impl AlpacaLiveMarketFeed {
                             "action": "subscribe",
                             "trades": ["SPY", "QQQ", "AAPL", "NVDA", "MSFT", "AMZN", "TSLA", "META", "GOOGL", "PLUG", "NIO", "LCID", "NOK", "SOFI", "SIRI"]
                         });
-                        if let Err(e) = write.send(Message::Text(sub_msg.to_string().into())).await {
+                        if let Err(e) = write.send(Message::Text(sub_msg.to_string().into())).await
+                        {
                             warn!(error = %e, "Failed to subscribe to symbols on Alpaca stream");
                             continue;
                         }
@@ -365,7 +379,9 @@ impl AlpacaLiveMarketFeed {
                         while let Some(msg_res) = read.next().await {
                             match msg_res {
                                 Ok(Message::Text(txt)) => {
-                                    if let Ok(records) = serde_json::from_str::<Vec<serde_json::Value>>(&txt) {
+                                    if let Ok(records) =
+                                        serde_json::from_str::<Vec<serde_json::Value>>(&txt)
+                                    {
                                         for rec in records {
                                             if rec.get("T").and_then(|v| v.as_str()) == Some("t") {
                                                 if let (Some(sym), Some(price_num), Some(vol_num)) = (
@@ -373,14 +389,22 @@ impl AlpacaLiveMarketFeed {
                                                     rec.get("p").and_then(|v| v.as_f64()),
                                                     rec.get("s").and_then(|v| v.as_i64()),
                                                 ) {
-                                                    let ts = rec.get("t")
+                                                    let ts = rec
+                                                        .get("t")
                                                         .and_then(|v| v.as_str())
-                                                        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                                                        .and_then(|s| {
+                                                            DateTime::parse_from_rfc3339(s).ok()
+                                                        })
                                                         .map(|dt| dt.with_timezone(&Utc))
                                                         .unwrap_or_else(Utc::now);
 
-                                                    if let Some(dec_price) = Decimal::from_f64_retain(price_num) {
-                                                        self.process_trade_tick(sym, dec_price, vol_num, ts).await;
+                                                    if let Some(dec_price) =
+                                                        Decimal::from_f64_retain(price_num)
+                                                    {
+                                                        self.process_trade_tick(
+                                                            sym, dec_price, vol_num, ts,
+                                                        )
+                                                        .await;
                                                     }
                                                 }
                                             }

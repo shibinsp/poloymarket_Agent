@@ -1105,7 +1105,10 @@ impl Venue for AlpacaVenue {
     #[instrument(skip(self), fields(venue = %self.id))]
     async fn cancel_order(&self, venue_order_id: &str) -> Result<()> {
         if self.is_paper {
-            info!(venue_order_id, "Backend paper-only safety: local simulated order cancelled");
+            info!(
+                venue_order_id,
+                "Backend paper-only safety: local simulated order cancelled"
+            );
             return Ok(());
         }
 

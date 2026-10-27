@@ -10,10 +10,10 @@
 
 use chrono::{TimeZone, Utc};
 use polymarket_agent::config::{AgentMode, AppConfig, Secrets, VenueConfig};
+use polymarket_agent::db::store::Store;
 use polymarket_agent::india::backtest::{
     parse_and_validate_csv, run_backtest, NseBacktestConfig, NseCandle,
 };
-use polymarket_agent::db::store::Store;
 use polymarket_agent::india::costs::IndianCostConfig;
 use polymarket_agent::india::instruments::{find_nse_instrument, nse_watchlist};
 use polymarket_agent::india::market_feed::UpstoxLiveMarketFeed;
@@ -263,36 +263,19 @@ async fn test_upstox_feed_to_strategy_pipeline() {
     assert!(itc_price > Decimal::ZERO);
 
     // Evaluate tick with ₹1,000 capital and 0 holdings -> BUY
-    let decision_buy = evaluate_strategy_tick(
-        "ITC",
-        dec!(480.00),
-        dec!(1000.0),
-        0,
-        None,
-    );
+    let decision_buy = evaluate_strategy_tick("ITC", dec!(480.00), dec!(1000.0), 0, None);
     assert_eq!(decision_buy.action, "BUY");
     assert_eq!(decision_buy.quantity, 1);
     assert_eq!(decision_buy.symbol, "ITC");
 
     // Stock with price > available cash (e.g. RELIANCE at ₹1,200 vs ₹1,000 cash) -> WAIT
-    let decision_wait = evaluate_strategy_tick(
-        "RELIANCE",
-        dec!(1200.00),
-        dec!(1000.0),
-        0,
-        None,
-    );
+    let decision_wait = evaluate_strategy_tick("RELIANCE", dec!(1200.00), dec!(1000.0), 0, None);
     assert_eq!(decision_wait.action, "WAIT");
     assert!(decision_wait.reason.contains("exceeds available cash"));
 
     // Holding 1 share of ITC bought at ₹480, price rises to ₹495 (+3.12% > 2% TP) -> SELL
-    let decision_sell = evaluate_strategy_tick(
-        "ITC",
-        dec!(495.00),
-        dec!(520.0),
-        1,
-        Some(dec!(480.00)),
-    );
+    let decision_sell =
+        evaluate_strategy_tick("ITC", dec!(495.00), dec!(520.0), 1, Some(dec!(480.00)));
     assert_eq!(decision_sell.action, "SELL");
     assert_eq!(decision_sell.quantity, 1);
     assert!(decision_sell.reason.contains("Take-Profit"));
@@ -304,7 +287,10 @@ async fn test_simulator_executes_paper_order_and_persists() {
     let base_capital = dec!(1000.0);
 
     // Initial portfolio
-    let orders = store.get_india_sandbox_orders(100).await.unwrap_or_default();
+    let orders = store
+        .get_india_sandbox_orders(100)
+        .await
+        .unwrap_or_default();
     let p0 = compute_portfolio_accounting(base_capital, &orders, &HashMap::new());
     assert_eq!(p0.available_cash_inr, dec!(1000.0));
     assert_eq!(p0.total_equity_inr, dec!(1000.0));
@@ -325,7 +311,10 @@ async fn test_simulator_executes_paper_order_and_persists() {
     assert_eq!(res.order.symbol, "ITC");
 
     // Check portfolio after BUY
-    let orders1 = store.get_india_sandbox_orders(100).await.unwrap_or_default();
+    let orders1 = store
+        .get_india_sandbox_orders(100)
+        .await
+        .unwrap_or_default();
     assert_eq!(orders1.len(), 1);
     let p1 = compute_portfolio_accounting(base_capital, &orders1, &HashMap::new());
     assert_eq!(p1.available_cash_inr, dec!(520.0)); // 1000 - 480
@@ -341,7 +330,10 @@ async fn test_simulator_executes_paper_order_and_persists() {
         trigger_reason: None,
     };
     let overrun_res = execute_paper_order(&store, base_capital, &overrun_req, dec!(480.00)).await;
-    assert!(overrun_res.is_err(), "Must reject order exceeding available cash");
+    assert!(
+        overrun_res.is_err(),
+        "Must reject order exceeding available cash"
+    );
     let err_msg = overrun_res.unwrap_err().to_string();
     assert!(err_msg.contains("Insufficient virtual cash"));
 
@@ -360,12 +352,18 @@ async fn test_simulator_executes_paper_order_and_persists() {
     assert_eq!(sell_res.order.status, "ACKNOWLEDGED");
 
     // Check portfolio after SELL
-    let orders2 = store.get_india_sandbox_orders(100).await.unwrap_or_default();
+    let orders2 = store
+        .get_india_sandbox_orders(100)
+        .await
+        .unwrap_or_default();
     assert_eq!(orders2.len(), 2);
     let p2 = compute_portfolio_accounting(base_capital, &orders2, &HashMap::new());
     assert_eq!(p2.available_cash_inr, dec!(1015.0)); // 520 + 495
     assert_eq!(p2.realized_profit_inr, dec!(15.0)); // 495 - 480
-    assert_eq!(p2.holdings.get("ITC").copied().unwrap_or(Decimal::ZERO), Decimal::ZERO);
+    assert_eq!(
+        p2.holdings.get("ITC").copied().unwrap_or(Decimal::ZERO),
+        Decimal::ZERO
+    );
 }
 
 #[tokio::test]
@@ -455,4 +453,3 @@ async fn test_upstox_v3_market_feed_subscription_session_and_deduplication() {
     assert_eq!(fresh3.len(), 1, "New price must be accepted");
     assert_eq!(feed.get_price("RELIANCE").await, dec!(2501.00));
 }
-

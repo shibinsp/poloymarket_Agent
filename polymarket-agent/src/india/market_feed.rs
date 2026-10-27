@@ -26,7 +26,8 @@ use crate::india::instruments::{find_nse_instrument, nse_watchlist};
 use crate::india::session::{detect_nse_session, NseSessionInfo};
 
 pub const UPSTOX_API_BASE: &str = "https://api.upstox.com/v2";
-pub const UPSTOX_V3_FEED_AUTHORIZE: &str = "https://api.upstox.com/v3/feed/market-data-feed/authorize";
+pub const UPSTOX_V3_FEED_AUTHORIZE: &str =
+    "https://api.upstox.com/v3/feed/market-data-feed/authorize";
 
 /// Real-time live market tick for an NSE equity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,8 +52,8 @@ pub struct LiveTick {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeedStatusInfo {
     pub connected: bool,
-    pub status: String,       // "CONNECTED" | "CONNECTING" | "RECONNECTING_BACKOFF" | "CLOSED_SESSION" | "AUTH_REQUIRED" | "STALE"
-    pub feed_type: String,    // "UPSTOX_V3_LIVE" | "UPSTOX_REST_LIVE" | "SEED_OFFLINE"
+    pub status: String, // "CONNECTED" | "CONNECTING" | "RECONNECTING_BACKOFF" | "CLOSED_SESSION" | "AUTH_REQUIRED" | "STALE"
+    pub feed_type: String, // "UPSTOX_V3_LIVE" | "UPSTOX_REST_LIVE" | "SEED_OFFLINE"
     pub token_configured: bool,
     pub token_preview: Option<String>,
     pub client_id_configured: bool,
@@ -326,7 +327,10 @@ impl UpstoxLiveMarketFeed {
 
     /// Build the standard Upstox V3 subscription JSON payload for the watchlist instruments.
     pub fn build_v3_subscription_message() -> String {
-        let keys: Vec<String> = nse_watchlist().iter().map(|i| i.upstox_key.clone()).collect();
+        let keys: Vec<String> = nse_watchlist()
+            .iter()
+            .map(|i| i.upstox_key.clone())
+            .collect();
         serde_json::json!({
             "guid": "guid-sub-nse-watchlist",
             "method": "sub",
@@ -496,7 +500,10 @@ impl UpstoxLiveMarketFeed {
         let now = Utc::now();
         let session = detect_nse_session(now);
 
-        let has_token = token.as_ref().map(|t| !t.trim().is_empty()).unwrap_or(false);
+        let has_token = token
+            .as_ref()
+            .map(|t| !t.trim().is_empty())
+            .unwrap_or(false);
         let preview = token.as_ref().map(|t| {
             if t.len() > 10 {
                 format!("{}...{}", &t[0..4], &t[t.len() - 4..])
@@ -622,7 +629,9 @@ impl UpstoxLiveMarketFeed {
                         debug!("Upstox V3 WebSocket feed authorized, connecting: {ws_uri}");
                         match tokio_tungstenite::connect_async(&ws_uri).await {
                             Ok((mut ws_stream, _response)) => {
-                                info!("Upstox Market Data Feed V3 WebSocket connected successfully");
+                                info!(
+                                    "Upstox Market Data Feed V3 WebSocket connected successfully"
+                                );
                                 attempt = 0;
                                 {
                                     let mut b = self.backoff_delay_secs.write().await;
@@ -635,7 +644,8 @@ impl UpstoxLiveMarketFeed {
 
                                 // Resubscribe ONCE for instruments in watchlist
                                 let sub_msg = Self::build_v3_subscription_message();
-                                if let Err(e) = ws_stream.send(Message::Text(sub_msg.into())).await {
+                                if let Err(e) = ws_stream.send(Message::Text(sub_msg.into())).await
+                                {
                                     warn!("Failed to send Upstox V3 subscription message: {e}");
                                 } else {
                                     let mut sc = self.resubscribe_count.write().await;
@@ -647,7 +657,8 @@ impl UpstoxLiveMarketFeed {
                                 while let Some(msg_result) = ws_stream.next().await {
                                     match msg_result {
                                         Ok(Message::Binary(bin_bytes)) => {
-                                            let parsed_ticks = parse_upstox_protobuf_feed(&bin_bytes);
+                                            let parsed_ticks =
+                                                parse_upstox_protobuf_feed(&bin_bytes);
                                             if !parsed_ticks.is_empty() {
                                                 self.process_incoming_ticks(parsed_ticks).await;
                                             }
@@ -696,8 +707,7 @@ impl UpstoxLiveMarketFeed {
 
                 info!(
                     attempt,
-                    backoff_secs,
-                    "Reconnecting to Upstox Market Data Feed V3 with backoff..."
+                    backoff_secs, "Reconnecting to Upstox Market Data Feed V3 with backoff..."
                 );
                 tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
             }
@@ -922,12 +932,7 @@ fn parse_feed_map_entry(buf: &[u8], now: DateTime<Utc>) -> Option<LiveTick> {
     })
 }
 
-fn parse_ltpc(
-    buf: &[u8],
-    ltp: &mut Option<f64>,
-    ltt: &mut Option<i64>,
-    cp: &mut Option<f64>,
-) {
+fn parse_ltpc(buf: &[u8], ltp: &mut Option<f64>, ltt: &mut Option<i64>, cp: &mut Option<f64>) {
     let mut pos = 0;
     while pos < buf.len() {
         let Some(tag_wire) = read_varint(buf, &mut pos) else {
@@ -948,6 +953,7 @@ fn parse_ltpc(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_full_feed(
     buf: &[u8],
     ltp: &mut Option<f64>,
@@ -1069,7 +1075,7 @@ mod tests {
         ltpc_buf.push((1 << 3) | 1);
         ltpc_buf.extend_from_slice(&2500.50f64.to_le_bytes());
         // tag 2, wire 0 (ltt)
-        ltpc_buf.push((2 << 3) | 0);
+        ltpc_buf.push(2 << 3);
         let mut t = 1700000000000u64;
         while t >= 0x80 {
             ltpc_buf.push(((t & 0x7F) as u8) | 0x80);

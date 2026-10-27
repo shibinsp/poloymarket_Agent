@@ -38,7 +38,7 @@ pub struct StrategyDecision {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndiaPaperOrderRequest {
     pub symbol: String,
-    pub side: String, // "BUY" | "SELL"
+    pub side: String,       // "BUY" | "SELL"
     pub order_type: String, // "LIMIT" | "MARKET"
     pub quantity: i64,
     pub price: Option<Decimal>,
@@ -196,11 +196,16 @@ pub async fn execute_paper_order(
     req: &IndiaPaperOrderRequest,
     current_market_price: Decimal,
 ) -> Result<IndiaPaperOrderResult> {
-    let instrument = find_nse_instrument(&req.symbol)
-        .context(format!("Symbol {:?} is not in the verified NSE universe", req.symbol))?;
+    let instrument = find_nse_instrument(&req.symbol).context(format!(
+        "Symbol {:?} is not in the verified NSE universe",
+        req.symbol
+    ))?;
 
     if req.quantity <= 0 {
-        bail!("Quantity must be a positive whole integer for NSE cash equities (got {})", req.quantity);
+        bail!(
+            "Quantity must be a positive whole integer for NSE cash equities (got {})",
+            req.quantity
+        );
     }
 
     let is_buy = req.side.eq_ignore_ascii_case("BUY");
@@ -214,7 +219,10 @@ pub async fn execute_paper_order(
         _ => current_market_price,
     };
 
-    let existing_orders = store.get_india_sandbox_orders(200).await.unwrap_or_default();
+    let existing_orders = store
+        .get_india_sandbox_orders(200)
+        .await
+        .unwrap_or_default();
     let portfolio = compute_portfolio_accounting(base_capital, &existing_orders, &HashMap::new());
 
     let order_cost = fill_price * Decimal::from(req.quantity);
@@ -228,7 +236,11 @@ pub async fn execute_paper_order(
             );
         }
     } else if is_sell {
-        let current_qty = portfolio.holdings.get(&req.symbol.to_uppercase()).copied().unwrap_or(Decimal::ZERO);
+        let current_qty = portfolio
+            .holdings
+            .get(&req.symbol.to_uppercase())
+            .copied()
+            .unwrap_or(Decimal::ZERO);
         let requested_qty = Decimal::from(req.quantity);
         if current_qty < requested_qty {
             bail!(
@@ -278,8 +290,12 @@ pub async fn execute_paper_order(
         "Paper simulator executed virtual trade (Zero live orders sent to Upstox)"
     );
 
-    let updated_orders = store.get_india_sandbox_orders(200).await.unwrap_or_default();
-    let updated_portfolio = compute_portfolio_accounting(base_capital, &updated_orders, &HashMap::new());
+    let updated_orders = store
+        .get_india_sandbox_orders(200)
+        .await
+        .unwrap_or_default();
+    let updated_portfolio =
+        compute_portfolio_accounting(base_capital, &updated_orders, &HashMap::new());
 
     Ok(IndiaPaperOrderResult {
         order: order_record,
@@ -304,7 +320,7 @@ pub fn compute_portfolio_accounting(
     sorted.sort_by(|a, b| a.created_at.cmp(&b.created_at));
 
     for o in &sorted {
-        if o.status.to_ascii_uppercase() == "REJECTED" || o.status.to_ascii_uppercase() == "CANCELLED" {
+        if o.status.eq_ignore_ascii_case("REJECTED") || o.status.eq_ignore_ascii_case("CANCELLED") {
             continue;
         }
 
@@ -322,7 +338,10 @@ pub fn compute_portfolio_accounting(
         let sym = o.symbol.to_uppercase();
 
         if o.side.eq_ignore_ascii_case("BUY") {
-            holdings_lots.entry(sym).or_default().push((fill_price, qty));
+            holdings_lots
+                .entry(sym)
+                .or_default()
+                .push((fill_price, qty));
         } else if o.side.eq_ignore_ascii_case("SELL") {
             if let Some(buys) = holdings_lots.get_mut(&sym) {
                 let mut remaining_to_sell = qty;

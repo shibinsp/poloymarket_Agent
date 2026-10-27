@@ -61,7 +61,11 @@ pub fn nse_watchlist() -> Vec<NseInstrument> {
         NseInstrument::new("ICICIBANK", "INE090A01021", "ICICI Bank Ltd"),
         NseInstrument::new("SBIN", "INE062A01020", "State Bank of India"),
         NseInstrument::new("INFY", "INE009A01021", "Infosys Ltd"),
-        NseInstrument::new("LICI", "INE115A01015", "Life Insurance Corporation of India"),
+        NseInstrument::new(
+            "LICI",
+            "INE115A01015",
+            "Life Insurance Corporation of India",
+        ),
         NseInstrument::new("HINDUNILVR", "INE030A01027", "Hindustan Unilever Ltd"),
         NseInstrument::new("BAJFINANCE", "INE296A01024", "Bajaj Finance Ltd"),
         NseInstrument::new("ITC", "INE154A01025", "ITC Ltd"),

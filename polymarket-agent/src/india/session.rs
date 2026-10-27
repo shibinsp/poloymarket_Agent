@@ -93,7 +93,11 @@ pub fn detect_nse_session(at: DateTime<Utc>) -> NseSessionInfo {
 
     // Check Weekend
     if weekday == Weekday::Sat || weekday == Weekday::Sun {
-        let next_mon = if weekday == Weekday::Sat { "Monday 09:00 IST" } else { "Tomorrow 09:00 IST" };
+        let next_mon = if weekday == Weekday::Sat {
+            "Monday 09:00 IST"
+        } else {
+            "Tomorrow 09:00 IST"
+        };
         return NseSessionInfo {
             session_kind: NseSessionKind::Closed,
             session_name: "Market Closed (Weekend)".to_string(),
@@ -201,7 +205,10 @@ mod tests {
     #[test]
     fn test_regular_hours_detected() {
         // 2026-09-17 10:30 IST
-        let at = Kolkata.with_ymd_and_hms(2026, 9, 17, 10, 30, 0).unwrap().with_timezone(&Utc);
+        let at = Kolkata
+            .with_ymd_and_hms(2026, 9, 17, 10, 30, 0)
+            .unwrap()
+            .with_timezone(&Utc);
         let s = detect_nse_session(at);
         assert_eq!(s.session_kind, NseSessionKind::Regular);
         assert!(s.is_trading_active);
@@ -211,7 +218,10 @@ mod tests {
     #[test]
     fn test_pre_open_detected() {
         // 2026-09-17 09:05 IST
-        let at = Kolkata.with_ymd_and_hms(2026, 9, 17, 9, 5, 0).unwrap().with_timezone(&Utc);
+        let at = Kolkata
+            .with_ymd_and_hms(2026, 9, 17, 9, 5, 0)
+            .unwrap()
+            .with_timezone(&Utc);
         let s = detect_nse_session(at);
         assert_eq!(s.session_kind, NseSessionKind::PreOpen);
         assert!(!s.is_trading_active);
@@ -220,7 +230,10 @@ mod tests {
     #[test]
     fn test_closed_detected_in_evening() {
         // 2026-09-17 18:30 IST
-        let at = Kolkata.with_ymd_and_hms(2026, 9, 17, 18, 30, 0).unwrap().with_timezone(&Utc);
+        let at = Kolkata
+            .with_ymd_and_hms(2026, 9, 17, 18, 30, 0)
+            .unwrap()
+            .with_timezone(&Utc);
         let s = detect_nse_session(at);
         assert_eq!(s.session_kind, NseSessionKind::Closed);
         assert!(!s.is_trading_active);
@@ -230,7 +243,10 @@ mod tests {
     #[test]
     fn test_weekend_detected() {
         // 2026-09-19 Saturday
-        let at = Kolkata.with_ymd_and_hms(2026, 9, 19, 11, 0, 0).unwrap().with_timezone(&Utc);
+        let at = Kolkata
+            .with_ymd_and_hms(2026, 9, 19, 11, 0, 0)
+            .unwrap()
+            .with_timezone(&Utc);
         let s = detect_nse_session(at);
         assert_eq!(s.session_kind, NseSessionKind::Closed);
     }

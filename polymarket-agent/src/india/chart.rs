@@ -237,13 +237,14 @@ pub fn generate_nse_chart(
         let ts = now - Duration::minutes(bar_offset);
         let ist_time = ts + Duration::hours(5) + Duration::minutes(30);
 
-        let time_str = if range == "1m" || range == "3m" || range == "5m" || range == "15m" || range == "1D" {
-            ist_time.format("%H:%M").to_string()
-        } else if range == "1W" {
-            ist_time.format("%a %H:%M").to_string()
-        } else {
-            ist_time.format("%d %b").to_string()
-        };
+        let time_str =
+            if range == "1m" || range == "3m" || range == "5m" || range == "15m" || range == "1D" {
+                ist_time.format("%H:%M").to_string()
+            } else if range == "1W" {
+                ist_time.format("%a %H:%M").to_string()
+            } else {
+                ist_time.format("%d %b").to_string()
+            };
 
         // Realistic alternating candle oscillation like TradingView
         let angle = (i as f64) * 0.28;
@@ -267,7 +268,7 @@ pub fn generate_nse_chart(
 
         let is_last_bar = i == bar_count - 1;
         let interval_secs = (step_minutes * 60) as u32;
-        let elapsed_in_interval = ((ts.timestamp() % (interval_secs as i64)).abs()) as u32;
+        let elapsed_in_interval = (ts.timestamp() % (interval_secs as i64)).unsigned_abs() as u32;
         let countdown = interval_secs.saturating_sub(elapsed_in_interval);
 
         candles.push(ChartPoint {
@@ -390,7 +391,9 @@ pub fn generate_nse_chart(
             total_tax: buy_cost.total,
             status: "FILLED".to_string(),
             marker_color: "blue".to_string(),
-            signal_reason: Some("Confirmed 5m Pullback Rebound: Price > VWAP & EMA20 > EMA50".to_string()),
+            signal_reason: Some(
+                "Confirmed 5m Pullback Rebound: Price > VWAP & EMA20 > EMA50".to_string(),
+            ),
         });
 
         trade_markers.push(ChartTradeMarker {
@@ -537,7 +540,9 @@ fn build_detailed_trades(
                 exit_reason: Some("TAKE_PROFIT".to_string()),
                 stop_loss_price: Some((buy.price * dec!(0.985)).round_dp(2)),
                 take_profit_price: Some((buy.price * dec!(1.025)).round_dp(2)),
-                signal_reason: Some("Confirmed 5m Pullback Rebound: Price > VWAP & EMA20 > EMA50".to_string()),
+                signal_reason: Some(
+                    "Confirmed 5m Pullback Rebound: Price > VWAP & EMA20 > EMA50".to_string(),
+                ),
             });
         } else {
             // Unmatched buy = open position
@@ -565,7 +570,9 @@ fn build_detailed_trades(
                 exit_reason: None,
                 stop_loss_price: Some((buy.price * dec!(0.985)).round_dp(2)),
                 take_profit_price: Some((buy.price * dec!(1.025)).round_dp(2)),
-                signal_reason: Some("Confirmed 5m Pullback Rebound: Price > VWAP & EMA20 > EMA50".to_string()),
+                signal_reason: Some(
+                    "Confirmed 5m Pullback Rebound: Price > VWAP & EMA20 > EMA50".to_string(),
+                ),
             });
         }
     }

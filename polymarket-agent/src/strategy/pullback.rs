@@ -31,15 +31,15 @@ pub struct FiveMinCandle {
 /// Parameters for the Pullback Rebound Strategy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PullbackStrategyConfig {
-    pub ema_fast_period: usize,           // 20
-    pub ema_slow_period: usize,           // 50
-    pub volume_avg_period: usize,         // 20
+    pub ema_fast_period: usize,              // 20
+    pub ema_slow_period: usize,              // 50
+    pub volume_avg_period: usize,            // 20
     pub max_pullback_pct_from_vwap: Decimal, // e.g. 0.015 (1.5% distance to VWAP)
-    pub stop_buffer_pct: Decimal,         // e.g. 0.003 (0.3% below pullback low)
-    pub reward_to_risk_ratio: Decimal,    // 1.5 (1.5:1 initial target)
-    pub slippage_bps: Decimal,            // e.g. 0.0005 (5 bps / 0.05%)
-    pub max_risk_per_trade_pct: Decimal,  // e.g. 0.01 (1% of paper cash)
-    pub max_position_pct_of_cash: Decimal,// e.g. 0.20 (20% of cash max per position)
+    pub stop_buffer_pct: Decimal,            // e.g. 0.003 (0.3% below pullback low)
+    pub reward_to_risk_ratio: Decimal,       // 1.5 (1.5:1 initial target)
+    pub slippage_bps: Decimal,               // e.g. 0.0005 (5 bps / 0.05%)
+    pub max_risk_per_trade_pct: Decimal,     // e.g. 0.01 (1% of paper cash)
+    pub max_position_pct_of_cash: Decimal,   // e.g. 0.20 (20% of cash max per position)
 }
 
 impl Default for PullbackStrategyConfig {
@@ -141,8 +141,8 @@ pub fn evaluate_pullback_setup(
     }
 
     let n = candles.len();
-    let current_bar = &candles[n - 1];   // Completed candle just closed
-    let prev_bar = &candles[n - 2];      // Prior completed candle
+    let current_bar = &candles[n - 1]; // Completed candle just closed
+    let prev_bar = &candles[n - 2]; // Prior completed candle
 
     let closes: Vec<Decimal> = candles.iter().map(|c| c.close).collect();
     let volumes: Vec<Decimal> = candles.iter().map(|c| c.volume).collect();
@@ -238,7 +238,10 @@ pub fn calculate_position_size(
     planned_risk_per_share: Decimal,
     config: &PullbackStrategyConfig,
 ) -> i64 {
-    if available_cash <= Decimal::ZERO || estimated_fill_price <= Decimal::ZERO || planned_risk_per_share <= Decimal::ZERO {
+    if available_cash <= Decimal::ZERO
+        || estimated_fill_price <= Decimal::ZERO
+        || planned_risk_per_share <= Decimal::ZERO
+    {
         return 0;
     }
 

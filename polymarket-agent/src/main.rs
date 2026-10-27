@@ -435,8 +435,14 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
 
     let alpaca_feed = std::sync::Arc::new(
         polymarket_agent::us::market_feed::AlpacaLiveMarketFeed::new(
-            secrets.alpaca_key_id.as_ref().map(|k| k.expose_secret().to_string()),
-            secrets.alpaca_secret_key.as_ref().map(|k| k.expose_secret().to_string()),
+            secrets
+                .alpaca_key_id
+                .as_ref()
+                .map(|k| k.expose_secret().to_string()),
+            secrets
+                .alpaca_secret_key
+                .as_ref()
+                .map(|k| k.expose_secret().to_string()),
             None,
         ),
     );

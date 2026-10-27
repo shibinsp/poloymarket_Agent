@@ -404,7 +404,9 @@ pub fn generate_us_chart(
             total_regulatory_fees: buy_cost.total,
             status: "FILLED".to_string(),
             marker_color: "blue".to_string(),
-            signal_reason: Some("Confirmed 5m Pullback Rebound: Price > VWAP & EMA20 > EMA50".to_string()),
+            signal_reason: Some(
+                "Confirmed 5m Pullback Rebound: Price > VWAP & EMA20 > EMA50".to_string(),
+            ),
         });
 
         trade_markers.push(ChartTradeMarker {
@@ -430,7 +432,11 @@ pub fn generate_us_chart(
     let summary = summarize_detailed_trades(&detailed_trades);
 
     let (data_source, feed_type, feed_disclaimer) = if let Some(fs) = feed_status {
-        (fs.feed_label.clone(), fs.feed_type.clone(), fs.feed_disclaimer.clone())
+        (
+            fs.feed_label.clone(),
+            fs.feed_type.clone(),
+            fs.feed_disclaimer.clone(),
+        )
     } else {
         (
             "Alpaca Stock Data (IEX)".to_string(),
@@ -559,7 +565,9 @@ fn build_detailed_trades(
                 exit_reason: Some("TAKE_PROFIT".to_string()),
                 stop_loss_price: Some((buy.price * dec!(0.985)).round_dp(2)),
                 take_profit_price: Some((buy.price * dec!(1.025)).round_dp(2)),
-                signal_reason: Some("Confirmed 5m Pullback Rebound: Price > VWAP & EMA20 > EMA50".to_string()),
+                signal_reason: Some(
+                    "Confirmed 5m Pullback Rebound: Price > VWAP & EMA20 > EMA50".to_string(),
+                ),
             });
         } else {
             // Unmatched buy = open position
@@ -587,7 +595,9 @@ fn build_detailed_trades(
                 exit_reason: None,
                 stop_loss_price: Some((buy.price * dec!(0.985)).round_dp(2)),
                 take_profit_price: Some((buy.price * dec!(1.025)).round_dp(2)),
-                signal_reason: Some("Confirmed 5m Pullback Rebound: Price > VWAP & EMA20 > EMA50".to_string()),
+                signal_reason: Some(
+                    "Confirmed 5m Pullback Rebound: Price > VWAP & EMA20 > EMA50".to_string(),
+                ),
             });
         }
     }

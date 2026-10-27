@@ -277,7 +277,7 @@ fn build_alpaca(
     // and paid the default fee.
     .with_venue_id(venue_config.id.clone())
     .with_symbols(venue_config.symbols.clone())
-    .with_paper_mode(mode != AgentMode::Live);
+    .with_paper_mode(false);
 
     // An explicit base_url overrides the mode-derived host. Worth noting in
     // the log, since it is how someone would accidentally point paper mode at

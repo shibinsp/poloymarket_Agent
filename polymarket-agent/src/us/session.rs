@@ -39,14 +39,14 @@ pub struct UsSessionInfo {
 pub fn us_market_holidays() -> Vec<NaiveDate> {
     vec![
         // 2024
-        NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),   // New Year's Day
-        NaiveDate::from_ymd_opt(2024, 1, 15).unwrap(),  // Martin Luther King Jr. Day
-        NaiveDate::from_ymd_opt(2024, 2, 19).unwrap(),  // Washington's Birthday / Presidents' Day
-        NaiveDate::from_ymd_opt(2024, 3, 29).unwrap(),  // Good Friday
-        NaiveDate::from_ymd_opt(2024, 5, 27).unwrap(),  // Memorial Day
-        NaiveDate::from_ymd_opt(2024, 6, 19).unwrap(),  // Juneteenth National Independence Day
-        NaiveDate::from_ymd_opt(2024, 7, 4).unwrap(),   // Independence Day
-        NaiveDate::from_ymd_opt(2024, 9, 2).unwrap(),   // Labor Day
+        NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(), // New Year's Day
+        NaiveDate::from_ymd_opt(2024, 1, 15).unwrap(), // Martin Luther King Jr. Day
+        NaiveDate::from_ymd_opt(2024, 2, 19).unwrap(), // Washington's Birthday / Presidents' Day
+        NaiveDate::from_ymd_opt(2024, 3, 29).unwrap(), // Good Friday
+        NaiveDate::from_ymd_opt(2024, 5, 27).unwrap(), // Memorial Day
+        NaiveDate::from_ymd_opt(2024, 6, 19).unwrap(), // Juneteenth National Independence Day
+        NaiveDate::from_ymd_opt(2024, 7, 4).unwrap(), // Independence Day
+        NaiveDate::from_ymd_opt(2024, 9, 2).unwrap(), // Labor Day
         NaiveDate::from_ymd_opt(2024, 11, 28).unwrap(), // Thanksgiving Day
         NaiveDate::from_ymd_opt(2024, 12, 25).unwrap(), // Christmas Day
         // 2025
@@ -86,7 +86,11 @@ pub fn detect_us_session(at: DateTime<Utc>) -> UsSessionInfo {
 
     // Check Weekend
     if weekday == Weekday::Sat || weekday == Weekday::Sun {
-        let next_mon = if weekday == Weekday::Sat { "Monday 09:30 ET" } else { "Tomorrow 09:30 ET" };
+        let next_mon = if weekday == Weekday::Sat {
+            "Monday 09:30 ET"
+        } else {
+            "Tomorrow 09:30 ET"
+        };
         return UsSessionInfo {
             session_kind: UsSessionKind::Closed,
             session_name: "Market Closed (Weekend)".to_string(),
@@ -149,7 +153,10 @@ pub fn detect_us_session(at: DateTime<Utc>) -> UsSessionInfo {
             next_session_event: "Regular Trading Hours open 09:30 ET".to_string(),
             current_date_et,
             is_market_closed: true,
-            strategy_paused_reason: Some("Pre-market session active — strategy paused until regular session open (09:30 ET)".to_string()),
+            strategy_paused_reason: Some(
+                "Pre-market session active — strategy paused until regular session open (09:30 ET)"
+                    .to_string(),
+            ),
         }
     } else if time >= t_rth_open && time < t_rth_close {
         // Regular Trading Hours: Strategy active & fills permitted
@@ -177,11 +184,17 @@ pub fn detect_us_session(at: DateTime<Utc>) -> UsSessionInfo {
             next_session_event: "After-Hours closes 20:00 ET".to_string(),
             current_date_et,
             is_market_closed: true,
-            strategy_paused_reason: Some("After-hours session active — strategy paused (RTH-only)".to_string()),
+            strategy_paused_reason: Some(
+                "After-hours session active — strategy paused (RTH-only)".to_string(),
+            ),
         }
     } else {
         // Post-market Closed (After 20:00 ET)
-        let next_day = if weekday == Weekday::Fri { "Monday 09:30 ET" } else { "Tomorrow 09:30 ET" };
+        let next_day = if weekday == Weekday::Fri {
+            "Monday 09:30 ET"
+        } else {
+            "Tomorrow 09:30 ET"
+        };
         UsSessionInfo {
             session_kind: UsSessionKind::Closed,
             session_name: "Market Closed".to_string(),
@@ -205,7 +218,10 @@ mod tests {
     #[test]
     fn test_us_session_rth() {
         // 2026-10-27 10:30:00 ET is regular trading hours
-        let dt = New_York.with_ymd_and_hms(2026, 10, 27, 10, 30, 0).unwrap().with_timezone(&Utc);
+        let dt = New_York
+            .with_ymd_and_hms(2026, 10, 27, 10, 30, 0)
+            .unwrap()
+            .with_timezone(&Utc);
         let session = detect_us_session(dt);
         assert_eq!(session.session_kind, UsSessionKind::Regular);
         assert!(session.is_trading_active);
@@ -216,7 +232,10 @@ mod tests {
     #[test]
     fn test_us_session_premarket() {
         // 2026-10-27 07:30:00 ET is pre-market
-        let dt = New_York.with_ymd_and_hms(2026, 10, 27, 7, 30, 0).unwrap().with_timezone(&Utc);
+        let dt = New_York
+            .with_ymd_and_hms(2026, 10, 27, 7, 30, 0)
+            .unwrap()
+            .with_timezone(&Utc);
         let session = detect_us_session(dt);
         assert_eq!(session.session_kind, UsSessionKind::PreMarket);
         assert!(!session.is_trading_active);
@@ -226,7 +245,10 @@ mod tests {
     #[test]
     fn test_us_session_closed_weekend() {
         // 2026-10-25 is Sunday
-        let dt = New_York.with_ymd_and_hms(2026, 10, 25, 12, 0, 0).unwrap().with_timezone(&Utc);
+        let dt = New_York
+            .with_ymd_and_hms(2026, 10, 25, 12, 0, 0)
+            .unwrap()
+            .with_timezone(&Utc);
         let session = detect_us_session(dt);
         assert_eq!(session.session_kind, UsSessionKind::Closed);
         assert!(session.is_market_closed);
