@@ -1565,6 +1565,39 @@ mod tests {
         let view = generate_us_momentum_view(&instrument, &quote, &below_sma_candles);
         assert_eq!(view.direction, Direction::Flat);
         assert_eq!(view.key_factors, vec!["momentum_filters_not_met"]);
+
+        // 4. SMA10 <= SMA30 (bearish trend)
+        let now = Utc::now();
+        let bear_candles: Vec<Candle> = (0..40)
+            .map(|i| {
+                let close = dec!(150.0) - Decimal::from(i) * dec!(0.5);
+                Candle {
+                    ts: now - Duration::hours((40 - i) as i64),
+                    open: close + dec!(0.2),
+                    high: close + dec!(0.5),
+                    low: close - dec!(0.5),
+                    close,
+                    volume: dec!(1200),
+                }
+            })
+            .collect();
+        let quote = us_quote(bear_candles.last().unwrap().close, dec!(0.12));
+        let view = generate_us_momentum_view(&instrument, &quote, &bear_candles);
+        assert_eq!(view.direction, Direction::Flat);
+        assert_eq!(view.key_factors, vec!["momentum_filters_not_met"]);
+
+        // 5. RSI > 68 (overbought filter)
+        let mut overbought_candles = us_breakout_candles();
+        let len = overbought_candles.len();
+        for j in 0..14 {
+            let idx = len - 14 + j;
+            overbought_candles[idx].close += Decimal::from(j + 1) * dec!(2.5);
+            overbought_candles[idx].high += Decimal::from(j + 1) * dec!(3.0);
+        }
+        let quote = us_quote(overbought_candles.last().unwrap().close, dec!(0.12));
+        let view = generate_us_momentum_view(&instrument, &quote, &overbought_candles);
+        assert_eq!(view.direction, Direction::Flat);
+        assert_eq!(view.key_factors, vec!["momentum_filters_not_met"]);
     }
 
     #[tokio::test]
