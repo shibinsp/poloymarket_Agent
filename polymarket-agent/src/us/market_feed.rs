@@ -391,7 +391,7 @@ impl AlpacaLiveMarketFeed {
                 }
                 let local = timestamp.with_timezone(&chrono_tz::America::New_York);
                 let minute_of_day = local.time().num_seconds_from_midnight() / 60;
-                if minute_of_day < 9 * 60 + 30 || minute_of_day >= 16 * 60 {
+                if !(9 * 60 + 30..16 * 60).contains(&minute_of_day) {
                     continue;
                 }
                 let price = |field: &str| {

@@ -131,14 +131,11 @@ pub fn combined_equity(reports: &[VenueReconcileReport]) -> Option<Decimal> {
     let mut total_usd = Decimal::ZERO;
 
     for report in reports {
-        if let Some(eq) = report.equity {
-            if report.venue_id == "upstox" || report.venue_id == "upstox_sandbox" {
-                total_usd += fx.inr_to_usd(eq);
-            } else {
-                total_usd += eq;
-            }
+        let eq = report.equity?;
+        if report.venue_id == "upstox" || report.venue_id == "upstox_sandbox" {
+            total_usd += fx.inr_to_usd(eq);
         } else {
-            return None;
+            total_usd += eq;
         }
     }
 

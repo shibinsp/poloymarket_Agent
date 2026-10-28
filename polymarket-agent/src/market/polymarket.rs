@@ -1385,11 +1385,11 @@ mod tests {
             "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
             "asset_id": "0",
             "timestamp": "1700000000000",
-            "bids": [{"price": "0.60", "size": "100"}],
-            "asks": [{"price": "0.70", "size": "100"}],
-            "min_order_size": "1",
+            "bids": [{"price": 0.60, "size": 100}],
+            "asks": [{"price": 0.70, "size": 100}],
+            "min_order_size": 1,
             "neg_risk": false,
-            "tick_size": "0.01"
+            "tick_size": 0.01
         }"#;
         let response = deserialize_order_book(json);
 
@@ -1407,9 +1407,9 @@ mod tests {
             "timestamp": "1700000000000",
             "bids": [],
             "asks": [],
-            "min_order_size": "1",
+            "min_order_size": 1,
             "neg_risk": false,
-            "tick_size": "0.01"
+            "tick_size": 0.01
         }"#;
         let response = deserialize_order_book(json);
 

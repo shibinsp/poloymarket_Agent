@@ -635,7 +635,7 @@ mod tests {
         use chrono::TimeZone;
 
         let mut price = dec!(2500.0);
-        for i in 0..50 {
+        for i in 0..70 {
             let naive = base_date + chrono::Duration::days(i);
             let ts = kolkata
                 .from_local_datetime(&naive)
