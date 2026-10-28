@@ -357,7 +357,26 @@ impl VenueCycle<'_> {
             .await
             .unwrap_or_default();
 
-        let (view, cost) = if let Some(llm) = llm {
+        let is_us_equity = instrument.asset_class == AssetClass::Equity
+            && instrument.quote_ccy.eq_ignore_ascii_case("USD")
+            && instrument.venue().as_str() == "alpaca";
+        let use_us_paper_strategy = is_us_equity && self.config.agent.mode == AgentMode::Paper;
+
+        // US equities use an explicit, auditable technical rule set in paper
+        // mode. The former generic LLM view repeatedly selected thin, low-
+        // priced names and its short paper record is not enough to establish
+        // an edge. Keep this candidate paper-only while it gathers evidence.
+        let (view, cost) = if use_us_paper_strategy {
+            let completed_candles: Vec<Candle> = candles
+                .iter()
+                .filter(|candle| candle.ts + Duration::hours(1) <= ctx.now)
+                .cloned()
+                .collect();
+            (
+                generate_us_momentum_view(instrument, &quote, &completed_candles),
+                Decimal::ZERO,
+            )
+        } else if let Some(llm) = llm {
             let system = build_system_prompt();
             let user = build_user_prompt(instrument, &quote, &candles, &[]);
             match llm.complete(&system, &user, Some(ctx.cycle)).await {
@@ -396,15 +415,26 @@ impl VenueCycle<'_> {
         // them made a cheap venue's edge look unprofitable and stopped it
         // trading at all.
         let fee_pct = self.config.venue_fee_pct(venue.id().as_str());
-        let cost_to_trade =
-            directional::round_trip_cost(&quote, fee_pct, self.config.execution.max_slippage_pct);
+        let estimated_slippage_pct = if use_us_paper_strategy {
+            // Use a modest 10-basis-point round-trip estimate for the liquid
+            // names this paper candidate permits. Replace this estimate with
+            // measured fill slippage once the paper sample is meaningful.
+            dec!(0.001)
+        } else {
+            self.config.execution.max_slippage_pct
+        };
+        let cost_to_trade = directional::round_trip_cost(&quote, fee_pct, estimated_slippage_pct);
 
-        if !directional::should_trade(
-            &view,
-            cost_to_trade,
-            self.config.min_p_up(),
-            self.config.valuation.min_edge_threshold,
-        ) {
+        let edge_threshold = if use_us_paper_strategy {
+            // A 1.5% net hurdle is intentionally above estimated spread,
+            // venue fees and slippage, while remaining reachable for an
+            // hourly equity move. This is a paper-only candidate threshold.
+            dec!(0.015)
+        } else {
+            self.config.valuation.min_edge_threshold
+        };
+        if !directional::should_trade(&view, cost_to_trade, self.config.min_p_up(), edge_threshold)
+        {
             info!(
                 instrument = %instrument.id,
                 direction = ?view.direction,
@@ -835,6 +865,142 @@ impl VenueCycle<'_> {
     }
 }
 
+/// US paper candidate: liquid, higher-priced equities in an hourly uptrend,
+/// breaking above recent resistance with confirming volume. Small-cap and
+/// penny-stock signals are deliberately excluded while the strategy is being
+/// evaluated in paper mode.
+fn generate_us_momentum_view(
+    instrument: &Instrument,
+    quote: &Quote,
+    candles: &[Candle],
+) -> DirectionalView {
+    let flat = |reason: String, factor: &str| DirectionalView {
+        direction: Direction::Flat,
+        p_up: dec!(0.50),
+        expected_return_pct: Decimal::ZERO,
+        horizon_hours: 24,
+        confidence: dec!(0.50),
+        invalidation_price: None,
+        target_price: None,
+        reasoning_summary: reason,
+        key_factors: vec![factor.to_string()],
+        data_quality: DataQuality::Medium,
+    };
+
+    if quote.mid < dec!(10.0) {
+        return flat(
+            format!(
+                "Skipping {}: US paper strategy excludes stocks below $10",
+                instrument.symbol()
+            ),
+            "price_floor",
+        );
+    }
+    if quote
+        .spread_pct()
+        .map(|spread| spread > dec!(0.0025))
+        .unwrap_or(true)
+    {
+        return flat(
+            format!(
+                "Skipping {}: quote spread is missing or exceeds 0.25%",
+                instrument.symbol()
+            ),
+            "spread_filter",
+        );
+    }
+    if candles.len() < 30 {
+        return flat(
+            format!(
+                "Skipping {}: need 30 completed hourly bars, got {}",
+                instrument.symbol(),
+                candles.len()
+            ),
+            "insufficient_history",
+        );
+    }
+
+    let n = candles.len();
+    let fast_sma = candles[n - 10..]
+        .iter()
+        .map(|candle| candle.close)
+        .sum::<Decimal>()
+        / dec!(10.0);
+    let slow_sma = candles[n - 30..]
+        .iter()
+        .map(|candle| candle.close)
+        .sum::<Decimal>()
+        / dec!(30.0);
+    let prior_resistance = candles[n - 11..n - 1]
+        .iter()
+        .map(|candle| candle.high)
+        .max()
+        .unwrap_or(Decimal::ZERO);
+    let average_volume = candles[n - 21..n - 1]
+        .iter()
+        .map(|candle| candle.volume)
+        .sum::<Decimal>()
+        / dec!(20.0);
+    let latest = &candles[n - 1];
+
+    let mut gains = Decimal::ZERO;
+    let mut losses = Decimal::ZERO;
+    for index in (n - 14)..n {
+        let change = candles[index].close - candles[index - 1].close;
+        if change > Decimal::ZERO {
+            gains += change;
+        } else {
+            losses += change.abs();
+        }
+    }
+    let rsi = if losses.is_zero() && gains.is_zero() {
+        dec!(50.0)
+    } else if losses.is_zero() {
+        dec!(100.0)
+    } else if gains.is_zero() {
+        dec!(0.0)
+    } else {
+        let relative_strength = gains / losses;
+        dec!(100.0) - (dec!(100.0) / (Decimal::ONE + relative_strength))
+    };
+
+    let trend_confirmed = latest.close > fast_sma && fast_sma > slow_sma;
+    let breakout_confirmed = latest.close > prior_resistance;
+    let volume_confirmed =
+        average_volume > Decimal::ZERO && latest.volume >= average_volume * dec!(1.10);
+    let momentum_confirmed = rsi >= dec!(45.0) && rsi <= dec!(68.0);
+
+    if !(trend_confirmed && breakout_confirmed && volume_confirmed && momentum_confirmed) {
+        let reason = format!(
+            "Skipping {}: hourly trend, resistance breakout, volume or RSI filter did not confirm (RSI {:.1})",
+            instrument.symbol(), rsi
+        );
+        return flat(reason, "momentum_filters_not_met");
+    }
+
+    let entry = quote.mid;
+    DirectionalView {
+        direction: Direction::Long,
+        p_up: dec!(0.58),
+        expected_return_pct: dec!(0.025),
+        horizon_hours: 24,
+        confidence: dec!(0.65),
+        invalidation_price: Some(entry * dec!(0.985)),
+        target_price: Some(entry * dec!(1.025)),
+        reasoning_summary: format!(
+            "US hourly momentum candidate for {}: price above SMA10 > SMA30, broke prior 10-bar high on above-average volume, RSI {:.1}",
+            instrument.symbol(), rsi
+        ),
+        key_factors: vec![
+            "hourly_trend".to_string(),
+            "resistance_breakout".to_string(),
+            "relative_volume".to_string(),
+            "rsi_range".to_string(),
+        ],
+        data_quality: DataQuality::Medium,
+    }
+}
+
 /// Algorithmic quantitative momentum & trend strategy used when no LLM API key is configured.
 /// Enforces trend alignment (SMA5 > SMA14), momentum confirmation, and healthy RSI before entering Long.
 /// Returns Direction::Flat (no trade) in choppy or downtrending conditions to protect capital.
@@ -1255,6 +1421,150 @@ mod tests {
     fn app_config() -> AppConfig {
         let toml = std::fs::read_to_string("config/default.toml").unwrap();
         toml::from_str(&toml).unwrap()
+    }
+
+    fn us_equity(symbol: &str) -> Instrument {
+        Instrument {
+            id: InstrumentId::new(VenueId::new("alpaca"), symbol),
+            asset_class: AssetClass::Equity,
+            display_name: symbol.to_string(),
+            quote_ccy: "USD".to_string(),
+            tick_size: Some(dec!(0.01)),
+            lot_size: None,
+            min_notional: None,
+            min_qty: None,
+            fractional: true,
+            meta: InstrumentMeta::Equity {
+                exchange: "NASDAQ".to_string(),
+            },
+        }
+    }
+
+    fn us_quote(mid: Decimal, spread: Decimal) -> Quote {
+        Quote {
+            instrument: InstrumentId::new(VenueId::new("alpaca"), "SPY"),
+            bid: mid - spread / dec!(2.0),
+            ask: mid + spread / dec!(2.0),
+            mid,
+            last: Some(mid),
+            ts: Utc::now(),
+            book: None,
+        }
+    }
+
+    fn us_breakout_candles() -> Vec<Candle> {
+        let now = Utc::now();
+        let mut candles: Vec<Candle> = (0..40)
+            .map(|i| {
+                let drift = Decimal::from(i) * dec!(0.12);
+                let oscillation = if i % 2 == 0 { dec!(0.4) } else { dec!(-0.4) };
+                let close = dec!(100.0) + drift + oscillation;
+                Candle {
+                    ts: now - Duration::hours((40 - i) as i64),
+                    open: close - dec!(0.2),
+                    high: close + dec!(0.15),
+                    low: close - dec!(0.15),
+                    close,
+                    volume: dec!(1000),
+                }
+            })
+            .collect();
+        let prior_high = candles[29..39]
+            .iter()
+            .map(|candle| candle.high)
+            .max()
+            .unwrap();
+        let close = prior_high + dec!(0.2);
+        let latest = candles.last_mut().unwrap();
+        latest.open = close - dec!(0.5);
+        latest.high = close + dec!(0.05);
+        latest.low = latest.open - dec!(0.05);
+        latest.close = close;
+        latest.volume = dec!(1200);
+        candles
+    }
+
+    #[test]
+    fn us_paper_strategy_accepts_confirmed_liquid_breakout() {
+        let candles = us_breakout_candles();
+        let instrument = us_equity("SPY");
+        let quote = us_quote(candles.last().unwrap().close, dec!(0.12));
+
+        let view = generate_us_momentum_view(&instrument, &quote, &candles);
+
+        assert_eq!(view.direction, Direction::Long);
+        assert_eq!(view.expected_return_pct, dec!(0.025));
+        assert!(view.invalidation_price.unwrap() < quote.mid);
+        assert!(view.target_price.unwrap() > quote.mid);
+        let round_trip_cost = directional::round_trip_cost(&quote, dec!(0.0025), dec!(0.001));
+        assert!(directional::should_trade(
+            &view,
+            round_trip_cost,
+            dec!(0.55),
+            dec!(0.015)
+        ));
+    }
+
+    #[test]
+    fn us_paper_strategy_rejects_penny_stocks_and_wide_spreads() {
+        let candles = us_breakout_candles();
+        let penny_stock = us_equity("PLUG");
+        let cheap_quote = us_quote(dec!(5.0), dec!(0.01));
+        let cheap_view = generate_us_momentum_view(&penny_stock, &cheap_quote, &candles);
+        assert_eq!(cheap_view.direction, Direction::Flat);
+        assert_eq!(cheap_view.key_factors, vec!["price_floor"]);
+
+        let liquid_stock = us_equity("SPY");
+        let mid = candles.last().unwrap().close;
+        let wide_quote = us_quote(mid, mid * dec!(0.01));
+        let wide_view = generate_us_momentum_view(&liquid_stock, &wide_quote, &candles);
+        assert_eq!(wide_view.direction, Direction::Flat);
+        assert_eq!(wide_view.key_factors, vec!["spread_filter"]);
+    }
+
+    #[test]
+    fn us_paper_strategy_rejects_incomplete_history() {
+        let candles: Vec<Candle> = us_breakout_candles().into_iter().take(29).collect();
+        let instrument = us_equity("SPY");
+        let quote = us_quote(candles.last().unwrap().close, dec!(0.12));
+
+        let view = generate_us_momentum_view(&instrument, &quote, &candles);
+        assert_eq!(view.direction, Direction::Flat);
+        assert_eq!(view.key_factors, vec!["insufficient_history"]);
+    }
+
+    #[test]
+    fn us_paper_strategy_rejects_failed_momentum_filters() {
+        let instrument = us_equity("SPY");
+
+        // 1. Weak volume (below 1.1x 20-bar avg)
+        let mut weak_volume_candles = us_breakout_candles();
+        weak_volume_candles.last_mut().unwrap().volume = dec!(1000);
+        let quote = us_quote(weak_volume_candles.last().unwrap().close, dec!(0.12));
+        let view = generate_us_momentum_view(&instrument, &quote, &weak_volume_candles);
+        assert_eq!(view.direction, Direction::Flat);
+        assert_eq!(view.key_factors, vec!["momentum_filters_not_met"]);
+
+        // 2. No resistance breakout (close <= prior 10-bar high)
+        let mut no_breakout_candles = us_breakout_candles();
+        let prior_high = no_breakout_candles[29..39]
+            .iter()
+            .map(|c| c.high)
+            .max()
+            .unwrap();
+        no_breakout_candles.last_mut().unwrap().close = prior_high - dec!(0.10);
+        let quote = us_quote(no_breakout_candles.last().unwrap().close, dec!(0.12));
+        let view = generate_us_momentum_view(&instrument, &quote, &no_breakout_candles);
+        assert_eq!(view.direction, Direction::Flat);
+        assert_eq!(view.key_factors, vec!["momentum_filters_not_met"]);
+
+        // 3. Price below SMA10
+        let mut below_sma_candles = us_breakout_candles();
+        below_sma_candles.last_mut().unwrap().close = dec!(90.0);
+        let quote = us_quote(below_sma_candles.last().unwrap().close, dec!(0.12));
+        let view = generate_us_momentum_view(&instrument, &quote, &below_sma_candles);
+        assert_eq!(view.direction, Direction::Flat);
+        assert_eq!(view.key_factors, vec!["momentum_filters_not_met"]);
     }
 
     #[tokio::test]
