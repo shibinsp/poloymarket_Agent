@@ -66,32 +66,18 @@ export function AppShell({
     <div className="shell">
       <header className="topbar">
         <div className="topbar__brand">
-          <strong>Polymarket Agent</strong>
+          <div className="topbar__brand-mark" aria-hidden="true">P</div>
+          <div className="topbar__brand-copy">
+            <strong>Polymarket Agent</strong>
+            <span>autonomous execution desk</span>
+          </div>
           <Badge tone={agentStateTone(state)} title="Agent lifecycle state">
             {state}
           </Badge>
           <button
-            className="btn btn--sm"
+            className={`btn btn--sm ${isHalted ? "btn--success" : "btn--danger"}`}
             onClick={handleToggleAgent}
             disabled={toggling}
-            style={{
-              marginLeft: "10px",
-              display: "inline-flex",
-              alignItems: "center",
-              gap: "6px",
-              fontWeight: 700,
-              fontSize: "12px",
-              borderRadius: "6px",
-              padding: "4px 12px",
-              cursor: "pointer",
-              backgroundColor: isHalted ? "#16a34a" : "#dc2626",
-              color: "#ffffff",
-              border: isHalted ? "1px solid #22c55e" : "1px solid #ef4444",
-              boxShadow: isHalted
-                ? "0 0 10px rgba(34, 197, 94, 0.35)"
-                : "0 0 10px rgba(239, 68, 68, 0.35)",
-              transition: "all 0.15s ease",
-            }}
             title={
               isHalted
                 ? "Press to start the autonomous trading agent"

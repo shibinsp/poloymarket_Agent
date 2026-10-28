@@ -192,6 +192,17 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
             (false, false) => "— not needed (no Polymarket venue is enabled)",
         }
     );
+
+    let startup_issues = config.startup_issues(secrets);
+    if !startup_issues.is_empty() {
+        println!("   ❌ Startup blockers:");
+        for issue in &startup_issues {
+            println!("      - {issue}");
+        }
+        println!("      The agent is not allowed to run in a paper/live session without a valuation key.");
+        return Err(anyhow::anyhow!("{}", startup_issues.join("; ")));
+    }
+
     if config.agent.mode == AgentMode::Live && !poly_ok && poly_needed {
         println!("   ❌ ERROR: POLYMARKET_PRIVATE_KEY required for live mode");
         return Err(anyhow::anyhow!("Missing required API key for live mode"));
