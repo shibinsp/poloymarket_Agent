@@ -14,6 +14,10 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use crate::india::costs::{IndianCostConfig, IndianTransactionCosts};
+use crate::strategy::pullback::{
+    calculate_position_size, evaluate_pullback_setup, FiveMinCandle, PullbackStrategyConfig,
+    SignalAction,
+};
 use crate::venue::types::Side;
 
 /// An OHLCV market candle for NSE cash equities.
@@ -52,7 +56,7 @@ impl Default for NseBacktestConfig {
     fn default() -> Self {
         Self {
             initial_capital_inr: dec!(500000.0), // ₹5,00,000 initial testing capital
-            max_position_pct: dec!(0.10),        // 10% max per stock
+            max_position_pct: Decimal::ONE,      // Match the live paper worker's notional cap
             max_total_exposure_pct: dec!(0.50),  // 50% max portfolio exposure
             spread_bps: dec!(0.0005),            // 5 bps spread (0.05%)
             slippage_bps: dec!(0.0005),          // 5 bps slippage (0.05%)
@@ -62,7 +66,7 @@ impl Default for NseBacktestConfig {
             rsi_period: 14,
             rsi_buy_threshold: dec!(40.0),
             stop_loss_pct: dec!(0.015),   // 1.5% stop loss
-            take_profit_pct: dec!(0.030), // 3.0% take profit
+            take_profit_pct: dec!(0.020), // Match the live paper worker's +2.0% target
             train_split_pct: dec!(0.60),  // 60% train
             val_split_pct: dec!(0.20),    // 20% validation, 20% test
             cost_config: IndianCostConfig::default(),
@@ -262,11 +266,13 @@ pub fn run_backtest(
     candles: &[NseCandle],
     config: &NseBacktestConfig,
 ) -> Result<NseBacktestResults> {
-    if candles.len() < config.slow_sma_period + 2 {
+    let strategy_config = PullbackStrategyConfig::default();
+    let min_candles = strategy_config.ema_slow_period + 2;
+    if candles.len() < min_candles {
         bail!(
             "Insufficient candle data (found {}, need at least {})",
             candles.len(),
-            config.slow_sma_period + 2
+            min_candles
         );
     }
 
@@ -300,7 +306,7 @@ pub fn run_backtest(
         .get(primary_symbol)
         .context("Primary symbol not found")?;
 
-    let mut pending_signal: Option<Side> = None;
+    let mut pending_signal: Option<(Side, Decimal, String)> = None;
     let mut high_water_mark = initial_capital;
 
     for i in 0..timeline.len() {
@@ -308,53 +314,61 @@ pub fn run_backtest(
         let now = current_bar.timestamp;
 
         // 1. Process pending execution from previous bar's signal (Strict No-Look-Ahead!)
-        if let Some(signal) = pending_signal.take() {
+        if let Some((signal, planned_risk_per_share, exit_reason)) = pending_signal.take() {
             if signal == Side::Buy && open_position.is_none() {
                 // Execute Buy at current bar OPEN with spread and slippage
                 let execution_price =
                     current_bar.open * (Decimal::ONE + config.spread_bps + config.slippage_bps);
-                let max_notional = initial_capital * config.max_position_pct;
-                let available_to_spend = cash.min(max_notional);
+                let mut sizing_config = strategy_config.clone();
+                sizing_config.max_position_pct_of_cash = config.max_position_pct;
+                sizing_config.max_risk_per_trade_pct = dec!(0.02);
+                let mut shares = calculate_position_size(
+                    cash,
+                    execution_price,
+                    planned_risk_per_share,
+                    &sizing_config,
+                );
+                // Keep the historical simulator's conservative volume participation cap.
+                let max_shares_by_vol = (current_bar.volume * config.volume_limit_pct)
+                    .floor()
+                    .to_string()
+                    .parse::<i64>()
+                    .unwrap_or(shares);
+                shares = shares.min(max_shares_by_vol);
 
-                if available_to_spend >= execution_price {
-                    // Whole shares only!
-                    let shares = (available_to_spend / execution_price)
-                        .floor()
-                        .to_string()
-                        .parse::<i64>()
-                        .unwrap_or(0);
-                    // Volume participation cap
-                    let max_shares_by_vol = (current_bar.volume * config.volume_limit_pct)
-                        .floor()
-                        .to_string()
-                        .parse::<i64>()
-                        .unwrap_or(shares);
-                    let shares = shares.min(max_shares_by_vol);
+                // Affordability check including estimated Indian statutory entry charges
+                while shares >= 1 {
+                    let trade_value = execution_price * Decimal::from(shares);
+                    let entry_costs = config.cost_config.calculate(trade_value, Side::Buy).total;
+                    if trade_value + entry_costs <= cash {
+                        break;
+                    }
+                    shares -= 1;
+                }
 
-                    if shares >= 1 {
-                        let trade_value = execution_price * Decimal::from(shares);
-                        let costs = config.cost_config.calculate(trade_value, Side::Buy);
-                        let total_deduction = trade_value + costs.total;
+                if shares >= 1 {
+                    let trade_value = execution_price * Decimal::from(shares);
+                    let costs = config.cost_config.calculate(trade_value, Side::Buy);
+                    let total_deduction = trade_value + costs.total;
 
-                        if cash >= total_deduction {
-                            cash -= total_deduction;
-                            open_position = Some(BacktestTrade {
-                                id: trade_seq,
-                                symbol: current_bar.symbol.clone(),
-                                shares,
-                                entry_time: now,
-                                entry_price: execution_price,
-                                entry_costs: costs,
-                                exit_time: None,
-                                exit_price: None,
-                                exit_costs: None,
-                                gross_pnl: Decimal::ZERO,
-                                total_costs: Decimal::ZERO,
-                                net_pnl: Decimal::ZERO,
-                                exit_reason: String::new(),
-                            });
-                            trade_seq += 1;
-                        }
+                    if cash >= total_deduction {
+                        cash -= total_deduction;
+                        open_position = Some(BacktestTrade {
+                            id: trade_seq,
+                            symbol: current_bar.symbol.clone(),
+                            shares,
+                            entry_time: now,
+                            entry_price: execution_price,
+                            entry_costs: costs,
+                            exit_time: None,
+                            exit_price: None,
+                            exit_costs: None,
+                            gross_pnl: Decimal::ZERO,
+                            total_costs: Decimal::ZERO,
+                            net_pnl: Decimal::ZERO,
+                            exit_reason: String::new(),
+                        });
+                        trade_seq += 1;
                     }
                 }
             } else if signal == Side::Sell && open_position.is_some() {
@@ -378,14 +392,16 @@ pub fn run_backtest(
                 pos.gross_pnl = gross.round_dp(2);
                 pos.total_costs = total_fee.round_dp(2);
                 pos.net_pnl = net.round_dp(2);
-                pos.exit_reason = "SIGNAL_EXIT".to_string();
+                pos.exit_reason = exit_reason;
 
                 completed_trades.push(pos);
             }
         }
 
-        // 2. Intra-bar Stop-Loss and Take-Profit evaluation for open positions
-        if let Some(pos) = open_position.take() {
+        // 2. Evaluate exit conditions for currently held open position on completed bar i
+        // Next candle open fills: If stop-loss (-1.5%) or take-profit (+2.0%) is breached on bar i,
+        // we set pending_signal to Side::Sell so it fills at bar i+1 open.
+        if let Some(pos) = open_position.as_ref() {
             let stop_price = pos.entry_price * (Decimal::ONE - config.stop_loss_pct);
             let target_price = pos.entry_price * (Decimal::ONE + config.take_profit_pct);
 
@@ -393,102 +409,43 @@ pub fn run_backtest(
             let hit_target = current_bar.high >= target_price;
 
             if hit_stop && hit_target {
-                // Conservative Rule: Stop loss triggers first!
-                let exit_price = stop_price * (Decimal::ONE - config.slippage_bps);
-                let trade_value = exit_price * Decimal::from(pos.shares);
-                let exit_costs = config.cost_config.calculate(trade_value, Side::Sell);
-                cash += trade_value - exit_costs.total;
-
-                let gross = (exit_price - pos.entry_price) * Decimal::from(pos.shares);
-                let total_fee = pos.entry_costs.total + exit_costs.total;
-                let net = gross - total_fee;
-
-                completed_trades.push(BacktestTrade {
-                    id: pos.id,
-                    symbol: pos.symbol,
-                    shares: pos.shares,
-                    entry_time: pos.entry_time,
-                    entry_price: pos.entry_price,
-                    entry_costs: pos.entry_costs,
-                    exit_time: Some(now),
-                    exit_price: Some(exit_price),
-                    exit_costs: Some(exit_costs),
-                    gross_pnl: gross.round_dp(2),
-                    total_costs: total_fee.round_dp(2),
-                    net_pnl: net.round_dp(2),
-                    exit_reason: "STOP_LOSS (OUTSIDE_BAR_CONSERVATIVE)".to_string(),
-                });
+                pending_signal = Some((
+                    Side::Sell,
+                    Decimal::ZERO,
+                    "STOP_LOSS (OUTSIDE_BAR_CONSERVATIVE)".to_string(),
+                ));
             } else if hit_stop {
-                let exit_price = stop_price * (Decimal::ONE - config.slippage_bps);
-                let trade_value = exit_price * Decimal::from(pos.shares);
-                let exit_costs = config.cost_config.calculate(trade_value, Side::Sell);
-                cash += trade_value - exit_costs.total;
-
-                let gross = (exit_price - pos.entry_price) * Decimal::from(pos.shares);
-                let total_fee = pos.entry_costs.total + exit_costs.total;
-                let net = gross - total_fee;
-
-                completed_trades.push(BacktestTrade {
-                    id: pos.id,
-                    symbol: pos.symbol,
-                    shares: pos.shares,
-                    entry_time: pos.entry_time,
-                    entry_price: pos.entry_price,
-                    entry_costs: pos.entry_costs,
-                    exit_time: Some(now),
-                    exit_price: Some(exit_price),
-                    exit_costs: Some(exit_costs),
-                    gross_pnl: gross.round_dp(2),
-                    total_costs: total_fee.round_dp(2),
-                    net_pnl: net.round_dp(2),
-                    exit_reason: "STOP_LOSS".to_string(),
-                });
+                pending_signal = Some((Side::Sell, Decimal::ZERO, "STOP_LOSS".to_string()));
             } else if hit_target {
-                let exit_price = target_price * (Decimal::ONE - config.slippage_bps);
-                let trade_value = exit_price * Decimal::from(pos.shares);
-                let exit_costs = config.cost_config.calculate(trade_value, Side::Sell);
-                cash += trade_value - exit_costs.total;
-
-                let gross = (exit_price - pos.entry_price) * Decimal::from(pos.shares);
-                let total_fee = pos.entry_costs.total + exit_costs.total;
-                let net = gross - total_fee;
-
-                completed_trades.push(BacktestTrade {
-                    id: pos.id,
-                    symbol: pos.symbol,
-                    shares: pos.shares,
-                    entry_time: pos.entry_time,
-                    entry_price: pos.entry_price,
-                    entry_costs: pos.entry_costs,
-                    exit_time: Some(now),
-                    exit_price: Some(exit_price),
-                    exit_costs: Some(exit_costs),
-                    gross_pnl: gross.round_dp(2),
-                    total_costs: total_fee.round_dp(2),
-                    net_pnl: net.round_dp(2),
-                    exit_reason: "TAKE_PROFIT".to_string(),
-                });
-            } else {
-                // Position stays open
-                open_position = Some(pos);
+                pending_signal = Some((Side::Sell, Decimal::ZERO, "TAKE_PROFIT".to_string()));
             }
         }
 
-        // 3. Generate signals using strictly information up to current bar close
-        if i >= config.slow_sma_period {
-            let slice = &timeline[..=i];
-            let fast_sma = compute_sma(slice, config.fast_sma_period);
-            let slow_sma = compute_sma(slice, config.slow_sma_period);
-            let rsi = compute_rsi(slice, config.rsi_period);
-
-            if open_position.is_none()
-                && fast_sma > slow_sma
-                && rsi > config.rsi_buy_threshold
-                && rsi < dec!(70.0)
+        // 3. Use the exact completed-bar pullback/rebound entry evaluator used
+        // by the live paper worker. Fills occur at the next bar open.
+        if open_position.is_none() && pending_signal.is_none() {
+            let strategy_candles: Vec<FiveMinCandle> = timeline[..=i]
+                .iter()
+                .map(|bar| FiveMinCandle {
+                    timestamp: bar.timestamp,
+                    symbol: bar.symbol.clone(),
+                    open: bar.open,
+                    high: bar.high,
+                    low: bar.low,
+                    close: bar.close,
+                    volume: bar.volume,
+                })
+                .collect();
+            if let SignalAction::Buy {
+                planned_risk_per_share,
+                ..
+            } = evaluate_pullback_setup(&strategy_candles, &strategy_config).0
             {
-                pending_signal = Some(Side::Buy);
-            } else if open_position.is_some() && fast_sma < slow_sma {
-                pending_signal = Some(Side::Sell);
+                pending_signal = Some((
+                    Side::Buy,
+                    planned_risk_per_share,
+                    "PULLBACK_REBOUND".to_string(),
+                ));
             }
         }
 
@@ -518,11 +475,15 @@ pub fn run_backtest(
         });
     }
 
-    // Close remaining open position at end of backtest to record final marks
+    // Close remaining open position at end of backtest to record final marks net of costs
     let mut unrealized_pnl = Decimal::ZERO;
     if let Some(p) = open_position {
         let last_close = timeline.last().unwrap().close;
-        unrealized_pnl = (last_close - p.entry_price) * Decimal::from(p.shares);
+        let current_val = last_close * Decimal::from(p.shares);
+        let exit_fees = config.cost_config.calculate(current_val, Side::Sell).total;
+        unrealized_pnl = (last_close - p.entry_price) * Decimal::from(p.shares)
+            - p.entry_costs.total
+            - exit_fees;
     }
 
     let final_equity = equity_curve
@@ -660,38 +621,6 @@ pub fn run_backtest(
         trades: completed_trades,
         equity_curve,
     })
-}
-
-fn compute_sma(candles: &[NseCandle], period: usize) -> Decimal {
-    if candles.len() < period || period == 0 {
-        return Decimal::ZERO;
-    }
-    let sum: Decimal = candles.iter().rev().take(period).map(|c| c.close).sum();
-    sum / Decimal::from(period)
-}
-
-fn compute_rsi(candles: &[NseCandle], period: usize) -> Decimal {
-    if candles.len() <= period || period == 0 {
-        return dec!(50.0);
-    }
-    let mut gains = Decimal::ZERO;
-    let mut losses = Decimal::ZERO;
-
-    let start = candles.len() - period;
-    for i in start..candles.len() {
-        let diff = candles[i].close - candles[i - 1].close;
-        if diff > Decimal::ZERO {
-            gains += diff;
-        } else {
-            losses += diff.abs();
-        }
-    }
-
-    if losses == Decimal::ZERO {
-        return dec!(100.0);
-    }
-    let rs = gains / losses;
-    dec!(100.0) - (dec!(100.0) / (Decimal::ONE + rs))
 }
 
 #[cfg(test)]

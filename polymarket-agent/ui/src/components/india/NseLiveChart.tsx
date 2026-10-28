@@ -99,7 +99,7 @@ export interface ChartData {
   measured_delay_ms?: number;
   is_stale?: boolean;
   stale_reason?: string;
-  upstox_instrument_key?: string;
+  provider_instrument_id?: string;
   trading_mode?: string;
   session?: NseSessionInfo;
   is_market_closed?: boolean;
@@ -124,27 +124,23 @@ export interface WatchlistStock {
   exchange: string;
   segment: string;
   isin: string;
-  upstox_token: string;
-  defaultPrice: number;
-  change: number;
-  changePct: number;
 }
 
-// Watchlist matching the exact Upstox Pro screenshot attached by the user
-export const UPSTOX_WATCHLIST: WatchlistStock[] = [
-  { symbol: "RELIANCE", name: "Reliance Industries Ltd", exchange: "NSE", segment: "EQ", isin: "INE002A01018", upstox_token: "NSE_EQ|INE002A01018", defaultPrice: 1191.50, change: -10.30, changePct: -0.86 },
-  { symbol: "HDFCBANK", name: "HDFC Bank Ltd", exchange: "NSE", segment: "EQ", isin: "INE040A01034", upstox_token: "NSE_EQ|INE040A01034", defaultPrice: 681.20, change: -6.85, changePct: -1.00 },
-  { symbol: "TCS", name: "Tata Consultancy Services Ltd", exchange: "NSE", segment: "EQ", isin: "INE467B01029", upstox_token: "NSE_EQ|INE467B01029", defaultPrice: 2506.00, change: -29.00, changePct: -1.14 },
-  { symbol: "BHARTIARTL", name: "Bharti Airtel Ltd", exchange: "NSE", segment: "EQ", isin: "INE397D01024", upstox_token: "NSE_EQ|INE397D01024", defaultPrice: 1968.80, change: 51.30, changePct: 2.68 },
-  { symbol: "ICICIBANK", name: "ICICI Bank Ltd", exchange: "NSE", segment: "EQ", isin: "INE090A01021", upstox_token: "NSE_EQ|INE090A01021", defaultPrice: 1383.50, change: -19.50, changePct: -1.39 },
-  { symbol: "SBIN", name: "State Bank of India", exchange: "NSE", segment: "EQ", isin: "INE062A01020", upstox_token: "NSE_EQ|INE062A01020", defaultPrice: 951.15, change: -9.65, changePct: -1.00 },
-  { symbol: "INFY", name: "Infosys Ltd", exchange: "NSE", segment: "EQ", isin: "INE009A01021", upstox_token: "NSE_EQ|INE009A01021", defaultPrice: 1163.05, change: -2.95, changePct: -0.25 },
-  { symbol: "LICI", name: "Life Insurance Corporation of India", exchange: "NSE", segment: "EQ", isin: "INE115A01015", upstox_token: "NSE_EQ|INE115A01015", defaultPrice: 386.35, change: 5.40, changePct: 1.42 },
-  { symbol: "HINDUNILVR", name: "Hindustan Unilever Ltd", exchange: "NSE", segment: "EQ", isin: "INE030A01027", upstox_token: "NSE_EQ|INE030A01027", defaultPrice: 1799.60, change: -19.00, changePct: -1.04 },
-  { symbol: "BAJFINANCE", name: "Bajaj Finance Ltd", exchange: "NSE", segment: "EQ", isin: "INE296A01024", upstox_token: "NSE_EQ|INE296A01024", defaultPrice: 910.60, change: -8.10, changePct: -0.88 },
-  { symbol: "ITC", name: "ITC Ltd", exchange: "NSE", segment: "EQ", isin: "INE154A01025", upstox_token: "NSE_EQ|INE154A01025", defaultPrice: 256.45, change: -4.05, changePct: -1.55 },
-  { symbol: "LT", name: "Larsen & Toubro Ltd", exchange: "NSE", segment: "EQ", isin: "INE018A01030", upstox_token: "NSE_EQ|INE018A01030", defaultPrice: 3672.80, change: 15.20, changePct: 0.42 },
-  { symbol: "TATAMOTORS", name: "Tata Motors Ltd", exchange: "NSE", segment: "EQ", isin: "INE155A01022", upstox_token: "NSE_EQ|INE155A01022", defaultPrice: 890.00, change: -5.30, changePct: -0.59 },
+// Curated starting symbols shown until the DhanHQ instrument master loads.
+export const NSE_WATCHLIST: WatchlistStock[] = [
+  { symbol: "RELIANCE", name: "Reliance Industries Ltd", exchange: "NSE", segment: "EQ", isin: "INE002A01018" },
+  { symbol: "HDFCBANK", name: "HDFC Bank Ltd", exchange: "NSE", segment: "EQ", isin: "INE040A01034" },
+  { symbol: "TCS", name: "Tata Consultancy Services Ltd", exchange: "NSE", segment: "EQ", isin: "INE467B01029" },
+  { symbol: "BHARTIARTL", name: "Bharti Airtel Ltd", exchange: "NSE", segment: "EQ", isin: "INE397D01024" },
+  { symbol: "ICICIBANK", name: "ICICI Bank Ltd", exchange: "NSE", segment: "EQ", isin: "INE090A01021" },
+  { symbol: "SBIN", name: "State Bank of India", exchange: "NSE", segment: "EQ", isin: "INE062A01020" },
+  { symbol: "INFY", name: "Infosys Ltd", exchange: "NSE", segment: "EQ", isin: "INE009A01021" },
+  { symbol: "LICI", name: "Life Insurance Corporation of India", exchange: "NSE", segment: "EQ", isin: "INE115A01015" },
+  { symbol: "HINDUNILVR", name: "Hindustan Unilever Ltd", exchange: "NSE", segment: "EQ", isin: "INE030A01027" },
+  { symbol: "BAJFINANCE", name: "Bajaj Finance Ltd", exchange: "NSE", segment: "EQ", isin: "INE296A01024" },
+  { symbol: "ITC", name: "ITC Ltd", exchange: "NSE", segment: "EQ", isin: "INE154A01025" },
+  { symbol: "LT", name: "Larsen & Toubro Ltd", exchange: "NSE", segment: "EQ", isin: "INE018A01030" },
+  { symbol: "TATAMOTORS", name: "Tata Motors Ltd", exchange: "NSE", segment: "EQ", isin: "INE155A01022" },
 ];
 
 const RANGES = ["1m", "3m", "5m", "15m", "1D", "1W", "1M"];
@@ -167,7 +163,6 @@ export function NseLiveChart({
   const [activeIndicators, setActiveIndicators] = useState({ sma: true, vol: true });
   const [instantOrderQty, setInstantOrderQty] = useState("1");
   const [searchQuery, setSearchQuery] = useState("");
-  const [clientReceiptTime, setClientReceiptTime] = useState<number>(Date.now());
   const [activeTabBottom, setActiveTabBottom] = useState<"orders" | "positions" | "holdings" | "trades" | "backtest">("orders");
   const [indiaBacktest, setIndiaBacktest] = useState<any>(null);
   const [loadingIndiaBacktest, setLoadingIndiaBacktest] = useState(false);
@@ -199,6 +194,7 @@ export function NseLiveChart({
 
   const [data, setData] = useState<ChartData | null>(null);
   const [livePricesMap, setLivePricesMap] = useState<Record<string, { price: number; change_pct: number }>>({});
+  const [marketWatchlist, setMarketWatchlist] = useState<WatchlistStock[]>(NSE_WATCHLIST);
   const [feedStatus, setFeedStatus] = useState<{
     connected: boolean;
     status: string;
@@ -216,13 +212,13 @@ export function NseLiveChart({
     deduped_ticks_count: number;
   }>({
     connected: false,
-    status: "CONNECTING",
+    status: "AUTH_REQUIRED",
     feed_type: "UPSTOX_V3_LIVE",
     last_update: null,
     last_feed_timestamp: null,
     measured_delay_ms: null,
-    is_stale: false,
-    trading_paused: false,
+    is_stale: true,
+    trading_paused: true,
     session: undefined,
     reconnect_count: 0,
     resubscribe_count: 0,
@@ -247,12 +243,9 @@ export function NseLiveChart({
   // Fetch feed status and price map
   const fetchFeedStatus = async () => {
     try {
-      const res = await fetch("/api/upstox/feed/status");
+      const res = await fetch("/api/india/feed/status");
       if (res.ok) {
         const json = await res.json();
-        const now = Date.now();
-        setClientReceiptTime(now);
-
         const lp: Record<string, { price: number; change_pct: number }> = {};
         if (json.live_prices) {
           for (const [k, v] of Object.entries(json.live_prices as Record<string, { price: number; change_pct: number }>)) {
@@ -267,7 +260,7 @@ export function NseLiveChart({
           feed_type: json.feed_type || "UPSTOX_V3_LIVE",
           last_update: json.last_tick_time || null,
           last_feed_timestamp: json.last_feed_timestamp || json.last_tick_time || null,
-          measured_delay_ms: json.measured_delay_ms ?? 42,
+          measured_delay_ms: json.measured_delay_ms ?? null,
           is_stale: Boolean(json.is_stale),
           stale_reason: json.stale_reason,
           trading_paused: Boolean(json.trading_paused_due_to_stale),
@@ -289,7 +282,6 @@ export function NseLiveChart({
       if (res.ok) {
         const json = await res.json();
         setData(json);
-        setClientReceiptTime(Date.now());
       }
     } catch (e) {
       console.error("Failed to load chart", e);
@@ -299,10 +291,17 @@ export function NseLiveChart({
   useEffect(() => {
     fetchChart();
     fetchFeedStatus();
+    fetch("/api/india/watchlist").then((res) => res.ok ? res.json() : null).then((json) => {
+      if (!Array.isArray(json?.symbols) || json.symbols.length === 0) return;
+      const known = new Map(NSE_WATCHLIST.map((item) => [item.symbol, item]));
+      setMarketWatchlist(json.symbols.map((symbol: string) => known.get(symbol) ?? {
+        symbol, name: symbol, exchange: "NSE", segment: "EQ", isin: "",
+      }));
+    }).catch(() => {});
     const interval = setInterval(() => {
       fetchChart();
       fetchFeedStatus();
-    }, 4000);
+    }, 1000);
     return () => clearInterval(interval);
   }, [selectedSymbol, selectedRange]);
 
@@ -317,7 +316,7 @@ export function NseLiveChart({
         return;
       }
 
-      const currentP = toN(data?.current_price, 1000);
+      const currentP = toN(data?.current_price, 0);
       const executionPrice = side === "BUY" ? (currentP + 0.10).toFixed(2) : (currentP - 0.10).toFixed(2);
 
       const res = await postJson<{ status: string; order: { client_order_id: string; average_fill_price: string }; disclaimer: string }>(
@@ -352,13 +351,11 @@ export function NseLiveChart({
 
   // Measured latency calculation (Receipt to Display)
   const measuredDisplayDelay = useMemo(() => {
-    if (data?.feed_timestamp) {
-      const feedTime = new Date(data.feed_timestamp).getTime();
-      const delay = Math.max(0, clientReceiptTime - feedTime);
-      return delay > 0 ? delay : 42;
-    }
-    return data?.measured_delay_ms ?? 45;
-  }, [data?.feed_timestamp, data?.measured_delay_ms, clientReceiptTime]);
+    // The feed timestamp is the exchange event time, so subtracting it from
+    // the browser clock measures quote age, not network/display latency.
+    // Use the latency measured when the backend received the tick instead.
+    return data?.measured_delay_ms ?? null;
+  }, [data?.measured_delay_ms]);
 
   // Colors & theme
   const isLight = chartTheme === "light";
@@ -373,17 +370,17 @@ export function NseLiveChart({
   const redColor = "#f23645";
   const purpleAccent = "#7c3aed";
 
-  const currPrice = toN(data?.current_price, 1191.50);
-  const changeNum = toN(data?.change, -10.30);
-  const changePctNum = toN(data?.change_pct, -0.86);
+  const currPrice = toN(data?.current_price, 0);
+  const changeNum = toN(data?.change, 0);
+  const changePctNum = toN(data?.change_pct, 0);
   const isPos = changeNum >= 0;
 
   // Filter watchlist
   const filteredWatchlist = useMemo(() => {
-    if (!searchQuery.trim()) return UPSTOX_WATCHLIST;
+    if (!searchQuery.trim()) return marketWatchlist.slice(0, 100);
     const q = searchQuery.trim().toUpperCase();
-    return UPSTOX_WATCHLIST.filter((w) => w.symbol.includes(q) || w.name.toUpperCase().includes(q));
-  }, [searchQuery]);
+    return marketWatchlist.filter((w) => w.symbol.includes(q) || w.name.toUpperCase().includes(q)).slice(0, 100);
+  }, [searchQuery, marketWatchlist]);
 
   // Active candle for ticker
   const activeCandle = hoveredCandle || (data?.candles && data.candles.length > 0 ? data.candles[data.candles.length - 1] : null);
@@ -530,7 +527,7 @@ export function NseLiveChart({
         fontFamily: "Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
       }}
     >
-      {/* 1. TOP INDICES & LATENCY RIBBON (Matching Upstox Pro Bar) */}
+      {/* 1. LIVE MARKET DATA STATUS */}
       <div
         style={{
           display: "flex",
@@ -544,38 +541,13 @@ export function NseLiveChart({
           gap: "8px",
         }}
       >
-        {/* Indices values */}
+        {/* Provider and market identity */}
         <div style={{ display: "flex", alignItems: "center", gap: "16px", flexWrap: "wrap" }}>
           <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-            <span style={{ background: "#7c3aed", color: "#fff", fontWeight: "800", padding: "1px 6px", borderRadius: "3px", fontSize: "11px" }}>
-              upstox
+            <span style={{ background: "#0284c7", color: "#fff", fontWeight: "800", padding: "1px 6px", borderRadius: "3px", fontSize: "11px" }}>
+              UPSTOX
             </span>
-            <span style={{ fontWeight: "700", color: "#3b82f6", fontSize: "11px" }}>+plus</span>
-          </div>
-
-          <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
-            <span style={{ fontWeight: "600", color: textSecondary }}>NIFTY 50</span>
-            <strong style={{ color: redColor }}>22,719.90</strong>
-            <span style={{ color: redColor, fontSize: "11px" }}>-33.30 (-0.15%)</span>
-            <span style={{ fontSize: "10px", color: textMuted, background: isLight ? "#e2e8f0" : "#1e293b", padding: "1px 4px", borderRadius: "2px" }}>Exp. Today</span>
-          </div>
-
-          <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
-            <span style={{ fontWeight: "600", color: textSecondary }}>BANKNIFTY</span>
-            <strong style={{ color: redColor }}>54,071.15</strong>
-            <span style={{ color: redColor, fontSize: "11px" }}>-295.55 (-0.54%)</span>
-            <span style={{ fontSize: "10px", color: textMuted, background: isLight ? "#e2e8f0" : "#1e293b", padding: "1px 4px", borderRadius: "2px" }}>Exp. Today</span>
-          </div>
-
-          <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
-            <span style={{ fontWeight: "600", color: textSecondary }}>SENSEX</span>
-            <strong style={{ color: redColor }}>73,448.21</strong>
-            <span style={{ color: redColor, fontSize: "11px" }}>-158.54 (-0.22%)</span>
-          </div>
-
-          <div style={{ display: "flex", alignItems: "center", gap: "8px", color: textSecondary }}>
-            <span>Hol. Total P&L <strong style={{ color: greenColor }}>₹0.00</strong></span>
-            <span>Pos. Total P&L: <strong style={{ color: greenColor }}>₹0.00</strong></span>
+            <span style={{ fontWeight: "600", color: textSecondary }}>NSE cash equities</span>
           </div>
         </div>
 
@@ -591,6 +563,11 @@ export function NseLiveChart({
               <span style={{ width: "8px", height: "8px", borderRadius: "50%", background: "#10b981", boxShadow: "0 0 6px #10b981" }} />
               UPSTOX V3 STREAMING ({feedStatus.deduped_ticks_count} deduped)
             </div>
+          ) : feedStatus.status === "REST_FALLBACK" && !feedStatus.is_stale ? (
+            <div style={{ display: "flex", alignItems: "center", gap: "5px", background: "#f0fdf4", color: "#15803d", padding: "3px 8px", borderRadius: "4px", fontWeight: "600", fontSize: "11px" }}>
+              <span style={{ width: "8px", height: "8px", borderRadius: "50%", background: "#22c55e" }} />
+              UPSTOX REST FALLBACK (POLLING)
+            </div>
           ) : feedStatus.status === "RECONNECTING_BACKOFF" ? (
             <div style={{ display: "flex", alignItems: "center", gap: "5px", background: "#fef3c7", color: "#b45309", padding: "3px 8px", borderRadius: "4px", fontWeight: "600", fontSize: "11px" }}>
               <span style={{ width: "8px", height: "8px", borderRadius: "50%", background: "#f59e0b" }} />
@@ -604,16 +581,22 @@ export function NseLiveChart({
           ) : (
             <div style={{ display: "flex", alignItems: "center", gap: "5px", background: "#eff6ff", color: "#1d4ed8", padding: "3px 8px", borderRadius: "4px", fontWeight: "600", fontSize: "11px" }}>
               <span style={{ width: "8px", height: "8px", borderRadius: "50%", background: "#3b82f6" }} />
-              V3 CONNECTING
+              UPSTOX AWAITING DATA
             </div>
           )}
 
           <div style={{ fontSize: "11px", color: textMuted }}>
-            Delay: <strong style={{ color: measuredDisplayDelay > 1000 ? redColor : textPrimary }}>~{measuredDisplayDelay}ms</strong>
+            {feedStatus.status === "CONNECTED" && !feedStatus.is_stale ? (
+              <>Stream delay: <strong style={{ color: measuredDisplayDelay !== null && measuredDisplayDelay > 1000 ? redColor : textPrimary }}>{measuredDisplayDelay !== null ? `~${measuredDisplayDelay}ms` : "—"}</strong></>
+            ) : feedStatus.status === "REST_FALLBACK" ? (
+              <span>REST snapshot (no stream latency)</span>
+            ) : (
+              <span>Feed delay: —</span>
+            )}
           </div>
 
           <div style={{ fontSize: "11px", color: textMuted }}>
-            Feed Time: <strong style={{ color: textPrimary }}>{data?.last_updated_at ? new Date(data.last_updated_at).toLocaleTimeString() : "14:45:50 IST"}</strong>
+            Feed Time: <strong style={{ color: textPrimary }}>{data?.last_updated_at ? new Date(data.last_updated_at).toLocaleTimeString() : "—"}</strong>
           </div>
 
           <Badge tone="warning" title="Strict paper execution mode">
@@ -672,7 +655,7 @@ export function NseLiveChart({
           <div style={{ display: "flex", alignItems: "center", gap: "12px", fontSize: "11px" }}>
             {!feedStatus.session.allows_order_entry && (
               <span style={{ color: textMuted }}>
-                Last Authentic Price: <strong style={{ color: textPrimary }}>₹{data?.last_received_price ? Number(data.last_received_price).toFixed(2) : currPrice.toFixed(2)}</strong> {data?.last_received_time ? `(${new Date(data.last_received_time).toLocaleTimeString()})` : ""} · Paper fills paused
+                Last Authentic Price: <strong style={{ color: textPrimary }}>{data?.last_received_price ? `₹${Number(data.last_received_price).toFixed(2)}` : "—"}</strong> {data?.last_received_time ? `(${new Date(data.last_received_time).toLocaleTimeString()})` : ""} · Paper fills paused
               </span>
             )}
             <span>{feedStatus.session.current_date_ist}</span>
@@ -697,7 +680,7 @@ export function NseLiveChart({
 
       {/* 3. MAIN WORKSPACE: WATCHLIST (LEFT) + CANDLESTICK CHART (RIGHT) */}
       <div style={{ display: "grid", gridTemplateColumns: "310px 1fr", minHeight: "680px" }}>
-        {/* LEFT COLUMN: UPSTOX WATCHLIST SIDEBAR */}
+        {/* LEFT COLUMN: NSE WATCHLIST SIDEBAR */}
         <div
           style={{
             background: bgSurface,
@@ -712,8 +695,8 @@ export function NseLiveChart({
           <div style={{ padding: "10px 12px", borderBottom: `1px solid ${borderColor}` }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
               <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                <span style={{ fontWeight: "700", fontSize: "13px", color: textPrimary }}>Top 20 by Market ...</span>
-                <span style={{ fontSize: "11px", color: textMuted }}>{filteredWatchlist.length} / 100</span>
+                <span style={{ fontWeight: "700", fontSize: "13px", color: textPrimary }}>NSE Equities</span>
+                <span style={{ fontSize: "11px", color: textMuted }}>{filteredWatchlist.length} / {marketWatchlist.length}</span>
               </div>
               <div style={{ display: "flex", gap: "6px", color: textSecondary, fontSize: "13px" }}>
                 <span style={{ cursor: "pointer" }} title="Filter">☰</span>
@@ -747,9 +730,9 @@ export function NseLiveChart({
             {filteredWatchlist.map((stock) => {
               const isSelected = selectedSymbol === stock.symbol;
               const liveData = livePricesMap[stock.symbol];
-              const price = liveData?.price ? liveData.price : stock.defaultPrice;
-              const changePct = liveData?.change_pct !== undefined ? liveData.change_pct : stock.changePct;
-              const changeAmt = ((price * changePct) / 100);
+              const price = liveData?.price ?? null;
+              const changePct = liveData?.change_pct ?? 0;
+              const changeAmt = price === null ? 0 : ((price * changePct) / 100);
               const isStockPos = changePct >= 0;
 
               return (
@@ -774,13 +757,13 @@ export function NseLiveChart({
                     </div>
                     <div style={{ fontSize: "11px", color: textMuted, display: "flex", alignItems: "center", gap: "4px" }}>
                       <span>{stock.exchange} {stock.segment}</span>
-                      <span title={`Upstox Key: ${stock.upstox_token}`} style={{ cursor: "help", opacity: 0.6 }}>ℹ️</span>
+                      <span title="NSE equity instrument" style={{ cursor: "help", opacity: 0.6 }}>ℹ️</span>
                     </div>
                   </div>
 
                   <div style={{ textAlign: "right" }}>
                     <div style={{ fontWeight: "700", fontSize: "13px", color: isStockPos ? greenColor : redColor }}>
-                      {price.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                      {price === null ? "—" : price.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                     </div>
                     <div style={{ fontSize: "11px", color: isStockPos ? greenColor : redColor, fontWeight: "500" }}>
                       {isStockPos ? `+${changeAmt.toFixed(2)} (+${changePct.toFixed(2)}%)` : `${changeAmt.toFixed(2)} (${changePct.toFixed(2)}%)`}
@@ -905,7 +888,7 @@ export function NseLiveChart({
                   alignItems: "center",
                 }}
               >
-                <span>SELL {feedStatus.session && !feedStatus.session.allows_order_entry ? "(CLOSED)" : (currPrice - 0.10).toFixed(2)}</span>
+                <span>SELL {feedStatus.session && !feedStatus.session.allows_order_entry ? "(CLOSED)" : currPrice > 0 ? (currPrice - 0.10).toFixed(2) : "(NO LIVE PRICE)"}</span>
               </button>
 
               <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
@@ -948,7 +931,7 @@ export function NseLiveChart({
                   alignItems: "center",
                 }}
               >
-                <span>BUY {feedStatus.session && !feedStatus.session.allows_order_entry ? "(CLOSED)" : (currPrice + 0.10).toFixed(2)}</span>
+                <span>BUY {feedStatus.session && !feedStatus.session.allows_order_entry ? "(CLOSED)" : currPrice > 0 ? (currPrice + 0.10).toFixed(2) : "(NO LIVE PRICE)"}</span>
               </button>
 
               <button
@@ -1012,17 +995,17 @@ export function NseLiveChart({
                 <span>O<strong style={{ color: textPrimary }}>{activeCandle ? Number(activeCandle.open).toFixed(2) : "1,191.50"}</strong></span>
                 <span>H<strong style={{ color: textPrimary }}>{activeCandle ? Number(activeCandle.high).toFixed(2) : "1,192.30"}</strong></span>
                 <span>L<strong style={{ color: textPrimary }}>{activeCandle ? Number(activeCandle.low).toFixed(2) : "1,191.30"}</strong></span>
-                <span>C<strong style={{ color: isPos ? greenColor : redColor }}>{activeCandle ? Number(activeCandle.close).toFixed(2) : currPrice.toFixed(2)}</strong></span>
+                <span>C<strong style={{ color: isPos ? greenColor : redColor }}>{activeCandle ? Number(activeCandle.close).toFixed(2) : currPrice > 0 ? currPrice.toFixed(2) : "—"}</strong></span>
                 <span style={{ color: isPos ? greenColor : redColor, fontWeight: "700" }}>
                   {isPos ? `+${changeNum.toFixed(2)} (+${changePctNum.toFixed(2)}%)` : `${changeNum.toFixed(2)} (${changePctNum.toFixed(2)}%)`}
                 </span>
-                <span style={{ color: textSecondary }}>Vol {activeCandle ? `${(toN(activeCandle.volume) / 1000).toFixed(2)}K` : "9.45K"}</span>
+                <span style={{ color: textSecondary }}>Vol {activeCandle ? `${(toN(activeCandle.volume) / 1000).toFixed(2)}K` : "—"}</span>
               </div>
             </div>
 
             <div style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "11px", color: textMuted }}>
-              <span>Volume SMA <strong style={{ color: "#3b82f6" }}>9.45K</strong></span>
-              <span>• Instrument: <strong style={{ color: textPrimary }}>{data?.upstox_instrument_key || `NSE_EQ|${selectedSymbol}`}</strong></span>
+              <span>Volume</span>
+              <span>• Instrument: <strong style={{ color: textPrimary }}>{data?.provider_instrument_id || `NSE_EQ|${selectedSymbol}`}</strong></span>
             </div>
           </div>
 
@@ -1158,6 +1141,7 @@ export function NseLiveChart({
 
 
               {/* Real-time Current Dotted Price Line extending to right axis */}
+              {currPrice > 0 && <>
               <line
                 x1={padding.left}
                 y1={currentPriceY}
@@ -1207,6 +1191,7 @@ export function NseLiveChart({
               >
                 {countdownFormatted}
               </text>
+              </>}
 
               {/* Hover Crosshairs & Tooltip */}
               {mousePos && (
@@ -1266,12 +1251,12 @@ export function NseLiveChart({
                 </button>
               ))}
               <span style={{ fontSize: "11px", color: textMuted }}>|</span>
-              <span style={{ fontSize: "11px", color: textMuted }}>Powered by <strong>Upstox Live Feed</strong></span>
+              <span style={{ fontSize: "11px", color: textMuted }}>Market data: <strong>DhanHQ</strong></span>
             </div>
 
             <div style={{ display: "flex", gap: "12px", alignItems: "center" }}>
               <span style={{ fontFamily: "monospace", fontSize: "11px", color: textPrimary }}>
-                {istClock || "14:45:50 (UTC+5:30)"}
+                {istClock || "--:--:-- (UTC+5:30)"}
               </span>
               <div style={{ display: "flex", gap: "6px", fontSize: "11px" }}>
                 <span style={{ cursor: "pointer" }}>%</span>
@@ -1382,7 +1367,7 @@ export function NseLiveChart({
                             <td style={{ padding: "6px 8px", fontFamily: "monospace", color: textSecondary }}>{t.id}</td>
                             <td style={{ padding: "6px 8px" }}>
                               <div style={{ fontWeight: "600", color: textPrimary }}>{t.market || "NSE Cash Equities"}</div>
-                              <div style={{ fontSize: "10px", color: purpleAccent }}>{t.provider_feed || "Upstox V3 Feed"}</div>
+                              <div style={{ fontSize: "10px", color: purpleAccent }}>{t.provider_feed || "DhanHQ Live Feed"}</div>
                             </td>
                             <td style={{ padding: "6px 8px", maxWidth: "200px" }}>
                               <span style={{ fontSize: "10px", color: textSecondary }}>

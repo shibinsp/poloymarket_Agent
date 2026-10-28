@@ -303,6 +303,138 @@ impl AlpacaLiveMarketFeed {
         }
     }
 
+    /// Fetch recent completed Alpaca 5-minute bars for a US pullback backtest.
+    /// Uses the configured IEX/SIP feed, restricts the sample to regular US
+    /// trading hours, and never falls back to bundled demonstration candles.
+    pub async fn fetch_intraday_5m_candles(
+        &self,
+        symbol: &str,
+    ) -> anyhow::Result<Vec<FiveMinCandle>> {
+        use anyhow::{bail, Context};
+        use chrono::Timelike;
+
+        let symbol = symbol.trim().to_uppercase();
+        if symbol.is_empty()
+            || symbol.len() > 15
+            || !symbol
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+        {
+            bail!("Invalid US stock symbol");
+        }
+
+        let key =
+            self.key_id.read().await.clone().context(
+                "Alpaca API key is not configured; add paper-market data credentials first",
+            )?;
+        let secret = self.secret_key.read().await.clone().context(
+            "Alpaca API secret is not configured; add paper-market data credentials first",
+        )?;
+        let feed = self.feed_type.read().await.to_lowercase();
+        let now = Utc::now();
+        let start = (now - chrono::Duration::days(180)).to_rfc3339();
+        let end = now.to_rfc3339();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .context("Could not initialize Alpaca history client")?;
+        let mut page_token: Option<String> = None;
+        let mut candles = Vec::new();
+
+        for _ in 0..10 {
+            let mut request = client
+                .get(format!(
+                    "https://data.alpaca.markets/v2/stocks/{symbol}/bars"
+                ))
+                .header("APCA-API-KEY-ID", &key)
+                .header("APCA-API-SECRET-KEY", &secret)
+                .query(&[
+                    ("timeframe", "5Min".to_string()),
+                    ("start", start.clone()),
+                    ("end", end.clone()),
+                    ("limit", "10000".to_string()),
+                    ("feed", feed.clone()),
+                    ("sort", "asc".to_string()),
+                ]);
+            if let Some(token) = page_token.as_ref() {
+                request = request.query(&[("page_token", token)]);
+            }
+
+            let response = request
+                .send()
+                .await
+                .context("Alpaca historical bars request failed")?;
+            let status = response.status();
+            if !status.is_success() {
+                bail!("Alpaca historical bars returned HTTP {status}; check API credentials and {feed} data access");
+            }
+            let payload: serde_json::Value = response
+                .json()
+                .await
+                .context("Alpaca historical bars response was not valid JSON")?;
+            let rows = payload
+                .get("bars")
+                .and_then(serde_json::Value::as_array)
+                .context("Alpaca historical bars response did not contain a bars array")?;
+
+            for row in rows {
+                let Some(timestamp) = row
+                    .get("t")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                    .map(|value| value.with_timezone(&Utc))
+                else {
+                    continue;
+                };
+                if timestamp + chrono::Duration::minutes(5) > now {
+                    continue;
+                }
+                let local = timestamp.with_timezone(&chrono_tz::America::New_York);
+                let minute_of_day = local.time().num_seconds_from_midnight() / 60;
+                if minute_of_day < 9 * 60 + 30 || minute_of_day >= 16 * 60 {
+                    continue;
+                }
+                let price = |field: &str| {
+                    row.get(field)
+                        .and_then(serde_json::Value::as_f64)
+                        .and_then(Decimal::from_f64_retain)
+                        .unwrap_or(Decimal::ZERO)
+                };
+                let open = price("o");
+                let high = price("h");
+                let low = price("l");
+                let close = price("c");
+                if open <= Decimal::ZERO || low <= Decimal::ZERO || close <= Decimal::ZERO {
+                    continue;
+                }
+                candles.push(FiveMinCandle {
+                    timestamp,
+                    symbol: symbol.clone(),
+                    open,
+                    high,
+                    low,
+                    close,
+                    volume: price("v"),
+                });
+            }
+
+            page_token = payload
+                .get("next_page_token")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            if page_token.is_none() {
+                break;
+            }
+        }
+
+        candles.sort_by_key(|candle| candle.timestamp);
+        candles.dedup_by_key(|candle| candle.timestamp);
+        if candles.is_empty() {
+            bail!("Alpaca returned no completed regular-session 5-minute bars for {symbol}");
+        }
+        Ok(candles)
+    }
+
     /// Starts the background WebSocket streaming loop.
     pub fn start_streaming(self: Arc<Self>) {
         tokio::spawn(async move {

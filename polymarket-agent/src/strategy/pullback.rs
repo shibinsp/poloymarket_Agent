@@ -135,6 +135,23 @@ pub fn evaluate_pullback_setup(
     candles: &[FiveMinCandle],
     config: &PullbackStrategyConfig,
 ) -> (SignalAction, Option<PullbackIndicators>) {
+    evaluate_pullback_setup_in_timezone(candles, config, chrono_tz::Asia::Kolkata)
+}
+
+/// US-market variant of the pullback evaluator. EMA warmup spans sessions,
+/// while VWAP and pullback detection reset on the New York trading date.
+pub fn evaluate_pullback_setup_us(
+    candles: &[FiveMinCandle],
+    config: &PullbackStrategyConfig,
+) -> (SignalAction, Option<PullbackIndicators>) {
+    evaluate_pullback_setup_in_timezone(candles, config, chrono_tz::America::New_York)
+}
+
+fn evaluate_pullback_setup_in_timezone(
+    candles: &[FiveMinCandle],
+    config: &PullbackStrategyConfig,
+    timezone: chrono_tz::Tz,
+) -> (SignalAction, Option<PullbackIndicators>) {
     let min_bars = config.ema_slow_period + 2;
     if candles.len() < min_bars {
         return (SignalAction::Hold, None);
@@ -144,11 +161,25 @@ pub fn evaluate_pullback_setup(
     let current_bar = &candles[n - 1]; // Completed candle just closed
     let prev_bar = &candles[n - 2]; // Prior completed candle
 
+    // EMA history may span sessions, but intraday VWAP and pullback checks
+    // must use only candles from the current market-local session.
+    let current_session_date = current_bar.timestamp.with_timezone(&timezone).date_naive();
+    let session_start = candles
+        .iter()
+        .rposition(|candle| {
+            candle.timestamp.with_timezone(&timezone).date_naive() != current_session_date
+        })
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    if n.saturating_sub(session_start) < 6 {
+        return (SignalAction::Hold, None);
+    }
+
     let closes: Vec<Decimal> = candles.iter().map(|c| c.close).collect();
     let volumes: Vec<Decimal> = candles.iter().map(|c| c.volume).collect();
 
     // 1. Technical Indicators
-    let session_vwap = compute_vwap(candles);
+    let session_vwap = compute_vwap(&candles[session_start..]);
     let ema_20 = compute_ema(&closes, config.ema_fast_period);
     let ema_50 = compute_ema(&closes, config.ema_slow_period);
 
@@ -165,11 +196,11 @@ pub fn evaluate_pullback_setup(
 
     // Rule 2: Pullback Detection
     // In the last 3-5 bars, price retraced toward VWAP or EMA 20 support
-    let lookback = 5.min(n - 1);
-    let mut pullback_low = current_bar.low;
+    let pullback_start = (n - 1).saturating_sub(5).max(session_start);
+    let mut pullback_low = Decimal::MAX;
     let mut pullback_detected = false;
 
-    for bar in &candles[n - lookback..n - 1] {
+    for bar in &candles[pullback_start..n - 1] {
         if bar.low < pullback_low {
             pullback_low = bar.low;
         }

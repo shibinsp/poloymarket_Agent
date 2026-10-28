@@ -108,6 +108,15 @@ impl Venue for UpstoxSandboxVenue {
         _interval: CandleInterval,
         limit: usize,
     ) -> Result<Vec<Candle>> {
+        let watchlist = crate::india::instruments::nse_watchlist();
+        if let Some(item) = watchlist.iter().find(|i| i.symbol == id.symbol) {
+            if let Ok(real_candles) = self.client.fetch_intraday_candles(&item.upstox_key).await {
+                if real_candles.len() >= 5 {
+                    return Ok(real_candles);
+                }
+            }
+        }
+
         let base_price = self
             .client
             .get_quote(&id.symbol)
@@ -119,8 +128,10 @@ impl Venue for UpstoxSandboxVenue {
         for i in 0..count {
             let offset_hours = (count - 1 - i) as i64;
             let ts = now - chrono::Duration::hours(offset_hours);
-            let factor =
-                Decimal::from_f64_retain(1.0 + (i as f64 - 10.0) * 0.0012).unwrap_or(Decimal::ONE);
+            let factor = Decimal::from_f64_retain(
+                1.0 + (i as f64 - 25.0) * 0.0003 + ((i as f64 * 0.4).sin() * 0.0008),
+            )
+            .unwrap_or(Decimal::ONE);
             let close = (base_price * factor).round_dp(2);
             let open = (close - dec!(0.50)).max(dec!(0.05));
             let high = close + dec!(1.50);
@@ -176,13 +187,21 @@ impl Venue for UpstoxSandboxVenue {
         };
 
         let venue_order_id = self.client.place_order(&payload).await?;
+        let fill_price = if price > Decimal::ZERO {
+            price
+        } else {
+            self.client
+                .get_quote(&nse.symbol)
+                .await
+                .unwrap_or(dec!(1000.0))
+        };
 
         Ok(OrderAck {
             venue_order_id,
             client_order_id: request.client_order_id.clone(),
-            state: OrderState::Accepted,
-            filled_qty: Decimal::ZERO,
-            avg_fill_price: None,
+            state: OrderState::Filled,
+            filled_qty: request.qty,
+            avg_fill_price: Some(fill_price),
             fees: Decimal::ZERO,
         })
     }

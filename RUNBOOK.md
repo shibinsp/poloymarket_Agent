@@ -7,7 +7,7 @@ A complete reference guide for running, configuring, monitoring, and operating M
 ## 1. Quick Start & Dashboard
 
 ### Accessing the Web UI
-- **URL**: [http://127.0.0.1:8080](http://127.0.0.1:8080)
+- **URL**: [http://127.0.0.1:8088](http://127.0.0.1:8088)
 - **Direct Navigation Hash Routes**:
   - `/#/overview`: Executive portfolio balance, unrealized PnL, circuit breaker status, and recent activity.
   - `/#/india`: Indian NSE Cash Equities sandbox, live tick charts, and interactive backtesting.
@@ -25,11 +25,12 @@ A complete reference guide for running, configuring, monitoring, and operating M
 ### On Windows
 | Action | Command / File | Description |
 | :--- | :--- | :--- |
-| **Quick Start** | Double-click `launch.bat` | Starts Paper Trading mode and automatically opens browser dashboard. |
-| **Full Menu** | Double-click `start.bat` | Terminal menu with options for Paper, Background, Backtest, Status, and Live. |
-| **Background Mode** | Double-click `start_background.bat` | Runs silently as a detached process without a command prompt window. |
-| **Stop Agent** | Double-click `stop_background.bat` | Gracefully terminates any running `polymarket-agent.exe` process. |
-| **Auto-Start on Boot** | Run `install_autostart.bat` | Configures Windows Task Scheduler to run MoneyAI on login. |
+| **Quick Start** | Double-click `launch.bat` | Starts Paper Trading mode, turns on Cloudflare remote tunnel, and opens dashboard. |
+| **Full Menu** | Double-click `start.bat` | Terminal menu (Paper, Background, Live, Status) with remote hosting always on. |
+| **Background Mode** | Double-click `start_background.bat` | Runs silently as a detached process with remote hosting active. |
+| **Stop Agent** | Double-click `stop_background.bat` | Gracefully terminates both `polymarket-agent.exe` and `cloudflared.exe`. |
+| **Auto-Start on Boot** | Run `install_autostart.bat` | Configures Windows Startup to launch agent and remote hosting automatically on login. |
+| **Remote Tunnel Only** | Double-click `start_public_tunnel.bat` | Starts/checks the Cloudflare remote tunnel and displays the public link. |
 
 ### On macOS / Linux
 ```bash
@@ -61,12 +62,12 @@ MoneyAI has safety circuit breakers that halt new order entries while keeping ex
 ### Via Terminal / Curl (with Required Security Header)
 ```bash
 # Resume trading / clear circuit breaker halt
-curl -X POST http://127.0.0.1:8080/api/resume \
+curl -X POST http://127.0.0.1:8088/api/resume \
   -H "Content-Type: application/json" \
   -H "x-agent-control: 1"
 
 # Emergency Halt
-curl -X POST http://127.0.0.1:8080/api/halt \
+curl -X POST http://127.0.0.1:8088/api/halt \
   -H "Content-Type: application/json" \
   -H "x-agent-control: 1"
 ```

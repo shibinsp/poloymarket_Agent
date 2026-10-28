@@ -18,8 +18,8 @@ use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 
 use crate::strategy::pullback::{
-    calculate_position_size, evaluate_pullback_setup, FiveMinCandle, PullbackStrategyConfig,
-    SignalAction,
+    calculate_position_size, evaluate_pullback_setup, evaluate_pullback_setup_us, FiveMinCandle,
+    PullbackStrategyConfig, SignalAction,
 };
 
 /// Performance metrics for a backtest evaluation period.
@@ -312,7 +312,11 @@ pub fn run_pullback_backtest(
         // 3. Evaluate bar close for new setups (completed candle i)
         if open_position.is_none() {
             let eval_slice = &candles[..=i];
-            let (signal, _) = evaluate_pullback_setup(eval_slice, config);
+            let signal = if is_us {
+                evaluate_pullback_setup_us(eval_slice, config).0
+            } else {
+                evaluate_pullback_setup(eval_slice, config).0
+            };
             if let SignalAction::Buy { .. } = signal {
                 pending_signal = Some((signal, i));
             }

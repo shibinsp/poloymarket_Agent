@@ -143,9 +143,12 @@ pub fn evaluate_strategy_tick(
         }
     }
 
-    // 2. If we don't hold shares, evaluate entry conditions within the ₹1,000 budget
-    // Only liquid sub-₹1,000 stocks (e.g. ITC ~₹470, SBIN ~₹800, TATAMOTORS ~₹950) can be bought
-    let single_share_cost = current_price;
+    // 2. If we don't hold shares, entry decisions are deferred to the continuous
+    // Pullback & Confirmed Rebound strategy worker which operates on completed 5-minute candles.
+    let entry_charges = crate::india::costs::IndianCostConfig::default()
+        .calculate(current_price, crate::venue::types::Side::Buy)
+        .total;
+    let single_share_cost = current_price + entry_charges;
     if single_share_cost > available_cash {
         return StrategyDecision {
             action: "WAIT".to_string(),
@@ -153,24 +156,9 @@ pub fn evaluate_strategy_tick(
             price: current_price,
             quantity: 0,
             reason: format!(
-                "Price ₹{current_price:.2} exceeds available cash ₹{available_cash:.2}. Budget preserved."
+                "Price ₹{current_price:.2} plus estimated entry charges ₹{entry_charges:.2} exceeds available cash ₹{available_cash:.2}. Budget preserved."
             ),
             confidence: dec!(1.0),
-            timestamp: now,
-        };
-    }
-
-    // Signal generation: Sub-₹1,000 high-liquidity stocks eligible for paper entry
-    if symbol == "ITC" || symbol == "SBIN" || symbol == "TATAMOTORS" {
-        return StrategyDecision {
-            action: "BUY".to_string(),
-            symbol: symbol.to_string(),
-            price: current_price,
-            quantity: 1,
-            reason: format!(
-                "Favorable intraday momentum on {symbol} @ ₹{current_price:.2} within available cash ₹{available_cash:.2}"
-            ),
-            confidence: dec!(0.85),
             timestamp: now,
         };
     }
@@ -180,7 +168,9 @@ pub fn evaluate_strategy_tick(
         symbol: symbol.to_string(),
         price: current_price,
         quantity: 0,
-        reason: format!("No active entry edge for {symbol} at current level ₹{current_price:.2}"),
+        reason: format!(
+            "No active position for {symbol}. Entries are evaluated on completed 5-minute candles by the Pullback & Confirmed Rebound strategy."
+        ),
         confidence: dec!(0.60),
         timestamp: now,
     }
@@ -226,13 +216,16 @@ pub async fn execute_paper_order(
     let portfolio = compute_portfolio_accounting(base_capital, &existing_orders, &HashMap::new());
 
     let order_cost = fill_price * Decimal::from(req.quantity);
+    let side_enum = if is_buy { Side::Buy } else { Side::Sell };
+    let costs = IndianCostConfig::default().calculate(order_cost, side_enum);
 
     if is_buy {
-        if order_cost > portfolio.available_cash_inr {
+        let total_debit = order_cost + costs.total;
+        if total_debit > portfolio.available_cash_inr {
             bail!(
-                "Insufficient virtual cash in Indian paper account. Available: ₹{:.2}, needed: ₹{:.2}. US market ($) funds are strictly isolated.",
+                "Insufficient virtual cash in Indian paper account. Available: ₹{:.2}, needed including charges: ₹{:.2}. US market ($) funds are strictly isolated.",
                 portfolio.available_cash_inr,
-                order_cost
+                total_debit
             );
         }
     } else if is_sell {
@@ -251,10 +244,6 @@ pub async fn execute_paper_order(
             );
         }
     }
-
-    // Statutory transaction fees calculation
-    let side_enum = if is_buy { Side::Buy } else { Side::Sell };
-    let costs = IndianCostConfig::default().calculate(order_cost, side_enum);
 
     let now = Utc::now().to_rfc3339();
     let client_order_id = format!("SIM-NSE-{}", Uuid::new_v4().simple());
@@ -312,7 +301,8 @@ pub fn compute_portfolio_accounting(
     orders: &[IndiaSandboxOrderRecord],
     current_prices: &HashMap<String, Decimal>,
 ) -> IndiaPaperPortfolioState {
-    let mut holdings_lots: HashMap<String, Vec<(Decimal, Decimal)>> = HashMap::new();
+    // Lots store entry price, remaining quantity, and entry fee per share.
+    let mut holdings_lots: HashMap<String, Vec<(Decimal, Decimal, Decimal)>> = HashMap::new();
     let mut realized_profit = Decimal::ZERO;
 
     // Chronological order processing (oldest to newest)
@@ -336,26 +326,39 @@ pub fn compute_portfolio_accounting(
             .unwrap_or_else(|| Decimal::from_str(&o.price).unwrap_or(Decimal::ZERO));
 
         let sym = o.symbol.to_uppercase();
+        let side = if o.side.eq_ignore_ascii_case("BUY") {
+            Side::Buy
+        } else {
+            Side::Sell
+        };
+        let fees = IndianCostConfig::default()
+            .calculate(fill_price * qty, side)
+            .total;
 
         if o.side.eq_ignore_ascii_case("BUY") {
             holdings_lots
                 .entry(sym)
                 .or_default()
-                .push((fill_price, qty));
+                .push((fill_price, qty, fees / qty));
         } else if o.side.eq_ignore_ascii_case("SELL") {
             if let Some(buys) = holdings_lots.get_mut(&sym) {
                 let mut remaining_to_sell = qty;
+                let mut gross_realized = Decimal::ZERO;
+                let mut allocated_buy_fees = Decimal::ZERO;
                 while remaining_to_sell > Decimal::ZERO && !buys.is_empty() {
-                    let (buy_p, buy_q) = buys.pop().unwrap();
+                    let (buy_p, buy_q, buy_fee_per_share) = buys.pop().unwrap();
                     if buy_q <= remaining_to_sell {
-                        realized_profit += (fill_price - buy_p) * buy_q;
+                        gross_realized += (fill_price - buy_p) * buy_q;
+                        allocated_buy_fees += buy_fee_per_share * buy_q;
                         remaining_to_sell -= buy_q;
                     } else {
-                        realized_profit += (fill_price - buy_p) * remaining_to_sell;
-                        buys.push((buy_p, buy_q - remaining_to_sell));
+                        gross_realized += (fill_price - buy_p) * remaining_to_sell;
+                        allocated_buy_fees += buy_fee_per_share * remaining_to_sell;
+                        buys.push((buy_p, buy_q - remaining_to_sell, buy_fee_per_share));
                         remaining_to_sell = Decimal::ZERO;
                     }
                 }
+                realized_profit += gross_realized - allocated_buy_fees - fees;
             }
         }
     }
@@ -365,16 +368,24 @@ pub fn compute_portfolio_accounting(
     let mut open_positions = Vec::new();
 
     for (sym, lots) in &holdings_lots {
-        let total_q: Decimal = lots.iter().map(|(_, q)| *q).sum();
+        let total_q: Decimal = lots.iter().map(|(_, q, _)| *q).sum();
         if total_q > Decimal::ZERO {
-            let total_cost: Decimal = lots.iter().map(|(p, q)| *p * *q).sum();
-            let avg_p = total_cost / total_q;
+            let shares_cost: Decimal = lots.iter().map(|(p, q, _)| *p * *q).sum();
+            let entry_fees: Decimal = lots
+                .iter()
+                .map(|(_, q, fee_per_share)| *q * *fee_per_share)
+                .sum();
+            let total_cost = shares_cost + entry_fees;
+            let avg_p = shares_cost / total_q;
             open_positions_cost += total_cost;
             holdings_qty.insert(sym.clone(), total_q);
 
             let mark_price = current_prices.get(sym).copied().unwrap_or(avg_p);
             let current_val = mark_price * total_q;
-            let unrealized = current_val - total_cost;
+            let estimated_exit_fees = IndianCostConfig::default()
+                .calculate(current_val, Side::Sell)
+                .total;
+            let unrealized = current_val - total_cost - estimated_exit_fees;
             let unrealized_pct = if total_cost > Decimal::ZERO {
                 (unrealized / total_cost) * dec!(100)
             } else {
@@ -395,7 +406,12 @@ pub fn compute_portfolio_accounting(
     }
 
     let available_cash = (base_capital + realized_profit - open_positions_cost).max(Decimal::ZERO);
-    let total_equity = base_capital + realized_profit;
+    let total_equity = base_capital
+        + realized_profit
+        + open_positions
+            .iter()
+            .map(|position| position.unrealized_pnl)
+            .sum::<Decimal>();
 
     IndiaPaperPortfolioState {
         base_capital_inr: base_capital,

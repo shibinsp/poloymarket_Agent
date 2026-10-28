@@ -132,8 +132,21 @@ pub async fn compute_metrics(
                 .quantity
                 .as_deref()
                 .and_then(|q| Decimal::from_str(q).ok());
-            unrealized_exposure +=
-                crate::execution::fills::calculate_trade_exposure(price, size, qty);
+            let exp = crate::execution::fills::calculate_trade_exposure(price, size, qty);
+            let is_india = crate::india::instruments::find_nse_instrument(&trade.market_id)
+                .is_some()
+                || trade.market_id.starts_with("NSE")
+                || trade
+                    .market_question
+                    .as_deref()
+                    .is_some_and(|q| q.contains("NSE") || q.contains("INR"));
+            let usd_exp = if is_india {
+                let fx = crate::market::fx::get_current_fx_rate();
+                fx.inr_to_usd(exp)
+            } else {
+                exp
+            };
+            unrealized_exposure += usd_exp;
         }
     }
 

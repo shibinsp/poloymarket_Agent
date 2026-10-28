@@ -131,5 +131,5 @@ except Exception as e:
     print(f"Error reading database: {e}\n")
 
 print("================================================================")
-print("Web Dashboard live anytime: http://127.0.0.1:8080")
+print("Web Dashboard live anytime: http://127.0.0.1:8088")
 print("================================================================")

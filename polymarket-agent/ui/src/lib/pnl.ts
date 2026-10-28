@@ -21,7 +21,25 @@ export interface OrderPnlResult {
   isSell: boolean;
 }
 
-export function computeRealizedPnl(orders: OrderInput[]): Map<string, OrderPnlResult> {
+export function calculateIndianTransactionCosts(tradeValue: number, isBuy: boolean): number {
+  if (tradeValue <= 0) return 0;
+  // Indian Cash Equities Intraday Rates:
+  // STT: 0.025% on sell turnover
+  const stt = isBuy ? 0 : tradeValue * 0.00025;
+  // Stamp duty: 0.003% on buy turnover
+  const stampDuty = isBuy ? tradeValue * 0.00003 : 0;
+  // Exchange turnover: 0.00345%
+  const exchange = tradeValue * 0.0000345;
+  // SEBI turnover charge: 0.0001%
+  const sebi = tradeValue * 0.000001;
+  // GST: 18% on exchange + SEBI charges
+  const gst = (exchange + sebi) * 0.18;
+  return stt + stampDuty + exchange + sebi + gst;
+}
+
+export function computeRealizedPnl(orders: OrderInput[], market?: string): Map<string, OrderPnlResult> {
+  const isIndia = market?.toLowerCase() === "india";
+
   // Sort oldest first for chronological matching
   const sorted = [...orders].sort((a, b) => {
     const ta = a.created_at ? new Date(a.created_at).getTime() : 0;
@@ -32,6 +50,7 @@ export function computeRealizedPnl(orders: OrderInput[]): Map<string, OrderPnlRe
   interface Lot {
     qty: number;
     price: number;
+    buyFeePerShare: number;
   }
 
   const inventory = new Map<string, Lot[]>();
@@ -59,7 +78,8 @@ export function computeRealizedPnl(orders: OrderInput[]): Map<string, OrderPnlRe
     const side = o.side ? o.side.toUpperCase() : "BUY";
 
     if (side === "BUY") {
-      lots.push({ qty, price: fillPrice });
+      const buyFee = isIndia ? calculateIndianTransactionCosts(qty * fillPrice, true) : 0;
+      lots.push({ qty, price: fillPrice, buyFeePerShare: qty > 0 ? buyFee / qty : 0 });
       results.set(o.id, {
         pnl: null,
         pnlPct: null,
@@ -72,16 +92,19 @@ export function computeRealizedPnl(orders: OrderInput[]): Map<string, OrderPnlRe
       let needed = qty;
       let totalCost = 0;
       let matchedQty = 0;
+      let allocatedBuyFees = 0;
 
       for (let i = lots.length - 1; i >= 0 && needed > 0; i--) {
         const lot = lots[i];
         if (lot.qty <= needed) {
           totalCost += lot.qty * lot.price;
+          allocatedBuyFees += lot.qty * lot.buyFeePerShare;
           matchedQty += lot.qty;
           needed -= lot.qty;
           lots.splice(i, 1);
         } else {
           totalCost += needed * lot.price;
+          allocatedBuyFees += needed * lot.buyFeePerShare;
           matchedQty += needed;
           lot.qty -= needed;
           needed = 0;
@@ -90,9 +113,11 @@ export function computeRealizedPnl(orders: OrderInput[]): Map<string, OrderPnlRe
 
       if (matchedQty > 0) {
         const proceeds = matchedQty * fillPrice;
-        const pnl = proceeds - totalCost;
+        const sellFees = isIndia ? calculateIndianTransactionCosts(proceeds, false) : 0;
+        const pnl = proceeds - totalCost - allocatedBuyFees - sellFees;
         const avgBuy = totalCost / matchedQty;
-        const pnlPct = avgBuy > 0 ? ((fillPrice - avgBuy) / avgBuy) * 100 : 0;
+        const baseCost = totalCost + allocatedBuyFees;
+        const pnlPct = baseCost > 0 ? (pnl / baseCost) * 100 : 0;
 
         results.set(o.id, {
           pnl: Number(pnl.toFixed(2)),

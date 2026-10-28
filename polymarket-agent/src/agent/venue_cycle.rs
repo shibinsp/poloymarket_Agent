@@ -178,6 +178,30 @@ impl VenueCycle<'_> {
             *venue_positions.entry(trade.venue_id.clone()).or_insert(0) += 1;
         }
 
+        // Account for any active Indian paper sandbox positions
+        if let Ok(sbx_orders) = self.store.get_india_sandbox_orders(200).await {
+            let india_cap = self
+                .config
+                .risk
+                .india_capital_allocation_inr
+                .unwrap_or(dec!(1000.0));
+            let portfolio = crate::india::simulator::compute_portfolio_accounting(
+                india_cap,
+                &sbx_orders,
+                &HashMap::new(),
+            );
+            if portfolio.open_positions_cost_inr > Decimal::ZERO {
+                let entry = venue_notional
+                    .entry("upstox_sandbox".to_string())
+                    .or_insert(Decimal::ZERO);
+                *entry = (*entry).max(portfolio.open_positions_cost_inr);
+                let pos_cnt = venue_positions
+                    .entry("upstox_sandbox".to_string())
+                    .or_insert(0);
+                *pos_cnt = (*pos_cnt).max(portfolio.open_positions.len());
+            }
+        }
+
         let ctx = CycleContext { now, state, cycle };
         let instruments = self.registry.list_tradeable_instruments(now, &filter).await;
         outcome.instruments_scanned = instruments.len();
@@ -229,8 +253,7 @@ impl VenueCycle<'_> {
                         self.config
                             .risk
                             .india_capital_allocation_inr
-                            .unwrap_or(reported_bankroll)
-                            .min(reported_bankroll)
+                            .unwrap_or(dec!(1000.0))
                     } else {
                         self.config
                             .risk
@@ -441,7 +464,7 @@ impl VenueCycle<'_> {
                 placed: false,
             });
         }
-        let qty = instrument.round_qty(sizing.position_usd / limit_price);
+        let mut qty = instrument.round_qty(sizing.position_usd / limit_price);
         if qty <= Decimal::ZERO {
             info!(
                 instrument = %instrument.id,
@@ -452,6 +475,52 @@ impl VenueCycle<'_> {
                 notional: Decimal::ZERO,
                 placed: false,
             });
+        }
+
+        // Strict Capital Allocation Guard: Indian Paper & US Market isolations
+        let is_india =
+            instrument.venue().to_string().contains("upstox") || instrument.quote_ccy == "INR";
+        let available_budget = bankroll.saturating_sub(open_notional);
+
+        if is_india {
+            if limit_price > available_budget {
+                info!(
+                    instrument = %instrument.id,
+                    price = %limit_price,
+                    available = %available_budget,
+                    bankroll = %bankroll,
+                    "Order blocked: 1 share of {} @ ₹{:.2} exceeds remaining Indian capital ₹{:.2} (out of ₹{:.2} allocation)",
+                    instrument.symbol(),
+                    limit_price,
+                    available_budget,
+                    bankroll
+                );
+                return Ok(EvaluationResult {
+                    cost,
+                    notional: Decimal::ZERO,
+                    placed: false,
+                });
+            }
+
+            let max_shares = (available_budget / limit_price).floor();
+            if max_shares < Decimal::ONE {
+                info!(
+                    instrument = %instrument.id,
+                    available = %available_budget,
+                    price = %limit_price,
+                    "Order blocked: remaining cash ₹{:.2} cannot afford 1 whole share @ ₹{:.2}",
+                    available_budget,
+                    limit_price
+                );
+                return Ok(EvaluationResult {
+                    cost,
+                    notional: Decimal::ZERO,
+                    placed: false,
+                });
+            }
+            if qty > max_shares {
+                qty = max_shares;
+            }
         }
 
         let extended_hours =
@@ -833,7 +902,7 @@ fn generate_algorithmic_view(
 
     // 3. Trend Alignment & Quality Check
     let is_uptrend = fast_sma > med_sma && last_close >= med_sma;
-    let is_healthy_rsi = rsi >= dec!(38) && rsi <= dec!(72);
+    let is_healthy_rsi = rsi >= dec!(35) && rsi <= dec!(85);
     let trend_favorable = is_uptrend || (last_close >= fast_sma && rsi > dec!(50));
 
     if trend_favorable && is_healthy_rsi {
@@ -956,7 +1025,7 @@ fn portfolio_block(
     bankroll: Decimal,
     risk: &crate::config::RiskConfig,
 ) -> Option<&'static str> {
-    if open_notional >= bankroll * risk.max_total_exposure_pct {
+    if open_notional >= bankroll * risk.max_total_exposure_pct || open_notional >= bankroll {
         return Some("total exposure is at its cap");
     }
     if open_positions >= risk.max_positions_per_category as usize {

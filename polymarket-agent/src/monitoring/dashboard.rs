@@ -713,6 +713,7 @@ async fn costs_handler(State(state): State<DashboardState>) -> impl IntoResponse
 #[derive(Debug, serde::Deserialize)]
 pub struct IndiaBacktestRunRequest {
     pub name: Option<String>,
+    pub symbol: Option<String>,
     pub csv_path: Option<String>,
     pub csv_content: Option<String>,
     pub initial_capital: Option<Decimal>,
@@ -741,39 +742,79 @@ async fn india_backtest_run_handler(
     Json(req): Json<IndiaBacktestRunRequest>,
 ) -> impl IntoResponse {
     use crate::india::backtest::{parse_and_validate_csv, run_backtest, NseBacktestConfig};
-
-    let content_res = if let Some(content) = req.csv_content {
-        Ok(content)
+    let symbol = req.symbol.as_deref().unwrap_or("RELIANCE");
+    let candles = if let Some(content) = req.csv_content.as_deref() {
+        match parse_and_validate_csv(content) {
+            Ok(candles) => candles,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": format!("Invalid OHLCV CSV: {e:#}") })),
+                )
+                    .into_response();
+            }
+        }
+    } else if let Some(path) = req.csv_path.as_deref() {
+        let content = match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": format!("Failed to read CSV at {path}: {e}") })),
+                )
+                    .into_response();
+            }
+        };
+        match parse_and_validate_csv(&content) {
+            Ok(candles) => candles,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": format!("Invalid OHLCV CSV: {e:#}") })),
+                )
+                    .into_response();
+            }
+        }
     } else {
-        let path = req
-            .csv_path
-            .as_deref()
-            .unwrap_or("data/nse_sample_data.csv");
-        std::fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("Failed to read CSV at {path}: {e}"))
+        let history = match state.upstox_feed.fetch_intraday_5m_candles(symbol).await {
+            Ok(history) => history,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("Could not load real Upstox 5-minute candles for {symbol}: {e:#}. Reauthorize Upstox or provide a historical OHLCV CSV.")
+                    })),
+                )
+                    .into_response();
+            }
+        };
+        history
+            .into_iter()
+            .map(|bar| crate::india::backtest::NseCandle {
+                timestamp: bar.timestamp,
+                symbol: bar.symbol,
+                open: bar.open,
+                high: bar.high,
+                low: bar.low,
+                close: bar.close,
+                volume: bar.volume,
+            })
+            .collect()
     };
 
-    let csv_content = match content_res {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response();
-        }
-    };
-
-    let candles = match parse_and_validate_csv(&csv_content) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": format!("Invalid OHLCV CSV: {e:#}") })),
-            )
-                .into_response();
-        }
-    };
+    let symbols: std::collections::HashSet<_> = candles
+        .iter()
+        .map(|candle| candle.symbol.as_str())
+        .collect();
+    if symbols.len() != 1 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "The NSE strategy backtest currently evaluates one symbol per run. Choose one symbol or split the CSV by symbol."
+            })),
+        )
+            .into_response();
+    }
 
     let mut config = NseBacktestConfig::default();
     if let Some(c) = req.initial_capital {
@@ -797,7 +838,7 @@ async fn india_backtest_run_handler(
 
     let run_name = req.name.unwrap_or_else(|| {
         format!(
-            "Backtest {}",
+            "Pullback backtest {symbol} {}",
             chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")
         )
     });
@@ -835,73 +876,9 @@ async fn india_backtest_run_handler(
 fn compute_india_sandbox_accounting(
     base_capital: Decimal,
     orders: &[crate::db::store::IndiaSandboxOrderRecord],
-) -> (
-    Decimal,
-    Decimal,
-    Decimal,
-    std::collections::HashMap<String, Decimal>,
-) {
-    use std::str::FromStr;
-    let mut realized_profit = Decimal::ZERO;
-    let mut open_positions_cost = Decimal::ZERO;
-    let mut holdings: std::collections::HashMap<String, Vec<(Decimal, Decimal)>> =
-        std::collections::HashMap::new();
-
-    for o in orders.iter().rev() {
-        if !o.status.eq_ignore_ascii_case("FILLED")
-            && !o.status.eq_ignore_ascii_case("ACKNOWLEDGED")
-        {
-            continue;
-        }
-        let qty = Decimal::from(o.fill_quantity);
-        if qty.is_zero() {
-            continue;
-        }
-        let fill_price = o
-            .average_fill_price
-            .as_deref()
-            .and_then(|p| Decimal::from_str(p).ok())
-            .unwrap_or_else(|| Decimal::from_str(&o.price).unwrap_or(Decimal::ZERO));
-
-        if o.side.eq_ignore_ascii_case("BUY") {
-            holdings
-                .entry(o.symbol.to_uppercase())
-                .or_default()
-                .push((fill_price, qty));
-        } else if o.side.eq_ignore_ascii_case("SELL") {
-            if let Some(buys) = holdings.get_mut(&o.symbol.to_uppercase()) {
-                let mut remaining_to_sell = qty;
-                while remaining_to_sell > Decimal::ZERO && !buys.is_empty() {
-                    let (buy_p, buy_q) = buys.pop().unwrap();
-                    if buy_q <= remaining_to_sell {
-                        realized_profit += (fill_price - buy_p) * buy_q;
-                        remaining_to_sell -= buy_q;
-                    } else {
-                        realized_profit += (fill_price - buy_p) * remaining_to_sell;
-                        buys.push((buy_p, buy_q - remaining_to_sell));
-                        remaining_to_sell = Decimal::ZERO;
-                    }
-                }
-            }
-        }
-    }
-
-    let mut current_quantities: std::collections::HashMap<String, Decimal> =
-        std::collections::HashMap::new();
-    for (sym, buys) in holdings.iter() {
-        for (p, q) in buys {
-            open_positions_cost += *p * *q;
-            *current_quantities.entry(sym.clone()).or_default() += *q;
-        }
-    }
-
-    let available_cash = (base_capital + realized_profit - open_positions_cost).max(Decimal::ZERO);
-    (
-        realized_profit,
-        open_positions_cost,
-        available_cash,
-        current_quantities,
-    )
+    prices: &std::collections::HashMap<String, Decimal>,
+) -> crate::india::simulator::IndiaPaperPortfolioState {
+    crate::india::simulator::compute_portfolio_accounting(base_capital, orders, prices)
 }
 
 async fn india_sandbox_status_handler(State(state): State<DashboardState>) -> impl IntoResponse {
@@ -913,11 +890,19 @@ async fn india_sandbox_status_handler(State(state): State<DashboardState>) -> im
     let watchlist = crate::india::instruments::nse_watchlist();
     let base_capital = state.dynamic_caps.read().await.india_capital_allocation_inr;
 
-    let (realized_profit, open_positions_cost, available_cash, holdings) =
-        compute_india_sandbox_accounting(base_capital, &recent_orders);
-
     let feed_info = state.upstox_feed.get_status_info().await;
     let ticks = state.upstox_feed.prices.read().await.clone();
+    let prices: std::collections::HashMap<String, Decimal> = ticks
+        .iter()
+        .map(|(k, v)| (k.clone(), v.last_price))
+        .collect();
+
+    let portfolio = compute_india_sandbox_accounting(base_capital, &recent_orders, &prices);
+    let unrealized_profit_inr: Decimal = portfolio
+        .open_positions
+        .iter()
+        .map(|p| p.unrealized_pnl)
+        .sum();
 
     let resp = serde_json::json!({
         "venue_id": "upstox_sandbox",
@@ -929,12 +914,14 @@ async fn india_sandbox_status_handler(State(state): State<DashboardState>) -> im
         "allowlisted_host": "api.upstox.com",
         "live_trading_allowed": false,
         "mode_description": "Upstox live market data feed connected to local Paper Trading Simulator. All buy/sell strategy decisions execute in the virtual simulator with configurable INR starting capital. Zero live orders are sent to Upstox.",
-        "base_capital_inr": base_capital,
-        "realized_profit_inr": realized_profit,
-        "open_positions_cost_inr": open_positions_cost,
-        "available_cash_inr": available_cash,
-        "total_equity_inr": base_capital + realized_profit,
-        "holdings": holdings,
+        "base_capital_inr": portfolio.base_capital_inr,
+        "realized_profit_inr": portfolio.realized_profit_inr,
+        "unrealized_profit_inr": unrealized_profit_inr,
+        "open_positions_cost_inr": portfolio.open_positions_cost_inr,
+        "available_cash_inr": portfolio.available_cash_inr,
+        "total_equity_inr": portfolio.total_equity_inr,
+        "holdings": portfolio.holdings,
+        "open_positions": portfolio.open_positions,
         "recent_orders": recent_orders,
         "watchlist": watchlist,
         "feed_status": feed_info,
@@ -1192,9 +1179,38 @@ async fn upstox_strategy_tick_handler(
     Json(req): Json<UpstoxStrategyTickRequest>,
 ) -> impl IntoResponse {
     let sym = req.symbol.to_uppercase();
-    let current_price = match req.price {
-        Some(p) if p > Decimal::ZERO => p,
-        _ => state.upstox_feed.get_price(&sym).await,
+    let live_tick = state.upstox_feed.prices.read().await.get(&sym).cloned();
+    if req.execute == Some(true) {
+        let session = crate::india::session::detect_nse_session(chrono::Utc::now());
+        let fresh_live_quote = live_tick
+            .as_ref()
+            .is_some_and(|tick| tick.last_price > Decimal::ZERO && tick.source == "UPSTOX_V3_LIVE");
+        if !session.allows_order_entry || state.upstox_feed.is_stale().await || !fresh_live_quote {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "Paper execution is paused until a fresh Upstox live quote is available during NSE trading hours.",
+                    "paused": true,
+                    "is_stale": state.upstox_feed.is_stale().await
+                })),
+            )
+                .into_response();
+        }
+    }
+    let current_price = if req.execute == Some(true) {
+        live_tick
+            .as_ref()
+            .map(|tick| tick.last_price)
+            .unwrap_or(Decimal::ZERO)
+    } else {
+        match req.price {
+            Some(p) if p > Decimal::ZERO => p,
+            _ => live_tick
+                .as_ref()
+                .filter(|tick| tick.source == "UPSTOX_V3_LIVE")
+                .map(|tick| tick.last_price)
+                .unwrap_or(Decimal::ZERO),
+        }
     };
 
     let base_capital = state
@@ -1279,18 +1295,48 @@ async fn upstox_strategy_tick_handler(
         "execution": execution_result,
         "portfolio": portfolio,
     }))
+    .into_response()
 }
 
 async fn upstox_simulator_order_handler(
     State(state): State<DashboardState>,
     Json(req): Json<crate::india::simulator::IndiaPaperOrderRequest>,
 ) -> impl IntoResponse {
+    if state.upstox_feed.is_stale().await {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Paper order paused: Upstox feed has no fresh live quote.",
+                "paused": true,
+                "is_stale": true
+            })),
+        )
+            .into_response();
+    }
     let base_capital = state
         .risk
         .india_capital_allocation_inr
         .unwrap_or(rust_decimal_macros::dec!(1000.0));
 
-    let live_price = state.upstox_feed.get_price(&req.symbol).await;
+    let live_price = state
+        .upstox_feed
+        .prices
+        .read()
+        .await
+        .get(&req.symbol.to_uppercase())
+        .filter(|tick| tick.source == "UPSTOX_V3_LIVE")
+        .map(|tick| tick.last_price)
+        .unwrap_or(Decimal::ZERO);
+    if live_price <= Decimal::ZERO {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "No fresh Upstox live quote is available for this symbol.",
+                "paused": true
+            })),
+        )
+            .into_response();
+    }
 
     match crate::india::simulator::execute_paper_order(&state.store, base_capital, &req, live_price)
         .await
@@ -1422,26 +1468,43 @@ async fn india_sandbox_order_handler(
         .get_india_sandbox_orders(500)
         .await
         .unwrap_or_default();
-    let (realized_profit, _open_positions_cost, available_cash, holdings) =
-        compute_india_sandbox_accounting(base_capital, &all_orders);
+    let prices: std::collections::HashMap<String, Decimal> = state
+        .upstox_feed
+        .prices
+        .read()
+        .await
+        .iter()
+        .map(|(k, v)| (k.clone(), v.last_price))
+        .collect();
+    let portfolio = compute_india_sandbox_accounting(base_capital, &all_orders, &prices);
+    let available_cash = portfolio.available_cash_inr;
+    let realized_profit = portfolio.realized_profit_inr;
+    let holdings = portfolio.holdings;
 
     let is_buy = req.side.eq_ignore_ascii_case("BUY");
     let is_sell = req.side.eq_ignore_ascii_case("SELL");
 
     if is_buy {
         let order_cost = order_price * Decimal::from(req.quantity);
-        if order_cost > available_cash {
+        let entry_charges = crate::india::costs::IndianCostConfig::default()
+            .calculate(order_cost, crate::venue::types::Side::Buy)
+            .total;
+        let total_needed = order_cost + entry_charges;
+        if total_needed > available_cash {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
                     "error": format!(
-                        "Insufficient Indian market cash. Indian trading is strictly restricted to initial ₹{:.2} capital + realized profits. Available cash: ₹{:.2}, but order cost is ₹{:.2}. US market funds ($) are completely isolated and cannot be used.",
+                        "Insufficient Indian market cash. Indian trading is strictly restricted to initial ₹{:.2} capital + realized profits. Available cash: ₹{:.2}, but order cost plus estimated charges (₹{:.2}) is ₹{:.2}. US market funds ($) are completely isolated and cannot be used.",
                         base_capital,
                         available_cash,
-                        order_cost
+                        entry_charges,
+                        total_needed
                     ),
                     "available_cash_inr": available_cash,
                     "order_cost_inr": order_cost,
+                    "estimated_charges_inr": entry_charges,
+                    "total_needed_inr": total_needed,
                     "base_capital_inr": base_capital,
                     "realized_profit_inr": realized_profit,
                 })),
@@ -1557,15 +1620,16 @@ async fn alpaca_feed_status_handler(State(state): State<DashboardState>) -> impl
 #[derive(Debug, serde::Deserialize)]
 pub struct PullbackBacktestParams {
     pub market: Option<String>, // "india" or "us"
+    pub symbol: Option<String>,
     pub initial_capital: Option<Decimal>,
 }
 
 async fn pullback_backtest_handler(
+    State(state): State<DashboardState>,
     axum::extract::Query(params): axum::extract::Query<PullbackBacktestParams>,
 ) -> impl IntoResponse {
     use crate::strategy::backtest::run_pullback_backtest;
     use crate::strategy::pullback::{FiveMinCandle, PullbackStrategyConfig};
-    use chrono::TimeZone;
     use rust_decimal_macros::dec;
 
     let market_lower = params.market.as_deref().unwrap_or("india").to_lowercase();
@@ -1575,79 +1639,50 @@ async fn pullback_backtest_handler(
 
     let config = PullbackStrategyConfig::default();
 
-    // Read existing sample CSV to generate 5m candle bars or generate high-integrity realistic series
-    let csv_file = if is_us {
-        "data/us_sample_data.csv"
+    let symbol = params
+        .symbol
+        .as_deref()
+        .unwrap_or(if is_us { "SPY" } else { "RELIANCE" });
+    let candles: Vec<FiveMinCandle> = if is_us {
+        match state.alpaca_feed.fetch_intraday_5m_candles(symbol).await {
+            Ok(bars) => bars,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("Could not load real Alpaca 5-minute candles for {symbol}: {e:#}. Check Alpaca data credentials and feed access. No synthetic data was substituted.")
+                    })),
+                )
+                    .into_response();
+            }
+        }
     } else {
-        "data/nse_sample_data.csv"
+        match state.upstox_feed.fetch_intraday_5m_candles(symbol).await {
+            Ok(bars) => bars,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("Could not load real Upstox 5-minute candles for {symbol}: {e:#}. Reauthorize Upstox or provide historical data. Never silently substituting synthetic or demo prices.")
+                    })),
+                )
+                    .into_response();
+            }
+        }
     };
-    let symbol = if is_us { "SPY" } else { "RELIANCE" };
-    let base_price = if is_us { 580.0 } else { 2500.0 };
 
-    let mut candles: Vec<FiveMinCandle> = Vec::new();
-    if let Ok(content) = std::fs::read_to_string(csv_file) {
-        for (i, line) in content.lines().enumerate() {
-            if i == 0 || line.starts_with('#') || line.starts_with("timestamp") {
-                continue;
-            }
-            let parts: Vec<&str> = line.split(',').collect();
-            if parts.len() >= 7 {
-                let open: Decimal = parts[2].trim().parse().unwrap_or(Decimal::ZERO);
-                let high: Decimal = parts[3].trim().parse().unwrap_or(Decimal::ZERO);
-                let low: Decimal = parts[4].trim().parse().unwrap_or(Decimal::ZERO);
-                let close: Decimal = parts[5].trim().parse().unwrap_or(Decimal::ZERO);
-                let volume: Decimal = parts[6].trim().parse().unwrap_or(Decimal::ZERO);
-                if open > Decimal::ZERO {
-                    candles.push(FiveMinCandle {
-                        timestamp: chrono::Utc
-                            .timestamp_opt(1704096000 + (candles.len() as i64 * 300), 0)
-                            .unwrap(),
-                        symbol: parts[1].trim().to_string(),
-                        open,
-                        high,
-                        low,
-                        close,
-                        volume,
-                    });
-                }
-            }
-        }
-    }
-
-    if candles.len() < 70 {
-        let mut price: f64 = base_price;
-        for i in 0..120 {
-            let cycle = i % 12;
-            let change: f64 = if cycle == 7 || cycle == 8 {
-                -0.45
-            } else if cycle == 9 {
-                0.80 // Confirmed rebound candle
-            } else {
-                0.25
-            };
-            let open: f64 = price;
-            let close: f64 = open + change;
-            let high: f64 = open.max(close) + 0.35;
-            let low: f64 = open.min(close) - 0.30;
-            let volume: f64 = 20000.0 + (i as f64 * 75.0);
-            price = close;
-
-            candles.push(FiveMinCandle {
-                timestamp: chrono::Utc
-                    .timestamp_opt(1704096000 + (i as i64 * 300), 0)
-                    .unwrap(),
-                symbol: symbol.to_string(),
-                open: Decimal::from_str_exact(&format!("{:.2}", open)).unwrap_or(dec!(100.0)),
-                high: Decimal::from_str_exact(&format!("{:.2}", high)).unwrap_or(dec!(100.0)),
-                low: Decimal::from_str_exact(&format!("{:.2}", low)).unwrap_or(dec!(100.0)),
-                close: Decimal::from_str_exact(&format!("{:.2}", close)).unwrap_or(dec!(100.0)),
-                volume: Decimal::from_str_exact(&format!("{:.2}", volume)).unwrap_or(dec!(1000.0)),
-            });
-        }
+    if candles.len() < config.ema_slow_period + 10 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("Insufficient real candle data (found {}, need at least {}). Never silently substituting synthetic or demo prices.", candles.len(), config.ema_slow_period + 10)
+            })),
+        )
+            .into_response();
     }
 
     let report = run_pullback_backtest(&candles, is_us, initial_capital, &config, dec!(0.65));
-    Json(serde_json::to_value(&report).unwrap_or_default())
+    Json(serde_json::to_value(&report).unwrap_or_default()).into_response()
 }
 
 async fn us_backtest_history_handler(State(state): State<DashboardState>) -> impl IntoResponse {
@@ -2159,9 +2194,12 @@ async fn combined_portfolio_handler(State(state): State<DashboardState>) -> impl
             caps.us_capital_allocation_usd,
         )
     };
-    let (india_sandbox_realized_profit, _in_open_cost, _in_cash, _in_holdings) =
-        compute_india_sandbox_accounting(india_base_capital, &india_orders);
-    india_realized_inr += india_sandbox_realized_profit;
+    let india_portfolio = compute_india_sandbox_accounting(
+        india_base_capital,
+        &india_orders,
+        &std::collections::HashMap::new(),
+    );
+    india_realized_inr += india_portfolio.realized_profit_inr;
 
     // Compute US paper realized P&L using unified accounting (base + compounded profits)
     let us_orders = state

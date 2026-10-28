@@ -118,7 +118,7 @@ path = "polymarket-agent.db"
 [[venues]]
 id = "alpaca"
 kind = "alpaca"
-enabled = true
+enabled = false
 base_url = "https://paper-api.alpaca.markets"
 data_url = "https://data.alpaca.markets"
 symbols = ["SIRI", "NOK", "LCID", "PLUG", "NIO", "SOFI", "BTC/USD", "ETH/USD", "SPY", "AAPL", "NVDA", "QQQ"]
@@ -179,7 +179,7 @@ fee_pct = 0.0025
 id = "upstox_sandbox"
 kind = "upstox_sandbox"
 enabled = true
-symbols = ["ITC", "SBIN", "TATAMOTORS", "RELIANCE", "INFY", "HDFCBANK", "ICICIBANK", "TCS"]
+symbols = ["ITC", "TATAMOTORS", "HDFCBANK", "SBIN", "RELIANCE", "INFY", "ICICIBANK", "TCS"]
 fee_pct = 0.001
 
 [sizing_continuous]

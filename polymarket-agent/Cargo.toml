@@ -34,7 +34,7 @@ toml = "0.8"
 dotenvy = "0.15"
 
 # Financial math — NEVER use f64 for money
-rust_decimal = { version = "1", features = ["serde-str"] }
+rust_decimal = { version = "1", features = ["serde-str", "serde-float"] }
 rust_decimal_macros = "1"
 
 # Crypto (for HMAC signing of non-SDK requests)

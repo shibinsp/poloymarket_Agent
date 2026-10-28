@@ -119,7 +119,7 @@ pub struct NseChartResponse {
     pub measured_delay_ms: Option<u64>,
     pub is_stale: bool,
     pub stale_reason: Option<String>,
-    pub upstox_instrument_key: String,
+    pub provider_instrument_id: String,
     pub trading_mode: String,
     pub session: crate::india::session::NseSessionInfo,
     pub is_market_closed: bool,
@@ -310,9 +310,9 @@ pub fn generate_nse_chart(
     let is_positive = change >= Decimal::ZERO;
     let data_source = live_tick
         .map(|t| t.source.clone())
-        .unwrap_or_else(|| "HIGH_FIDELITY_SIMULATED".to_string());
+        .unwrap_or_else(|| "NO_LIVE_DATA".to_string());
     let is_live_data = live_tick
-        .map(|t| t.source == "UPSTOX_LIVE")
+        .map(|t| matches!(t.source.as_str(), "UPSTOX_V3_LIVE" | "UPSTOX_REST_LIVE"))
         .unwrap_or(false);
     let last_updated_at = live_tick
         .map(|t| t.timestamp.to_rfc3339())
@@ -366,55 +366,6 @@ pub fn generate_nse_chart(
         });
     }
 
-    // Default demonstration markers if none yet exist for the symbol
-    if trade_markers.is_empty() {
-        let buy_p = (base_price - dec!(12.60)).round_dp(2);
-        let buy_val = buy_p * dec!(10.0);
-        let buy_cost = cost_cfg.calculate(buy_val, Side::Buy);
-
-        let sell_p = (base_price + dec!(5.70)).round_dp(2);
-        let sell_val = sell_p * dec!(10.0);
-        let sell_cost = cost_cfg.calculate(sell_val, Side::Sell);
-
-        trade_markers.push(ChartTradeMarker {
-            id: format!("mkr-{}-buy", symbol_upper.to_lowercase()),
-            order_id: format!("NSE-MIS-{}-1001-BUY", symbol_upper),
-            side: "BUY".to_string(),
-            price: buy_p,
-            shares: 10,
-            time: "10:15 IST".to_string(),
-            timestamp: (now - Duration::hours(3)).to_rfc3339(),
-            total_value: buy_val,
-            stt: buy_cost.stt,
-            stamp_duty: buy_cost.stamp_duty,
-            gst: buy_cost.gst,
-            total_tax: buy_cost.total,
-            status: "FILLED".to_string(),
-            marker_color: "blue".to_string(),
-            signal_reason: Some(
-                "Confirmed 5m Pullback Rebound: Price > VWAP & EMA20 > EMA50".to_string(),
-            ),
-        });
-
-        trade_markers.push(ChartTradeMarker {
-            id: format!("mkr-{}-sell", symbol_upper.to_lowercase()),
-            order_id: format!("NSE-MIS-{}-1002-SELL", symbol_upper),
-            side: "SELL".to_string(),
-            price: sell_p,
-            shares: 10,
-            time: "14:20 IST".to_string(),
-            timestamp: (now - Duration::minutes(40)).to_rfc3339(),
-            total_value: sell_val,
-            stt: sell_cost.stt,
-            stamp_duty: sell_cost.stamp_duty,
-            gst: sell_cost.gst,
-            total_tax: sell_cost.total,
-            status: "FILLED".to_string(),
-            marker_color: "black".to_string(),
-            signal_reason: Some("Planned reward target (1.5:1 ratio) reached".to_string()),
-        });
-    }
-
     // Build itemized detailed trades
     let detailed_trades = build_detailed_trades(&symbol_upper, &trade_markers, name);
     let summary = summarize_detailed_trades(&detailed_trades);
@@ -447,9 +398,9 @@ pub fn generate_nse_chart(
     } else {
         None
     };
-    let upstox_instrument_key = crate::india::instruments::find_nse_instrument(symbol)
-        .map(|i| i.upstox_key)
-        .unwrap_or_else(|| format!("NSE_EQ|{symbol}"));
+    let provider_instrument_id = live_tick
+        .map(|t| t.instrument_token.clone())
+        .unwrap_or_else(|| "Upstox instrument master".to_string());
 
     let last_received_price = current_price;
     let last_received_time = live_tick
@@ -482,7 +433,7 @@ pub fn generate_nse_chart(
         measured_delay_ms,
         is_stale,
         stale_reason,
-        upstox_instrument_key,
+        provider_instrument_id,
         trading_mode,
         session,
         is_market_closed,

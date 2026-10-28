@@ -524,10 +524,21 @@ fn build_detailed_trades(
 ) -> Vec<DetailedTradeRecord> {
     let mut records = Vec::new();
     let mut buys: Vec<&ChartTradeMarker> = markers.iter().filter(|m| m.side == "BUY").collect();
-    let sells: Vec<&ChartTradeMarker> = markers.iter().filter(|m| m.side == "SELL").collect();
+    let mut sells: Vec<&ChartTradeMarker> = markers.iter().filter(|m| m.side == "SELL").collect();
+
+    // Sort chronologically (oldest first) so that historical buys match historical sells,
+    // and active unclosed positions correctly remain OPEN.
+    buys.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    sells.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
 
     let mut sell_idx = 0;
     for buy in buys.drain(..) {
+        // Skip any older sells that happened before this buy
+        while sell_idx < sells.len() && sells[sell_idx].timestamp < buy.timestamp {
+            sell_idx += 1;
+        }
+
+        // Match with the first sell that occurred after or at this buy
         if sell_idx < sells.len() {
             let sell = sells[sell_idx];
             sell_idx += 1;
@@ -570,7 +581,7 @@ fn build_detailed_trades(
                 ),
             });
         } else {
-            // Unmatched buy = open position
+            // Unmatched buy = active open position
             records.push(DetailedTradeRecord {
                 id: format!("us-trade-{}", records.len() + 1),
                 symbol: symbol.to_string(),
@@ -600,6 +611,12 @@ fn build_detailed_trades(
                 ),
             });
         }
+    }
+
+    // Most recent trades at top of ledger
+    records.reverse();
+    for (i, r) in records.iter_mut().enumerate() {
+        r.id = format!("us-trade-{}", i + 1);
     }
 
     records

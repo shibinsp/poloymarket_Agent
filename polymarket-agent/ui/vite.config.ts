@@ -36,6 +36,6 @@ export default defineConfig({
   server: {
     port: 5173,
     // `npm run dev` talks to a locally running agent.
-    proxy: { "/api": "http://127.0.0.1:8080" },
+    proxy: { "/api": "http://127.0.0.1:8088" },
   },
 });

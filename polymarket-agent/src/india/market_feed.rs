@@ -24,6 +24,7 @@ use tracing::{debug, info, warn};
 
 use crate::india::instruments::{find_nse_instrument, nse_watchlist};
 use crate::india::session::{detect_nse_session, NseSessionInfo};
+use crate::strategy::pullback::FiveMinCandle;
 
 pub const UPSTOX_API_BASE: &str = "https://api.upstox.com/v2";
 pub const UPSTOX_V3_FEED_AUTHORIZE: &str =
@@ -109,17 +110,17 @@ struct UpstoxQuoteFullResponse {
 
 #[derive(Debug, Deserialize)]
 struct UpstoxFullQuoteItem {
-    pub last_price: Option<Decimal>,
+    pub last_price: Option<f64>,
     pub ohlc: Option<UpstoxOhlcItem>,
     pub volume: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct UpstoxOhlcItem {
-    pub open: Option<Decimal>,
-    pub high: Option<Decimal>,
-    pub low: Option<Decimal>,
-    pub close: Option<Decimal>,
+    pub open: Option<f64>,
+    pub high: Option<f64>,
+    pub low: Option<f64>,
+    pub close: Option<f64>,
 }
 
 /// Shared Upstox Live Market Data Feed service.
@@ -149,6 +150,7 @@ impl UpstoxLiveMarketFeed {
     ) -> Self {
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(8))
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
             .build()
             .unwrap_or_default();
 
@@ -399,14 +401,15 @@ impl UpstoxLiveMarketFeed {
             });
 
             if let Some(item) = maybe_item {
-                if let Some(lp) = item.last_price {
+                if let Some(lp_f64) = item.last_price {
+                    let lp = Decimal::from_f64_retain(lp_f64).unwrap_or(Decimal::ZERO);
                     if lp > Decimal::ZERO {
                         let (o, h, l, c) = if let Some(ref ohlc) = item.ohlc {
                             (
-                                ohlc.open.unwrap_or(lp),
-                                ohlc.high.unwrap_or(lp),
-                                ohlc.low.unwrap_or(lp),
-                                ohlc.close.unwrap_or(lp),
+                                ohlc.open.and_then(Decimal::from_f64_retain).unwrap_or(lp),
+                                ohlc.high.and_then(Decimal::from_f64_retain).unwrap_or(lp),
+                                ohlc.low.and_then(Decimal::from_f64_retain).unwrap_or(lp),
+                                ohlc.close.and_then(Decimal::from_f64_retain).unwrap_or(lp),
                             )
                         } else {
                             (lp, lp, lp, lp)
@@ -424,7 +427,7 @@ impl UpstoxLiveMarketFeed {
                             timestamp: now,
                             feed_timestamp: now,
                             received_at: now,
-                            latency_ms: 45,
+                            latency_ms: 0,
                             is_stale: false,
                             source: "UPSTOX_REST_LIVE".to_string(),
                         };
@@ -443,6 +446,147 @@ impl UpstoxLiveMarketFeed {
         }
 
         Ok(ticks)
+    }
+
+    /// Parse Upstox V3 candle response rows into completed FiveMinCandle structs.
+    fn parse_upstox_candle_rows(
+        payload: &serde_json::Value,
+        symbol: &str,
+        now: DateTime<Utc>,
+    ) -> Vec<FiveMinCandle> {
+        let Some(rows) = payload
+            .get("data")
+            .and_then(|data| data.get("candles"))
+            .and_then(serde_json::Value::as_array)
+        else {
+            return Vec::new();
+        };
+
+        let mut candles = Vec::with_capacity(rows.len());
+        for row in rows.iter().rev() {
+            let Some(values) = row.as_array() else {
+                continue;
+            };
+            if values.len() < 6 {
+                continue;
+            }
+            let Some(timestamp) = values[0]
+                .as_str()
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| value.with_timezone(&Utc))
+            else {
+                continue;
+            };
+            // The current candle is still forming. Never feed it as a completed bar.
+            if timestamp + chrono::Duration::minutes(5) > now {
+                continue;
+            }
+            let number = |index: usize| {
+                values[index]
+                    .as_f64()
+                    .and_then(Decimal::from_f64_retain)
+                    .unwrap_or(Decimal::ZERO)
+            };
+            let (open, high, low, close, volume) =
+                (number(1), number(2), number(3), number(4), number(5));
+            if open <= Decimal::ZERO || low <= Decimal::ZERO || close <= Decimal::ZERO {
+                continue;
+            }
+            candles.push(FiveMinCandle {
+                timestamp,
+                symbol: symbol.to_string(),
+                open,
+                high,
+                low,
+                close,
+                volume,
+            });
+        }
+        candles
+    }
+
+    /// Fetch recent completed five-minute candles for strategy warm-up.
+    /// Combines Upstox V3 historical candles (prior days for EMA warm-up)
+    /// and intraday completed candles (today's session for VWAP and pullback checks).
+    pub async fn fetch_intraday_5m_candles(&self, symbol: &str) -> Result<Vec<FiveMinCandle>> {
+        let instrument = find_nse_instrument(symbol)
+            .with_context(|| format!("Unknown NSE symbol for candle history: {symbol}"))?;
+        let token = self
+            .access_token
+            .read()
+            .await
+            .clone()
+            .context("Upstox access token required to load strategy candle history")?;
+        let now = Utc::now();
+        let today = now.with_timezone(&chrono_tz::Asia::Kolkata).date_naive();
+        let from = today - chrono::Duration::days(5);
+        let key = urlencoding::encode(&instrument.upstox_key);
+
+        let mut all_candles = Vec::new();
+
+        // 1. Historical candles (prior days up to today)
+        let hist_url =
+            format!("https://api.upstox.com/v3/historical-candle/{key}/minutes/5/{today}/{from}");
+        match self
+            .http
+            .get(&hist_url)
+            .bearer_auth(&token)
+            .header(ACCEPT, "application/json")
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(payload) = resp.json::<serde_json::Value>().await {
+                    let parsed = Self::parse_upstox_candle_rows(&payload, &instrument.symbol, now);
+                    all_candles.extend(parsed);
+                }
+            }
+            Ok(resp) => {
+                warn!(%symbol, status = %resp.status(), "Upstox historical candle fetch returned non-success");
+            }
+            Err(err) => {
+                warn!(%symbol, %err, "Failed to fetch Upstox historical candles");
+            }
+        }
+
+        // 2. Intraday completed candles (today's session 09:15 onwards)
+        let intra_url =
+            format!("https://api.upstox.com/v3/historical-candle/intraday/{key}/minutes/5");
+        match self
+            .http
+            .get(&intra_url)
+            .bearer_auth(&token)
+            .header(ACCEPT, "application/json")
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(payload) = resp.json::<serde_json::Value>().await {
+                    let parsed = Self::parse_upstox_candle_rows(&payload, &instrument.symbol, now);
+                    for candle in parsed {
+                        if all_candles
+                            .last()
+                            .map(|prev| prev.timestamp < candle.timestamp)
+                            .unwrap_or(true)
+                        {
+                            all_candles.push(candle);
+                        }
+                    }
+                }
+            }
+            Ok(resp) => {
+                warn!(%symbol, status = %resp.status(), "Upstox intraday candle fetch returned non-success");
+            }
+            Err(err) => {
+                warn!(%symbol, %err, "Failed to fetch Upstox intraday candles");
+            }
+        }
+
+        if all_candles.is_empty() {
+            bail!("Could not retrieve any completed five-minute candles for {symbol}");
+        }
+
+        Ok(all_candles)
     }
 
     /// Process incoming ticks with strict deduplication:
@@ -514,15 +658,46 @@ impl UpstoxLiveMarketFeed {
 
         let auth_url = self.auth_dialog_url().await;
         let symbols: Vec<String> = nse_watchlist().into_iter().map(|i| i.symbol).collect();
-        let connected = *feed_status == "CONNECTED";
+        // Distinguish an actual V3 stream tick from a fresh REST quote. The
+        // REST poller keeps prices usable as a fallback, but it must not make
+        // the UI claim the WebSocket stream is connected.
+        let newest_price_tick = p_map
+            .values()
+            .filter(|tick| matches!(tick.source.as_str(), "UPSTOX_V3_LIVE" | "UPSTOX_REST_LIVE"))
+            .max_by_key(|tick| tick.received_at);
+        let newest_stream_tick = p_map
+            .values()
+            .filter(|tick| tick.source == "UPSTOX_V3_LIVE")
+            .max_by_key(|tick| tick.received_at);
+        let newest_rest_tick = p_map
+            .values()
+            .filter(|tick| tick.source == "UPSTOX_REST_LIVE")
+            .max_by_key(|tick| tick.received_at);
+        let age_ms =
+            |received_at: DateTime<Utc>| (now - received_at).num_milliseconds().max(0) as u64;
+        let stream_fresh = newest_stream_tick
+            .map(|tick| age_ms(tick.received_at) <= 15_000)
+            .unwrap_or(false);
+        let rest_fresh = newest_rest_tick
+            .map(|tick| age_ms(tick.received_at) <= 15_000)
+            .unwrap_or(false);
+        let prices_fresh = stream_fresh || rest_fresh;
+        let connected = stream_fresh;
+        let latest_update = newest_price_tick.map(|tick| tick.received_at).or(last_up);
+        // Keep event-to-receipt delay separate from price freshness. REST
+        // request duration is not an exchange-tick delay measurement.
+        let quote_latency_ms = if stream_fresh {
+            newest_stream_tick.map(|tick| tick.latency_ms)
+        } else {
+            None
+        };
 
-        let delay_ms = last_up.map(|lu| (now - lu).num_milliseconds().max(0) as u64);
-
-        // Stale if: market is closed/closing or if >15s without ticks during active trading
+        // Fresh REST prices remain usable for paper decisions, but are clearly
+        // labeled as fallback instead of being presented as a live stream.
         let is_stale = if !session.is_trading_active {
             true
         } else {
-            delay_ms.map(|d| d > 15_000).unwrap_or(true)
+            !prices_fresh
         };
 
         let stale_reason = if !session.is_trading_active {
@@ -531,7 +706,12 @@ impl UpstoxLiveMarketFeed {
                 session.status_badge, session.session_name
             ))
         } else if is_stale {
-            Some("No feed updates received for >15s. Paper trading order decisions paused until fresh data resumes.".to_string())
+            Some("No fresh Upstox stream or REST prices received for more than 15 seconds. Paper decisions are paused.".to_string())
+        } else if !connected {
+            Some(
+                "Fresh REST snapshots are available; the Upstox V3 stream is disconnected."
+                    .to_string(),
+            )
         } else {
             None
         };
@@ -540,9 +720,11 @@ impl UpstoxLiveMarketFeed {
 
         let connection_state = if !session.is_trading_active {
             "CLOSED_SESSION".to_string()
-        } else if connected && !is_stale {
+        } else if connected {
             "CONNECTED".to_string()
-        } else if connected && is_stale {
+        } else if rest_fresh {
+            "REST_FALLBACK".to_string()
+        } else if is_stale {
             "STALE".to_string()
         } else {
             feed_status.clone()
@@ -550,6 +732,8 @@ impl UpstoxLiveMarketFeed {
 
         let feed_type = if connected {
             "UPSTOX_V3_LIVE".to_string()
+        } else if rest_fresh {
+            "UPSTOX_REST_LIVE".to_string()
         } else if has_token {
             "UPSTOX_CONNECTING".to_string()
         } else {
@@ -565,10 +749,10 @@ impl UpstoxLiveMarketFeed {
             client_id_configured: client_id.is_some(),
             subscribed_count: p_map.len(),
             symbols,
-            last_update: last_up,
-            last_feed_timestamp: last_up,
-            last_receipt_timestamp: last_up,
-            measured_delay_ms: delay_ms,
+            last_update: latest_update,
+            last_feed_timestamp: newest_stream_tick.map(|tick| tick.feed_timestamp),
+            last_receipt_timestamp: newest_price_tick.map(|tick| tick.received_at),
+            measured_delay_ms: quote_latency_ms,
             is_stale,
             stale_reason,
             trading_paused_due_to_stale,
@@ -579,7 +763,13 @@ impl UpstoxLiveMarketFeed {
             resubscribe_count,
             backoff_delay_secs,
             deduped_ticks_count,
-            notes: "Live market data feed connected to Upstox Market Data Feed V3. All paper execution is permanently isolated to the local simulator with zero live broker orders.".to_string(),
+            notes: if connected {
+                "Fresh Upstox Market Data Feed V3 stream ticks are arriving. All execution remains local paper trading; no live broker orders are sent.".to_string()
+            } else if rest_fresh {
+                "Fresh Upstox REST quote snapshots are available; the V3 WebSocket stream is not currently delivering ticks. All execution remains local paper trading; no live broker orders are sent.".to_string()
+            } else {
+                "No fresh Upstox prices are available. Paper decisions pause until fresh prices resume. All execution remains local paper trading.".to_string()
+            },
         }
     }
 
@@ -599,6 +789,22 @@ impl UpstoxLiveMarketFeed {
 
     /// Spawn autonomous background WebSocket streaming worker with exponential backoff and tick deduplication.
     pub fn spawn_feed_worker(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let poller = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let token_available = {
+                    let t = poller.access_token.read().await;
+                    t.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
+                };
+                if token_available {
+                    if let Err(e) = poller.fetch_live_quotes().await {
+                        debug!("Periodic live quote fetch: {e}");
+                    }
+                }
+                tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
+            }
+        });
+
         tokio::spawn(async move {
             info!("Upstox V3 Market Data Feed background service initializing...");
             let mut attempt = 0u32;
@@ -644,7 +850,12 @@ impl UpstoxLiveMarketFeed {
 
                                 // Resubscribe ONCE for instruments in watchlist
                                 let sub_msg = Self::build_v3_subscription_message();
-                                if let Err(e) = ws_stream.send(Message::Text(sub_msg.into())).await
+                                // Upstox V3 expects the JSON subscription packet in a
+                                // binary WebSocket frame. Sending it as text leaves the
+                                // socket open but produces no market updates.
+                                if let Err(e) = ws_stream
+                                    .send(Message::Binary(sub_msg.into_bytes().into()))
+                                    .await
                                 {
                                     warn!("Failed to send Upstox V3 subscription message: {e}");
                                 } else {
@@ -689,15 +900,14 @@ impl UpstoxLiveMarketFeed {
                         }
                     }
                     Err(e) => {
-                        debug!(error = %e, "Upstox V3 feed authorization failed — fallback polling");
-                        // Fallback: if market is open and REST polling succeeds, update quotes
-                        let _ = self.fetch_live_quotes().await;
+                        warn!(error = %e, "Upstox V3 feed authorization failed; live decisions remain paused until the stream reconnects");
                     }
                 }
 
-                // Exponential backoff reconnect: 1s, 2s, 4s, 8s, 16s, up to 30s max
+                // Keep reconnect attempts responsive while still backing off
+                // briefly after repeated failures: 2s, 4s, then 5s maximum.
                 attempt = attempt.saturating_add(1);
-                let backoff_secs = std::cmp::min(30, 1u64 << attempt.min(5));
+                let backoff_secs = std::cmp::min(5, 1u64 << attempt.min(3));
                 {
                     let mut b = self.backoff_delay_secs.write().await;
                     *b = backoff_secs;
@@ -801,8 +1011,8 @@ pub fn parse_upstox_protobuf_feed(bytes: &[u8]) -> Vec<LiveTick> {
         let tag = tag_wire >> 3;
         let wire = (tag_wire & 0x07) as u8;
 
-        if tag == 1 && wire == 2 {
-            // feeds map entry: tag 1, wire 2
+        if (tag == 1 || tag == 2) && wire == 2 {
+            // feeds map entry: tag 2 (Upstox V3 FeedResponse.feeds) or tag 1
             if let Some(entry_buf) = read_length_delimited(bytes, &mut pos) {
                 if let Some(tick) = parse_feed_map_entry(entry_buf, now) {
                     ticks.push(tick);

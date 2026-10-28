@@ -432,6 +432,18 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
         ),
     );
     upstox_feed.clone().spawn_feed_worker();
+    // Indian strategy decisions run continuously from fresh Upstox ticks, but
+    // only after the operator resumes the agent and only as local paper fills.
+    let _india_strategy_worker =
+        polymarket_agent::india::strategy_worker::spawn_upstox_strategy_worker(
+            upstox_feed.clone(),
+            store.clone_for_parallel(),
+            kill_switch.clone(),
+            config
+                .risk
+                .india_capital_allocation_inr
+                .unwrap_or(dec!(1000.0)),
+        );
 
     let alpaca_feed = std::sync::Arc::new(
         polymarket_agent::us::market_feed::AlpacaLiveMarketFeed::new(

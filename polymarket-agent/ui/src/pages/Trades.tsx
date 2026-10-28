@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useDataset } from "../data/useDataset";
 import { Card } from "../components/ui/Card";
 import { StatTile } from "../components/ui/StatTile";
@@ -38,6 +38,15 @@ export interface UnifiedTradeItem {
 }
 
 export function Trades() {
+  const [indiaFeed, setIndiaFeed] = useState<{
+    connected: boolean; status: string; symbols_subscribed: string[];
+  } | null>(null);
+  useEffect(() => {
+    const load = () => fetch("/api/upstox/feed/status").then((r) => r.ok ? r.json() : null).then(setIndiaFeed).catch(() => {});
+    load();
+    const timer = setInterval(load, 2000);
+    return () => clearInterval(timer);
+  }, []);
   const trades = useDataset<TradeRecord[]>("tradesAll");
   const india = useDataset<IndiaSandboxStatusResponse>("indiaSandbox");
   const us = useDataset<UsPaperStatusResponse>("usPaper");
@@ -87,6 +96,19 @@ export function Trades() {
 
     // 1. Polymarket Trades
     for (const t of polyTrades) {
+      const sym = (t.market_id ?? "").toUpperCase();
+      const isIndianStock = [
+        "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "SBIN",
+        "BHARTIARTL", "ITC", "LT", "TATAMOTORS", "LICI", "HINDUNILVR", "BAJFINANCE"
+      ].includes(sym);
+      const isUsStock = [
+        "SIRI", "NOK", "LCID", "PLUG", "NIO", "SOFI", "SPY", "AAPL", "NVDA", "QQQ"
+      ].includes(sym);
+      // Equities belong to their respective venues (Indian Paper or US Paper). Do not render them as Polymarket CLOB in USD!
+      if (isIndianStock || isUsStock || t.direction === "BUY" || t.direction === "SELL") {
+        continue;
+      }
+
       const pnlNum = num(t.pnl);
       list.push({
         id: `poly-${t.id}`,
@@ -109,7 +131,7 @@ export function Trades() {
       });
     }
 
-    // 2. India Upstox Sandbox Orders
+    // 2. Indian paper-market orders
     for (const o of indiaOrders) {
       const rawP = num(o.average_fill_price || o.price) ?? 0;
       // If simulated market order filled at default tick or pending quote
@@ -120,7 +142,7 @@ export function Trades() {
         market_id: `NSE:${o.symbol}`,
         market_question: `${o.symbol} · NSE Cash Equity (Intraday)`,
         symbol: o.symbol,
-        venue_name: "Upstox Sandbox (NSE)",
+        venue_name: "Indian Paper (NSE)",
         market_group: "india",
         direction: o.side,
         entry_price: `₹${p.toFixed(2)}`,
@@ -419,9 +441,9 @@ export function Trades() {
         </button>
       </div>
 
-      {/* Upstox Live Feed & Local Paper Trading Simulator Dashboard */}
+      {/* Upstox background feed & local paper trading simulator */}
       {(marketFilter === "INDIA" || marketFilter === "ALL") && (
-        <Card title="🇮🇳 Upstox Live Market Data → Strategy → Local Paper Simulator">
+        <Card title="🇮🇳 Upstox Background Feed → Strategy → Local Paper Simulator">
           <div
             style={{
               display: "flex",
@@ -441,22 +463,17 @@ export function Trades() {
                   width: "10px",
                   height: "10px",
                   borderRadius: "50%",
-                  background: india.data?.upstox_feed?.connected ? "#10b981" : "#f59e0b",
+                  background: indiaFeed?.connected ? "#10b981" : "#f59e0b",
                   display: "inline-block",
-                  boxShadow: india.data?.upstox_feed?.connected ? "0 0 8px #10b981" : "0 0 8px #f59e0b",
+                  boxShadow: indiaFeed?.connected ? "0 0 8px #10b981" : "0 0 8px #f59e0b",
                 }}
               />
               <span style={{ fontWeight: 600, fontSize: "13px" }}>
-                Upstox Feed:{" "}
-                {india.data?.upstox_feed?.connected
-                  ? "Live WebSocket / Quote Stream"
-                  : india.data?.upstox_feed?.authorized
-                    ? "Connecting to Upstox Stream..."
-                    : "Live Drift Simulator Active"}
+                Upstox Feed: {indiaFeed?.connected ? "Live WebSocket stream" : "Waiting for live data"}
               </span>
             </div>
             <div style={{ fontSize: "12px", color: "var(--text-secondary)" }}>
-              Subscribed: {india.data?.upstox_feed?.symbols_subscribed?.slice(0, 6).join(", ") || "ITC, SBIN, RELIANCE, INFY, TATAMOTORS, TCS"}
+              Subscribed: {indiaFeed?.symbols_subscribed?.slice(0, 6).join(", ") || "No symbols subscribed yet"}
             </div>
             <div style={{ marginLeft: "auto", display: "flex", gap: "8px", alignItems: "center" }}>
               <Badge tone="good">100% Paper Simulator · Zero Live Orders</Badge>
@@ -475,44 +492,10 @@ export function Trades() {
             </div>
           </div>
 
-          {/* Real-time Ticker Ribbon */}
-          {india.data?.upstox_feed?.live_prices && Object.keys(india.data.upstox_feed.live_prices).length > 0 && (
-            <div
-              style={{
-                display: "grid",
-                gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))",
-                gap: "8px",
-                marginBottom: "14px",
-              }}
-            >
-              {Object.entries(india.data.upstox_feed.live_prices).slice(0, 5).map(([sym, item]) => {
-                const chg = Number(item?.change_pct ?? 0);
-                const isUp = chg >= 0;
-                const itemPrice = Number(item?.price ?? 0);
-                return (
-                  <div
-                    key={sym}
-                    style={{
-                      padding: "8px 10px",
-                      borderRadius: "6px",
-                      background: "rgba(15, 23, 42, 0.6)",
-                      border: "1px solid rgba(255, 255, 255, 0.06)",
-                    }}
-                  >
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                      <span style={{ fontSize: "11px", fontWeight: "700", color: "#fff" }}>{sym}</span>
-                      <span style={{ fontSize: "10px", fontWeight: "600", color: isUp ? "#4ade80" : "#f87171" }}>
-                        {isUp ? `+${chg.toFixed(2)}%` : `${chg.toFixed(2)}%`}
-                      </span>
-                    </div>
-                    <div style={{ fontSize: "13px", fontWeight: "800", color: "#38bdf8", marginTop: "2px" }}>
-                      ₹{itemPrice.toFixed(2)}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
+          <div style={{ margin: "0 0 14px", color: "var(--text-secondary)", fontSize: "12px" }}>
+            The agent evaluates fresh Upstox updates in the background. Market prices are not displayed here.
+            <a href="https://pro.upstox.com/" target="_blank" rel="noopener noreferrer" style={{ marginLeft: "8px" }}>View live market ↗</a>
+          </div>
 
           <div
             className="grid grid--tiles"
@@ -607,7 +590,7 @@ export function Trades() {
         {allUnified.length === 0 ? (
           <EmptyState
             title="No trades yet"
-            hint="Trades appear here automatically when orders are placed on Indian Upstox sandbox, US Alpaca paper, or Polymarket."
+            hint="Trades appear here automatically when orders are placed in the Indian paper market, US Alpaca paper, or Polymarket."
           />
         ) : filtered.length === 0 ? (
           <EmptyState

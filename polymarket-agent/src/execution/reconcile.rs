@@ -126,20 +126,23 @@ pub fn combined_equity(reports: &[VenueReconcileReport]) -> Option<Decimal> {
     if reports.is_empty() {
         return None;
     }
-    // Indian market funds (Upstox/NSE) are in INR and must NEVER be added directly
-    // to the USD equity pool at 1:1, preserving strict currency and pool isolation.
-    let relevant: Vec<&VenueReconcileReport> = reports
-        .iter()
-        .filter(|r| r.venue_id != "upstox" && r.venue_id != "upstox_sandbox")
-        .collect();
 
-    if relevant.is_empty() {
-        return None;
+    let fx = crate::market::fx::get_current_fx_rate();
+    let mut total_usd = Decimal::ZERO;
+
+    for report in reports {
+        if let Some(eq) = report.equity {
+            if report.venue_id == "upstox" || report.venue_id == "upstox_sandbox" {
+                total_usd += fx.inr_to_usd(eq);
+            } else {
+                total_usd += eq;
+            }
+        } else {
+            return None;
+        }
     }
 
-    relevant
-        .iter()
-        .try_fold(Decimal::ZERO, |sum, report| Some(sum + report.equity?))
+    Some(total_usd)
 }
 
 impl VenueReconcileReport {

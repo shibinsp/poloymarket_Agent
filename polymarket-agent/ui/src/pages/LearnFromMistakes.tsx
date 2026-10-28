@@ -45,7 +45,19 @@ export function LearnFromMistakes() {
   const isLlmConnected = health.data?.valuation_enabled ?? true;
   const valuationModel = health.data?.valuation_model || "minimaxai/minimax-m3.1-flash";
 
-  const polyTrades = trades.data ?? [];
+  const polyTrades = useMemo(() => {
+    return (trades.data ?? []).filter((t) => {
+      const sym = (t.market_id ?? "").toUpperCase();
+      const isIndianStock = [
+        "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "SBIN",
+        "BHARTIARTL", "ITC", "LT", "TATAMOTORS", "LICI", "HINDUNILVR", "BAJFINANCE"
+      ].includes(sym);
+      const isUsStock = [
+        "SIRI", "NOK", "LCID", "PLUG", "NIO", "SOFI", "SPY", "AAPL", "NVDA", "QQQ"
+      ].includes(sym);
+      return !isIndianStock && !isUsStock && t.direction !== "BUY" && t.direction !== "SELL";
+    });
+  }, [trades.data]);
   const indiaOrders = india.data?.recent_orders ?? [];
   const usOrders = us.data?.recent_orders ?? [];
 

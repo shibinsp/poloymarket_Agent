@@ -126,40 +126,82 @@ timestamp,symbol,open,high,low,close,volume
 #[test]
 fn test_no_look_ahead_bias_and_conservative_sl_tp() {
     let mut candles = Vec::new();
-    let base_dt = Utc.with_ymd_and_hms(2024, 1, 1, 3, 45, 0).unwrap(); // 09:15 IST is 03:45 UTC
+    let yesterday = Utc.with_ymd_and_hms(2026, 10, 27, 4, 0, 0).unwrap();
 
-    // Build 20 candles with upward trend to trigger fast SMA > slow SMA
-    for i in 0..20 {
-        let ts = base_dt + chrono::Duration::hours(i as i64);
-        let px = dec!(2400.0) + Decimal::from(i * 10);
+    // 52 warmup candles on prior day (EMA 50 warmup)
+    for i in 0..52 {
         candles.push(NseCandle {
-            timestamp: ts,
+            timestamp: yesterday + chrono::Duration::minutes(i * 5),
             symbol: "RELIANCE".to_string(),
-            open: px,
-            high: px + dec!(15.0),
-            low: px - dec!(5.0),
-            close: px + dec!(10.0),
-            volume: dec!(100000.0),
+            open: dec!(2400.0),
+            high: dec!(2410.0),
+            low: dec!(2395.0),
+            close: dec!(2405.0),
+            volume: dec!(50000.0),
         });
     }
 
-    // Candle 20: Big candle that touches BOTH SL and TP
-    let ts_both = base_dt + chrono::Duration::hours(20);
+    // Today's session candles (2026-10-28)
+    let today = Utc.with_ymd_and_hms(2026, 10, 28, 3, 45, 0).unwrap(); // 09:15 IST
+    for i in 0..8 {
+        let (open, high, low, close) = if i == 6 {
+            // Pullback bar toward VWAP
+            (dec!(2430.0), dec!(2435.0), dec!(2405.0), dec!(2410.0))
+        } else if i == 7 {
+            // Rebound confirmation closing above prior high
+            (dec!(2410.0), dec!(2445.0), dec!(2410.0), dec!(2440.0))
+        } else {
+            // Rising trend
+            (dec!(2410.0), dec!(2430.0), dec!(2405.0), dec!(2425.0))
+        };
+        candles.push(NseCandle {
+            timestamp: today + chrono::Duration::minutes(i * 5),
+            symbol: "RELIANCE".to_string(),
+            open,
+            high,
+            low,
+            close,
+            volume: dec!(60000.0),
+        });
+    }
+
+    // Bar 8 (09:55 IST): Opens and executes the Buy fill at next-candle-open (bar 8 open)
     candles.push(NseCandle {
-        timestamp: ts_both,
+        timestamp: today + chrono::Duration::minutes(8 * 5),
         symbol: "RELIANCE".to_string(),
-        open: dec!(2600.0),
-        high: dec!(2700.0), // Touches TP
-        low: dec!(2500.0),  // Touches SL
-        close: dec!(2650.0),
-        volume: dec!(100000.0),
+        open: dec!(2442.0),
+        high: dec!(2448.0),
+        low: dec!(2438.0),
+        close: dec!(2444.0),
+        volume: dec!(50000.0),
+    });
+
+    // Bar 9 (10:00 IST): Outside bar that drops through SL (-1.5%) and spikes above TP (+2.0%)
+    candles.push(NseCandle {
+        timestamp: today + chrono::Duration::minutes(9 * 5),
+        symbol: "RELIANCE".to_string(),
+        open: dec!(2444.0),
+        high: dec!(2550.0), // Above TP (+2%)
+        low: dec!(2380.0),  // Below SL (-1.5%)
+        close: dec!(2440.0),
+        volume: dec!(80000.0),
+    });
+
+    // Bar 10 (10:05 IST): Opens and fills the exit at bar 10 open
+    let ts_fill_exit = today + chrono::Duration::minutes(10 * 5);
+    candles.push(NseCandle {
+        timestamp: ts_fill_exit,
+        symbol: "RELIANCE".to_string(),
+        open: dec!(2420.0),
+        high: dec!(2430.0),
+        low: dec!(2415.0),
+        close: dec!(2425.0),
+        volume: dec!(50000.0),
     });
 
     let config = NseBacktestConfig {
-        fast_sma_period: 3,
-        slow_sma_period: 7,
         stop_loss_pct: dec!(0.015),
-        take_profit_pct: dec!(0.030),
+        take_profit_pct: dec!(0.020),
         ..NseBacktestConfig::default()
     };
 
@@ -169,14 +211,22 @@ fn test_no_look_ahead_bias_and_conservative_sl_tp() {
         "Must have executed at least one trade"
     );
 
-    // Conservative check: if SL and TP are both touched on bar 20, STOP LOSS must be the recorded exit reason
-    let both_touch_trade = result.trades.iter().find(|t| t.exit_time == Some(ts_both));
-    if let Some(t) = both_touch_trade {
-        assert_eq!(
-            t.exit_reason, "STOP_LOSS",
-            "Conservative rule must trigger STOP_LOSS when both are touched"
-        );
-    }
+    // Verify exit executed at bar 10 open and conservative outside bar triggered STOP LOSS
+    let executed_trade = &result.trades[0];
+    assert_eq!(
+        executed_trade.entry_time,
+        today + chrono::Duration::minutes(8 * 5),
+        "Buy must fill at bar 8 open after bar 7 confirmation (zero look-ahead)"
+    );
+    assert_eq!(
+        executed_trade.exit_time,
+        Some(ts_fill_exit),
+        "Exit must fill at next candle open (bar 10 open) after bar 9 threshold breach"
+    );
+    assert!(
+        executed_trade.exit_reason.contains("STOP_LOSS"),
+        "Conservative rule must trigger STOP_LOSS when outside bar touches both thresholds"
+    );
 }
 
 #[tokio::test]
@@ -238,9 +288,11 @@ async fn test_upstox_sandbox_isolation_and_live_blocking() {
         "Must reject negative/zero quantity"
     );
 
-    // 4. Valid mock order executes and returns client order id
+    // 4. Valid mock order executes and returns client order id (within ₹1,000 budget)
     let mut valid_order = invalid_order;
-    valid_order.quantity = 10;
+    valid_order.quantity = 1;
+    valid_order.price = dec!(480.0);
+    valid_order.instrument_token = "NSE_EQ|INE154A01025".to_string();
     let order_id = client
         .place_order(&valid_order)
         .await
@@ -262,11 +314,14 @@ async fn test_upstox_feed_to_strategy_pipeline() {
     let itc_price = feed.get_price("ITC").await;
     assert!(itc_price > Decimal::ZERO);
 
-    // Evaluate tick with ₹1,000 capital and 0 holdings -> BUY
-    let decision_buy = evaluate_strategy_tick("ITC", dec!(480.00), dec!(1000.0), 0, None);
-    assert_eq!(decision_buy.action, "BUY");
-    assert_eq!(decision_buy.quantity, 1);
-    assert_eq!(decision_buy.symbol, "ITC");
+    // Evaluate tick with ₹1,000 capital and 0 holdings -> WAIT
+    // (Entry decisions are deferred to completed 5m candle Pullback & Confirmed Rebound strategy)
+    let decision_wait_entry = evaluate_strategy_tick("ITC", dec!(480.00), dec!(1000.0), 0, None);
+    assert_eq!(decision_wait_entry.action, "WAIT");
+    assert_eq!(decision_wait_entry.quantity, 0);
+    assert!(decision_wait_entry
+        .reason
+        .contains("Pullback & Confirmed Rebound"));
 
     // Stock with price > available cash (e.g. RELIANCE at ₹1,200 vs ₹1,000 cash) -> WAIT
     let decision_wait = evaluate_strategy_tick("RELIANCE", dec!(1200.00), dec!(1000.0), 0, None);
@@ -317,7 +372,7 @@ async fn test_simulator_executes_paper_order_and_persists() {
         .unwrap_or_default();
     assert_eq!(orders1.len(), 1);
     let p1 = compute_portfolio_accounting(base_capital, &orders1, &HashMap::new());
-    assert_eq!(p1.available_cash_inr, dec!(520.0)); // 1000 - 480
+    assert_eq!(p1.available_cash_inr, dec!(519.15)); // 1000 - (480 + 0.85 statutory charges)
     assert_eq!(p1.holdings.get("ITC").copied(), Some(dec!(1.0)));
 
     // 2. Attempt BUY exceeding available cash (needs ₹960, only ₹520 left) -> MUST FAIL
@@ -358,8 +413,8 @@ async fn test_simulator_executes_paper_order_and_persists() {
         .unwrap_or_default();
     assert_eq!(orders2.len(), 2);
     let p2 = compute_portfolio_accounting(base_capital, &orders2, &HashMap::new());
-    assert_eq!(p2.available_cash_inr, dec!(1015.0)); // 520 + 495
-    assert_eq!(p2.realized_profit_inr, dec!(15.0)); // 495 - 480
+    assert_eq!(p2.available_cash_inr, dec!(1013.34)); // 1000 + 13.34 net profit
+    assert_eq!(p2.realized_profit_inr, dec!(13.34)); // 15 gross profit - (0.85 buy costs + 0.81 sell costs)
     assert_eq!(
         p2.holdings.get("ITC").copied().unwrap_or(Decimal::ZERO),
         Decimal::ZERO
@@ -452,4 +507,95 @@ async fn test_upstox_v3_market_feed_subscription_session_and_deduplication() {
     let fresh3 = feed.process_incoming_ticks(vec![tick2]).await;
     assert_eq!(fresh3.len(), 1, "New price must be accepted");
     assert_eq!(feed.get_price("RELIANCE").await, dec!(2501.00));
+}
+
+#[tokio::test]
+async fn test_pullback_strategy_completed_candle_evaluation_and_sizing() {
+    use chrono::TimeZone;
+    use polymarket_agent::strategy::pullback::{
+        calculate_position_size, evaluate_pullback_setup, FiveMinCandle, PullbackStrategyConfig,
+        SignalAction,
+    };
+
+    let config = PullbackStrategyConfig::default();
+    let mut sizing_config = config.clone();
+    sizing_config.max_position_pct_of_cash = Decimal::ONE;
+    sizing_config.max_risk_per_trade_pct = dec!(0.02);
+
+    // Build series of completed candles: 50 historical prior days, followed by 10 today's candles
+    let mut candles = Vec::new();
+    let base_time = Utc.with_ymd_and_hms(2026, 10, 27, 4, 0, 0).unwrap(); // Yesterday
+    for i in 0..52 {
+        candles.push(FiveMinCandle {
+            timestamp: base_time + chrono::Duration::minutes(i * 5),
+            symbol: "ITC".to_string(),
+            open: dec!(250.0),
+            high: dec!(251.0),
+            low: dec!(249.5),
+            close: dec!(250.5),
+            volume: dec!(10000.0),
+        });
+    }
+
+    // Today's session candles (2026-10-28)
+    let today_time = Utc.with_ymd_and_hms(2026, 10, 28, 3, 45, 0).unwrap(); // 09:15 IST
+    for i in 0..8 {
+        let (open, high, low, close) = if i == 6 {
+            // Bar 6: Pullback to VWAP / support
+            (dec!(253.0), dec!(253.5), dec!(250.5), dec!(251.0))
+        } else if i == 7 {
+            // Bar 7: Bullish rebound closing above prior bar's high
+            (dec!(251.0), dec!(254.5), dec!(251.0), dec!(254.0))
+        } else {
+            // Bars 0..5: Rising trend
+            (dec!(251.0), dec!(253.0), dec!(250.5), dec!(252.5))
+        };
+
+        candles.push(FiveMinCandle {
+            timestamp: today_time + chrono::Duration::minutes(i * 5),
+            symbol: "ITC".to_string(),
+            open,
+            high,
+            low,
+            close,
+            volume: dec!(12000.0),
+        });
+    }
+
+    let (signal, indicators) = evaluate_pullback_setup(&candles, &config);
+    assert!(indicators.is_some());
+    let ind = indicators.unwrap();
+    assert!(ind.trend_bullish);
+    assert!(ind.pullback_detected);
+    assert!(ind.rebound_confirmed);
+
+    match signal {
+        SignalAction::Buy {
+            symbol,
+            stop_price,
+            planned_risk_per_share,
+            target_price,
+            ..
+        } => {
+            assert_eq!(symbol, "ITC");
+            assert!(stop_price < dec!(254.0));
+            assert!(target_price > dec!(254.0));
+            assert!(planned_risk_per_share > Decimal::ZERO);
+
+            // Size paper trade from available INR cash (₹1,000 max budget)
+            let cash = dec!(1000.0);
+            let fill_price = dec!(254.0);
+            let qty =
+                calculate_position_size(cash, fill_price, planned_risk_per_share, &sizing_config);
+            assert!(
+                qty >= 1,
+                "Should size at least 1 share within ₹1,000 budget"
+            );
+            assert!(
+                Decimal::from(qty) * fill_price <= cash,
+                "Never exceed ₹1,000 available cash"
+            );
+        }
+        other => panic!("Expected Buy signal, got: {:?}", other),
+    }
 }

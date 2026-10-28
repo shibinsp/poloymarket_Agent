@@ -13,7 +13,7 @@ export const ROUTES: RouteDef[] = [
   { path: "/cycles", label: "Cycles", title: "Cycles" },
   { path: "/learn", label: "Learn From Mistakes", title: "Learn from Mistakes · Trade Post-Mortem" },
   { path: "/costs", label: "Costs", title: "API costs" },
-  { path: "/india", label: "India — Test", title: "India — Test · NSE Equities & Upstox Sandbox" },
+  { path: "/india", label: "India — Test", title: "India — Upstox Feed & Paper Strategy" },
   { path: "/us", label: "US — Test", title: "US — Test · Equities & Alpaca Paper" },
   { path: "/health", label: "Health", title: "Health" },
   { path: "/settings", label: "Settings", title: "Settings" },

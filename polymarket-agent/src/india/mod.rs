@@ -7,3 +7,4 @@ pub mod instruments;
 pub mod market_feed;
 pub mod session;
 pub mod simulator;
+pub mod strategy_worker;

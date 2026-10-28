@@ -4,14 +4,13 @@ import { StatTile } from "../components/ui/StatTile";
 import { Badge } from "../components/ui/Badge";
 import { inr, inrSigned, shares, istTime, pctFromFraction, DASH } from "../lib/format";
 import { postJson } from "../api/client";
-import { NseLiveChart } from "../components/india/NseLiveChart";
 import { computeRealizedPnl } from "../lib/pnl";
 
 interface Instrument {
   symbol: string;
   name: string;
   isin: string;
-  upstox_token: string;
+  provider_instrument_id: string;
   tick_size: string;
   lot_size: number;
   fractional: boolean;
@@ -109,10 +108,12 @@ interface SandboxStatus {
   mode_description: string;
   base_capital_inr?: number;
   realized_profit_inr?: number;
+  unrealized_profit_inr?: number;
   open_positions_cost_inr?: number;
   available_cash_inr?: number;
   total_equity_inr?: number;
   holdings?: Record<string, number>;
+  open_positions?: Array<unknown>;
   recent_orders: SandboxOrder[];
   watchlist: Instrument[];
 }
@@ -122,9 +123,10 @@ export function IndiaTest() {
   
   // Backtest form state
   const [initialCapital, setInitialCapital] = useState("1000");
-  const [positionPct, setPositionPct] = useState("0.10");
+  const [positionPct, setPositionPct] = useState("1.0");
+  const [backtestSymbol, setBacktestSymbol] = useState("RELIANCE");
   const [stopLossPct, setStopLossPct] = useState("0.015");
-  const [takeProfitPct, setTakeProfitPct] = useState("0.030");
+  const [takeProfitPct, setTakeProfitPct] = useState("0.020");
   const [trainSplitPct, setTrainSplitPct] = useState("0.60");
   const [valSplitPct, setValSplitPct] = useState("0.20");
   const [useCustomCsv, setUseCustomCsv] = useState(false);
@@ -144,6 +146,7 @@ export function IndiaTest() {
   const [orderSuccess, setOrderSuccess] = useState<string | null>(null);
   const [baseCapitalInr, setBaseCapitalInr] = useState<number>(1000.0);
   const [realizedProfitInr, setRealizedProfitInr] = useState<number>(0.0);
+  const [unrealizedProfitInr, setUnrealizedProfitInr] = useState<number>(0.0);
   const [openPositionsCostInr, setOpenPositionsCostInr] = useState<number>(0.0);
   const [availableCashInr, setAvailableCashInr] = useState<number>(1000.0);
   const [totalEquityInr, setTotalEquityInr] = useState<number>(1000.0);
@@ -151,25 +154,15 @@ export function IndiaTest() {
   const [resetting, setResetting] = useState(false);
   const [resetMsg, setResetMsg] = useState<string | null>(null);
 
-  // Upstox Live Feed & Strategy Tester State
+  // Upstox live feed and strategy tester state
   const [feedStatus, setFeedStatus] = useState<{
     connected: boolean;
     status: string;
     feed_type: string;
     token_configured: boolean;
-    token_preview?: string;
-    redirect_uri?: string;
-    auth_dialog_url?: string;
     symbols_subscribed: string[];
     last_tick_time?: string;
-    live_prices: Record<string, { price: number | string; time: string; source: string; change_pct: number | string }>;
   } | null>(null);
-
-  const [clientIdInput, setClientIdInput] = useState("");
-  const [clientSecretInput, setClientSecretInput] = useState("");
-  const [accessTokenInput, setAccessTokenInput] = useState("");
-  const [authSaving, setAuthSaving] = useState(false);
-  const [authMsg, setAuthMsg] = useState<string | null>(null);
 
   const [stratSymbol, setStratSymbol] = useState("ITC");
   const [stratPrice, setStratPrice] = useState("");
@@ -198,6 +191,7 @@ export function IndiaTest() {
         average_fill_price: o.average_fill_price,
         created_at: o.created_at,
       })),
+      "india",
     );
   }, [sandboxStatus]);
 
@@ -210,6 +204,7 @@ export function IndiaTest() {
         setSandboxStatus(data);
         if (data.base_capital_inr !== undefined) setBaseCapitalInr(Number(data.base_capital_inr));
         if (data.realized_profit_inr !== undefined) setRealizedProfitInr(Number(data.realized_profit_inr));
+        if (data.unrealized_profit_inr !== undefined) setUnrealizedProfitInr(Number(data.unrealized_profit_inr));
         if (data.open_positions_cost_inr !== undefined) setOpenPositionsCostInr(Number(data.open_positions_cost_inr));
         if (data.available_cash_inr !== undefined) setAvailableCashInr(Number(data.available_cash_inr));
         if (data.total_equity_inr !== undefined) setTotalEquityInr(Number(data.total_equity_inr));
@@ -249,75 +244,17 @@ export function IndiaTest() {
       if (res.ok) {
         const d = await res.json();
         const feedInfo = d.feed || d;
-        let lpMap: Record<string, { price: number; time: string; source: string; change_pct: number }> = {};
-        if (d.live_prices && Object.keys(d.live_prices).length > 0) {
-          for (const [sym, lp] of Object.entries(d.live_prices as Record<string, { price: string | number; time: string; source: string; change_pct: string | number }>)) {
-            lpMap[sym] = {
-              price: Number(lp?.price || 0),
-              time: lp?.time || "",
-              source: lp?.source || "SIMULATED",
-              change_pct: Number(lp?.change_pct || 0),
-            };
-          }
-        } else if (d.ticks) {
-          for (const [sym, t] of Object.entries(d.ticks as Record<string, { last_price: string | number; timestamp: string; source: string; close: string | number }>)) {
-            const last = Number(t.last_price || 0);
-            const close = Number(t.close || last);
-            const changePct = close > 0 ? ((last - close) / close) * 100 : 0;
-            lpMap[sym] = {
-              price: last,
-              time: t.timestamp,
-              source: t.source,
-              change_pct: changePct,
-            };
-          }
-        }
         setFeedStatus({
           connected: Boolean(feedInfo.connected),
-          status: feedInfo.status || "SIMULATED",
-          feed_type: feedInfo.feed_type || "HIGH_FIDELITY_SIMULATED",
+          status: feedInfo.status || "AUTH_REQUIRED",
+          feed_type: feedInfo.feed_type || "UPSTOX_V3_LIVE",
           token_configured: Boolean(feedInfo.token_configured),
-          token_preview: feedInfo.token_preview,
-          redirect_uri: feedInfo.redirect_uri,
-          auth_dialog_url: feedInfo.auth_dialog_url,
-          symbols_subscribed: feedInfo.symbols_subscribed || feedInfo.symbols || ["ITC", "SBIN", "RELIANCE", "INFY", "TATAMOTORS"],
+          symbols_subscribed: feedInfo.symbols_subscribed || feedInfo.symbols || [],
           last_tick_time: feedInfo.last_tick_time || feedInfo.last_update,
-          live_prices: lpMap,
         });
       }
     } catch {
       // ignore
-    }
-  };
-
-  const handleSaveUpstoxAuth = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setAuthSaving(true);
-    setAuthMsg(null);
-    try {
-      const body: Record<string, string> = {};
-      if (clientIdInput.trim()) body.client_id = clientIdInput.trim();
-      if (clientSecretInput.trim()) body.client_secret = clientSecretInput.trim();
-      if (accessTokenInput.trim()) body.access_token = accessTokenInput.trim();
-
-      const res = await fetch("/api/upstox/auth/token", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-
-      if (res.ok) {
-        setAuthMsg("Upstox credentials updated successfully! Market data feed is connecting.");
-        setAccessTokenInput("");
-        loadFeedStatus();
-      } else {
-        const t = await res.text();
-        setAuthMsg(`Failed to save Upstox auth: ${t}`);
-      }
-    } catch (err: unknown) {
-      setAuthMsg(`Error: ${err instanceof Error ? err.message : String(err)}`);
-    } finally {
-      setAuthSaving(false);
     }
   };
 
@@ -349,9 +286,9 @@ export function IndiaTest() {
           reason: data.decision.reason,
           confidence: data.decision.confidence,
           timestamp: data.decision.timestamp,
-          executed: data.paper_order_executed,
+          executed: Boolean(data.execution),
         });
-        if (data.paper_order_executed) {
+        if (data.execution) {
           loadSandboxStatus();
         }
       } else {
@@ -380,6 +317,7 @@ export function IndiaTest() {
     try {
       const payload: Record<string, unknown> = {
         name: `Backtest NSE ${new Date().toLocaleTimeString()}`,
+        symbol: backtestSymbol,
         initial_capital: initialCapital,
         risk_pct_per_trade: positionPct,
         stop_loss_pct: stopLossPct,
@@ -477,7 +415,7 @@ export function IndiaTest() {
             style={{ fontSize: "0.825rem", padding: "0.35rem 0.75rem", display: "flex", alignItems: "center", gap: "0.4rem" }}
           >
             <span style={{ display: "inline-block", width: "8px", height: "8px", borderRadius: "50%", background: "#10b981" }} />
-            Live Market Chart & Trades
+            Upstox Market Link
           </button>
           <button
             className={`btn ${activeTab === "sandbox" ? "btn--primary" : "btn--secondary"}`}
@@ -503,16 +441,37 @@ export function IndiaTest() {
         </div>
       </div>
 
-      {/* Tab 0: Live Market Graph & Detailed Trade Ledger */}
+      {/* The agent consumes the background Upstox feed; users open the market separately. */}
       {activeTab === "live" && (
-        <NseLiveChart onOrderPlaced={loadSandboxStatus} />
+        <Card title="Open the market in Upstox">
+          <p style={{ color: "var(--text-secondary)", marginTop: 0 }}>
+            The agent follows Upstox prices in the background while it is running. This page does not display the live chart.
+          </p>
+          <a href="https://pro.upstox.com/" target="_blank" rel="noopener noreferrer" className="btn btn--primary">
+            View live market ↗
+          </a>
+        </Card>
       )}
 
       {/* Tab 1: Historical Backtester */}
       {activeTab === "backtest" && (
         <>
           <Card title="Strategy Backtest Configuration">
+            <div style={{ color: "var(--muted)", fontSize: "0.85rem", marginBottom: "1rem" }}>
+              Runs the live 5-minute pullback/rebound entry rules against recent real Upstox historical candles by default. Exits strictly match the live paper agent: 1.5% stop-loss and 2.0% take-profit filled at next candle open to eliminate look-ahead bias. If candle data is unavailable, an error is returned; synthetic or demo prices are never substituted.
+            </div>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: "1rem", marginBottom: "1rem" }}>
+              <div>
+                <label style={{ display: "block", fontSize: "0.8rem", color: "var(--muted)", marginBottom: "0.25rem" }}>
+                  NSE Symbol
+                </label>
+                <input
+                  type="text"
+                  value={backtestSymbol}
+                  onChange={(e) => setBacktestSymbol(e.target.value.toUpperCase())}
+                  style={{ width: "100%", padding: "0.4rem", borderRadius: "4px", border: "1px solid var(--border)", background: "var(--surface)" }}
+                />
+              </div>
               <div>
                 <label style={{ display: "block", fontSize: "0.8rem", color: "var(--muted)", marginBottom: "0.25rem" }}>
                   Initial Capital (INR)
@@ -548,7 +507,7 @@ export function IndiaTest() {
               </div>
               <div>
                 <label style={{ display: "block", fontSize: "0.8rem", color: "var(--muted)", marginBottom: "0.25rem" }}>
-                  Take Profit (fraction, e.g. 0.030 = 3.0%)
+                  Take Profit (fraction, live default 0.020 = 2.0%)
                 </label>
                 <input
                   type="text"
@@ -795,7 +754,7 @@ export function IndiaTest() {
         </>
       )}
 
-      {/* Tab 2: Upstox Sandbox Adapter */}
+      {/* Tab 2: Indian Market Paper Trading */}
       {activeTab === "sandbox" && (
         <>
           {/* Strictly Isolated Capital Allocation Banner & Reset Button */}
@@ -862,7 +821,15 @@ export function IndiaTest() {
                 <div style={{ fontSize: "20px", fontWeight: "800", color: Number(realizedProfitInr) >= 0 ? "#4ade80" : "#f87171", marginTop: "4px" }}>
                   {Number(realizedProfitInr) >= 0 ? `+₹${Number(realizedProfitInr).toFixed(2)}` : `-₹${Math.abs(Number(realizedProfitInr)).toFixed(2)}`} INR
                 </div>
-                <div style={{ fontSize: "11px", color: "#64748b", marginTop: "2px" }}>Available to re-trade</div>
+                <div style={{ fontSize: "11px", color: "#64748b", marginTop: "2px" }}>After entry & exit statutory charges</div>
+              </div>
+
+              <div style={{ padding: "14px", background: "rgba(15, 23, 42, 0.7)", borderRadius: "8px", border: "1px solid rgba(255, 255, 255, 0.08)" }}>
+                <div style={{ fontSize: "11px", color: "#94a3b8", fontWeight: "600", textTransform: "uppercase" }}>Unrealized P&L (Net of Fees)</div>
+                <div style={{ fontSize: "20px", fontWeight: "800", color: Number(unrealizedProfitInr) >= 0 ? "#4ade80" : "#f87171", marginTop: "4px" }}>
+                  {Number(unrealizedProfitInr) >= 0 ? `+₹${Number(unrealizedProfitInr).toFixed(2)}` : `-₹${Math.abs(Number(unrealizedProfitInr)).toFixed(2)}`} INR
+                </div>
+                <div style={{ fontSize: "11px", color: "#64748b", marginTop: "2px" }}>Net of entry & estimated exit fees</div>
               </div>
 
               <div style={{ padding: "14px", background: "rgba(15, 23, 42, 0.7)", borderRadius: "8px", border: "1px solid rgba(59, 130, 246, 0.3)" }}>
@@ -889,94 +856,29 @@ export function IndiaTest() {
 
           {/* Live Candlestick & Volume Market Chart (TradingView Mode matching Image 1) */}
           <div style={{ marginBottom: "20px" }}>
-            <NseLiveChart initialSymbol={stratSymbol} onOrderPlaced={loadSandboxStatus} />
+            <div style={{ padding: "12px 14px", marginBottom: "20px", borderRadius: "8px", background: "rgba(15, 23, 42, 0.55)", color: "#94a3b8" }}>
+              The agent evaluates incoming Upstox ticks in the background. <a href="https://pro.upstox.com/" target="_blank" rel="noopener noreferrer" style={{ color: "#60a5fa" }}>Open Upstox market ↗</a>
+            </div>
           </div>
 
-          {/* Upstox Live Market Data Feed & Strategy Decision Engine */}
-          <Card title="⚡ Upstox Live Market Feed → Agent Strategy → Local Paper Simulator">
-            {/* Live Ticker Ribbon */}
-            <div style={{ marginBottom: "16px" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
-                <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                  <span
-                    style={{
-                      width: "8px",
-                      height: "8px",
-                      borderRadius: "50%",
-                      background: feedStatus?.connected ? "#10b981" : "#f59e0b",
-                      display: "inline-block",
-                      boxShadow: feedStatus?.connected ? "0 0 8px #10b981" : "0 0 6px #f59e0b",
-                    }}
-                  />
-                  <span style={{ fontSize: "12px", fontWeight: "700", color: "#e2e8f0" }}>
-                    {feedStatus?.connected
-                      ? "UPSTOX LIVE FEED (WEBSOCKET/QUOTE)"
-                      : feedStatus?.token_configured
-                        ? "UPSTOX FEED (CONNECTING...)"
-                        : "HIGH-FIDELITY LIVE DRIFT SIMULATOR"}
-                  </span>
-                  <span style={{ fontSize: "11px", color: "#64748b" }}>
-                    · Updated: {feedStatus?.last_tick_time ? new Date(feedStatus.last_tick_time).toLocaleTimeString() : "Live"}
-                  </span>
-                </div>
-                <Badge tone="good">Upstox Live Orders Blocked · Paper Simulator Active</Badge>
-              </div>
-
-              {/* Ticker Cards */}
-              <div
-                style={{
-                  display: "grid",
-                  gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))",
-                  gap: "10px",
-                }}
-              >
-                {Object.entries(feedStatus?.live_prices ?? {}).map(([sym, item]) => {
-                  const chg = Number(item?.change_pct ?? 0);
-                  const isUp = chg >= 0;
-                  const itemPrice = Number(item?.price ?? 0);
-                  const isSelected = stratSymbol === sym;
-                  return (
-                    <div
-                      key={sym}
-                      onClick={() => {
-                        setStratSymbol(sym);
-                        setStratPrice(itemPrice.toFixed(2));
-                      }}
-                      style={{
-                        padding: "10px 12px",
-                        background: isSelected
-                          ? "rgba(59, 130, 246, 0.2)"
-                          : "rgba(15, 23, 42, 0.6)",
-                        border: isSelected
-                          ? "1px solid #3b82f6"
-                          : "1px solid rgba(255, 255, 255, 0.08)",
-                        borderRadius: "8px",
-                        cursor: "pointer",
-                        transition: "all 0.15s ease",
-                      }}
-                    >
-                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                        <span style={{ fontSize: "12px", fontWeight: "700", color: "#fff" }}>{sym}</span>
-                        <span
-                          style={{
-                            fontSize: "10px",
-                            fontWeight: "600",
-                            color: isUp ? "#4ade80" : "#f87171",
-                          }}
-                        >
-                          {isUp ? `+${chg.toFixed(2)}%` : `${chg.toFixed(2)}%`}
-                        </span>
-                      </div>
-                      <div style={{ fontSize: "14px", fontWeight: "800", color: "#38bdf8", marginTop: "4px" }}>
-                        ₹{itemPrice.toFixed(2)}
-                      </div>
-                      <div style={{ fontSize: "10px", color: "#64748b", marginTop: "2px" }}>
-                        {item?.source === "UPSTOX_LIVE" ? "🟢 Live Tick" : "🟡 Drift Tick"}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
+          {/* Upstox Live Market Data Feed & Continuous Strategy */}
+          <Card title="⚡ Upstox background feed → Continuous strategy → Paper simulator">
+            <div style={{ display: "flex", flexWrap: "wrap", gap: "12px", alignItems: "center", marginBottom: "16px" }}>
+              <Badge tone={feedStatus?.connected ? "good" : "warning"}>
+                {feedStatus?.connected
+                  ? "Upstox V3 stream connected"
+                  : feedStatus?.status === "REST_FALLBACK"
+                    ? "Fresh REST prices · V3 stream disconnected"
+                    : feedStatus?.token_configured
+                      ? "Waiting for fresh Upstox prices"
+                      : "Upstox authorization required"}
+              </Badge>
+              <span style={{ color: "#94a3b8", fontSize: "12px" }}>
+                Strategy decisions use fresh prices. REST snapshots are labeled as fallback; paper only, no live orders are sent.
+              </span>
+              <a href="https://pro.upstox.com/" target="_blank" rel="noopener noreferrer" style={{ color: "#60a5fa", marginLeft: "auto" }}>
+                View live market ↗
+              </a>
             </div>
 
             {/* Strategy Tester & Paper Order Submission Grid */}
@@ -1011,8 +913,6 @@ export function IndiaTest() {
                       onChange={(e) => {
                         const s = e.target.value;
                         setStratSymbol(s);
-                        const p = feedStatus?.live_prices?.[s]?.price;
-                        if (p !== undefined) setStratPrice(Number(p).toFixed(2));
                       }}
                       style={{
                         width: "100%",
@@ -1023,7 +923,7 @@ export function IndiaTest() {
                         color: "#fff",
                       }}
                     >
-                      {Object.keys(feedStatus?.live_prices || { ITC: 1, SBIN: 1, RELIANCE: 1, INFY: 1, TATAMOTORS: 1 }).map((s) => (
+                    {(feedStatus?.symbols_subscribed || []).map((s) => (
                         <option key={s} value={s}>{s}</option>
                       ))}
                     </select>
@@ -1037,7 +937,7 @@ export function IndiaTest() {
                       type="number"
                       step="0.05"
                       value={stratPrice}
-                      placeholder={feedStatus?.live_prices?.[stratSymbol]?.price !== undefined ? Number(feedStatus.live_prices[stratSymbol].price).toFixed(2) : "480.00"}
+                      placeholder="Price is used for a manual dry run only"
                       onChange={(e) => setStratPrice(e.target.value)}
                       style={{
                         width: "100%",
@@ -1142,137 +1042,29 @@ export function IndiaTest() {
                           color: "#4ade80",
                         }}
                       >
-                        ✓ Order recorded in local Paper Simulator database (Zero live Upstox orders).
+                        ✓ Order recorded in local Paper Simulator database (no live orders).
                       </div>
                     )}
                   </div>
                 )}
               </div>
 
-              {/* Right Column: Upstox Developer App Authorization */}
+              {/* Upstox market-data setup */}
               <div>
                 <h4 style={{ margin: "0 0 10px 0", fontSize: "14px", fontWeight: "700", color: "#f8fafc" }}>
-                  2. Upstox Developer API App Authorization
+                  2. Connect Upstox market data
                 </h4>
                 <p style={{ margin: "0 0 12px 0", fontSize: "12px", color: "#94a3b8" }}>
-                  Authorizes Upstox market data access for WebSocket feeds and live quotes. Orders are strictly routed to the paper simulator.
+                  Configure UPSTOX_API_KEY, UPSTOX_API_SECRET, and UPSTOX_ACCESS_TOKEN in the local .env file, then restart the agent. The token must be current. The continuous strategy only records simulated paper orders.
                 </p>
-
-                <form onSubmit={handleSaveUpstoxAuth}>
-                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px", marginBottom: "8px" }}>
-                    <div>
-                      <label style={{ display: "block", fontSize: "11px", color: "#94a3b8", marginBottom: "2px" }}>
-                        Client ID (API Key)
-                      </label>
-                      <input
-                        type="text"
-                        placeholder="e.g. 524e93fb-..."
-                        value={clientIdInput}
-                        onChange={(e) => setClientIdInput(e.target.value)}
-                        style={{
-                          width: "100%",
-                          padding: "6px 8px",
-                          borderRadius: "4px",
-                          border: "1px solid rgba(255, 255, 255, 0.15)",
-                          background: "#0f172a",
-                          color: "#fff",
-                          fontSize: "11px",
-                        }}
-                      />
-                    </div>
-                    <div>
-                      <label style={{ display: "block", fontSize: "11px", color: "#94a3b8", marginBottom: "2px" }}>
-                        Client Secret
-                      </label>
-                      <input
-                        type="password"
-                        placeholder="Upstox API Secret"
-                        value={clientSecretInput}
-                        onChange={(e) => setClientSecretInput(e.target.value)}
-                        style={{
-                          width: "100%",
-                          padding: "6px 8px",
-                          borderRadius: "4px",
-                          border: "1px solid rgba(255, 255, 255, 0.15)",
-                          background: "#0f172a",
-                          color: "#fff",
-                          fontSize: "11px",
-                        }}
-                      />
-                    </div>
-                  </div>
-
-                  <div style={{ marginBottom: "10px" }}>
-                    <label style={{ display: "block", fontSize: "11px", color: "#94a3b8", marginBottom: "2px" }}>
-                      Direct Access Token (Optional)
-                    </label>
-                    <input
-                      type="password"
-                      placeholder="Paste daily Upstox access token directly..."
-                      value={accessTokenInput}
-                      onChange={(e) => setAccessTokenInput(e.target.value)}
-                      style={{
-                        width: "100%",
-                        padding: "6px 8px",
-                        borderRadius: "4px",
-                        border: "1px solid rgba(255, 255, 255, 0.15)",
-                        background: "#0f172a",
-                        color: "#fff",
-                        fontSize: "11px",
-                      }}
-                    />
-                  </div>
-
-                  <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
-                    <button
-                      type="submit"
-                      disabled={authSaving}
-                      style={{
-                        padding: "6px 12px",
-                        background: "linear-gradient(135deg, #475569 0%, #334155 100%)",
-                        color: "#fff",
-                        border: "none",
-                        borderRadius: "4px",
-                        fontWeight: "600",
-                        fontSize: "11px",
-                        cursor: authSaving ? "not-allowed" : "pointer",
-                      }}
-                    >
-                      {authSaving ? "Saving..." : "Save Credentials"}
-                    </button>
-
-                    {feedStatus?.auth_dialog_url && (
-                      <a
-                        href={feedStatus.auth_dialog_url}
-                        target="_blank"
-                        rel="noreferrer"
-                        style={{
-                          padding: "6px 12px",
-                          background: "linear-gradient(135deg, #8b5cf6 0%, #7c3aed 100%)",
-                          color: "#fff",
-                          textDecoration: "none",
-                          borderRadius: "4px",
-                          fontWeight: "600",
-                          fontSize: "11px",
-                          display: "inline-block",
-                        }}
-                      >
-                        Authorize via Upstox Login ↗
-                      </a>
-                    )}
-                  </div>
-
-                  {authMsg && (
-                    <div style={{ marginTop: "8px", fontSize: "11px", color: authMsg.includes("Error") ? "#f87171" : "#4ade80" }}>
-                      {authMsg}
-                    </div>
-                  )}
-                </form>
+                <Badge tone={feedStatus?.token_configured ? "good" : "warning"}>
+                  {feedStatus?.token_configured ? "Upstox credentials configured" : "Waiting for Upstox authorization"}
+                </Badge>
               </div>
             </div>
           </Card>
 
-          <Card title="Upstox Sandbox Venue Status">
+          <Card title="Indian Market Paper Trading Status">
             <div className="grid grid--tiles">
               <StatTile
                 hero
@@ -1282,8 +1074,8 @@ export function IndiaTest() {
               />
               <StatTile
                 label="Allowed Host"
-                value="api.upstox.com"
-                sub="Strict host allowlist enforced"
+                value="Upstox market data"
+                sub="Paper order execution only"
               />
               <StatTile
                 label="Trading Session"
@@ -1483,7 +1275,7 @@ export function IndiaTest() {
                     <th style={{ padding: "0.5rem" }}>Symbol</th>
                     <th style={{ padding: "0.5rem" }}>Company Name</th>
                     <th style={{ padding: "0.5rem" }}>ISIN</th>
-                    <th style={{ padding: "0.5rem" }}>Upstox Instrument Token</th>
+                    <th style={{ padding: "0.5rem" }}>Provider Instrument ID</th>
                     <th style={{ padding: "0.5rem" }}>Tick Size</th>
                     <th style={{ padding: "0.5rem" }}>Lot Size</th>
                     <th style={{ padding: "0.5rem" }}>Fractional?</th>
@@ -1495,7 +1287,7 @@ export function IndiaTest() {
                       <td style={{ padding: "0.5rem", fontWeight: 600 }}>{inst.symbol}</td>
                       <td style={{ padding: "0.5rem" }}>{inst.name}</td>
                       <td style={{ padding: "0.5rem", fontFamily: "monospace", fontSize: "0.8rem" }}>{inst.isin}</td>
-                      <td style={{ padding: "0.5rem", fontFamily: "monospace", fontSize: "0.8rem" }}>{inst.upstox_token}</td>
+                      <td style={{ padding: "0.5rem", fontFamily: "monospace", fontSize: "0.8rem" }}>{inst.provider_instrument_id || "—"}</td>
                       <td style={{ padding: "0.5rem" }}>₹{inst.tick_size}</td>
                       <td style={{ padding: "0.5rem" }}>{inst.lot_size} share</td>
                       <td style={{ padding: "0.5rem" }}>

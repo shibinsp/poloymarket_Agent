@@ -36,10 +36,10 @@ if "%1"=="dryrun" goto run_dry_run
 
 :menu
 echo Select operation mode:
-echo   [1] Paper Trading Mode (Interactive Terminal - Foreground)
-echo   [2] Run in Background (Silent / Detached - keeps running when you close window)
-echo   [3] Stop Background Agent
-echo   [4] Check Status & Open Web Dashboard (http://127.0.0.1:8088)
+echo   [1] Paper Trading Mode (Interactive Foreground - Remote Hosting ON)
+echo   [2] Run in Background (Silent / Detached - Remote Hosting ON)
+echo   [3] Stop Background Agent & Remote Tunnel
+echo   [4] Check Status & Open Web Dashboard (Local + Remote Links)
 echo   [5] Show Profit & Performance Report (Track Earnings)
 echo   [6] Setup Auto-Start on Windows Login (Runs automatically offline/on boot)
 echo   [7] Remove Auto-Start from Windows
@@ -70,14 +70,36 @@ goto run_paper
 :run_paper
 echo.
 echo =======================================================
-echo  Starting Agent in PAPER TRADING MODE (Foreground)
-echo  Dashboard: http://127.0.0.1:8088
+echo  Starting Cloudflare Remote Hosting Tunnel...
 echo =======================================================
+call python scratch\manage_tunnel.py start
+
+set "PUBLIC_URL="
+if exist "public_url.txt" set /p PUBLIC_URL=<public_url.txt
+
+echo.
+echo =======================================================
+echo  Starting Agent in PAPER TRADING MODE (Foreground)
+echo  Local Dashboard  : http://127.0.0.1:8088
+if defined PUBLIC_URL (
+echo  Remote Dashboard : !PUBLIC_URL!
+echo  (Phone / External Access: Open this link anywhere!)
+)
+echo =======================================================
+echo.
+
+:: Open local dashboard in browser
+start "" cmd /c "timeout /t 5 /nobreak >nul && start http://127.0.0.1:8088"
+
 if exist "target\release\polymarket-agent.exe" (
     target\release\polymarket-agent.exe --mode paper
 ) else (
     cargo run --release -- --mode paper
 )
+
+echo.
+echo Stopping remote tunnel...
+call python scratch\manage_tunnel.py stop
 goto end
 
 :run_background
@@ -88,33 +110,51 @@ echo =======================================================
 tasklist /FI "IMAGENAME eq polymarket-agent.exe" 2>nul | find /I "polymarket-agent.exe" >nul
 if not errorlevel 1 (
     echo [INFO] Polymarket Agent is ALREADY running in the background!
-    echo [INFO] Dashboard: http://127.0.0.1:8088
-    goto end
+    goto show_bg_urls
 )
+
 cscript //nologo "%~dp0run_background.vbs"
-timeout /t 2 /nobreak >nul
+timeout /t 4 /nobreak >nul
+
 tasklist /FI "IMAGENAME eq polymarket-agent.exe" 2>nul | find /I "polymarket-agent.exe" >nul
 if not errorlevel 1 (
     echo [SUCCESS] Agent is now running in the background!
     echo [INFO] It will keep running even if you close this window.
     echo [INFO] Output log: %~dp0polymarket-agent\agent.log
-    echo [INFO] Dashboard: http://127.0.0.1:8088
+    goto show_bg_urls
 ) else (
     echo [ERROR] Agent failed to start. Check polymarket-agent\agent.log
+    goto end
 )
+
+:show_bg_urls
+tasklist /FI "IMAGENAME eq cloudflared.exe" 2>nul | find /I "cloudflared.exe" >nul
+if errorlevel 1 (
+    echo Starting Cloudflare remote hosting tunnel...
+    python scratch\manage_tunnel.py start --quiet
+)
+
+set "PUBLIC_URL="
+if exist "public_url.txt" (
+    set /p PUBLIC_URL=<public_url.txt
+) else if exist "%~dp0public_url.txt" (
+    set /p PUBLIC_URL=<%~dp0public_url.txt
+)
+
+echo.
+echo =======================================================
+echo  Web Dashboard Links:
+echo  Local Dashboard  : http://127.0.0.1:8088
+if defined PUBLIC_URL (
+echo  Remote Dashboard : !PUBLIC_URL!
+echo  (Access from your phone or any external browser)
+)
+echo =======================================================
 goto end
 
 :stop_background
 echo.
-echo =======================================================
-echo  Stopping Background Agent
-echo =======================================================
-taskkill /F /IM polymarket-agent.exe 2>nul
-if not errorlevel 1 (
-    echo [SUCCESS] Background agent stopped.
-) else (
-    echo [INFO] No running agent process found.
-)
+call "%~dp0stop_background.bat"
 goto end
 
 :check_status
@@ -128,6 +168,29 @@ if not errorlevel 1 (
 ) else (
     echo [STATUS] Polymarket Agent process is NOT currently running.
 )
+
+tasklist /FI "IMAGENAME eq cloudflared.exe" 2>nul | find /I "cloudflared.exe" >nul
+if not errorlevel 1 (
+    echo [STATUS] Cloudflare Remote Tunnel is RUNNING.
+) else (
+    echo [STATUS] Cloudflare Remote Tunnel is NOT running.
+    echo [ACTION] Starting remote hosting tunnel...
+    python scratch\manage_tunnel.py start --quiet
+)
+
+set "PUBLIC_URL="
+if exist "public_url.txt" (
+    set /p PUBLIC_URL=<public_url.txt
+) else if exist "%~dp0public_url.txt" (
+    set /p PUBLIC_URL=<%~dp0public_url.txt
+)
+
+echo.
+echo Local Dashboard  : http://127.0.0.1:8088
+if defined PUBLIC_URL (
+echo Remote Dashboard : !PUBLIC_URL!
+)
+echo.
 echo Opening Web Dashboard in browser: http://127.0.0.1:8088
 start http://127.0.0.1:8088
 goto end
@@ -173,11 +236,13 @@ if /i not "%confirm%"=="y" (
     echo Live trading cancelled.
     goto menu
 )
+call python scratch\manage_tunnel.py start
 if exist "target\release\polymarket-agent.exe" (
     target\release\polymarket-agent.exe --mode live
 ) else (
     cargo run --release -- --mode live
 )
+call python scratch\manage_tunnel.py stop
 goto end
 
 :exit_app

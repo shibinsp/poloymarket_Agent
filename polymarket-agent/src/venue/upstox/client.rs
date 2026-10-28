@@ -6,7 +6,8 @@
 //! 3. High-fidelity in-memory mock sandbox fallback when credentials are not configured.
 
 use anyhow::{bail, Context, Result};
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+use chrono::Utc;
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use secrecy::{ExposeSecret, SecretString};
@@ -16,6 +17,7 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use crate::india::instruments::find_nse_instrument;
+use crate::venue::types::Candle;
 use crate::venue::upstox::types::*;
 
 pub const UPSTOX_API_BASE: &str = "https://api.upstox.com/v2";
@@ -74,6 +76,7 @@ impl UpstoxSandboxClient {
 
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
             .build()
             .context("Failed to build HTTP client for Upstox")?;
 
@@ -88,6 +91,94 @@ impl UpstoxSandboxClient {
     /// True if running in simulated in-memory mock mode.
     pub fn is_mock(&self) -> bool {
         self.is_mock
+    }
+
+    /// Fetch real live intraday candles directly from Upstox API v2.
+    pub async fn fetch_intraday_candles(&self, instrument_key: &str) -> Result<Vec<Candle>> {
+        let Some(ref token) = self.token else {
+            bail!("No Upstox token configured for intraday candle polling");
+        };
+
+        let encoded_key = urlencoding::encode(instrument_key);
+        let url = format!("{UPSTOX_API_BASE}/historical-candle/intraday/{encoded_key}/30minute");
+        self.validate_url(&url)?;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", token.expose_secret()))?,
+        );
+        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+
+        let resp = self
+            .http
+            .get(&url)
+            .headers(headers)
+            .send()
+            .await
+            .context("Network error fetching Upstox intraday candles")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let txt = resp.text().await.unwrap_or_default();
+            bail!("Upstox candles request failed {status}: {txt}");
+        }
+
+        let body: serde_json::Value = resp.json().await?;
+        let candle_rows = body
+            .get("data")
+            .and_then(|d| d.get("candles"))
+            .and_then(|c| c.as_array())
+            .context("Invalid candles response structure from Upstox API")?;
+
+        let mut candles = Vec::new();
+        for row in candle_rows.iter().rev() {
+            if let Some(arr) = row.as_array() {
+                if arr.len() >= 6 {
+                    let ts_str = arr[0].as_str().unwrap_or_default();
+                    let ts = chrono::DateTime::parse_from_rfc3339(ts_str)
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .unwrap_or_else(|_| Utc::now());
+                    let open = arr[1]
+                        .as_f64()
+                        .and_then(Decimal::from_f64_retain)
+                        .unwrap_or(Decimal::ZERO);
+                    let high = arr[2]
+                        .as_f64()
+                        .and_then(Decimal::from_f64_retain)
+                        .unwrap_or(Decimal::ZERO);
+                    let low = arr[3]
+                        .as_f64()
+                        .and_then(Decimal::from_f64_retain)
+                        .unwrap_or(Decimal::ZERO);
+                    let close = arr[4]
+                        .as_f64()
+                        .and_then(Decimal::from_f64_retain)
+                        .unwrap_or(Decimal::ZERO);
+                    let volume = arr[5]
+                        .as_f64()
+                        .and_then(Decimal::from_f64_retain)
+                        .unwrap_or(Decimal::ZERO);
+
+                    if close > Decimal::ZERO {
+                        candles.push(Candle {
+                            ts,
+                            open,
+                            high,
+                            low,
+                            close,
+                            volume,
+                        });
+                    }
+                }
+            }
+        }
+
+        if candles.is_empty() {
+            bail!("No valid candles parsed from Upstox response");
+        }
+
+        Ok(candles)
     }
 
     /// Enforce sandbox URL and host allowlist check.
@@ -114,13 +205,13 @@ impl UpstoxSandboxClient {
 
         // All order routing is permanently isolated to the local paper simulator
         let mut state = self.mock_state.write().await;
-        Ok(Self::execute_mock_order_internal(&mut state, req))
+        Self::execute_mock_order_internal(&mut state, req)
     }
 
     fn execute_mock_order_internal(
         state: &mut MockSandboxState,
         req: &UpstoxOrderRequestPayload,
-    ) -> String {
+    ) -> Result<String> {
         let order_id = format!("UPSTOX-SBX-{}", uuid::Uuid::new_v4().simple());
 
         let symbol = find_nse_instrument(&req.instrument_token)
@@ -134,25 +225,15 @@ impl UpstoxSandboxClient {
             req.price
         };
 
-        let order_record = UpstoxOrderRecord {
-            order_id: order_id.clone(),
-            exchange: Some("NSE".to_string()),
-            trading_symbol: Some(symbol.clone()),
-            instrument_token: Some(req.instrument_token.clone()),
-            status: "complete".to_string(),
-            quantity: req.quantity,
-            filled_quantity: Some(req.quantity),
-            price: Some(req.price),
-            average_price: Some(fill_price),
-            order_timestamp: Some(chrono::Utc::now().to_rfc3339()),
-            status_message: Some("Executed in Upstox Mock Sandbox".to_string()),
-            tag: req.tag.clone(),
-        };
-
-        state.orders.insert(order_id.clone(), order_record);
-
         let notional = fill_price * Decimal::from(req.quantity);
         if req.transaction_type == "BUY" {
+            if notional > state.cash {
+                bail!(
+                    "Order rejected: cost ₹{:.2} exceeds available INR cash ₹{:.2} (strictly isolated ₹1,000 India allocation)",
+                    notional,
+                    state.cash
+                );
+            }
             state.cash -= notional;
             let pos =
                 state
@@ -181,14 +262,32 @@ impl UpstoxSandboxClient {
             }
         }
 
+        let order_record = UpstoxOrderRecord {
+            order_id: order_id.clone(),
+            exchange: Some("NSE".to_string()),
+            trading_symbol: Some(symbol.clone()),
+            instrument_token: Some(req.instrument_token.clone()),
+            status: "complete".to_string(),
+            quantity: req.quantity,
+            filled_quantity: Some(req.quantity),
+            price: Some(req.price),
+            average_price: Some(fill_price),
+            order_timestamp: Some(chrono::Utc::now().to_rfc3339()),
+            status_message: Some("Executed in Upstox Mock Sandbox".to_string()),
+            tag: req.tag.clone(),
+        };
+
+        state.orders.insert(order_id.clone(), order_record);
+
         info!(
             order_id = %order_id,
             symbol = %symbol,
             qty = req.quantity,
             price = %fill_price,
+            remaining_cash = %state.cash,
             "Placed order in Upstox Mock Sandbox"
         );
-        order_id
+        Ok(order_id)
     }
 
     /// Retrieve order details.
@@ -226,41 +325,8 @@ impl UpstoxSandboxClient {
     }
 
     /// Get current sandbox positions.
+    /// Strictly isolated to the local simulated paper portfolio.
     pub async fn get_positions(&self) -> Result<Vec<UpstoxPositionRecord>> {
-        if self.is_mock {
-            let state = self.mock_state.read().await;
-            return Ok(state
-                .positions
-                .values()
-                .filter(|p| p.quantity > 0)
-                .cloned()
-                .collect());
-        }
-
-        let url = format!("{UPSTOX_API_BASE}/portfolio/short-term-positions");
-        self.validate_url(&url)?;
-
-        let mut headers = HeaderMap::new();
-        if let Some(ref t) = self.token {
-            headers.insert(
-                AUTHORIZATION,
-                HeaderValue::from_str(&format!("Bearer {}", t.expose_secret()))?,
-            );
-        }
-
-        if let Ok(resp) = self.http.get(&url).headers(headers).send().await {
-            if let Ok(body) = resp
-                .json::<UpstoxApiResponse<Vec<UpstoxPositionRecord>>>()
-                .await
-            {
-                if let Some(data) = body.data {
-                    if !data.is_empty() {
-                        return Ok(data);
-                    }
-                }
-            }
-        }
-
         let state = self.mock_state.read().await;
         Ok(state
             .positions
@@ -271,41 +337,10 @@ impl UpstoxSandboxClient {
     }
 
     /// Get current sandbox funds and available margin in INR.
+    /// Strictly isolated to the user's allocated virtual budget (₹1,000 max).
     pub async fn get_funds(&self) -> Result<Decimal> {
-        if self.is_mock {
-            let state = self.mock_state.read().await;
-            return Ok(state.cash);
-        }
-
-        let url = format!("{UPSTOX_API_BASE}/user/get-funds-and-margin");
-        self.validate_url(&url)?;
-
-        let mut headers = HeaderMap::new();
-        if let Some(ref t) = self.token {
-            headers.insert(
-                AUTHORIZATION,
-                HeaderValue::from_str(&format!("Bearer {}", t.expose_secret()))?,
-            );
-        }
-
-        let resp = self.http.get(&url).headers(headers).send().await?;
-        let body: UpstoxApiResponse<UpstoxFundsData> = resp.json().await?;
-        if let Some(ref errs) = body.errors {
-            if let Some(e) = errs.first() {
-                tracing::debug!("Upstox funds API message: {}", e.message);
-            }
-        }
-        let avail = body
-            .data
-            .and_then(|d| d.equity)
-            .map(|e| e.available_margin)
-            .unwrap_or(Decimal::ZERO);
-        if avail <= Decimal::ZERO {
-            // When Upstox live token is invalid/expired or returns 0, fall back to sandbox virtual margin (₹1,00,000)
-            let state = self.mock_state.read().await;
-            return Ok(state.cash);
-        }
-        Ok(avail)
+        let state = self.mock_state.read().await;
+        Ok(state.cash.min(dec!(1000.0)))
     }
 
     /// Get live or simulated quote for an instrument key.

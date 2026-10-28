@@ -341,7 +341,7 @@ impl TradingSession {
     }
 
     /// Check if intraday square-off exit is due at the given time.
-    /// Returns true if the session is closed, or if regular session will close within `square_off_minutes`.
+    /// Returns true ONLY if regular session is open and will close within `square_off_minutes`.
     pub fn is_intraday_exit_due(&self, at: DateTime<Utc>, square_off_minutes: i64) -> bool {
         match self.state_at(at) {
             SessionState::Open(SessionKind::Regular) => {
@@ -351,7 +351,7 @@ impl TradingSession {
                     false
                 }
             }
-            _ => true,
+            _ => false,
         }
     }
 
