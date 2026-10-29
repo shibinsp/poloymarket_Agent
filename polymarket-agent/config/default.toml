@@ -44,7 +44,7 @@ max_total_exposure_pct = 1.0         # Full exposure cap for micro-capital tradi
 max_positions_per_category = 3
 min_position_usd = 1.0
 india_capital_allocation_inr = 1000.0     # INR: ₹1,000 isolated paper/sandbox allocation
-us_capital_allocation_usd = 5.0          # USD: strictly $5.00 initial capital for US equities
+us_capital_allocation_usd = 20.0         # USD: strictly $20.00 initial capital for US equities
 
 
 # --- Circuit breakers -------------------------------------------------------

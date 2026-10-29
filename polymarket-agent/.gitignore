@@ -20,3 +20,4 @@ stderr.txt
 # Scratch test files (keep only check_profit.py)
 scratch/*
 !scratch/check_profit.py
+run_paper/
