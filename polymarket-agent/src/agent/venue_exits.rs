@@ -31,6 +31,7 @@ pub enum ExitReason {
     MaxHold,
     SessionClose,
     EmergencyStop,
+    SmaDeathCross,
 }
 
 impl ExitReason {
@@ -41,6 +42,7 @@ impl ExitReason {
             ExitReason::MaxHold => "MAX_HOLD",
             ExitReason::SessionClose => "SESSION_CLOSE",
             ExitReason::EmergencyStop => "EMERGENCY_STOP",
+            ExitReason::SmaDeathCross => "SMA_DEATH_CROSS",
         }
     }
 }
@@ -53,11 +55,12 @@ pub struct ExitRules {
     pub max_hold_until: Option<DateTime<Utc>>,
     pub session_close_due: bool,
     pub emergency_stop: bool,
+    pub sma_exit_due: bool,
 }
 
 /// Decide whether an open long should be closed at the current mark.
 ///
-/// Emergency stop and session close take precedence over price boundaries.
+/// Emergency stop, SMA death cross and session close take precedence over price boundaries.
 /// Stop is checked before target: if a bar straddles both, assuming the good
 /// outcome would flatter every backtest and every logged P&L.
 pub fn evaluate_exit(
@@ -67,6 +70,9 @@ pub fn evaluate_exit(
 ) -> Option<ExitReason> {
     if rules.emergency_stop {
         return Some(ExitReason::EmergencyStop);
+    }
+    if rules.sma_exit_due {
+        return Some(ExitReason::SmaDeathCross);
     }
     if rules.session_close_due {
         return Some(ExitReason::SessionClose);
@@ -105,6 +111,8 @@ pub struct VenueExits<'a> {
     pub order_ttl_seconds: i64,
     /// Account-wide emergency stop flag.
     pub emergency_stop: bool,
+    /// Optional US strategy config for SMA crossover exits.
+    pub us_strategy: Option<&'a crate::config::UsStrategyConfig>,
 }
 
 impl VenueExits<'_> {
@@ -212,6 +220,44 @@ impl VenueExits<'_> {
 
         let is_equity = trade.asset_class.eq_ignore_ascii_case("equity");
         let session_close_due = is_equity && venue.session().is_intraday_exit_due(now, 15);
+        let is_us_alpaca_equity = is_equity && trade.venue_id.eq_ignore_ascii_case("alpaca");
+
+        let sma_exit_due = if is_us_alpaca_equity
+            && self
+                .us_strategy
+                .map(|s| s.strategy.eq_ignore_ascii_case("sma_crossover"))
+                .unwrap_or(false)
+        {
+            if let Ok(daily_bars) = venue
+                .candles(&instrument_id, crate::venue::types::CandleInterval::D1, 65)
+                .await
+            {
+                let completed: Vec<crate::venue::types::Candle> = daily_bars
+                    .into_iter()
+                    .filter(|c| c.ts + Duration::hours(24) <= now)
+                    .collect();
+                if completed.len() >= 51 {
+                    let closes: Vec<Decimal> = completed.iter().map(|c| c.close).collect();
+                    let n = closes.len();
+                    if let (Some(fast_curr), Some(slow_curr), Some(fast_prev), Some(slow_prev)) = (
+                        crate::us::sma_crossover::calculate_sma(&closes[..n], 20),
+                        crate::us::sma_crossover::calculate_sma(&closes[..n], 50),
+                        crate::us::sma_crossover::calculate_sma(&closes[..n - 1], 20),
+                        crate::us::sma_crossover::calculate_sma(&closes[..n - 1], 50),
+                    ) {
+                        fast_prev >= slow_prev && fast_curr < slow_curr
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
 
         let rules = ExitRules {
             stop_price: trade.stop_price,
@@ -221,6 +267,7 @@ impl VenueExits<'_> {
                 .map(|opened| opened + Duration::hours(self.max_hold_hours)),
             session_close_due,
             emergency_stop: self.emergency_stop,
+            sma_exit_due,
         };
 
         let Some(reason) = evaluate_exit(mark, now, &rules) else {
@@ -590,6 +637,7 @@ mod tests {
             max_hold_hours: 72,
             order_ttl_seconds: 300,
             emergency_stop: false,
+            us_strategy: None,
         };
         exits.run(Utc::now(), 1).await.expect("first pass");
         let after_first = store.get_unresolved_orders().await.unwrap().len();
@@ -618,6 +666,7 @@ mod tests {
             max_hold_hours: 72,
             order_ttl_seconds: 300,
             emergency_stop: false,
+            us_strategy: None,
         };
         exits.run(Utc::now(), 1).await.expect("pass");
 
@@ -693,6 +742,7 @@ mod tests {
             max_hold_until: deadline,
             session_close_due: false,
             emergency_stop: false,
+            sma_exit_due: false,
         }
     }
 

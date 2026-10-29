@@ -344,6 +344,7 @@ fn config(alpaca: &MockServer, model: &MockServer, poly: &MockServer, db: &str) 
             symbols: vec!["BTC/USD".to_string()],
             fee_pct: dec!(0.0025),
         }],
+        us_strategy: polymarket_agent::config::UsStrategyConfig::default(),
     }
 }
 

@@ -197,3 +197,101 @@ fn test_us_backtest_simulation_with_zero_lookahead() {
         results.winning_trades + results.losing_trades
     );
 }
+
+#[test]
+fn test_us_sma_crossover_strategy_golden_cross_and_exit_signals() {
+    use chrono::{Duration, TimeZone, Utc};
+    use polymarket_agent::us::sma_crossover::{
+        evaluate_sma_crossover, SmaCrossoverConfig, SmaSignalAction,
+    };
+    use polymarket_agent::venue::types::{
+        Candle, Instrument, InstrumentId, InstrumentMeta, VenueId,
+    };
+
+    let instrument = Instrument {
+        id: InstrumentId::new(VenueId::new("alpaca"), "SPY"),
+        asset_class: polymarket_agent::venue::types::AssetClass::Equity,
+        display_name: "SPDR S&P 500 ETF Trust".to_string(),
+        quote_ccy: "USD".to_string(),
+        tick_size: Some(dec!(0.01)),
+        lot_size: Some(dec!(1.0)),
+        min_notional: Some(dec!(1.0)),
+        min_qty: Some(dec!(0.001)),
+        fractional: true,
+        meta: InstrumentMeta::Equity {
+            exchange: "NYSE".to_string(),
+        },
+    };
+
+    let base_time = Utc.with_ymd_and_hms(2024, 1, 1, 16, 0, 0).unwrap();
+    let mut candles = Vec::new();
+    for i in 0..55 {
+        let close = if i < 54 { dec!(100.0) } else { dec!(150.0) };
+        candles.push(Candle {
+            ts: base_time + Duration::days(i as i64),
+            open: close - dec!(0.50),
+            high: close + dec!(1.00),
+            low: close - dec!(1.00),
+            close,
+            volume: dec!(1000000),
+        });
+    }
+
+    let config = SmaCrossoverConfig::default();
+    let now = candles.last().unwrap().ts + Duration::hours(2);
+
+    // 1. Golden Cross
+    let signal = evaluate_sma_crossover(&instrument, &candles, now, &config)
+        .expect("evaluation should succeed");
+    assert_eq!(signal.action, SmaSignalAction::LongEntry);
+    assert_eq!(signal.moving_average_type, "SMA");
+    assert_eq!(signal.fast_sma_previous, dec!(100.0));
+    assert_eq!(signal.slow_sma_previous, dec!(100.0));
+    assert!(signal.fast_sma_current > signal.slow_sma_current);
+
+    // 2. Death Cross
+    let mut death_candles = Vec::new();
+    for i in 0..55 {
+        let close = if i < 54 { dec!(100.0) } else { dec!(50.0) };
+        death_candles.push(Candle {
+            ts: base_time + Duration::days(i as i64),
+            open: close - dec!(0.50),
+            high: close + dec!(1.00),
+            low: close - dec!(1.00),
+            close,
+            volume: dec!(1000000),
+        });
+    }
+    let death_signal = evaluate_sma_crossover(&instrument, &death_candles, now, &config)
+        .expect("evaluation should succeed");
+    assert_eq!(death_signal.action, SmaSignalAction::Exit);
+    assert!(death_signal.fast_sma_current < death_signal.slow_sma_current);
+}
+
+#[test]
+fn test_us_sma_crossover_backtest_with_buy_and_hold_baseline() {
+    use polymarket_agent::us::backtest::parse_and_validate_us_csv;
+    use polymarket_agent::us::sma_crossover::run_us_sma_crossover_backtest;
+
+    let csv_content = std::fs::read_to_string("data/us_daily_sample_data.csv")
+        .expect("data/us_daily_sample_data.csv must exist");
+    let candles = parse_and_validate_us_csv(&csv_content).expect("daily CSV must parse cleanly");
+
+    assert!(candles.len() >= 80, "Expected at least 80 daily candles");
+
+    let config = UsBacktestConfig::default();
+    let results = run_us_sma_crossover_backtest(&candles, &config)
+        .expect("SMA crossover backtest should succeed");
+
+    assert_eq!(results.initial_capital, dec!(100000.0));
+    assert!(results.final_equity > Decimal::ZERO);
+    assert_eq!(
+        results.total_trades,
+        results.winning_trades + results.losing_trades
+    );
+    assert!(results.equity_curve.len() >= 80);
+    // Benchmark baseline must be calculated over the same dates
+    assert_ne!(results.benchmark_return_pct, Decimal::ZERO);
+    // Statutory and regulatory costs tracked
+    assert!(results.total_costs >= Decimal::ZERO);
+}

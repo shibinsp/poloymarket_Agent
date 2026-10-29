@@ -740,6 +740,7 @@ impl Agent {
                 max_hold_hours: self.config.exits_continuous.max_hold_hours,
                 order_ttl_seconds: self.config.execution.order_ttl_seconds as i64,
                 emergency_stop: self.config.risk.emergency_stop,
+                us_strategy: Some(&self.config.us_strategy),
             };
             match exits
                 .run(chrono::Utc::now(), self.cycle_number as i64)

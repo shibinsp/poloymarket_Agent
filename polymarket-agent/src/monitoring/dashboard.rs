@@ -1701,6 +1701,7 @@ pub struct UsBacktestRunRequest {
     pub risk_pct_per_trade: Option<Decimal>,
     pub stop_loss_pct: Option<Decimal>,
     pub take_profit_pct: Option<Decimal>,
+    pub strategy: Option<String>,
 }
 
 async fn us_backtest_run_handler(
@@ -1709,10 +1710,18 @@ async fn us_backtest_run_handler(
 ) -> impl IntoResponse {
     use crate::us::backtest::{parse_and_validate_us_csv, run_us_backtest, UsBacktestConfig};
 
+    let strategy_choice = req.strategy.as_deref().unwrap_or("sma_crossover");
+
+    let default_csv = if strategy_choice.eq_ignore_ascii_case("sma_crossover") {
+        "data/us_daily_sample_data.csv"
+    } else {
+        "data/us_sample_data.csv"
+    };
+
     let content_res = if let Some(content) = req.csv_content {
         Ok(content)
     } else {
-        let path = req.csv_path.as_deref().unwrap_or("data/us_sample_data.csv");
+        let path = req.csv_path.as_deref().unwrap_or(default_csv);
         std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("Failed to read CSV at {path}: {e}"))
     };
@@ -1760,14 +1769,29 @@ async fn us_backtest_run_handler(
         )
     });
 
-    let result = match run_us_backtest(&candles, &config) {
-        Ok(r) => r,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": format!("Backtest execution failed: {e:#}") })),
-            )
-                .into_response();
+    let result = if strategy_choice.eq_ignore_ascii_case("sma_crossover") {
+        match crate::us::sma_crossover::run_us_sma_crossover_backtest(&candles, &config) {
+            Ok(r) => r,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": format!("SMA Crossover backtest failed: {e:#}") })),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        match run_us_backtest(&candles, &config) {
+            Ok(r) => r,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(
+                        serde_json::json!({ "error": format!("Backtest execution failed: {e:#}") }),
+                    ),
+                )
+                    .into_response();
+            }
         }
     };
 

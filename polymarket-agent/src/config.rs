@@ -26,6 +26,9 @@ pub struct AppConfig {
     /// Trading venues. Empty keeps the legacy Polymarket-only behaviour.
     #[serde(default)]
     pub venues: Vec<VenueConfig>,
+    /// Selectable US equity strategy configuration.
+    #[serde(default)]
+    pub us_strategy: UsStrategyConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -792,8 +795,7 @@ impl AppConfig {
 
         if self.requires_valuation_key() && secrets.llm_api_key.is_none() {
             issues.push(
-                "LLM_API_KEY or ANTHROPIC_API_KEY is required for paper/live trading"
-                    .to_string(),
+                "LLM_API_KEY or ANTHROPIC_API_KEY is required for paper/live trading".to_string(),
             );
         }
 
@@ -1545,4 +1547,48 @@ mod tests {
         };
         assert_eq!(db.url(), "sqlite:test.db");
     }
+}
+
+/// Configuration for selectable U.S. stock strategies.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct UsStrategyConfig {
+    /// Strategy mode: "sma_crossover" | "momentum_pullback"
+    #[serde(default = "default_us_strategy")]
+    pub strategy: String,
+    /// Fast SMA period in days (default: 20).
+    #[serde(default = "default_fast_sma")]
+    pub fast_sma_period: usize,
+    /// Slow SMA period in days (default: 50).
+    #[serde(default = "default_slow_sma")]
+    pub slow_sma_period: usize,
+    /// Moving average calculation method. Strictly "SMA" (Simple Moving Average), not EMA.
+    #[serde(default = "default_moving_average_type")]
+    pub moving_average_type: String,
+}
+
+impl Default for UsStrategyConfig {
+    fn default() -> Self {
+        Self {
+            strategy: default_us_strategy(),
+            fast_sma_period: default_fast_sma(),
+            slow_sma_period: default_slow_sma(),
+            moving_average_type: default_moving_average_type(),
+        }
+    }
+}
+
+fn default_us_strategy() -> String {
+    "sma_crossover".to_string()
+}
+
+fn default_fast_sma() -> usize {
+    20
+}
+
+fn default_slow_sma() -> usize {
+    50
+}
+
+fn default_moving_average_type() -> String {
+    "SMA".to_string()
 }

@@ -168,6 +168,10 @@ impl VenueCycle<'_> {
         // via PortfolioManager since the beginning.
         let mut balances: HashMap<String, Option<Decimal>> = HashMap::new();
         let all_open_trades = self.store.get_open_venue_trades().await?;
+        let open_symbols: HashSet<String> = all_open_trades
+            .iter()
+            .map(|t| format!("{}:{}", t.venue_id, t.symbol))
+            .collect();
         let mut venue_notional: HashMap<String, Decimal> = HashMap::new();
         let mut venue_positions: HashMap<String, usize> = HashMap::new();
         for trade in &all_open_trades {
@@ -213,6 +217,13 @@ impl VenueCycle<'_> {
             }
             if busy.contains(&instrument.id.key()) {
                 outcome.skipped_unresolved += 1;
+                continue;
+            }
+            if open_symbols.contains(&instrument.id.key()) {
+                info!(
+                    instrument = %instrument.id,
+                    "Position already open for this instrument — skipping duplicate entry"
+                );
                 continue;
             }
 
@@ -350,32 +361,72 @@ impl VenueCycle<'_> {
     ) -> Result<EvaluationResult> {
         let quote = venue.quote(&instrument.id).await?;
 
-        // Enough bars for the ATR window plus its seed bar.
-        let wanted = self.config.sizing_continuous.atr_period + 1;
-        let candles = venue
-            .candles(&instrument.id, CandleInterval::H1, wanted.max(50))
-            .await
-            .unwrap_or_default();
-
         let is_us_equity = instrument.asset_class == AssetClass::Equity
             && instrument.quote_ccy.eq_ignore_ascii_case("USD")
             && instrument.venue().as_str() == "alpaca";
         let use_us_paper_strategy = is_us_equity && self.config.agent.mode == AgentMode::Paper;
+        let is_sma_crossover = self
+            .config
+            .us_strategy
+            .strategy
+            .eq_ignore_ascii_case("sma_crossover");
+
+        let candles = if use_us_paper_strategy && is_sma_crossover {
+            // Daily candles for 20-day / 50-day SMA crossover (need >= 51 completed daily bars)
+            venue
+                .candles(&instrument.id, CandleInterval::D1, 65)
+                .await
+                .unwrap_or_default()
+        } else {
+            // Enough bars for the ATR window plus its seed bar.
+            let wanted = self.config.sizing_continuous.atr_period + 1;
+            venue
+                .candles(&instrument.id, CandleInterval::H1, wanted.max(50))
+                .await
+                .unwrap_or_default()
+        };
 
         // US equities use an explicit, auditable technical rule set in paper
         // mode. The former generic LLM view repeatedly selected thin, low-
         // priced names and its short paper record is not enough to establish
         // an edge. Keep this candidate paper-only while it gathers evidence.
         let (view, cost) = if use_us_paper_strategy {
-            let completed_candles: Vec<Candle> = candles
-                .iter()
-                .filter(|candle| candle.ts + Duration::hours(1) <= ctx.now)
-                .cloned()
-                .collect();
-            (
-                generate_us_momentum_view(instrument, &quote, &completed_candles),
-                Decimal::ZERO,
-            )
+            if is_sma_crossover {
+                let completed_daily: Vec<Candle> = candles
+                    .iter()
+                    .filter(|candle| candle.ts + Duration::hours(24) <= ctx.now)
+                    .cloned()
+                    .collect();
+
+                let sma_cfg = crate::us::sma_crossover::SmaCrossoverConfig {
+                    fast_sma_period: self.config.us_strategy.fast_sma_period,
+                    slow_sma_period: self.config.us_strategy.slow_sma_period,
+                    moving_average_type: self.config.us_strategy.moving_average_type.clone(),
+                    min_history_bars: crate::us::sma_crossover::MINIMUM_REQUIRED_DAILY_BARS,
+                    max_stale_days: crate::us::sma_crossover::MAX_PERMISSIBLE_STALE_DAYS,
+                };
+
+                (
+                    crate::us::sma_crossover::generate_sma_crossover_view(
+                        instrument,
+                        &quote,
+                        &completed_daily,
+                        ctx.now,
+                        &sma_cfg,
+                    ),
+                    Decimal::ZERO,
+                )
+            } else {
+                let completed_candles: Vec<Candle> = candles
+                    .iter()
+                    .filter(|candle| candle.ts + Duration::hours(1) <= ctx.now)
+                    .cloned()
+                    .collect();
+                (
+                    generate_us_momentum_view(instrument, &quote, &completed_candles),
+                    Decimal::ZERO,
+                )
+            }
         } else if let Some(llm) = llm {
             let system = build_system_prompt();
             let user = build_user_prompt(instrument, &quote, &candles, &[]);
@@ -870,13 +921,13 @@ impl VenueCycle<'_> {
 /// 1. Excludes sub-dollar microcaps (< $1.00) and excessive spreads while permitting
 ///    active, liquid growth equities (e.g. SOFI, NOK, PLUG, LCID, NIO).
 /// 2. Accepts TWO high-expectancy setups:
-///    a) Confirmed Resistance Breakout: Bullish trend (Fast SMA > Slow SMA), price
-///       breaking above prior 10-bar resistance with confirming volume (>= 1.0x avg)
-///       and healthy RSI (45-72).
-///    b) Pullback Rebound (Mean Reversion in Trend): Strong established uptrend
-///       (Fast SMA >= Slow SMA, Close > Slow SMA), price pulling back near Fast SMA
-///       (within 2%), green reversal candle (close >= open), RSI in sweet spot (40-68),
-///       and steady volume.
+///    - Confirmed Resistance Breakout: Bullish trend (Fast SMA > Slow SMA), price
+///      breaking above prior 10-bar resistance with confirming volume (>= 1.0x avg)
+///      and healthy RSI (45-72).
+///    - Pullback Rebound (Mean Reversion in Trend): Strong established uptrend
+///      (Fast SMA >= Slow SMA, Close > Slow SMA), price pulling back near Fast SMA
+///      (within 2%), green reversal candle (close >= open), RSI in sweet spot (40-68),
+///      and steady volume.
 /// 3. Invalidation stop is placed at support (-1.5%), with a +2.2% to +2.5% profit target.
 fn generate_us_momentum_view(
     instrument: &Instrument,
@@ -1729,11 +1780,7 @@ mod tests {
     fn us_paper_strategy_accepts_pullback_rebound_in_uptrend() {
         let mut candles = us_breakout_candles();
         let n = candles.len();
-        let fast_sma = candles[n - 10..]
-            .iter()
-            .map(|c| c.close)
-            .sum::<Decimal>()
-            / dec!(10.0);
+        let fast_sma = candles[n - 10..].iter().map(|c| c.close).sum::<Decimal>() / dec!(10.0);
         // Set last candle to bounce right at fast_sma with a green bar (close > open)
         let latest = candles.last_mut().unwrap();
         latest.open = fast_sma * dec!(0.992);

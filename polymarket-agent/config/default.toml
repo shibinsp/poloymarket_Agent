@@ -195,6 +195,13 @@ max_orders_per_cycle = 2        # cap on new positions opened per cycle
 take_profit_pct = 0.015          # 2.0% realistic take-profit target
 max_hold_hours = 24             # 24 hours max hold
 
+[us_strategy]
+# Selectable US equity strategy: "sma_crossover" | "momentum_pullback"
+strategy = "sma_crossover"
+fast_sma_period = 20
+slow_sma_period = 50
+moving_average_type = "SMA"   # Explicitly Simple Moving Average (SMA), not EMA
+
 [telemetry]
 # OpenTelemetry span export. Off unless an endpoint is set here or via
 # OTEL_EXPORTER_OTLP_ENDPOINT / LANGFUSE_HOST in the environment.
