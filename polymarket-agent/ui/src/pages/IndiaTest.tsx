@@ -83,19 +83,6 @@ interface SandboxOrder {
   created_at: string;
 }
 
-const NSE_DEFAULT_PRICES: Record<string, string> = {
-  ITC: "480.00",
-  SBIN: "820.00",
-  TATAMOTORS: "890.00",
-  RELIANCE: "1198.70",
-  ICICIBANK: "1250.00",
-  HDFCBANK: "1650.00",
-  BHARTIARTL: "1680.00",
-  INFY: "1850.00",
-  LT: "3550.00",
-  TCS: "3800.00",
-};
-
 interface SandboxStatus {
   venue_id: string;
   name: string;
@@ -116,6 +103,9 @@ interface SandboxStatus {
   open_positions?: Array<unknown>;
   recent_orders: SandboxOrder[];
   watchlist: Instrument[];
+  upstox_feed?: {
+    live_prices?: Record<string, { price: number | string }>;
+  };
 }
 
 export function IndiaTest() {
@@ -140,7 +130,7 @@ export function IndiaTest() {
   const [orderSymbol, setOrderSymbol] = useState("ITC");
   const [orderSide, setOrderSide] = useState<"BUY" | "SELL">("BUY");
   const [orderQty, setOrderQty] = useState("1");
-  const [orderPrice, setOrderPrice] = useState("480.00");
+  const [orderPrice, setOrderPrice] = useState("");
   const [orderSubmitting, setOrderSubmitting] = useState(false);
   const [orderError, setOrderError] = useState<string | null>(null);
   const [orderSuccess, setOrderSuccess] = useState<string | null>(null);
@@ -351,6 +341,12 @@ export function IndiaTest() {
     const qty = parseInt(orderQty, 10);
     if (isNaN(qty) || qty <= 0) {
       setOrderError("Quantity must be a positive whole integer for NSE cash equities");
+      setOrderSubmitting(false);
+      return;
+    }
+    const price = Number(orderPrice);
+    if (!Number.isFinite(price) || price <= 0) {
+      setOrderError("Enter a positive limit price; a current quote is not available to prefill it");
       setOrderSubmitting(false);
       return;
     }
@@ -1103,9 +1099,9 @@ export function IndiaTest() {
                     onChange={(e) => {
                       const sym = e.target.value;
                       setOrderSymbol(sym);
-                      if (NSE_DEFAULT_PRICES[sym]) {
-                        setOrderPrice(NSE_DEFAULT_PRICES[sym]);
-                      }
+                      const quote =
+                        sandboxStatus?.upstox_feed?.live_prices?.[sym]?.price;
+                      setOrderPrice(quote == null ? "" : String(quote));
                     }}
                     style={{ width: "100%", padding: "0.4rem", borderRadius: "4px", border: "1px solid var(--border)", background: "var(--surface)" }}
                   >
@@ -1148,9 +1144,12 @@ export function IndiaTest() {
                   </label>
                   <input
                     type="number"
+                    min="0.01"
                     step="0.05"
                     value={orderPrice}
                     onChange={(e) => setOrderPrice(e.target.value)}
+                    placeholder="Enter limit price"
+                    required
                     style={{ width: "100%", padding: "0.4rem", borderRadius: "4px", border: "1px solid var(--border)", background: "var(--surface)" }}
                   />
                 </div>

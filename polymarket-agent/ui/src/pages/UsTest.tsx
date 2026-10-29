@@ -346,6 +346,8 @@ export function UsTest() {
     }
   }
 
+  const fxRate = Number(status?.fx_rate?.rate);
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "20px" }}>
       {/* Top Header Bar Matching Reference Terminal Design */}
@@ -358,11 +360,15 @@ export function UsTest() {
           <Badge tone="neutral">USD ($)</Badge>
           <Badge tone="neutral">America/New_York (09:30 - 16:00 ET)</Badge>
           <Badge tone={status?.us.session_state === "OPEN" ? "good" : "neutral"}>
-            {status?.us.session_state === "OPEN" ? "SESSION OPEN" : "REGULAR SESSION"}
+            {status?.us.session_state === "OPEN"
+              ? "SESSION OPEN"
+              : status?.us.session_state === "CLOSED"
+                ? "SESSION CLOSED"
+                : "SESSION STATUS UNAVAILABLE"}
           </Badge>
           <Badge tone="warning">ALPACA PAPER SIMULATION</Badge>
-          {status?.fx_rate && (
-            <Badge tone="neutral">1 USD = ₹{(parseFloat(String(status.fx_rate.rate)) || 86.5).toFixed(2)}</Badge>
+          {Number.isFinite(fxRate) && fxRate > 0 && (
+            <Badge tone="neutral">1 USD = ₹{fxRate.toFixed(2)}</Badge>
           )}
         </div>
 

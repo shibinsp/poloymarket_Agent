@@ -13,13 +13,7 @@ import { absTime, durationMs, int, money, moneySigned, relTime } from "../lib/fo
 import { parseTs } from "../lib/time";
 import { decimate } from "../lib/scale";
 import { useNow } from "../data/useNow";
-import type {
-  CycleRecord,
-  IndiaSandboxStatusResponse,
-  Metrics,
-  UsPaperStatusResponse,
-} from "../api/types";
-import { computeRealizedPnl } from "../lib/pnl";
+import type { CycleRecord, Metrics } from "../api/types";
 
 /** The three scan stages, as separate small multiples. */
 const FUNNEL: {
@@ -36,49 +30,9 @@ export function Cycles() {
   const cycles = useDataset<CycleRecord[]>("cyclesAll");
   const latest = useDataset<CycleRecord | null>("cycle");
   const metrics = useDataset<Metrics>("metrics");
-  const india = useDataset<IndiaSandboxStatusResponse>("indiaSandbox");
-  const us = useDataset<UsPaperStatusResponse>("usPaper");
   const now = useNow();
 
   const avgDuration = metrics.data?.avg_cycle_duration_ms ?? null;
-
-  const indiaOrders = india.data?.recent_orders ?? [];
-  const usOrders = us.data?.recent_orders ?? [];
-
-  const indiaPnlMap = computeRealizedPnl(
-    indiaOrders.map((o) => ({
-      id: o.id,
-      symbol: o.symbol,
-      side: o.side,
-      quantity: o.quantity,
-      price: o.price,
-      average_fill_price: o.average_fill_price,
-      created_at: o.created_at,
-    })),
-  );
-
-  const usPnlMap = computeRealizedPnl(
-    usOrders.map((o) => ({
-      id: o.id,
-      symbol: o.symbol,
-      side: o.side,
-      quantity: o.quantity,
-      price: o.price,
-      average_fill_price: o.average_fill_price,
-      created_at: o.created_at,
-    })),
-  );
-
-  const indiaProfitInr = Array.from(indiaPnlMap.values())
-    .filter((p) => p.pnl !== null)
-    .reduce((sum, p) => sum + (p.pnl ?? 0), 0);
-
-  const usProfitUsd = Array.from(usPnlMap.values())
-    .filter((p) => p.pnl !== null)
-    .reduce((sum, p) => sum + (p.pnl ?? 0), 0);
-
-  const polyRealizedUsd = num(metrics.data?.realized_pnl) ?? 0;
-  const totalRealizedCombinedUsd = polyRealizedUsd + usProfitUsd + indiaProfitInr / 86.5;
 
   return (
     <div className="page">
@@ -99,9 +53,7 @@ export function Cycles() {
               <StatTile label="Trades placed" value={int(c.trades_placed)} />
               <StatTile
                 label="Bankroll"
-                value={money((num(c.bankroll) ?? 1161.07) + totalRealizedCombinedUsd)}
-                tone={totalRealizedCombinedUsd > 0 ? "pos" : null}
-                sub={totalRealizedCombinedUsd > 0 ? `+$${totalRealizedCombinedUsd.toFixed(2)} profit added` : undefined}
+                value={money(num(c.bankroll))}
               />
               <StatTile label="Duration" value={durationMs(c.duration_ms)} />
               <StatTile
@@ -117,7 +69,7 @@ export function Cycles() {
       <DatasetCard title="Bankroll and unrealized P&L" label="Cycle history" dataset={cycles} datasetKey="cyclesAll">
         {(rows) => {
           const asc = cyclesAscending(rows);
-          const shown = decimate(asc, (c) => (num(c.bankroll) ?? 1161.07) + totalRealizedCombinedUsd, 240);
+          const shown = decimate(asc, (c) => num(c.bankroll) ?? 0, 240);
           if (shown.length === 0) return <EmptyState title="No cycles recorded yet" />;
           const cats = shown.map((c) => String(c.cycle_number));
           return (
@@ -140,10 +92,7 @@ export function Cycles() {
                     {
                       name: "Bankroll",
                       color: "var(--series-1)",
-                      values: shown.map((c, idx) => {
-                        const base = num(c.bankroll) ?? 1161.07;
-                        return idx >= Math.max(0, shown.length - 3) ? base + totalRealizedCombinedUsd : base;
-                      }),
+                      values: shown.map((c) => num(c.bankroll) ?? 0),
                     },
                   ]}
                 />
@@ -256,8 +205,7 @@ export function Cycles() {
                   key: "b",
                   header: "Bankroll",
                   numeric: true,
-                  render: (c) =>
-                    money((num(c.bankroll) ?? 1161.07) + totalRealizedCombinedUsd),
+                  render: (c) => money(num(c.bankroll)),
                   sortValue: (c) => num(c.bankroll),
                 },
                 { key: "u", header: "Unrealized", numeric: true, render: (c) => moneySigned(num(c.unrealized_pnl)), sortValue: (c) => num(c.unrealized_pnl) },

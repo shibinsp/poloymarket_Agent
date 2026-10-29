@@ -23,11 +23,13 @@ pub struct BacktestConfig {
     pub initial_balance: Decimal,
     pub risk_config: RiskConfig,
     pub valuation_config: ValuationConfig,
+    pub taker_fee_pct: Decimal,
     /// Simulated API cost per market evaluation.
     pub simulated_api_cost_per_eval: Decimal,
     /// Maximum number of evaluations per cycle.
     pub max_evaluations_per_cycle: usize,
-    /// Whether to skip Claude valuation and use market prices as fair values.
+    /// Skip external valuation calls and use a supplied out-of-sample forecast
+    /// when available; otherwise use the market prior.
     pub skip_valuation: bool,
 }
 
@@ -37,6 +39,7 @@ impl BacktestConfig {
             initial_balance: config.agent.initial_paper_balance,
             risk_config: config.risk.clone(),
             valuation_config: config.valuation.clone(),
+            taker_fee_pct: config.polymarket.taker_fee_pct,
             simulated_api_cost_per_eval: dec!(0.01),
             max_evaluations_per_cycle: 10,
             skip_valuation: true, // Default: no Claude calls during backtest
@@ -46,9 +49,9 @@ impl BacktestConfig {
 
 /// Run a backtest over historical snapshots.
 ///
-/// In skip_valuation mode, uses the historical fair value (resolved outcome)
-/// as a proxy for Claude's valuation. This tests the sizing/execution pipeline
-/// without incurring API costs.
+/// A forecast supplied in the historical file is used only if it was created
+/// out of sample at that snapshot's timestamp. The resolved outcome is used
+/// exclusively as the target for settlement, never to construct a forecast.
 pub fn run_backtest(snapshots: &[HistoricalSnapshot], config: &BacktestConfig) -> BacktestResults {
     let mut tracker = BacktestTracker::new(config.initial_balance);
     let mut portfolio = PortfolioManager::new(config.risk_config.clone());
@@ -94,48 +97,63 @@ pub fn run_backtest(snapshots: &[HistoricalSnapshot], config: &BacktestConfig) -
                 continue;
             };
 
+            if !(Decimal::ZERO..=Decimal::ONE).contains(&resolved_outcome)
+                || (resolved_outcome != Decimal::ZERO && resolved_outcome != Decimal::ONE)
+                || !(Decimal::ZERO..=Decimal::ONE).contains(&snapshot.yes_price)
+                || !(Decimal::ZERO..=Decimal::ONE).contains(&snapshot.no_price)
+                || snapshot.model_probability.is_some_and(|probability| {
+                    !(Decimal::ZERO..=Decimal::ONE).contains(&probability)
+                })
+            {
+                warn!(
+                    market_id = %snapshot.market_id,
+                    "Skipping historical snapshot with invalid probability or outcome"
+                );
+                continue;
+            }
+
+            if let Some(model_probability) = snapshot.model_probability {
+                tracker.record_forecast(model_probability, snapshot.yes_price, resolved_outcome);
+            }
+
             // Convert to candidate
             let candidate = historical::snapshot_to_candidate(snapshot);
 
-            // Simulate valuation: use a "noisy" version of the true outcome
-            // as if Claude had some predictive ability but not perfect
+            // A missing model forecast is just the market prior. Never use
+            // `resolved_outcome` to synthesize an edge: that leaks the answer
+            // into the strategy and makes the backtest meaningless.
             let simulated_fair_value = if config.skip_valuation {
-                // Blend market price with outcome to simulate imperfect prediction
-                // 60% weight on true outcome + 40% on market price = decent edge
-                let noise_factor = dec!(0.60);
-                snapshot.yes_price * (Decimal::ONE - noise_factor) + resolved_outcome * noise_factor
+                snapshot.model_probability.unwrap_or(snapshot.yes_price)
             } else {
-                // Would call Claude here in non-skip mode
+                // Backtests do not call the live model. Use the no-signal
+                // market prior unless an out-of-sample forecast was supplied.
                 snapshot.yes_price
             };
 
             let confidence = dec!(0.75); // Simulated confidence
-
-            // Determine side and edge
-            let market_price = snapshot.yes_price;
-            let edge_val = simulated_fair_value - market_price;
-
-            let min_edge = config.valuation_config.min_edge_threshold;
-            if edge_val.abs() < min_edge {
-                continue; // No edge
-            }
-
-            let (side, trade_price) = if edge_val > Decimal::ZERO {
-                (Side::Yes, market_price)
-            } else {
-                (Side::No, Decimal::ONE - market_price)
+            let valuation = crate::valuation::fair_value::ValuationResult {
+                probability: simulated_fair_value,
+                confidence,
+                reasoning_summary: "Historical out-of-sample forecast".to_string(),
+                key_factors: vec![],
+                data_quality: crate::valuation::fair_value::DataQuality::High,
+                time_sensitivity: crate::valuation::fair_value::TimeSensitivity::Days,
             };
+            let Some(edge_result) = edge::evaluate_edge(
+                &candidate,
+                &valuation,
+                &config.valuation_config,
+                config.taker_fee_pct,
+            ) else {
+                continue;
+            };
+            let side = edge_result.side;
+            let trade_price = edge_result.trade_price;
 
             // Kelly sizing
-            let fair_prob = if side == Side::Yes {
-                simulated_fair_value
-            } else {
-                Decimal::ONE - simulated_fair_value
-            };
-
             let kelly_result = kelly::kelly_size(
-                fair_prob,
-                trade_price,
+                edge_result.fair_probability,
+                trade_price * (Decimal::ONE + config.taker_fee_pct),
                 confidence,
                 tracker.balance(),
                 state,
@@ -147,25 +165,10 @@ pub fn run_backtest(snapshots: &[HistoricalSnapshot], config: &BacktestConfig) -
             }
 
             // Portfolio constraint check
-            let edge_result_edge = edge_val.abs();
             let opp = edge::to_opportunity(
                 &candidate,
-                &crate::valuation::fair_value::ValuationResult {
-                    probability: simulated_fair_value,
-                    confidence,
-                    reasoning_summary: String::new(),
-                    key_factors: vec![],
-                    data_quality: crate::valuation::fair_value::DataQuality::Medium,
-                    time_sensitivity: crate::valuation::fair_value::TimeSensitivity::Days,
-                },
-                &crate::valuation::edge::EdgeResult {
-                    raw_edge: edge_result_edge,
-                    side,
-                    trade_price,
-                    threshold: min_edge,
-                    market_probability: market_price,
-                    fair_probability: simulated_fair_value,
-                },
+                &valuation,
+                &edge_result,
                 kelly_result.position_usd,
             );
 
@@ -197,11 +200,13 @@ pub fn run_backtest(snapshots: &[HistoricalSnapshot], config: &BacktestConfig) -
             }
 
             // Execute simulated trade
-            let shares = if trade_price > Decimal::ZERO {
-                liquidity_size / trade_price
+            let all_in_price = trade_price * (Decimal::ONE + config.taker_fee_pct);
+            let shares = if all_in_price > Decimal::ZERO {
+                liquidity_size / all_in_price
             } else {
                 continue;
             };
+            let entry_fee = shares * trade_price * config.taker_fee_pct;
 
             let trade = SimulatedTrade {
                 market_id: snapshot.market_id.clone(),
@@ -211,8 +216,9 @@ pub fn run_backtest(snapshots: &[HistoricalSnapshot], config: &BacktestConfig) -
                 size_usd: liquidity_size,
                 shares,
                 fair_value: simulated_fair_value,
-                edge: edge_result_edge,
+                edge: edge_result.net_edge,
                 confidence,
+                entry_fee_usd: entry_fee,
                 outcome_price: None,
                 pnl: None,
             };
@@ -287,6 +293,7 @@ mod tests {
                 low_confidence_edge: dec!(0.08),
                 cache_ttl_seconds: 300,
             },
+            taker_fee_pct: dec!(0.02),
             simulated_api_cost_per_eval: dec!(0.01),
             max_evaluations_per_cycle: 10,
             skip_valuation: true,
@@ -294,20 +301,36 @@ mod tests {
     }
 
     #[test]
-    fn test_backtest_synthetic_data() {
+    fn test_backtest_without_forecasts_does_not_invent_an_edge_from_outcomes() {
         let snapshots = historical::generate_synthetic(50);
         let config = test_config();
 
         let results = run_backtest(&snapshots, &config);
 
-        // Should have executed some trades
-        assert!(results.total_trades > 0, "Should have some trades");
-        // Win rate should be reasonable (not 0% or 100%)
-        assert!(results.total_trades >= results.wins);
+        assert_eq!(results.total_trades, 0);
         // API costs should be tracked
         assert!(results.total_api_cost > Decimal::ZERO);
         // Final balance should exist
         assert!(results.final_balance > Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_backtest_uses_supplied_forecast_and_executable_prices() {
+        let mut snapshots = historical::generate_synthetic(10);
+        for snapshot in &mut snapshots {
+            snapshot.yes_price = dec!(0.50);
+            snapshot.no_price = dec!(0.50);
+            snapshot.spread = dec!(0.02);
+            snapshot.resolved_outcome = Some(Decimal::ONE);
+            snapshot.model_probability = Some(dec!(0.90));
+        }
+
+        let results = run_backtest(&snapshots, &test_config());
+        assert!(results.total_trades > 0);
+        assert!(results.total_pnl > Decimal::ZERO);
+        assert_eq!(results.evaluated_forecasts, 10);
+        assert_eq!(results.model_brier_score, Some(dec!(0.01)));
+        assert_eq!(results.market_brier_score, Some(dec!(0.25)));
     }
 
     #[test]

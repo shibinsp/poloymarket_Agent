@@ -199,7 +199,7 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
         for issue in &startup_issues {
             println!("      - {issue}");
         }
-        println!("      The agent is not allowed to run in a paper/live session without a valuation key.");
+        println!("      Resolve all startup blockers before running this mode.");
         return Err(anyhow::anyhow!("{}", startup_issues.join("; ")));
     }
 

@@ -6,7 +6,7 @@ import { EmptyState } from "../components/ui/States";
 import { Badge, tradeStatusTone, type StatusTone } from "../components/ui/Badge";
 import { DataTable, type Column } from "../components/ui/DataTable";
 import { num } from "../lib/decimal";
-import { absTime, int, money, price, relTime } from "../lib/format";
+import { absTime, int, money, moneyInr, moneySigned, price, relTime } from "../lib/format";
 import { parseTs } from "../lib/time";
 import { useNow } from "../data/useNow";
 import { computeRealizedPnl } from "../lib/pnl";
@@ -134,8 +134,7 @@ export function Trades() {
     // 2. Indian paper-market orders
     for (const o of indiaOrders) {
       const rawP = num(o.average_fill_price || o.price) ?? 0;
-      // If simulated market order filled at default tick or pending quote
-      const p = rawP > 0 ? rawP : (o.symbol === "RELIANCE" ? 1205.50 : 2500.00);
+      const p = rawP;
       const match = indiaPnlMap.get(o.id);
       list.push({
         id: `ind-${o.id}`,
@@ -145,7 +144,7 @@ export function Trades() {
         venue_name: "Indian Paper (NSE)",
         market_group: "india",
         direction: o.side,
-        entry_price: `₹${p.toFixed(2)}`,
+        entry_price: p > 0 ? `₹${p.toFixed(2)}` : "—",
         raw_price: p,
         quantity: o.quantity,
         size: `${o.quantity} shares`,
@@ -170,7 +169,7 @@ export function Trades() {
         venue_name: "Alpaca Paper (US)",
         market_group: "us",
         direction: o.side,
-        entry_price: `$${p.toFixed(2)}`,
+        entry_price: p > 0 ? `$${p.toFixed(2)}` : "—",
         raw_price: p,
         quantity: o.quantity,
         size: `${o.quantity} shares`,
@@ -211,31 +210,44 @@ export function Trades() {
     marketFilter !== "ALL" || status !== "ALL" || direction !== "ALL" || query.trim() !== "";
 
   // Aggregate Realized Profit/Loss
-  const indiaProfitInr = useMemo(() => {
+  const indiaProfitInrValue = useMemo(() => {
     return filtered
       .filter((t) => t.market_group === "india" && t.pnl_num !== null)
       .reduce((acc, t) => acc + (t.pnl_num ?? 0), 0);
   }, [filtered]);
 
-  const usProfitUsd = useMemo(() => {
+  const usProfitUsdValue = useMemo(() => {
     return filtered
       .filter((t) => t.market_group === "us" && t.pnl_num !== null)
       .reduce((acc, t) => acc + (t.pnl_num ?? 0), 0);
   }, [filtered]);
 
-  const polyProfitUsd = useMemo(() => {
+  const polyProfitUsdValue = useMemo(() => {
     return filtered
       .filter((t) => t.market_group === "polymarket" && t.pnl_num !== null)
       .reduce((acc, t) => acc + (t.pnl_num ?? 0), 0);
   }, [filtered]);
 
-  // Combined USD (using audited rate: 1 USD = ₹86.50)
-  const combinedProfitUsd = usProfitUsd + polyProfitUsd + indiaProfitInr / 86.5;
+  const indiaProfitInr =
+    india.data === undefined ||
+    !filtered.some((t) => t.market_group === "india" && t.pnl_num !== null)
+      ? null
+      : indiaProfitInrValue;
+  const usProfitUsd =
+    us.data === undefined ||
+    !filtered.some((t) => t.market_group === "us" && t.pnl_num !== null)
+      ? null
+      : usProfitUsdValue;
+  const polyProfitUsd =
+    trades.data === undefined ||
+    !filtered.some((t) => t.market_group === "polymarket" && t.pnl_num !== null)
+      ? null
+      : polyProfitUsdValue;
 
-  const closedSells = filtered.filter((t) => t.pnl_num !== null);
-  const winCount = closedSells.filter((t) => (t.pnl_num ?? 0) > 0).length;
-  const lossCount = closedSells.filter((t) => (t.pnl_num ?? 0) < 0).length;
-  const flatCount = closedSells.filter((t) => (t.pnl_num ?? 0) === 0).length;
+  const realizedRows = filtered.filter((t) => t.pnl_num !== null);
+  const winCount = realizedRows.filter((t) => (t.pnl_num ?? 0) > 0).length;
+  const lossCount = realizedRows.filter((t) => (t.pnl_num ?? 0) < 0).length;
+  const flatCount = realizedRows.filter((t) => (t.pnl_num ?? 0) === 0).length;
 
   const countIndia = allUnified.filter((t) => t.market_group === "india").length;
   const countUs = allUnified.filter((t) => t.market_group === "us").length;
@@ -381,34 +393,32 @@ export function Trades() {
       <Card title={filtersActive ? "Selection P&L Performance" : "Realized P&L Performance (After Selling)"}>
         <div className="grid grid--tiles">
           <StatTile
-            hero
-            label="Combined Realized Profit"
-            value={combinedProfitUsd >= 0 ? `+$${combinedProfitUsd.toFixed(2)}` : `-$${Math.abs(combinedProfitUsd).toFixed(2)}`}
-            sub={`+$${usProfitUsd.toFixed(2)} USD + +₹${indiaProfitInr.toFixed(2)} INR (@ ₹86.50)`}
-            tone={combinedProfitUsd > 0 ? "pos" : null}
+            label="India P&L (INR)"
+            value={indiaProfitInr === null ? "—" : moneyInr(indiaProfitInr)}
+            sub="Resolved trades in current selection"
+            tone={indiaProfitInr === null ? null : indiaProfitInr > 0 ? "pos" : indiaProfitInr < 0 ? "neg" : null}
           />
           <StatTile
-            label="Indian Market Profit"
-            value={indiaProfitInr >= 0 ? `+₹${indiaProfitInr.toFixed(2)}` : `-₹${Math.abs(indiaProfitInr).toFixed(2)}`}
-            sub="₹550.00 INFY + ₹500.00 RELIANCE"
-            tone={indiaProfitInr > 0 ? "pos" : null}
+            label="US P&L (USD)"
+            value={usProfitUsd === null ? "—" : moneySigned(usProfitUsd)}
+            sub="Resolved trades in current selection"
+            tone={usProfitUsd === null ? null : usProfitUsd > 0 ? "pos" : usProfitUsd < 0 ? "neg" : null}
           />
           <StatTile
-            label="US Market Profit"
-            value={usProfitUsd >= 0 ? `+$${usProfitUsd.toFixed(2)}` : `-$${Math.abs(usProfitUsd).toFixed(2)}`}
-            sub="+$85.60 on SPY 10-share scalp"
-            tone={usProfitUsd > 0 ? "pos" : null}
+            label="Polymarket P&L (USD)"
+            value={polyProfitUsd === null ? "—" : moneySigned(polyProfitUsd)}
+            sub="Resolved trades in current selection"
+            tone={polyProfitUsd === null ? null : polyProfitUsd > 0 ? "pos" : polyProfitUsd < 0 ? "neg" : null}
           />
           <StatTile
-            label="Win Rate (Closed Sells)"
-            value={closedSells.length > 0 ? `${((winCount / (winCount + lossCount || 1)) * 100).toFixed(0)}%` : "N/A"}
+            label="Win rate"
+            value={winCount + lossCount > 0 ? `${((winCount / (winCount + lossCount)) * 100).toFixed(0)}%` : "—"}
             sub={`${int(winCount)}W / ${int(lossCount)}L · ${int(flatCount)} flat`}
-            tone="pos"
           />
           <StatTile
             label="Total Orders"
             value={int(filtered.length)}
-            sub={`${int(closedSells.length)} closed sells · ${int(filtered.length - closedSells.length)} open positions`}
+            sub={`${int(realizedRows.length)} with realized P&L · ${int(filtered.length - realizedRows.length)} without`}
           />
         </div>
       </Card>
@@ -425,13 +435,13 @@ export function Trades() {
           className={`btn ${marketFilter === "INDIA" ? "btn--primary" : ""}`}
           onClick={() => setMarketFilter("INDIA")}
         >
-          🇮🇳 Indian Equities ({countIndia}) · +₹{indiaProfitInr.toFixed(0)}
+          🇮🇳 Indian Equities ({countIndia})
         </button>
         <button
           className={`btn ${marketFilter === "US" ? "btn--primary" : ""}`}
           onClick={() => setMarketFilter("US")}
         >
-          🇺🇸 US Equities & ETFs ({countUs}) · +${usProfitUsd.toFixed(2)}
+          🇺🇸 US Equities & ETFs ({countUs})
         </button>
         <button
           className={`btn ${marketFilter === "POLYMARKET" ? "btn--primary" : ""}`}
@@ -503,19 +513,17 @@ export function Trades() {
           >
             <StatTile
               label="Virtual Indian Cash"
-              value={`₹${Number(india.data?.available_cash_inr ?? 1000).toFixed(2)}`}
-              sub="Starting capital: ₹1,000.00 locked"
-              tone={Number(india.data?.available_cash_inr ?? 0) > 0 ? "pos" : null}
+              value={moneyInr(num(india.data?.available_cash_inr))}
+              sub="Available sandbox cash"
             />
             <StatTile
               label="Virtual Total Equity"
-              value={`₹${Number(india.data?.total_equity_inr ?? 1000).toFixed(2)}`}
-              sub="Cash + Open Holdings mark-to-market"
-              tone={Number(india.data?.total_equity_inr ?? 1000) >= 1000 ? "pos" : "neg"}
+              value={moneyInr(num(india.data?.total_equity_inr))}
+              sub="Reported sandbox equity"
             />
             <StatTile
               label="Open Virtual Positions"
-              value={`₹${Number(india.data?.open_positions_cost_inr ?? 0).toFixed(2)}`}
+              value={moneyInr(num(india.data?.open_positions_cost_inr))}
               sub={
                 Object.keys(india.data?.holdings ?? {}).length > 0
                   ? Object.entries(india.data?.holdings ?? {})
@@ -527,12 +535,10 @@ export function Trades() {
             <StatTile
               label="Realized P&L (Post-Sale)"
               value={
-                indiaProfitInr >= 0
-                  ? `+₹${indiaProfitInr.toFixed(2)}`
-                  : `-₹${Math.abs(indiaProfitInr).toFixed(2)}`
+                indiaProfitInr === null ? "—" : moneyInr(indiaProfitInr)
               }
               sub="Saved in SQLite (survives restarts)"
-              tone={indiaProfitInr > 0 ? "pos" : null}
+              tone={indiaProfitInr === null ? null : indiaProfitInr > 0 ? "pos" : indiaProfitInr < 0 ? "neg" : null}
             />
           </div>
         </Card>

@@ -323,6 +323,7 @@ fn config(alpaca: &MockServer, model: &MockServer, poly: &MockServer, db: &str) 
             clob_base_url: poly.uri(),
             gamma_base_url: poly.uri(),
             chain_id: 137,
+            taker_fee_pct: dec!(0.02),
         },
         rate_limit: RateLimitConfig {
             requests_per_second: 100,

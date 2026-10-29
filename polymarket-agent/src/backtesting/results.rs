@@ -21,6 +21,8 @@ pub struct SimulatedTrade {
     pub fair_value: Decimal,
     pub edge: Decimal,
     pub confidence: Decimal,
+    /// Estimated entry taker fee paid for this trade.
+    pub entry_fee_usd: Decimal,
     /// The actual outcome price (1.0 for win, 0.0 for loss).
     pub outcome_price: Option<Decimal>,
     /// Realized P&L after resolution.
@@ -32,7 +34,7 @@ impl SimulatedTrade {
     pub fn resolve(&mut self, outcome_price: Decimal) {
         self.outcome_price = Some(outcome_price);
         // P&L = shares * (outcome_price - entry_price)
-        self.pnl = Some(self.shares * (outcome_price - self.entry_price));
+        self.pnl = Some(self.shares * (outcome_price - self.entry_price) - self.entry_fee_usd);
     }
 
     pub fn is_resolved(&self) -> bool {
@@ -65,6 +67,9 @@ pub struct BacktestResults {
     pub edge_accuracy: Decimal,
     pub total_api_cost: Decimal,
     pub net_profit: Decimal,
+    pub evaluated_forecasts: u64,
+    pub model_brier_score: Option<Decimal>,
+    pub market_brier_score: Option<Decimal>,
 }
 
 impl fmt::Display for BacktestResults {
@@ -78,7 +83,8 @@ impl fmt::Display for BacktestResults {
              Max Drawdown: ${} ({:.1}%)\n\
              Peak Balance: ${} | Final: ${}\n\
              Avg Edge: {:.1}% | Edge Accuracy: {:.1}%\n\
-             Profit Factor: {:.2} | Avg P&L/Trade: ${}",
+             Profit Factor: {:.2} | Avg P&L/Trade: ${}\n\
+             OOS Brier (model/market): {}/{} (n={})",
             self.total_trades,
             self.wins,
             self.losses,
@@ -98,6 +104,13 @@ impl fmt::Display for BacktestResults {
             self.edge_accuracy * dec!(100),
             self.profit_factor,
             self.avg_pnl_per_trade,
+            self.model_brier_score
+                .map(|score| format!("{score:.4}"))
+                .unwrap_or_else(|| "N/A".to_string()),
+            self.market_brier_score
+                .map(|score| format!("{score:.4}"))
+                .unwrap_or_else(|| "N/A".to_string()),
+            self.evaluated_forecasts,
         )
     }
 }
@@ -110,6 +123,7 @@ pub struct BacktestTracker {
     max_drawdown: Decimal,
     trades: Vec<SimulatedTrade>,
     total_api_cost: Decimal,
+    forecast_errors: Vec<(Decimal, Decimal)>,
 }
 
 impl BacktestTracker {
@@ -121,12 +135,26 @@ impl BacktestTracker {
             max_drawdown: Decimal::ZERO,
             trades: Vec::new(),
             total_api_cost: Decimal::ZERO,
+            forecast_errors: Vec::new(),
         }
+    }
+
+    /// Record model and market-prior Brier losses for the same resolved sample.
+    pub fn record_forecast(
+        &mut self,
+        model_probability: Decimal,
+        market_probability: Decimal,
+        outcome: Decimal,
+    ) {
+        let model_error = model_probability - outcome;
+        let market_error = market_probability - outcome;
+        self.forecast_errors
+            .push((model_error * model_error, market_error * market_error));
     }
 
     /// Record a new trade entry. Deducts cost from balance.
     pub fn record_entry(&mut self, trade: SimulatedTrade) {
-        let cost = trade.entry_price * trade.shares;
+        let cost = trade.entry_price * trade.shares + trade.entry_fee_usd;
         self.balance -= cost;
         self.trades.push(trade);
     }
@@ -256,6 +284,25 @@ impl BacktestTracker {
         // Sharpe ratio from per-trade P&L
         let pnl_values: Vec<Decimal> = resolved.iter().filter_map(|t| t.pnl).collect();
         let sharpe_ratio = compute_sharpe(&pnl_values);
+        let evaluated_forecasts = self.forecast_errors.len() as u64;
+        let (model_brier_score, market_brier_score) = if evaluated_forecasts > 0 {
+            let count = Decimal::from(evaluated_forecasts);
+            let model_score = self
+                .forecast_errors
+                .iter()
+                .map(|(model, _)| *model)
+                .sum::<Decimal>()
+                / count;
+            let market_score = self
+                .forecast_errors
+                .iter()
+                .map(|(_, market)| *market)
+                .sum::<Decimal>()
+                / count;
+            (Some(model_score), Some(market_score))
+        } else {
+            (None, None)
+        };
 
         BacktestResults {
             total_trades,
@@ -276,6 +323,9 @@ impl BacktestTracker {
             edge_accuracy,
             total_api_cost: self.total_api_cost,
             net_profit,
+            evaluated_forecasts,
+            model_brier_score,
+            market_brier_score,
         }
     }
 }
@@ -340,6 +390,7 @@ mod tests {
             fair_value: entry_price + edge,
             edge,
             confidence: dec!(0.8),
+            entry_fee_usd: Decimal::ZERO,
             outcome_price: None,
             pnl: None,
         }
@@ -363,6 +414,14 @@ mod tests {
         assert!(!trade.is_win());
         // shares = 10, pnl = 10 * (0.0 - 0.60) = -6.0
         assert_eq!(trade.pnl, Some(dec!(-6)));
+    }
+
+    #[test]
+    fn simulated_trade_pnl_subtracts_entry_fee() {
+        let mut trade = make_trade(dec!(0.10), dec!(0.60), dec!(6));
+        trade.entry_fee_usd = dec!(0.20);
+        trade.resolve(Decimal::ONE);
+        assert_eq!(trade.pnl, Some(dec!(3.8)));
     }
 
     #[test]
@@ -413,6 +472,19 @@ mod tests {
         let results = tracker.finalize();
         assert_eq!(results.total_api_cost, dec!(0.08));
         assert_eq!(results.final_balance, dec!(99.92));
+    }
+
+    #[test]
+    fn forecast_brier_scores_compare_model_and_market_on_identical_samples() {
+        let mut tracker = BacktestTracker::new(dec!(100));
+        tracker.record_forecast(dec!(0.9), dec!(0.5), Decimal::ONE);
+        tracker.record_forecast(dec!(0.1), dec!(0.5), Decimal::ZERO);
+
+        let results = tracker.finalize();
+
+        assert_eq!(results.evaluated_forecasts, 2);
+        assert_eq!(results.model_brier_score, Some(dec!(0.01)));
+        assert_eq!(results.market_brier_score, Some(dec!(0.25)));
     }
 
     #[test]

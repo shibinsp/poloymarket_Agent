@@ -572,6 +572,14 @@ pub struct PolymarketConfig {
     pub clob_base_url: String,
     pub gamma_base_url: String,
     pub chain_id: u64,
+    /// Conservative estimated one-way taker fee as a fraction of purchase
+    /// notional. Verify against the market's current fee schedule.
+    #[serde(default = "default_polymarket_taker_fee_pct")]
+    pub taker_fee_pct: Decimal,
+}
+
+fn default_polymarket_taker_fee_pct() -> Decimal {
+    rust_decimal_macros::dec!(0.02)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -792,7 +800,15 @@ impl AppConfig {
 
         if self.requires_valuation_key() && secrets.llm_api_key.is_none() {
             issues.push(
-                "LLM_API_KEY or ANTHROPIC_API_KEY is required for paper/live trading"
+                "LLM_API_KEY or ANTHROPIC_API_KEY is required for paper/live trading".to_string(),
+            );
+        }
+
+        if self.agent.mode == AgentMode::Live && self.uses_polymarket() {
+            issues.push(
+                "Polymarket live trading is disabled until order status, open-order listing, \
+                 position reporting, and cash reconciliation are implemented and verified; \
+                 use paper mode"
                     .to_string(),
             );
         }
@@ -1476,6 +1492,25 @@ mod tests {
 
         assert!(!config.requires_valuation_key());
         assert!(config.startup_issues(&Secrets::default()).is_empty());
+    }
+
+    #[test]
+    fn polymarket_live_mode_is_blocked_even_when_credentials_are_present() {
+        let config_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config/default.toml");
+        let contents = std::fs::read_to_string(config_path).expect("default config exists");
+        let mut config: AppConfig = toml::from_str(&contents).expect("default config parses");
+        config.agent.mode = AgentMode::Live;
+        config.venues.clear();
+        let mut secrets = Secrets::default();
+        secrets.polymarket_private_key = Some(SecretString::new("configured".to_string().into()));
+        secrets.llm_api_key = Some(SecretString::new("configured".to_string().into()));
+
+        let issues = config.startup_issues(&secrets);
+
+        assert!(issues.iter().any(|issue| {
+            issue.contains("Polymarket live trading is disabled")
+                && issue.contains("cash reconciliation")
+        }));
     }
 
     #[test]

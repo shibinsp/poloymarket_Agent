@@ -32,10 +32,29 @@ export function AppShell({
   const [toggling, setToggling] = useState(false);
 
   const stateRaw = health.data?.agent_state;
-  const isHalted = health.data ? (health.data.halted === true || !!health.data.halt) : true;
-  const state = isHalted ? "HALTED" : (stateRaw === "HALTED" || !stateRaw ? "ALIVE" : stateRaw);
+  const normalizedState = stateRaw?.toUpperCase();
+  const isHalted =
+    health.data?.halted === true ||
+    health.data?.halt != null ||
+    normalizedState === "HALTED";
+  const stateKnown =
+    isHalted ||
+    normalizedState === "ALIVE" ||
+    normalizedState === "LOWFUEL" ||
+    normalizedState === "CRITICALSURVIVAL";
+  const canToggle =
+    health.data !== undefined &&
+    !health.loading &&
+    !health.error &&
+    stateKnown;
+  const state = !health.data || health.loading || health.error
+    ? "CONNECTING"
+    : isHalted
+      ? "HALTED"
+      : stateRaw || "UNKNOWN";
 
   async function handleToggleAgent() {
+    if (!canToggle) return;
     setToggling(true);
     try {
       const res = isHalted ? await resume() : await halt();
@@ -69,22 +88,30 @@ export function AppShell({
           <div className="topbar__brand-mark" aria-hidden="true">P</div>
           <div className="topbar__brand-copy">
             <strong>Polymarket Agent</strong>
-            <span>autonomous execution desk</span>
+            <span>trading operations dashboard</span>
           </div>
           <Badge tone={agentStateTone(state)} title="Agent lifecycle state">
             {state}
           </Badge>
           <button
-            className={`btn btn--sm ${isHalted ? "btn--success" : "btn--danger"}`}
+            className={`btn btn--sm ${!canToggle ? "" : isHalted ? "btn--success" : "btn--danger"}`}
             onClick={handleToggleAgent}
-            disabled={toggling}
+            disabled={toggling || !canToggle}
             title={
-              isHalted
+              !canToggle
+                ? "Agent state is unavailable; wait for a successful health check before changing it"
+                : isHalted
                 ? "Press to start the autonomous trading agent"
                 : "Press to pause the agent and cancel resting orders"
             }
           >
-            {toggling ? "…" : isHalted ? "▶ Start Agent" : "⏹ Pause Agent"}
+            {toggling
+              ? "Working…"
+              : !canToggle
+                ? "Status unavailable"
+                : isHalted
+                  ? "Start agent"
+                  : "Pause agent"}
           </button>
         </div>
 
@@ -125,7 +152,7 @@ export function AppShell({
       </main>
 
       <footer className="footer">
-        <span>Polymarket autonomous trading agent</span>
+        <span>Trading operations dashboard</span>
         <span className="muted">
           UI build {typeof __BUILD_ID__ === "string" ? __BUILD_ID__ : "dev"}
         </span>

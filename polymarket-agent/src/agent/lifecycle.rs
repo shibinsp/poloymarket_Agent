@@ -1018,7 +1018,6 @@ impl Agent {
         // Parallel evaluation with JoinSet for higher throughput
         let mut join_set = tokio::task::JoinSet::new();
         let engine_arc = self.valuation_engine.as_ref().unwrap().clone_for_parallel();
-        let config_valuation = self.config.valuation.clone();
 
         // Start only as many valuations as the day's budget can pay for.
         //
@@ -1060,7 +1059,6 @@ impl Agent {
                 .cloned()
                 .collect();
             let engine = engine_arc.clone();
-            let config = config_valuation.clone();
             let cycle_num = self.cycle_number as i64;
             let remaining_budget = bankroll - result.api_cost;
 
@@ -1075,20 +1073,15 @@ impl Agent {
                     Err(_) => return None,
                 };
 
-                let edge = match evaluate_edge(&candidate, &valuation, &config) {
-                    Some(e) => e,
-                    None => return None,
-                };
-
-                Some((candidate, valuation, edge))
+                Some((candidate, valuation))
             });
         }
 
         // Collect results from parallel tasks
         let mut eval_results = Vec::new();
         while let Some(result_opt) = join_set.join_next().await {
-            if let Ok(Some((candidate, valuation, edge))) = result_opt {
-                eval_results.push((candidate, valuation, edge));
+            if let Ok(Some((candidate, valuation))) = result_opt {
+                eval_results.push((candidate, valuation));
             }
         }
 
@@ -1097,12 +1090,60 @@ impl Agent {
             "Parallel evaluations complete"
         );
 
+        // Fit one market-relative calibration weight per cycle. If historical
+        // data cannot be read, use the conservative default blend rather than
+        // letting the raw model forecast override the market.
+        let (market_model_weight, market_calibration_samples) =
+            match calibration::market_model_weight(self.store.pool()).await {
+                Ok(result) => result,
+                Err(e) => {
+                    warn!(error = %e, "Failed to fit market-relative calibration — using conservative default");
+                    (calibration::DEFAULT_MARKET_MODEL_WEIGHT, 0)
+                }
+            };
+
         // Process results sequentially for trade execution
-        for (candidate, valuation, edge) in eval_results {
-            let estimated_cost = engine.estimated_call_cost();
+        let estimated_cost = engine.estimated_call_cost();
+        for (candidate, valuation) in eval_results {
+            // Every successful valuation incurred cost even when it did not
+            // produce a tradeable edge.
             result.api_cost += estimated_cost;
+
+            let Some(calibrated_probability) = calibration::blend_with_market_prior(
+                valuation.probability,
+                candidate.order_book.implied_probability,
+                market_model_weight,
+            ) else {
+                warn!(
+                    market = %candidate.market.question,
+                    "Invalid model probability or market prior — skipping candidate"
+                );
+                continue;
+            };
+            let mut calibrated_valuation = valuation.clone();
+            calibrated_valuation.probability = calibrated_probability;
+
+            let edge = match evaluate_edge(
+                &candidate,
+                &calibrated_valuation,
+                &self.config.valuation,
+                self.config.polymarket.taker_fee_pct,
+            ) {
+                Some(e) => e,
+                None => continue,
+            };
+
             result.opportunities += 1;
-            self.log_opportunity(&candidate, &valuation, &edge);
+            self.log_opportunity(&candidate, &calibrated_valuation, &edge);
+
+            info!(
+                model_weight = %market_model_weight,
+                calibration_samples = market_calibration_samples,
+                raw_probability = %valuation.probability,
+                market_prior = %candidate.order_book.implied_probability,
+                calibrated_probability = %calibrated_probability,
+                "Market-relative probability calibration"
+            );
 
             // Apply calibration discount to confidence (HAL-01)
             let calibrated_confidence = match crate::valuation::calibration::compute_discount(
@@ -1130,9 +1171,13 @@ impl Agent {
             };
 
             // Phase 5: Kelly sizing with calibrated confidence
+            // Treat the estimated fee as part of the share acquisition cost,
+            // so Kelly does not size from the gross quote.
+            let all_in_price =
+                edge.trade_price * (Decimal::ONE + self.config.polymarket.taker_fee_pct);
             let kelly_result = kelly::kelly_size(
-                valuation.probability,
-                edge.trade_price,
+                edge.fair_probability,
+                all_in_price,
                 calibrated_confidence,
                 bankroll - result.api_cost,
                 self.state,
@@ -1149,11 +1194,11 @@ impl Agent {
             }
 
             // Phase 7: Check if projected profit justifies the API cost
-            if !edge_justifies_cost(kelly_result.position_usd, edge.raw_edge, estimated_cost) {
+            if !edge_justifies_cost(kelly_result.position_usd, edge.net_edge, estimated_cost) {
                 info!(
                     market = %candidate.market.question,
                     position_usd = %kelly_result.position_usd,
-                    edge = %edge.raw_edge,
+                    net_edge = %edge.net_edge,
                     api_cost = %estimated_cost,
                     "Edge doesn't justify API cost — skipping"
                 );
@@ -1161,8 +1206,12 @@ impl Agent {
             }
 
             // Build opportunity with kelly size
-            let opportunity =
-                to_opportunity(&candidate, &valuation, &edge, kelly_result.position_usd);
+            let opportunity = to_opportunity(
+                &candidate,
+                &calibrated_valuation,
+                &edge,
+                kelly_result.position_usd,
+            );
 
             // Portfolio constraint check
             let constraint_check = self.portfolio.check_constraints(&opportunity, bankroll);
@@ -1212,7 +1261,10 @@ impl Agent {
 
             // Update opportunity with final adjusted size
             let mut final_opportunity = opportunity;
-            final_opportunity.kelly_size = liquidity_size;
+            // `liquidity_size` is the all-in capital budget; convert it back
+            // to purchasable share notional because the fee is paid separately.
+            final_opportunity.kelly_size =
+                liquidity_size / (Decimal::ONE + self.config.polymarket.taker_fee_pct);
 
             // Phase 6: Prepare and execute order
             let prepared = match order::prepare_order(
@@ -1235,7 +1287,8 @@ impl Agent {
                 size = %prepared.size,
                 kelly_raw = %kelly_result.kelly_raw,
                 kelly_adjusted = %kelly_result.kelly_adjusted,
-                edge = %edge.raw_edge,
+                gross_edge = %edge.raw_edge,
+                net_edge = %edge.net_edge,
                 "Executing trade"
             );
 
@@ -1273,13 +1326,17 @@ impl Agent {
             if execution.status == OrderStatus::Filled {
                 result.trades += 1;
 
-                // Record prediction for confidence calibration (HAL-01)
-                if let Err(e) = calibration::record_prediction(
+                // Record one market-relative forecast for the position that
+                // actually entered. The raw forecast and YES prior are kept
+                // separately so calibration can measure incremental value.
+                if let Err(e) = calibration::record_prediction_with_market_prior(
                     self.store.pool(),
                     &prepared.market_id,
                     valuation.confidence,
                     valuation.probability,
-                    prepared.price,
+                    calibrated_valuation.probability,
+                    candidate.order_book.implied_probability,
+                    candidate.order_book.implied_probability,
                 )
                 .await
                 {
@@ -1304,7 +1361,7 @@ impl Agent {
                         prepared.side,
                         liquidity_size,
                         prepared.price,
-                        edge.raw_edge,
+                        edge.net_edge,
                     )
                     .await
                 {
@@ -1513,9 +1570,10 @@ impl Agent {
     ) {
         info!(
             market = %candidate.market.question,
-            fair_prob = %valuation.probability,
+            fair_prob = %edge.fair_probability,
             market_prob = %edge.market_probability,
-            edge = %edge.raw_edge,
+            gross_edge = %edge.raw_edge,
+            net_edge = %edge.net_edge,
             side = %edge.side,
             confidence = %valuation.confidence,
             "OPPORTUNITY FOUND"
