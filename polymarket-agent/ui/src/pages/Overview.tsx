@@ -194,7 +194,7 @@ export function Overview() {
   return (
     <div className="page">
       {/* 0. CAPITAL ALLOCATION & AGENT ENGINE CONTROL */}
-      <div className="card" style={{ padding: "16px 20px", background: "linear-gradient(135deg, rgba(30, 41, 59, 0.7) 0%, rgba(15, 23, 42, 0.8) 100%)", border: "1px solid var(--border-accent, #334155)", borderRadius: "var(--radius-md)" }}>
+      <div className="card" style={{ padding: "16px 20px", background: "var(--surface-1)", border: "1px solid var(--border-strong)", borderRadius: "var(--radius)" }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "12px" }}>
           <div>
             <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
@@ -217,7 +217,7 @@ export function Overview() {
         </div>
 
         {/* Dynamic Base Amount Presets & Custom Input */}
-        <div style={{ marginTop: "14px", paddingTop: "12px", borderTop: "1px solid rgba(255,255,255,0.08)", display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: "12px" }}>
+        <div style={{ marginTop: "14px", paddingTop: "12px", borderTop: "1px solid var(--border)", display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: "12px" }}>
           <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
             <span style={{ fontSize: "12px", fontWeight: "600", color: "var(--text-secondary)" }}>Set Base Amount:</span>
             {[

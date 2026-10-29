@@ -345,15 +345,6 @@ td.truncate { max-width: 340px; overflow: hidden; text-overflow: ellipsis; }
   overflow-wrap: anywhere;
 }
 
-/* Destructive only in the sense that it stops trading; the colour is a
-   deliberate speed bump, and the label always says what will happen. */
-.btn--danger {
-  border-color: color-mix(in srgb, var(--status-critical) 55%, transparent);
-  color: var(--status-critical);
-}
-.btn--danger:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--status-critical) 12%, transparent);
-}
 .btn--quiet { border-color: transparent; color: var(--text-muted); }
 
 /* --- Limit usage bar ----------------------------------------------------- */

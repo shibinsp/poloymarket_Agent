@@ -144,15 +144,23 @@ export function AgentActionButtons({ compact = false }: { compact?: boolean }) {
           type="button"
           disabled={busyVenue === "india"}
           onClick={() => toggleVenue("india")}
-          className={`btn btn--sm ${indiaRunning ? "btn--danger" : "btn--primary"}`}
+          className="btn btn--sm"
           title={indiaRunning ? "Pause Indian NSE automated trading" : "Start Indian NSE automated trading"}
           style={{
-            fontWeight: 600,
+            fontWeight: 700,
             fontSize: "12px",
-            padding: "4px 8px",
+            padding: "5px 10px",
             display: "inline-flex",
             alignItems: "center",
-            gap: "4px",
+            gap: "5px",
+            color: "#ffffff",
+            background: indiaRunning
+              ? "linear-gradient(180deg, #ef4444, #dc2626)"
+              : "linear-gradient(180deg, #10b981, #059669)",
+            border: `1px solid ${indiaRunning ? "#b91c1c" : "#047857"}`,
+            boxShadow: indiaRunning
+              ? "0 2px 6px rgba(239, 68, 68, 0.3)"
+              : "0 2px 6px rgba(16, 185, 129, 0.3)",
           }}
         >
           {busyVenue === "india" ? "…" : indiaRunning ? "⏹ Stop India" : "▶ Start India"}
@@ -168,15 +176,23 @@ export function AgentActionButtons({ compact = false }: { compact?: boolean }) {
           type="button"
           disabled={busyVenue === "us"}
           onClick={() => toggleVenue("us")}
-          className={`btn btn--sm ${usRunning ? "btn--danger" : "btn--primary"}`}
+          className="btn btn--sm"
           title={usRunning ? "Pause US Alpaca automated trading" : "Start US Alpaca automated trading"}
           style={{
-            fontWeight: 600,
+            fontWeight: 700,
             fontSize: "12px",
-            padding: "4px 8px",
+            padding: "5px 10px",
             display: "inline-flex",
             alignItems: "center",
-            gap: "4px",
+            gap: "5px",
+            color: "#ffffff",
+            background: usRunning
+              ? "linear-gradient(180deg, #ef4444, #dc2626)"
+              : "linear-gradient(180deg, #10b981, #059669)",
+            border: `1px solid ${usRunning ? "#b91c1c" : "#047857"}`,
+            boxShadow: usRunning
+              ? "0 2px 6px rgba(239, 68, 68, 0.3)"
+              : "0 2px 6px rgba(16, 185, 129, 0.3)",
           }}
         >
           {busyVenue === "us" ? "…" : usRunning ? "⏹ Stop US" : "▶ Start US"}
@@ -192,14 +208,23 @@ export function AgentActionButtons({ compact = false }: { compact?: boolean }) {
           type="button"
           disabled={busyVenue === "master"}
           onClick={toggleMaster}
-          className={`btn btn--sm ${isMasterHalted ? "btn--primary" : "btn--quiet"}`}
+          className="btn btn--sm"
           title={isMasterHalted ? "Start the master agent loop" : "Pause all automated trading"}
           style={{
+            fontWeight: 700,
             fontSize: "12px",
-            padding: "4px 8px",
+            padding: "5px 10px",
             display: "inline-flex",
             alignItems: "center",
-            gap: "4px",
+            gap: "5px",
+            color: "#ffffff",
+            background: isMasterHalted
+              ? "linear-gradient(180deg, #10b981, #059669)"
+              : "linear-gradient(180deg, #ef4444, #dc2626)",
+            border: `1px solid ${isMasterHalted ? "#047857" : "#b91c1c"}`,
+            boxShadow: isMasterHalted
+              ? "0 2px 6px rgba(16, 185, 129, 0.3)"
+              : "0 2px 6px rgba(239, 68, 68, 0.3)",
           }}
         >
           {busyVenue === "master" ? "…" : isMasterHalted ? "▶ Start All" : "⏹ Stop All"}
