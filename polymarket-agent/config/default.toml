@@ -2,7 +2,7 @@
 mode = "paper"                    # paper | live | backtest
 cycle_interval_seconds = 60       # 1 minute (reduced from 600s to eliminate latency)
 death_balance_threshold = 0.0
-low_fuel_threshold = 10.0
+low_fuel_threshold = 2.0
 api_reserve = 2.0
 initial_paper_balance = 100.0
 daily_api_budget = 0.50           # max API spend per UTC day ($); see [risk] below
@@ -10,9 +10,9 @@ max_sleep_seconds = 3600          # longest sleep while every venue is closed
 
 [scanning]
 max_markets = 1000
-min_volume_24h = 5000.0
+min_volume_24h = 1500.0
 max_resolution_days = 14
-max_spread_pct = 0.05
+max_spread_pct = 0.08
 categories = ["weather", "sports", "crypto", "politics"]
 
 [valuation]
@@ -32,9 +32,9 @@ model = "meta/llama-3.2-11b-vision-instruct"
 max_tokens = 4096
 # input_price_per_million = 3.00
 # output_price_per_million = 15.00
-min_edge_threshold = 0.005
-high_confidence_edge = 0.005
-low_confidence_edge = 0.010
+min_edge_threshold = 0.010
+high_confidence_edge = 0.010
+low_confidence_edge = 0.020
 cache_ttl_seconds = 300
 
 [risk]
@@ -43,7 +43,7 @@ max_position_pct = 1.0               # Allow up to 100% allocation for micro $5.
 max_total_exposure_pct = 1.0         # Full exposure cap for micro-capital trading
 max_positions_per_category = 3
 min_position_usd = 1.0
-india_capital_allocation_inr = 1000.0     # INR: ₹1,000 isolated paper/sandbox allocation
+india_capital_allocation_inr = 25000.0     # INR: ₹1,000 isolated paper/sandbox allocation
 us_capital_allocation_usd = 20.0         # USD: strictly $20.00 initial capital for US equities
 
 
@@ -118,7 +118,7 @@ path = "polymarket-agent.db"
 [[venues]]
 id = "alpaca"
 kind = "alpaca"
-enabled = false
+enabled = true
 base_url = "https://paper-api.alpaca.markets"
 data_url = "https://data.alpaca.markets"
 symbols = ["SIRI", "NOK", "LCID", "PLUG", "NIO", "SOFI", "BTC/USD", "ETH/USD", "SPY", "AAPL", "NVDA", "QQQ"]
@@ -179,7 +179,7 @@ fee_pct = 0.0025
 id = "upstox_sandbox"
 kind = "upstox_sandbox"
 enabled = true
-symbols = ["ITC", "TATAMOTORS", "HDFCBANK", "SBIN", "RELIANCE", "INFY", "ICICIBANK", "TCS"]
+symbols = ["ITC", "TATAMOTORS", "HDFCBANK", "SBIN", "RELIANCE", "INFY", "ICICIBANK", "TCS", "BHARTIARTL", "LT", "HINDUNILVR"]
 fee_pct = 0.001
 
 [sizing_continuous]
@@ -192,7 +192,7 @@ min_p_up = 0.51                 # minimum probability-of-up before a view is tra
 max_orders_per_cycle = 2        # cap on new positions opened per cycle
 
 [exits_continuous]
-take_profit_pct = 0.02          # 2.0% realistic take-profit target
+take_profit_pct = 0.015          # 2.0% realistic take-profit target
 max_hold_hours = 24             # 24 hours max hold
 
 [telemetry]

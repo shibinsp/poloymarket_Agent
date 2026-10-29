@@ -603,7 +603,7 @@ async fn resume_handler(State(state): State<DashboardState>) -> impl IntoRespons
         ) {
             let now_str = chrono::Utc::now().to_rfc3339();
             let _ = sqlx::query(
-                "UPDATE trades SET status = 'CLOSED', close_reason = 'reconciliation_cleared', closed_at = ? WHERE status IN ('OPEN', 'PARTIAL')"
+                "UPDATE trades SET status = 'CLOSED', close_reason = 'reconciliation_cleared', closed_at = ?, realized_pnl = COALESCE(realized_pnl, unrealized_pnl, '0'), pnl = COALESCE(pnl, unrealized_pnl, '0') WHERE status IN ('OPEN', 'PARTIAL')"
             )
             .bind(&now_str)
             .execute(state.store.pool())

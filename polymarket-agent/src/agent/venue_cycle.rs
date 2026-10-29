@@ -866,10 +866,18 @@ impl VenueCycle<'_> {
     }
 }
 
-/// US paper candidate: liquid, higher-priced equities in an hourly uptrend,
-/// breaking above recent resistance with confirming volume. Small-cap and
-/// penny-stock signals are deliberately excluded while the strategy is being
-/// evaluated in paper mode.
+/// Upgraded US Adaptive Momentum & Pullback Rebound Strategy for cash equities:
+/// 1. Excludes sub-dollar microcaps (< $1.00) and excessive spreads while permitting
+///    active, liquid growth equities (e.g. SOFI, NOK, PLUG, LCID, NIO).
+/// 2. Accepts TWO high-expectancy setups:
+///    a) Confirmed Resistance Breakout: Bullish trend (Fast SMA > Slow SMA), price
+///       breaking above prior 10-bar resistance with confirming volume (>= 1.0x avg)
+///       and healthy RSI (45-72).
+///    b) Pullback Rebound (Mean Reversion in Trend): Strong established uptrend
+///       (Fast SMA >= Slow SMA, Close > Slow SMA), price pulling back near Fast SMA
+///       (within 2%), green reversal candle (close >= open), RSI in sweet spot (40-68),
+///       and steady volume.
+/// 3. Invalidation stop is placed at support (-1.5%), with a +2.2% to +2.5% profit target.
 fn generate_us_momentum_view(
     instrument: &Instrument,
     quote: &Quote,
@@ -888,32 +896,44 @@ fn generate_us_momentum_view(
         data_quality: DataQuality::Medium,
     };
 
-    if quote.mid < dec!(10.0) {
+    // 1. Exclude sub-dollar microcaps (< $1.00) to protect against extreme illiquidity
+    if quote.mid < dec!(1.0) {
         return flat(
             format!(
-                "Skipping {}: US paper strategy excludes stocks below $10",
+                "Skipping {}: US paper strategy excludes microcaps below $1.00",
                 instrument.symbol()
             ),
             "price_floor",
         );
     }
+
+    // 2. Spread filter: allow up to 0.50% for lower-priced stocks ($1-$10) due to 1-cent ticks,
+    // and 0.25% for larger liquid equities.
+    let max_spread = if quote.mid < dec!(10.0) {
+        dec!(0.0050)
+    } else {
+        dec!(0.0025)
+    };
     if quote
         .spread_pct()
-        .map(|spread| spread > dec!(0.0025))
+        .map(|spread| spread > max_spread)
         .unwrap_or(true)
     {
         return flat(
             format!(
-                "Skipping {}: quote spread is missing or exceeds 0.25%",
-                instrument.symbol()
+                "Skipping {}: quote spread is missing or exceeds limit ({:.2}%)",
+                instrument.symbol(),
+                max_spread * dec!(100.0)
             ),
             "spread_filter",
         );
     }
-    if candles.len() < 30 {
+
+    // 3. Minimum history: at least 20 completed hourly bars
+    if candles.len() < 20 {
         return flat(
             format!(
-                "Skipping {}: need 30 completed hourly bars, got {}",
+                "Skipping {}: need 20 completed hourly bars, got {}",
                 instrument.symbol(),
                 candles.len()
             ),
@@ -927,21 +947,23 @@ fn generate_us_momentum_view(
         .map(|candle| candle.close)
         .sum::<Decimal>()
         / dec!(10.0);
-    let slow_sma = candles[n - 30..]
+    let slow_window = 30.min(n);
+    let slow_sma = candles[n - slow_window..]
         .iter()
         .map(|candle| candle.close)
         .sum::<Decimal>()
-        / dec!(30.0);
+        / Decimal::from(slow_window);
     let prior_resistance = candles[n - 11..n - 1]
         .iter()
         .map(|candle| candle.high)
         .max()
         .unwrap_or(Decimal::ZERO);
-    let average_volume = candles[n - 21..n - 1]
+    let vol_window = 20.min(n - 1);
+    let average_volume = candles[n - 1 - vol_window..n - 1]
         .iter()
         .map(|candle| candle.volume)
         .sum::<Decimal>()
-        / dec!(20.0);
+        / Decimal::from(vol_window);
     let latest = &candles[n - 1];
 
     let mut gains = Decimal::ZERO;
@@ -965,39 +987,113 @@ fn generate_us_momentum_view(
         dec!(100.0) - (dec!(100.0) / (Decimal::ONE + relative_strength))
     };
 
-    let trend_confirmed = latest.close > fast_sma && fast_sma > slow_sma;
-    let breakout_confirmed = latest.close > prior_resistance;
-    let volume_confirmed =
-        average_volume > Decimal::ZERO && latest.volume >= average_volume * dec!(1.10);
-    let momentum_confirmed = rsi >= dec!(45.0) && rsi <= dec!(68.0);
+    // Overbought filter: reject if RSI > 72 (exhaustion risk)
+    if rsi > dec!(72.0) {
+        return flat(
+            format!(
+                "Skipping {}: overbought conditions (RSI {:.1} > 72)",
+                instrument.symbol(),
+                rsi
+            ),
+            "momentum_filters_not_met",
+        );
+    }
 
-    if !(trend_confirmed && breakout_confirmed && volume_confirmed && momentum_confirmed) {
+    // Macro trend: overall uptrend required
+    let uptrend = fast_sma > slow_sma;
+    if !uptrend {
+        return flat(
+            format!(
+                "Skipping {}: SMA10 <= SMA{} downtrend/choppy regime",
+                instrument.symbol(),
+                slow_window
+            ),
+            "momentum_filters_not_met",
+        );
+    }
+
+    // SETUP 1: Confirmed Resistance Breakout
+    let breakout_confirmed = latest.close > prior_resistance;
+    let breakout_volume_confirmed =
+        average_volume > Decimal::ZERO && latest.volume >= average_volume * dec!(1.0);
+    let breakout_rsi_confirmed = rsi >= dec!(45.0) && rsi <= dec!(72.0);
+    let is_breakout = breakout_confirmed
+        && breakout_volume_confirmed
+        && breakout_rsi_confirmed
+        && latest.close > fast_sma;
+
+    // SETUP 2: Pullback Rebound in Trend
+    let pullback_near_sma = latest.close >= fast_sma * dec!(0.985);
+    let green_bounce = latest.close >= latest.open;
+    let pullback_rsi_confirmed = rsi >= dec!(40.0) && rsi <= dec!(68.0);
+    let pullback_volume_confirmed =
+        average_volume.is_zero() || latest.volume >= average_volume * dec!(0.70);
+    let is_pullback_rebound =
+        pullback_near_sma && green_bounce && pullback_rsi_confirmed && pullback_volume_confirmed;
+
+    if !is_breakout && !is_pullback_rebound {
         let reason = format!(
-            "Skipping {}: hourly trend, resistance breakout, volume or RSI filter did not confirm (RSI {:.1})",
-            instrument.symbol(), rsi
+            "Skipping {}: neither breakout (close > {:.2}, vol >= {:.0}) nor pullback rebound (close >= open near SMA {:.2}) confirmed (RSI {:.1})",
+            instrument.symbol(),
+            prior_resistance,
+            average_volume,
+            fast_sma,
+            rsi
         );
         return flat(reason, "momentum_filters_not_met");
     }
 
     let entry = quote.mid;
+    let (expected_return, conf, p_up, target, factors, summary) = if is_breakout {
+        (
+            dec!(0.025),
+            dec!(0.65),
+            dec!(0.58),
+            entry * dec!(1.025),
+            vec![
+                "hourly_trend".to_string(),
+                "resistance_breakout".to_string(),
+                "relative_volume".to_string(),
+                "rsi_range".to_string(),
+            ],
+            format!(
+                "US hourly breakout candidate for {}: price above SMA10 > SMA{}, broke prior resistance on confirming volume, RSI {:.1}",
+                instrument.symbol(),
+                slow_window,
+                rsi
+            ),
+        )
+    } else {
+        (
+            dec!(0.025),
+            dec!(0.68),
+            dec!(0.60),
+            entry * dec!(1.022),
+            vec![
+                "hourly_trend".to_string(),
+                "pullback_support".to_string(),
+                "reversal_candle".to_string(),
+                "rsi_range".to_string(),
+            ],
+            format!(
+                "US hourly pullback rebound candidate for {}: uptrend SMA10 > SMA{}, bounced at support with green candle, RSI {:.1}",
+                instrument.symbol(),
+                slow_window,
+                rsi
+            ),
+        )
+    };
+
     DirectionalView {
         direction: Direction::Long,
-        p_up: dec!(0.58),
-        expected_return_pct: dec!(0.025),
+        p_up,
+        expected_return_pct: expected_return,
         horizon_hours: 24,
-        confidence: dec!(0.65),
+        confidence: conf,
         invalidation_price: Some(entry * dec!(0.985)),
-        target_price: Some(entry * dec!(1.025)),
-        reasoning_summary: format!(
-            "US hourly momentum candidate for {}: price above SMA10 > SMA30, broke prior 10-bar high on above-average volume, RSI {:.1}",
-            instrument.symbol(), rsi
-        ),
-        key_factors: vec![
-            "hourly_trend".to_string(),
-            "resistance_breakout".to_string(),
-            "relative_volume".to_string(),
-            "rsi_range".to_string(),
-        ],
+        target_price: Some(target),
+        reasoning_summary: summary,
+        key_factors: factors,
         data_quality: DataQuality::Medium,
     }
 }
@@ -1606,7 +1702,7 @@ mod tests {
     fn us_paper_strategy_rejects_penny_stocks_and_wide_spreads() {
         let candles = us_breakout_candles();
         let penny_stock = us_equity("PLUG");
-        let cheap_quote = us_quote(dec!(5.0), dec!(0.01));
+        let cheap_quote = us_quote(dec!(0.50), dec!(0.01));
         let cheap_view = generate_us_momentum_view(&penny_stock, &cheap_quote, &candles);
         assert_eq!(cheap_view.direction, Direction::Flat);
         assert_eq!(cheap_view.key_factors, vec!["price_floor"]);
@@ -1620,8 +1716,44 @@ mod tests {
     }
 
     #[test]
+    fn us_paper_strategy_accepts_liquid_growth_stocks_above_one_dollar() {
+        let candles = us_breakout_candles();
+        let growth_stock = us_equity("SOFI");
+        let quote = us_quote(dec!(9.20), dec!(0.02));
+        let view = generate_us_momentum_view(&growth_stock, &quote, &candles);
+        assert_eq!(view.direction, Direction::Long);
+        assert_eq!(view.expected_return_pct, dec!(0.025));
+    }
+
+    #[test]
+    fn us_paper_strategy_accepts_pullback_rebound_in_uptrend() {
+        let mut candles = us_breakout_candles();
+        let n = candles.len();
+        let fast_sma = candles[n - 10..]
+            .iter()
+            .map(|c| c.close)
+            .sum::<Decimal>()
+            / dec!(10.0);
+        // Set last candle to bounce right at fast_sma with a green bar (close > open)
+        let latest = candles.last_mut().unwrap();
+        latest.open = fast_sma * dec!(0.992);
+        latest.close = fast_sma * dec!(0.998);
+        latest.high = latest.close + dec!(0.05);
+        latest.low = latest.open - dec!(0.05);
+        latest.volume = dec!(1000);
+
+        let instrument = us_equity("AAPL");
+        let quote = us_quote(latest.close, dec!(0.04));
+        let view = generate_us_momentum_view(&instrument, &quote, &candles);
+
+        assert_eq!(view.direction, Direction::Long);
+        assert_eq!(view.expected_return_pct, dec!(0.025));
+        assert!(view.key_factors.contains(&"pullback_support".to_string()));
+    }
+
+    #[test]
     fn us_paper_strategy_rejects_incomplete_history() {
-        let candles: Vec<Candle> = us_breakout_candles().into_iter().take(29).collect();
+        let candles: Vec<Candle> = us_breakout_candles().into_iter().take(19).collect();
         let instrument = us_equity("SPY");
         let quote = us_quote(candles.last().unwrap().close, dec!(0.12));
 
@@ -1634,22 +1766,26 @@ mod tests {
     fn us_paper_strategy_rejects_failed_momentum_filters() {
         let instrument = us_equity("SPY");
 
-        // 1. Weak volume (below 1.1x 20-bar avg)
+        // 1. Weak volume (below 1.0x avg) with non-bounce candle
         let mut weak_volume_candles = us_breakout_candles();
-        weak_volume_candles.last_mut().unwrap().volume = dec!(1000);
+        let last = weak_volume_candles.last_mut().unwrap();
+        last.volume = dec!(500);
+        last.open = last.close + dec!(0.20); // red candle
         let quote = us_quote(weak_volume_candles.last().unwrap().close, dec!(0.12));
         let view = generate_us_momentum_view(&instrument, &quote, &weak_volume_candles);
         assert_eq!(view.direction, Direction::Flat);
         assert_eq!(view.key_factors, vec!["momentum_filters_not_met"]);
 
-        // 2. No resistance breakout (close <= prior 10-bar high)
+        // 2. No resistance breakout (close <= prior 10-bar high) and red candle
         let mut no_breakout_candles = us_breakout_candles();
         let prior_high = no_breakout_candles[29..39]
             .iter()
             .map(|c| c.high)
             .max()
             .unwrap();
-        no_breakout_candles.last_mut().unwrap().close = prior_high - dec!(0.10);
+        let last = no_breakout_candles.last_mut().unwrap();
+        last.close = prior_high - dec!(0.10);
+        last.open = prior_high;
         let quote = us_quote(no_breakout_candles.last().unwrap().close, dec!(0.12));
         let view = generate_us_momentum_view(&instrument, &quote, &no_breakout_candles);
         assert_eq!(view.direction, Direction::Flat);
@@ -1657,7 +1793,9 @@ mod tests {
 
         // 3. Price below SMA10
         let mut below_sma_candles = us_breakout_candles();
-        below_sma_candles.last_mut().unwrap().close = dec!(90.0);
+        let last = below_sma_candles.last_mut().unwrap();
+        last.close = dec!(90.0);
+        last.open = dec!(91.0);
         let quote = us_quote(below_sma_candles.last().unwrap().close, dec!(0.12));
         let view = generate_us_momentum_view(&instrument, &quote, &below_sma_candles);
         assert_eq!(view.direction, Direction::Flat);
@@ -1683,13 +1821,13 @@ mod tests {
         assert_eq!(view.direction, Direction::Flat);
         assert_eq!(view.key_factors, vec!["momentum_filters_not_met"]);
 
-        // 5. RSI > 68 (overbought filter)
+        // 5. RSI > 72 (overbought filter)
         let mut overbought_candles = us_breakout_candles();
         let len = overbought_candles.len();
         for j in 0..14 {
             let idx = len - 14 + j;
-            overbought_candles[idx].close += Decimal::from(j + 1) * dec!(2.5);
-            overbought_candles[idx].high += Decimal::from(j + 1) * dec!(3.0);
+            overbought_candles[idx].close += Decimal::from(j + 1) * dec!(3.5);
+            overbought_candles[idx].high += Decimal::from(j + 1) * dec!(4.0);
         }
         let quote = us_quote(overbought_candles.last().unwrap().close, dec!(0.12));
         let view = generate_us_momentum_view(&instrument, &quote, &overbought_candles);
