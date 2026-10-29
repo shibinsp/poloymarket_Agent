@@ -84,7 +84,7 @@ export function Overview() {
   const indiaUsdEquivalent = indiaCurrentInr / 86.5;
   const indiaProfitPct = indiaBaseInr > 0 ? (indiaProfit / indiaBaseInr) * 100 : 0;
 
-  const usBaseUsd = us.data?.base_capital_usd ? Number(us.data.base_capital_usd) : 5.0;
+  const usBaseUsd = us.data?.base_capital_usd ? Number(us.data.base_capital_usd) : 1000.0;
   const usProfit = us.data?.realized_profit_usd !== undefined ? Number(us.data.realized_profit_usd) : usProfitUsd;
   const usCurrentUsd = usBaseUsd + usProfit;
   const usInrEquivalent = usCurrentUsd * 86.5;

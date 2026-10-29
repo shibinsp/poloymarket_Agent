@@ -79,7 +79,7 @@ impl DashboardState {
             .unwrap_or(rust_decimal_macros::dec!(1000.0));
         let init_us = risk
             .us_capital_allocation_usd
-            .unwrap_or(rust_decimal_macros::dec!(5.0));
+            .unwrap_or(rust_decimal_macros::dec!(1000.0));
 
         Self {
             store: Arc::new(store),
@@ -596,20 +596,7 @@ async fn resume_handler(State(state): State<DashboardState>) -> impl IntoRespons
             .into_response();
     }
 
-    if let Some(ref h) = cleared {
-        if matches!(
-            h.source,
-            crate::agent::kill_switch::HaltSource::Reconciliation
-        ) {
-            let now_str = chrono::Utc::now().to_rfc3339();
-            let _ = sqlx::query(
-                "UPDATE trades SET status = 'CLOSED', close_reason = 'reconciliation_cleared', closed_at = ?, realized_pnl = COALESCE(realized_pnl, unrealized_pnl, '0'), pnl = COALESCE(pnl, unrealized_pnl, '0') WHERE status IN ('OPEN', 'PARTIAL')"
-            )
-            .bind(&now_str)
-            .execute(state.store.pool())
-            .await;
-        }
-    }
+
 
     info!(?cleared, "Resumed over the API");
     Json(serde_json::json!({
@@ -2386,7 +2373,7 @@ async fn settings_caps_get_handler(State(state): State<DashboardState>) -> impl 
         "india_capital_allocation_inr": caps.india_capital_allocation_inr,
         "us_capital_allocation_usd": caps.us_capital_allocation_usd,
         "default_india_capital_inr": 1000.0,
-        "default_us_capital_usd": 5.0,
+        "default_us_capital_usd": 1000.0,
         "currency_inr": "₹",
         "currency_usd": "$"
     }))
