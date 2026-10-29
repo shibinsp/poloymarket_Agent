@@ -972,7 +972,7 @@ impl Agent {
         }
 
         // Phase 8: Periodic metrics summary (every 10 cycles)
-        if self.cycle_number > 0 && self.cycle_number % 10 == 0 {
+        if self.cycle_number > 0 && self.cycle_number.is_multiple_of(10) {
             match compute_metrics(&self.store, self.config.agent.initial_paper_balance).await {
                 Ok(m) => {
                     log_metrics(&m);

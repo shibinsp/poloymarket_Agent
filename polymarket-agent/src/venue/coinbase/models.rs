@@ -80,7 +80,7 @@ impl Product {
             && self
                 .product_type
                 .as_deref()
-                .map_or(true, |t| t.eq_ignore_ascii_case("SPOT"))
+                .is_none_or(|t| t.eq_ignore_ascii_case("SPOT"))
     }
 }
 
