@@ -777,6 +777,38 @@ impl AppConfig {
         }
         enabled.any(|v| v.kind.eq_ignore_ascii_case("polymarket"))
     }
+
+    /// The runtime needs a valuation key whenever a non-backtest session is
+    /// expected to make decisions. Without a key, the agent can start but will
+    /// immediately sit in a disabled valuation state, which looks healthy in a
+    /// dry run and only fails later when a trade is needed.
+    pub fn requires_valuation_key(&self) -> bool {
+        !matches!(self.agent.mode, AgentMode::Backtest)
+    }
+
+    /// One concise list of startup blockers for a non-backtest run.
+    pub fn startup_issues(&self, secrets: &Secrets) -> Vec<String> {
+        let mut issues = Vec::new();
+
+        if self.requires_valuation_key() && secrets.llm_api_key.is_none() {
+            issues.push(
+                "LLM_API_KEY or ANTHROPIC_API_KEY is required for paper/live trading"
+                    .to_string(),
+            );
+        }
+
+        if self.agent.mode == AgentMode::Live
+            && self.uses_polymarket()
+            && secrets.polymarket_private_key.is_none()
+        {
+            issues.push(
+                "POLYMARKET_PRIVATE_KEY is required for live mode when Polymarket is enabled"
+                    .to_string(),
+            );
+        }
+
+        issues
+    }
 }
 
 /// Read an env var, treating blank/whitespace-only as unset.
@@ -1422,6 +1454,28 @@ mod tests {
         std::env::set_var("BLANK_ENV_TEST", " value ");
         assert_eq!(non_empty_env("BLANK_ENV_TEST"), Some("value".to_string()));
         std::env::remove_var("BLANK_ENV_TEST");
+    }
+
+    #[test]
+    fn paper_mode_requires_llm_key() {
+        let config_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config/default.toml");
+        let contents = std::fs::read_to_string(config_path).expect("default config exists");
+        let config: AppConfig = toml::from_str(&contents).expect("default config parses");
+
+        let issues = config.startup_issues(&Secrets::default());
+        assert!(config.requires_valuation_key());
+        assert!(issues.iter().any(|issue| issue.contains("LLM_API_KEY")));
+    }
+
+    #[test]
+    fn backtest_mode_does_not_require_llm_key() {
+        let config_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config/default.toml");
+        let contents = std::fs::read_to_string(config_path).expect("default config exists");
+        let mut config: AppConfig = toml::from_str(&contents).expect("default config parses");
+        config.agent.mode = AgentMode::Backtest;
+
+        assert!(!config.requires_valuation_key());
+        assert!(config.startup_issues(&Secrets::default()).is_empty());
     }
 
     #[test]

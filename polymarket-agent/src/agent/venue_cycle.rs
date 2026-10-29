@@ -414,7 +414,8 @@ impl VenueCycle<'_> {
         // The venue's own fee. Charging every venue the highest fee among
         // them made a cheap venue's edge look unprofitable and stopped it
         // trading at all.
-        let fee_pct = self.config.venue_fee_pct(venue.id().as_str());
+        let configured_fee_pct = self.config.venue_fee_pct(venue.id().as_str());
+        let fee_pct = effective_venue_fee_pct(use_us_paper_strategy, configured_fee_pct);
         let estimated_slippage_pct = if use_us_paper_strategy {
             // Use a modest 10-basis-point round-trip estimate for the liquid
             // names this paper candidate permits. Replace this estimate with
@@ -1001,6 +1002,19 @@ fn generate_us_momentum_view(
     }
 }
 
+/// The generic venue fee is configured for prediction-market taker fees.
+/// Standard Alpaca self-directed equity API orders are commission-free, so
+/// do not apply that unrelated per-side fee to the US paper strategy. Spread
+/// and slippage are still charged by `round_trip_cost`; regulatory sell fees
+/// remain a small modeling limitation.
+fn effective_venue_fee_pct(use_us_paper_strategy: bool, configured_fee_pct: Decimal) -> Decimal {
+    if use_us_paper_strategy {
+        Decimal::ZERO
+    } else {
+        configured_fee_pct
+    }
+}
+
 /// Algorithmic quantitative momentum & trend strategy used when no LLM API key is configured.
 /// Enforces trend alignment (SMA5 > SMA14), momentum confirmation, and healthy RSI before entering Long.
 /// Returns Direction::Flat (no trade) in choppy or downtrending conditions to protect capital.
@@ -1496,13 +1510,96 @@ mod tests {
         assert_eq!(view.expected_return_pct, dec!(0.025));
         assert!(view.invalidation_price.unwrap() < quote.mid);
         assert!(view.target_price.unwrap() > quote.mid);
-        let round_trip_cost = directional::round_trip_cost(&quote, dec!(0.0025), dec!(0.001));
-        assert!(directional::should_trade(
-            &view,
-            round_trip_cost,
-            dec!(0.55),
-            dec!(0.015)
-        ));
+
+        // US Alpaca paper cost model: zero commission, spread + 10-bps slippage.
+        // The configured 25-bps fee (prediction-market taker fee) must NOT be
+        // charged here — Alpaca equity orders are commission-free.
+        let paper_fee = effective_venue_fee_pct(/*use_us_paper_strategy=*/ true, dec!(0.0025));
+        assert_eq!(
+            paper_fee,
+            Decimal::ZERO,
+            "commission must be zero on the US paper path"
+        );
+        let round_trip_cost = directional::round_trip_cost(&quote, paper_fee, dec!(0.001));
+
+        // The net edge still clears the 1.5% hurdle after paying spread and slippage.
+        assert!(
+            directional::should_trade(&view, round_trip_cost, dec!(0.55), dec!(0.015)),
+            "a valid breakout must clear the edge threshold after spread + slippage \
+             (cost {round_trip_cost}, view {view:?})"
+        );
+    }
+
+    /// Alpaca self-directed equity API accounts charge zero commission.
+    /// The generic `fee_pct` in `VenueConfig` exists for prediction-market
+    /// taker fees (25 bps per side); applying it to commission-free equity
+    /// orders overstates costs and incorrectly rejects qualifying paper trades.
+    ///
+    /// This tests both branches of `effective_venue_fee_pct`:
+    ///   • US Alpaca paper path  → zero commission (fee is waived)
+    ///   • All other cases       → the configured fee is passed through unchanged
+    #[test]
+    fn alpaca_paper_commission_is_zero_other_venues_keep_their_configured_fee() {
+        // US Alpaca paper: commission is waived regardless of what fee_pct is
+        // configured.  Even a non-default value must be zeroed out.
+        assert_eq!(
+            effective_venue_fee_pct(true, dec!(0.0025)),
+            Decimal::ZERO,
+            "US Alpaca paper path must carry zero commission"
+        );
+        assert_eq!(
+            effective_venue_fee_pct(true, dec!(0.01)),
+            Decimal::ZERO,
+            "any configured fee must be zeroed on the US paper path"
+        );
+
+        // Any other venue or mode: the configured fee is returned unchanged.
+        assert_eq!(
+            effective_venue_fee_pct(false, dec!(0.0025)),
+            dec!(0.0025),
+            "non-paper or non-Alpaca path must keep the configured fee"
+        );
+        assert_eq!(
+            effective_venue_fee_pct(false, Decimal::ZERO),
+            Decimal::ZERO,
+            "a zero fee on another venue stays zero"
+        );
+    }
+
+    /// Even though commission is zero on the Alpaca paper path, spread and the
+    /// 10-basis-point round-trip slippage estimate are still included in the
+    /// cost calculation.  A live or non-Alpaca venue adds its configured fee
+    /// on top of those same components.
+    #[test]
+    fn alpaca_paper_cost_includes_spread_and_slippage_but_not_commission() {
+        use crate::valuation::directional;
+
+        let mid = dec!(100.0);
+        let spread = dec!(0.20); // bid 99.90 / ask 100.10 — 0.20% spread
+        let quote = us_quote(mid, spread);
+
+        // US paper path: fee = 0, slippage = 10 bps
+        let paper_fee = effective_venue_fee_pct(true, dec!(0.0025));
+        let paper_slippage = dec!(0.001); // 10 bps
+        let paper_cost = directional::round_trip_cost(&quote, paper_fee, paper_slippage);
+
+        // Generic / live path: fee = 25 bps per side, same slippage
+        let generic_fee = effective_venue_fee_pct(false, dec!(0.0025));
+        let generic_cost = directional::round_trip_cost(&quote, generic_fee, paper_slippage);
+
+        // Paper cost is positive — spread and slippage are not zeroed.
+        assert!(
+            paper_cost > Decimal::ZERO,
+            "spread and slippage must contribute to the paper cost (got {paper_cost})"
+        );
+
+        // Generic cost is higher than paper because it includes the 25-bps
+        // commission; the difference equals two sides of commission.
+        assert!(
+            generic_cost > paper_cost,
+            "live/other-venue cost must exceed paper cost by at least the commission \
+             (paper {paper_cost}, generic {generic_cost})"
+        );
     }
 
     #[test]

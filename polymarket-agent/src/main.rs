@@ -192,6 +192,17 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
             (false, false) => "— not needed (no Polymarket venue is enabled)",
         }
     );
+
+    let startup_issues = config.startup_issues(secrets);
+    if !startup_issues.is_empty() {
+        println!("   ❌ Startup blockers:");
+        for issue in &startup_issues {
+            println!("      - {issue}");
+        }
+        println!("      The agent is not allowed to run in a paper/live session without a valuation key.");
+        return Err(anyhow::anyhow!("{}", startup_issues.join("; ")));
+    }
+
     if config.agent.mode == AgentMode::Live && !poly_ok && poly_needed {
         println!("   ❌ ERROR: POLYMARKET_PRIVATE_KEY required for live mode");
         return Err(anyhow::anyhow!("Missing required API key for live mode"));
@@ -414,6 +425,16 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
         chrono::Utc::now(),
     ));
 
+    // Upstox requires the OAuth redirect URI to match the callback served by
+    // this dashboard instance. Keep it aligned with the configured dashboard
+    // port, while allowing deployments to supply the exact URI registered in
+    // their Upstox developer app.
+    let upstox_redirect_uri = std::env::var("UPSTOX_REDIRECT_URI").unwrap_or_else(|_| {
+        format!(
+            "http://127.0.0.1:{}/api/upstox/callback",
+            config.monitoring.dashboard_port
+        )
+    });
     let upstox_feed = std::sync::Arc::new(
         polymarket_agent::india::market_feed::UpstoxLiveMarketFeed::new(
             secrets
@@ -428,7 +449,7 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
                 .upstox_sandbox_token
                 .as_ref()
                 .map(|k| k.expose_secret().to_string()),
-            None,
+            Some(upstox_redirect_uri),
         ),
     );
     upstox_feed.clone().spawn_feed_worker();
