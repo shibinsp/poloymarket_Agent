@@ -94,21 +94,77 @@ export function Trades() {
   const allUnified: UnifiedTradeItem[] = useMemo(() => {
     const list: UnifiedTradeItem[] = [];
 
-    // 1. Polymarket Trades
+    const seenIds = new Set<string>();
+
+    // 1. Process all venue trades from core trades table
     for (const t of polyTrades) {
-      const sym = (t.market_id ?? "").toUpperCase();
+      const sym = (t.symbol || t.market_id || "").toUpperCase();
       const isIndianStock = [
         "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "SBIN",
         "BHARTIARTL", "ITC", "LT", "TATAMOTORS", "LICI", "HINDUNILVR", "BAJFINANCE"
-      ].includes(sym);
+      ].some(s => sym.includes(s));
       const isUsStock = [
-        "SIRI", "NOK", "LCID", "PLUG", "NIO", "SOFI", "SPY", "AAPL", "NVDA", "QQQ"
-      ].includes(sym);
-      // Equities belong to their respective venues (Indian Paper or US Paper). Do not render them as Polymarket CLOB in USD!
-      if (isIndianStock || isUsStock || t.direction === "BUY" || t.direction === "SELL") {
+        "SIRI", "NOK", "LCID", "PLUG", "NIO", "SOFI", "SPY", "AAPL", "NVDA", "QQQ", "MSFT", "AMZN", "TSLA", "META", "GOOGL"
+      ].some(s => sym.includes(s));
+      const isCrypto = sym.includes("BTC") || sym.includes("ETH");
+      const isAlpaca = t.venue_id === "alpaca" || isUsStock || isCrypto;
+      const isIndia = t.venue_id === "upstox_sandbox" || isIndianStock;
+
+      if (isAlpaca) {
+        const p = num(t.avg_fill_price || t.entry_price) ?? 0;
+        const pnlNum = num(t.pnl || t.unrealized_pnl || t.realized_pnl);
+        const q = num(t.quantity) ?? num(t.size) ?? 1;
+        seenIds.add(`us-${sym}`);
+        list.push({
+          id: `alpaca-trade-${t.id}`,
+          market_id: `US:${sym}`,
+          market_question: t.market_question || `${sym} · Alpaca Paper`,
+          symbol: sym,
+          venue_name: "Alpaca Paper (US)",
+          market_group: "us",
+          direction: t.direction || t.side || "BUY",
+          entry_price: `$${p.toFixed(2)}`,
+          raw_price: p,
+          quantity: q,
+          size: `${q} ${isCrypto ? "units" : "shares"}`,
+          status: t.status,
+          pnl_num: pnlNum,
+          pnl_pct: p > 0 && pnlNum !== null ? (pnlNum / (p * q)) * 100 : null,
+          currency_symbol: "$",
+          matched_buy_price: p,
+          created_at: t.created_at,
+        });
         continue;
       }
 
+      if (isIndia) {
+        const p = num(t.avg_fill_price || t.entry_price) ?? 0;
+        const pnlNum = num(t.pnl || t.realized_pnl);
+        const q = num(t.quantity) ?? num(t.size) ?? 1;
+        seenIds.add(`ind-${sym}`);
+        list.push({
+          id: `india-trade-${t.id}`,
+          market_id: `NSE:${sym}`,
+          market_question: t.market_question || `${sym} · NSE Cash Equity`,
+          symbol: sym,
+          venue_name: "Indian Paper (NSE)",
+          market_group: "india",
+          direction: t.direction || t.side || "BUY",
+          entry_price: `₹${p.toFixed(2)}`,
+          raw_price: p,
+          quantity: q,
+          size: `${q} shares`,
+          status: t.status,
+          pnl_num: pnlNum,
+          pnl_pct: p > 0 && pnlNum !== null ? (pnlNum / (p * q)) * 100 : null,
+          currency_symbol: "₹",
+          matched_buy_price: p,
+          created_at: t.created_at,
+        });
+        continue;
+      }
+
+      // Polymarket binary prediction market
       const pnlNum = num(t.pnl);
       list.push({
         id: `poly-${t.id}`,
@@ -131,10 +187,10 @@ export function Trades() {
       });
     }
 
-    // 2. Indian paper-market orders
+    // 2. Indian paper-market simulator orders
     for (const o of indiaOrders) {
+      if (seenIds.has(`ind-${o.symbol}`)) continue;
       const rawP = num(o.average_fill_price || o.price) ?? 0;
-      // If simulated market order filled at default tick or pending quote
       const p = rawP > 0 ? rawP : (o.symbol === "RELIANCE" ? 1205.50 : 2500.00);
       const match = indiaPnlMap.get(o.id);
       list.push({
@@ -158,8 +214,9 @@ export function Trades() {
       });
     }
 
-    // 3. US Alpaca Paper Orders
+    // 3. US Alpaca Paper simulator orders
     for (const o of usOrders) {
+      if (seenIds.has(`us-${o.symbol}`)) continue;
       const p = num(o.average_fill_price || o.price) ?? 0;
       const match = usPnlMap.get(o.id);
       list.push({

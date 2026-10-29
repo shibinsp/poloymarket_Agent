@@ -193,6 +193,7 @@ export interface TradeRecord {
   direction: string;
   entry_price: string;
   size: string;
+  quantity?: string;
   /** Fraction. */
   edge_at_entry: string;
   claude_fair_value: string;
@@ -207,6 +208,14 @@ export interface TradeRecord {
   /** SQLite `datetime('now')` — bare UTC, no zone. Use `parseTs`. */
   created_at: string | null;
   resolved_at: string | null;
+  venue_id?: string;
+  symbol?: string;
+  asset_class?: string;
+  side?: string;
+  avg_fill_price?: string;
+  realized_pnl?: string;
+  unrealized_pnl?: string;
+  mark_price?: string;
 }
 
 /** Every value the `trades.status` CHECK constraint allows. */

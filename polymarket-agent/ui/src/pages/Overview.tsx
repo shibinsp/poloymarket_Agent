@@ -34,8 +34,14 @@ export function Overview() {
 
   const indiaOrders = india.data?.recent_orders ?? [];
   const usOrders = us.data?.recent_orders ?? [];
+  const usTradeCount = (trades.data ?? []).filter(t => {
+    const sym = (t.symbol || t.market_id || "").toUpperCase();
+    return t.venue_id === "alpaca" || sym.includes("BTC") || sym.includes("ETH") || [
+      "SIRI", "NOK", "LCID", "PLUG", "NIO", "SOFI", "SPY", "AAPL", "NVDA", "QQQ"
+    ].some(s => sym.includes(s));
+  }).length;
   const indiaCount = indiaOrders.length;
-  const usCount = usOrders.length;
+  const usCount = Math.max(usOrders.length, usTradeCount);
   const polyTradesCount = metrics.data?.total_trades ?? 0;
   const totalCombinedTrades = polyTradesCount + indiaCount + usCount;
 
