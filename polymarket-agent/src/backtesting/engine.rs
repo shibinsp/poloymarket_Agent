@@ -157,6 +157,10 @@ pub fn run_backtest(snapshots: &[HistoricalSnapshot], config: &BacktestConfig) -
                     key_factors: vec![],
                     data_quality: crate::valuation::fair_value::DataQuality::Medium,
                     time_sensitivity: crate::valuation::fair_value::TimeSensitivity::Days,
+                    uncertainty_min: None,
+                    uncertainty_max: None,
+                    counter_arguments: Vec::new(),
+                    verdict: None,
                 },
                 &crate::valuation::edge::EdgeResult {
                     raw_edge: edge_result_edge,

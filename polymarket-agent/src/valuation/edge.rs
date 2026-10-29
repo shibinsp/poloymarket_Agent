@@ -16,6 +16,13 @@ pub fn evaluate_edge(
     valuation: &ValuationResult,
     config: &ValuationConfig,
 ) -> Option<EdgeResult> {
+    // 1. If skeptical analyst returned a "pass" verdict, respect it and skip
+    if let Some(ref verdict) = valuation.verdict {
+        if verdict.eq_ignore_ascii_case("pass") {
+            return None;
+        }
+    }
+
     let market_prob = candidate.order_book.implied_probability;
     let fair_prob = valuation.probability;
 
@@ -41,11 +48,44 @@ pub fn evaluate_edge(
         Side::No // Market overprices YES → buy NO
     };
 
-    // Effective price for the side we want to trade
-    let trade_price = match side {
-        Side::Yes => candidate.order_book.midpoint,
-        Side::No => Decimal::ONE - candidate.order_book.midpoint,
+    // 2. Derive true executable price from book (ask for YES, 1 - bid for NO)
+    let executable_price = match side {
+        Side::Yes => candidate
+            .order_book
+            .asks
+            .first()
+            .map(|a| a.price)
+            .unwrap_or(candidate.order_book.midpoint),
+        Side::No => {
+            let best_bid = candidate
+                .order_book
+                .bids
+                .first()
+                .map(|b| b.price)
+                .unwrap_or(candidate.order_book.midpoint);
+            Decimal::ONE - best_bid
+        }
     };
+
+    // 3. Conservative edge test:
+    // If uncertainty range is provided, conservative bound MUST still beat executable price
+    match side {
+        Side::Yes => {
+            if let Some(min_prob) = valuation.uncertainty_min {
+                if min_prob <= executable_price {
+                    return None;
+                }
+            }
+        }
+        Side::No => {
+            if let Some(max_prob_yes) = valuation.uncertainty_max {
+                let min_prob_no = Decimal::ONE - max_prob_yes;
+                if min_prob_no <= executable_price {
+                    return None;
+                }
+            }
+        }
+    }
 
     Some(EdgeResult {
         raw_edge,
@@ -53,7 +93,7 @@ pub fn evaluate_edge(
         side,
         fair_probability: fair_prob,
         market_probability: market_prob,
-        trade_price,
+        trade_price: executable_price,
     })
 }
 
@@ -166,6 +206,10 @@ mod tests {
             key_factors: vec!["test".to_string()],
             data_quality: DataQuality::High,
             time_sensitivity: crate::valuation::fair_value::TimeSensitivity::Days,
+            uncertainty_min: None,
+            uncertainty_max: None,
+            counter_arguments: Vec::new(),
+            verdict: None,
         }
     }
 
@@ -241,5 +285,49 @@ mod tests {
 
         let result = evaluate_edge(&candidate, &valuation, &config);
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_skeptical_pass_verdict_rejects_trade() {
+        let config = test_config();
+        let candidate = test_candidate(dec!(0.50));
+        let mut valuation = test_valuation(dec!(0.75), dec!(0.85));
+        valuation.verdict = Some("pass".to_string());
+
+        let result = evaluate_edge(&candidate, &valuation, &config);
+        assert!(
+            result.is_none(),
+            "A 'pass' verdict from skeptical analyst must reject trade"
+        );
+    }
+
+    #[test]
+    fn test_conservative_edge_below_executable_price_rejects_trade() {
+        let config = test_config();
+        let candidate = test_candidate(dec!(0.50)); // asks first price is 0.52
+                                                    // Fair value is 0.60, but uncertainty min is 0.51 (which is <= executable ask 0.52)
+        let mut valuation = test_valuation(dec!(0.60), dec!(0.85));
+        valuation.uncertainty_min = Some(dec!(0.51));
+        valuation.uncertainty_max = Some(dec!(0.69));
+
+        let result = evaluate_edge(&candidate, &valuation, &config);
+        assert!(
+            result.is_none(),
+            "Conservative lower bound must beat executable price"
+        );
+
+        // Now test where conservative lower bound does beat executable price:
+        valuation.uncertainty_min = Some(dec!(0.58));
+        let result = evaluate_edge(&candidate, &valuation, &config);
+        assert!(
+            result.is_some(),
+            "Conservative lower bound above ask permits trade"
+        );
+        let edge = result.unwrap();
+        assert_eq!(
+            edge.trade_price,
+            dec!(0.52),
+            "Trade price must be executable ask"
+        );
     }
 }
