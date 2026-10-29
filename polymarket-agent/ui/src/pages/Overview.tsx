@@ -19,7 +19,6 @@ import type {
   Health,
   IndiaSandboxStatusResponse,
   Metrics,
-  RiskStatus,
   TradeRecord,
   UsPaperStatusResponse,
 } from "../api/types";
@@ -31,7 +30,6 @@ export function Overview() {
   const india = useDataset<IndiaSandboxStatusResponse>("indiaSandbox");
   const us = useDataset<UsPaperStatusResponse>("usPaper");
   const health = useDataset<Health>("health");
-  const risk = useDataset<RiskStatus>("risk");
 
   const orderedCycles = cycles.data ? cyclesAscending(cycles.data) : [];
   const latestCycle = orderedCycles.at(-1) ?? null;
@@ -46,7 +44,6 @@ export function Overview() {
       : health.data.agent_state || "UNKNOWN"
     : "CONNECTING";
   const netProfit = num(m?.net_profit);
-  const drawdownLimit = num(risk.data?.limits.max_daily_loss_pct);
   const lastCycleAt = parseTs(health.data?.last_cycle_at);
 
   return (
@@ -109,7 +106,7 @@ export function Overview() {
         </Card>
       </section>
 
-      <Card title="Performance and risk">
+      <Card title="Polymarket strategy performance">
         <div className="grid grid--tiles">
           <StatTile
             label="Win rate"
@@ -120,7 +117,18 @@ export function Overview() {
             label="Net profit"
             value={money(netProfit)}
             tone={toneOf(netProfit)}
-            sub="Reported by the agent"
+            sub="Agent-reported metric"
+          />
+          <StatTile
+            label="Realized P&L"
+            value={money(num(m?.realized_pnl))}
+            tone={toneOf(num(m?.realized_pnl))}
+            sub="Closed positions"
+          />
+          <StatTile
+            label="Average entry edge"
+            value={pctFromFraction(num(m?.avg_edge_at_entry))}
+            sub="Recorded when positions opened"
           />
           <StatTile
             label="Open positions"
@@ -128,15 +136,15 @@ export function Overview() {
             sub="Polymarket trade ledger"
           />
           <StatTile
-            label="Daily loss limit"
-            value={pctFromFraction(drawdownLimit)}
-            sub={
-              risk.data
-                ? `${money(num(risk.data.limits.max_daily_loss_usd))} maximum`
-                : "Risk configuration unavailable"
-            }
+            label="Open exposure"
+            value={money(num(m?.unrealized_exposure))}
+            sub="Capital in open positions"
           />
         </div>
+        <p className="muted" style={{ margin: "12px 0 0", fontSize: 12 }}>
+          Net profit and realized P&amp;L are separate agent-reported fields; open exposure is not unrealized profit.
+          Risk limits and drawdown are shown on the Risk page.
+        </p>
       </Card>
 
       <DatasetCard
@@ -147,7 +155,7 @@ export function Overview() {
       >
         {(rows) => {
           const ascending = cyclesAscending(rows);
-          const shown = decimate(ascending, (cycle) => num(cycle.bankroll) ?? 0, 120);
+          const shown = decimate(ascending, (cycle) => num(cycle.bankroll), 120);
           if (shown.length === 0) {
             return <EmptyState title="No cycle balances recorded" />;
           }
@@ -164,7 +172,7 @@ export function Overview() {
                     {
                       name: "Bankroll",
                       color: "var(--series-1)",
-                      values: shown.map((cycle) => num(cycle.bankroll) ?? 0),
+                      values: shown.map((cycle) => num(cycle.bankroll)),
                     },
                   ]}
                 />
@@ -292,6 +300,19 @@ export function Overview() {
                   header: "Edge",
                   numeric: true,
                   render: (trade) => pctFromFraction(num(trade.edge_at_entry)),
+                },
+                {
+                  key: "fair-value",
+                  header: "Model YES probability",
+                  numeric: true,
+                  render: (trade) => pctFromFraction(num(trade.claude_fair_value)),
+                  title: () => "Model-estimated probability of the YES outcome at entry",
+                },
+                {
+                  key: "confidence",
+                  header: "Model confidence",
+                  numeric: true,
+                  render: (trade) => pctFromFraction(num(trade.confidence)),
                 },
                 {
                   key: "status",

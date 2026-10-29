@@ -276,6 +276,8 @@ td.truncate { max-width: 340px; overflow: hidden; text-overflow: ellipsis; }
 .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--text-secondary); }
 .legend__item { display: inline-flex; align-items: center; gap: 6px; }
 .legend__swatch { width: 12px; height: 2px; border-radius: 1px; flex: none; }
+.donut__legend-item { appearance: none; }
+.donut__legend-item:focus-visible { outline: 2px solid var(--series-1); outline-offset: 2px; }
 
 /* ---------- dialog ---------- */
 .backdrop {

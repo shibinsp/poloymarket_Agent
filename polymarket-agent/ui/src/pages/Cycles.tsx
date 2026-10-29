@@ -69,7 +69,7 @@ export function Cycles() {
       <DatasetCard title="Bankroll and unrealized P&L" label="Cycle history" dataset={cycles} datasetKey="cyclesAll">
         {(rows) => {
           const asc = cyclesAscending(rows);
-          const shown = decimate(asc, (c) => num(c.bankroll) ?? 0, 240);
+          const shown = decimate(asc, (c) => num(c.bankroll), 240);
           if (shown.length === 0) return <EmptyState title="No cycles recorded yet" />;
           const cats = shown.map((c) => String(c.cycle_number));
           return (
@@ -92,7 +92,7 @@ export function Cycles() {
                     {
                       name: "Bankroll",
                       color: "var(--series-1)",
-                      values: shown.map((c) => num(c.bankroll) ?? 0),
+                      values: shown.map((c) => num(c.bankroll)),
                     },
                   ]}
                 />

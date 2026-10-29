@@ -7,6 +7,7 @@ import { EmptyState } from "../components/ui/States";
 import { Badge, type StatusTone } from "../components/ui/Badge";
 import { DataTable } from "../components/ui/DataTable";
 import { LineChart } from "../components/charts/LineChart";
+import { ColumnChart } from "../components/charts/ColumnChart";
 import { ChartOrTable } from "../components/charts/ChartOrTable";
 import { HaltControl } from "../components/shell/HaltControl";
 import { dataStore } from "../data/store";
@@ -14,6 +15,7 @@ import { num } from "../lib/decimal";
 import { absTime, int, money, pctFromFraction, relTime, DASH } from "../lib/format";
 import { parseTs } from "../lib/time";
 import { useNow } from "../data/useNow";
+import { equitySeries } from "../lib/equity";
 import type {
   DailyEquity,
   Health,
@@ -216,22 +218,7 @@ export function Risk() {
 }
 
 function EquitySection({ rows }: { rows: DailyEquity[] }) {
-  const series = useMemo(() => {
-    // Peak-to-trough, walked forward. The stored high-water mark is already
-    // cumulative, but recomputing it here means the chart and the number
-    // agree even against an older agent that never wrote one.
-    let peak = -Infinity;
-    return rows.map((r) => {
-      const close = num(r.closing_equity) ?? num(r.starting_equity) ?? 0;
-      peak = Math.max(peak, close);
-      return {
-        day: r.day,
-        equity: close,
-        peak,
-        drawdown: peak > 0 ? (peak - close) / peak : 0,
-      };
-    });
-  }, [rows]);
+  const series = useMemo(() => equitySeries(rows), [rows]);
 
   if (series.length === 0) {
     return (
@@ -242,33 +229,44 @@ function EquitySection({ rows }: { rows: DailyEquity[] }) {
     );
   }
 
-  const worst = series.reduce((a, b) => (b.drawdown > a.drawdown ? b : a));
-  const latest = series[series.length - 1];
+  const recorded = series.filter((point) => point.equity !== null);
+  if (recorded.length === 0) {
+    return (
+      <EmptyState
+        title="No closing equity recorded yet"
+        hint="Opening equity is not treated as a closing balance. Daily equity is recorded in UTC."
+      />
+    );
+  }
+  const worst = recorded.reduce((a, b) =>
+    (b.drawdown ?? 0) > (a.drawdown ?? 0) ? b : a,
+  );
+  const latest = recorded[recorded.length - 1];
 
   return (
     <>
       <div className="grid grid--tiles">
-        <StatTile label="Latest equity" value={money(latest.equity)} />
+        <StatTile label="Latest equity" value={money(latest.equity)} sub="USD · latest recorded close" />
         <StatTile
-          label="Current drawdown"
+          label="Drawdown at latest close"
           value={pctFromFraction(latest.drawdown, 2)}
-          tone={latest.drawdown > 0 ? "neg" : null}
+          tone={latest.drawdown !== null && latest.drawdown > 0 ? "neg" : null}
         />
         <StatTile
           label="Worst drawdown"
           value={pctFromFraction(worst.drawdown, 2)}
           sub={`on ${worst.day}`}
-          tone={worst.drawdown > 0 ? "neg" : null}
+          tone={worst.drawdown !== null && worst.drawdown > 0 ? "neg" : null}
         />
-        <StatTile label="Days recorded" value={int(series.length)} />
+        <StatTile label="Daily closes" value={int(recorded.length)} sub="UTC" />
       </div>
       <ChartOrTable
-        label="Equity against its running peak"
+        label="Daily closing equity against its running peak"
         chart={
           <LineChart
-            ariaLabel="Account equity against its all-time high"
+            ariaLabel="Daily closing equity in USD against its running peak"
             categories={series.map((s) => s.day)}
-            formatX={(c) => c}
+            formatX={(c) => c.slice(5)}
             formatY={(v) => money(v)}
             series={[
               {
@@ -305,6 +303,42 @@ function EquitySection({ rows }: { rows: DailyEquity[] }) {
           />
         }
       />
+      <div style={{ marginTop: 16 }}>
+        <h3 className="muted">Drawdown from running peak · UTC</h3>
+        <ChartOrTable
+          label="Drawdown from running peak"
+          chart={
+            <ColumnChart
+              ariaLabel="Daily drawdown from running equity peak"
+              categories={series.map((point) => point.day)}
+              formatX={(day) => day.slice(5)}
+              formatY={(value) => pctFromFraction(value, 2)}
+              series={[
+                {
+                  name: "Drawdown",
+                  color: "var(--status-critical)",
+                  values: series.map((point) => point.drawdown),
+                },
+              ]}
+            />
+          }
+          table={
+            <DataTable
+              rows={series}
+              rowKey={(point) => point.day}
+              columns={[
+                { key: "day", header: "Day (UTC)", render: (point) => point.day },
+                {
+                  key: "drawdown",
+                  header: "Drawdown from peak",
+                  numeric: true,
+                  render: (point) => pctFromFraction(point.drawdown, 2),
+                },
+              ]}
+            />
+          }
+        />
+      </div>
     </>
   );
 }

@@ -163,11 +163,12 @@ export function Orders() {
           <StatTile
             label="Median slippage"
             value={stats.medianSlippage === null ? DASH : `${stats.medianSlippage.toFixed(1)} bps`}
-            sub={stats.withSlippage === 0 ? "clean paper fills" : `${int(stats.withSlippage)} fills`}
+            sub={stats.withSlippage === 0 ? "slippage data unavailable" : `${int(stats.withSlippage)} fills`}
           />
           <StatTile
             label="Median time to fill"
-            value={stats.medianFillMs === null ? "< 120ms" : durationMs(stats.medianFillMs)}
+            value={stats.medianFillMs === null ? DASH : durationMs(stats.medianFillMs)}
+            sub={stats.medianFillMs === null ? "fill timing unavailable" : "observed fills"}
           />
           <StatTile
             label="Unresolved"

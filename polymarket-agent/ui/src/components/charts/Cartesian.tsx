@@ -203,7 +203,11 @@ export function Cartesian({
         <Tooltip
           left={MARGIN.left + x.at(hover) + x.bandwidth / 2}
           width={width}
-          head={categories[hover]}
+          head={
+            formatX
+              ? formatX(categories[hover], hover)
+              : categories[hover]
+          }
           rows={series
             .map((s) => ({
               name: s.name,
