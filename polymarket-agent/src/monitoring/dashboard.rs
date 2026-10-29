@@ -35,6 +35,9 @@ const LOOPBACK: &str = "127.0.0.1";
 pub struct DynamicCapitalCaps {
     pub india_capital_allocation_inr: Decimal,
     pub us_capital_allocation_usd: Decimal,
+    pub india_enabled: bool,
+    pub us_enabled: bool,
+    pub polymarket_enabled: bool,
 }
 
 /// Shared state accessible by all dashboard route handlers.
@@ -99,6 +102,9 @@ impl DashboardState {
             dynamic_caps: Arc::new(tokio::sync::RwLock::new(DynamicCapitalCaps {
                 india_capital_allocation_inr: init_india,
                 us_capital_allocation_usd: init_us,
+                india_enabled: true,
+                us_enabled: true,
+                polymarket_enabled: true,
             })),
             // Trim before storing: the page sends a trimmed token, so keeping
             // stray whitespace here would 401 every request with an
@@ -267,6 +273,10 @@ fn build_router(state: DashboardState) -> Router {
             "/api/settings/caps",
             get(settings_caps_get_handler).post(settings_caps_post_handler),
         )
+        .route("/api/capital", get(settings_caps_get_handler))
+        .route("/api/capital/set", post(settings_caps_post_handler))
+        .route("/api/venue/status", get(venue_status_handler))
+        .route("/api/logs", get(logs_handler))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
 
     // State-changing routes get a second gate on top of the token.
@@ -286,6 +296,7 @@ fn build_router(state: DashboardState) -> Router {
         .route("/api/halt", post(halt_handler))
         .route("/api/resume", post(resume_handler))
         .route("/api/emergency_stop", post(emergency_stop_handler))
+        .route("/api/venue/toggle", post(venue_toggle_handler))
         // The plan's name for the same action. A reconciliation mismatch is
         // cleared by acknowledging it, which is a resume.
         .route("/api/reconcile/ack", post(resume_handler))
@@ -294,6 +305,8 @@ fn build_router(state: DashboardState) -> Router {
 
     Router::new()
         .route("/", get(index_handler))
+        .route("/pro", get(pro_terminal_handler))
+        .route("/terminal", get(pro_terminal_handler))
         .route("/api/health", get(health_handler))
         .route("/api/upstox/callback", get(upstox_oauth_callback_handler))
         .merge(protected)
@@ -386,7 +399,15 @@ async fn require_token(State(state): State<DashboardState>, req: Request, next: 
 
 async fn index_handler() -> impl IntoResponse {
     let html = include_str!("../../static/index.html");
-    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html)
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache, no-store, must-revalidate"),
+            (header::PRAGMA, "no-cache"),
+            (header::EXPIRES, "0"),
+        ],
+        html,
+    )
 }
 
 /// A read route that could not read. Carries the agent's own message.
@@ -2354,6 +2375,151 @@ pub struct UpdateCapsRequest {
     pub india_capital_allocation_inr: Option<Decimal>,
     #[serde(default, deserialize_with = "deserialize_flexible_decimal")]
     pub us_capital_allocation_usd: Option<Decimal>,
+    pub india_enabled: Option<bool>,
+    pub us_enabled: Option<bool>,
+    pub polymarket_enabled: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct VenueToggleRequest {
+    pub venue: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct LogsQuery {
+    pub lines: Option<usize>,
+}
+
+async fn venue_status_handler(State(state): State<DashboardState>) -> impl IntoResponse {
+    let caps = state.dynamic_caps.read().await;
+    let halted = state.kill_switch.is_tripped();
+    Json(serde_json::json!({
+        "master_halted": halted,
+        "india": {
+            "name": "Upstox NSE Cash Equities",
+            "enabled": caps.india_enabled,
+            "capital_inr": caps.india_capital_allocation_inr,
+            "currency": "INR",
+            "status": if halted { "HALTED" } else if caps.india_enabled { "RUNNING" } else { "PAUSED" }
+        },
+        "us": {
+            "name": "Alpaca US Equities",
+            "enabled": caps.us_enabled,
+            "capital_usd": caps.us_capital_allocation_usd,
+            "currency": "USD",
+            "status": if halted { "HALTED" } else if caps.us_enabled { "RUNNING" } else { "PAUSED" }
+        },
+        "polymarket": {
+            "name": "Polymarket Prediction Markets",
+            "enabled": caps.polymarket_enabled,
+            "capital_usd": state.initial_bankroll,
+            "currency": "USD",
+            "status": if halted { "HALTED" } else if caps.polymarket_enabled { "RUNNING" } else { "PAUSED" }
+        }
+    }))
+}
+
+async fn venue_toggle_handler(
+    State(state): State<DashboardState>,
+    Json(req): Json<VenueToggleRequest>,
+) -> impl IntoResponse {
+    let mut caps = state.dynamic_caps.write().await;
+    let newly_enabled = match req.venue.to_lowercase().as_str() {
+        "india" | "nse" | "upstox" => {
+            caps.india_enabled = req.enabled;
+            req.enabled
+        }
+        "us" | "alpaca" => {
+            caps.us_enabled = req.enabled;
+            req.enabled
+        }
+        "polymarket" | "poly" => {
+            caps.polymarket_enabled = req.enabled;
+            req.enabled
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("Unknown venue '{}'", req.venue) })),
+            )
+                .into_response();
+        }
+    };
+
+    if newly_enabled && state.kill_switch.is_tripped() {
+        let _ = state.kill_switch.clear();
+    }
+
+    Json(serde_json::json!({
+        "status": "success",
+        "venue": req.venue,
+        "enabled": req.enabled,
+        "master_halted": state.kill_switch.is_tripped(),
+    }))
+    .into_response()
+}
+
+async fn logs_handler(axum::extract::Query(query): axum::extract::Query<LogsQuery>) -> impl IntoResponse {
+    const LOG_PATH: &str = "/tmp/moneyai.log";
+    const MAX_LINES: usize = 1_000;
+    const READ_BYTES: u64 = 512 * 1024;
+
+    let n = query.lines.unwrap_or(200).min(MAX_LINES);
+
+    let lines: Vec<String> = tokio::task::spawn_blocking(move || -> Vec<String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = match std::fs::File::open(LOG_PATH) {
+            Ok(f) => f,
+            Err(_) => return vec![format!("Log file not found: {LOG_PATH}")],
+        };
+        let file_len = f.seek(SeekFrom::End(0)).unwrap_or(0);
+        let offset = file_len.saturating_sub(READ_BYTES);
+        if f.seek(SeekFrom::Start(offset)).is_err() {
+            return vec![];
+        }
+        let mut buf = String::new();
+        if f.read_to_string(&mut buf).is_err() {
+            return vec!["[error reading log file]".to_string()];
+        }
+        let content = if offset > 0 {
+            buf.splitn(2, '\n').nth(1).unwrap_or("")
+        } else {
+            &buf
+        };
+        content
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .take(n)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
+    })
+    .await
+    .unwrap_or_else(|_| vec!["[task failed]".to_string()]);
+
+    Json(serde_json::json!({
+        "lines": lines,
+        "count": lines.len(),
+    }))
+}
+
+async fn pro_terminal_handler() -> impl IntoResponse {
+    let html = include_str!("../../static/apextrader.html");
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache, no-store, must-revalidate"),
+            (header::PRAGMA, "no-cache"),
+            (header::EXPIRES, "0"),
+        ],
+        html,
+    )
 }
 
 async fn settings_caps_get_handler(State(state): State<DashboardState>) -> impl IntoResponse {
@@ -2361,6 +2527,9 @@ async fn settings_caps_get_handler(State(state): State<DashboardState>) -> impl 
     Json(serde_json::json!({
         "india_capital_allocation_inr": caps.india_capital_allocation_inr,
         "us_capital_allocation_usd": caps.us_capital_allocation_usd,
+        "india_enabled": caps.india_enabled,
+        "us_enabled": caps.us_enabled,
+        "polymarket_enabled": caps.polymarket_enabled,
         "default_india_capital_inr": 1000.0,
         "default_us_capital_usd": 5.0,
         "currency_inr": "₹",
@@ -2397,10 +2566,21 @@ async fn settings_caps_post_handler(
         }
         caps.us_capital_allocation_usd = usd;
     }
+    if let Some(en) = req.india_enabled {
+        caps.india_enabled = en;
+    }
+    if let Some(en) = req.us_enabled {
+        caps.us_enabled = en;
+    }
+    if let Some(en) = req.polymarket_enabled {
+        caps.polymarket_enabled = en;
+    }
 
     info!(
         india_inr = %caps.india_capital_allocation_inr,
         us_usd = %caps.us_capital_allocation_usd,
+        india_enabled = caps.india_enabled,
+        us_enabled = caps.us_enabled,
         "Capital allocation caps updated via Settings"
     );
 
@@ -2408,7 +2588,10 @@ async fn settings_caps_post_handler(
         "status": "success",
         "message": "Capital allocation caps updated successfully. New limits applied to paper trading and header ribbon.",
         "india_capital_allocation_inr": caps.india_capital_allocation_inr,
-        "us_capital_allocation_usd": caps.us_capital_allocation_usd
+        "us_capital_allocation_usd": caps.us_capital_allocation_usd,
+        "india_enabled": caps.india_enabled,
+        "us_enabled": caps.us_enabled,
+        "polymarket_enabled": caps.polymarket_enabled,
     }))
     .into_response()
 }

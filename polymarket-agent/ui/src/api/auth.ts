@@ -98,15 +98,7 @@ export const auth = {
    * in force — callers treat `""` as "give up for now", not as a retry signal.
    */
   requestToken(): Promise<string> {
-    if (token !== "") return Promise.resolve(token);
-    if (Date.now() < declinedUntil) return Promise.resolve("");
-    if (promptInFlight) return promptInFlight;
-
-    promptInFlight = new Promise<string>((resolve) => {
-      resolvePrompt = resolve;
-    });
-    notify();
-    return promptInFlight;
+    return Promise.resolve(token);
   },
 
   /** Called by the dialog when the operator saves a token. */

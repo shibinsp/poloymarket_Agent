@@ -1,17 +1,15 @@
-import { useState, useSyncExternalStore, type ReactNode } from "react";
+import { useSyncExternalStore, type ReactNode } from "react";
 import { Link } from "../../router/Link";
 import { ROUTES } from "../../router/routes";
-import { Badge, agentStateTone } from "../ui/Badge";
 import { Freshness } from "../ui/Freshness";
 import { ConnectionBar } from "./ConnectionBar";
 import { MarketSessionRibbon } from "./MarketSessionRibbon";
-import { TokenDialog } from "./TokenDialog";
-import { useAllDatasets, useDataset } from "../../data/useDataset";
+import { AgentActionButtons } from "./AgentActionButtons";
+import { useAllDatasets } from "../../data/useDataset";
 import { dataStore } from "../../data/store";
 import { useNow } from "../../data/useNow";
 import { settings } from "../../data/settings";
-import { resume, halt } from "../../api/endpoints";
-import type { Health } from "../../api/types";
+import { Badge } from "../ui/Badge";
 import type { DatasetKey } from "../../api/endpoints";
 
 /** Build stamp, so "am I looking at the new bundle?" is answerable in-page. */
@@ -25,50 +23,8 @@ export function AppShell({
   children: ReactNode;
 }) {
   const now = useNow();
-  const health = useDataset<Health>("health");
   const all = useAllDatasets();
   const cfg = useSyncExternalStore(settings.subscribe, settings.getSnapshot, settings.getSnapshot);
-
-  const [toggling, setToggling] = useState(false);
-
-  const stateRaw = health.data?.agent_state;
-  const normalizedState = stateRaw?.toUpperCase();
-  const isHalted =
-    health.data?.halted === true ||
-    health.data?.halt != null ||
-    normalizedState === "HALTED";
-  const stateKnown =
-    isHalted ||
-    normalizedState === "ALIVE" ||
-    normalizedState === "LOWFUEL" ||
-    normalizedState === "CRITICALSURVIVAL";
-  const canToggle =
-    health.data !== undefined &&
-    !health.loading &&
-    !health.error &&
-    stateKnown;
-  const state = !health.data || health.loading || health.error
-    ? "CONNECTING"
-    : isHalted
-      ? "HALTED"
-      : stateRaw || "UNKNOWN";
-
-  async function handleToggleAgent() {
-    if (!canToggle) return;
-    setToggling(true);
-    try {
-      const res = isHalted ? await resume() : await halt();
-      if (!res.ok) {
-        console.error("Failed to toggle agent state:", res.error);
-      }
-      await dataStore.refresh();
-      setTimeout(() => void dataStore.refresh(), 250);
-    } catch (e) {
-      console.error("Failed to toggle agent state:", e);
-    } finally {
-      setToggling(false);
-    }
-  }
 
   // The header reports the *worst* freshness across everything loaded, so the
   // top of the page can never claim to be current while a card below it is
@@ -87,32 +43,10 @@ export function AppShell({
         <div className="topbar__brand">
           <div className="topbar__brand-mark" aria-hidden="true">P</div>
           <div className="topbar__brand-copy">
-            <strong>Polymarket Agent</strong>
-            <span>trading operations dashboard</span>
+            <strong>MoneyAI</strong>
+            <span>autonomous multi-venue trading operations</span>
           </div>
-          <Badge tone={agentStateTone(state)} title="Agent lifecycle state">
-            {state}
-          </Badge>
-          <button
-            className={`btn btn--sm ${!canToggle ? "" : isHalted ? "btn--success" : "btn--danger"}`}
-            onClick={handleToggleAgent}
-            disabled={toggling || !canToggle}
-            title={
-              !canToggle
-                ? "Agent state is unavailable; wait for a successful health check before changing it"
-                : isHalted
-                ? "Press to start the autonomous trading agent"
-                : "Press to pause the agent and cancel resting orders"
-            }
-          >
-            {toggling
-              ? "Working…"
-              : !canToggle
-                ? "Status unavailable"
-                : isHalted
-                  ? "Start agent"
-                  : "Pause agent"}
-          </button>
+          <AgentActionButtons />
         </div>
 
         <nav className="nav" aria-label="Sections">
@@ -152,13 +86,11 @@ export function AppShell({
       </main>
 
       <footer className="footer">
-        <span>Trading operations dashboard</span>
+        <span>MoneyAI Trading Operations Dashboard · 60Hz Low-Latency Visualization Engine</span>
         <span className="muted">
           UI build {typeof __BUILD_ID__ === "string" ? __BUILD_ID__ : "dev"}
         </span>
       </footer>
-
-      <TokenDialog />
     </div>
   );
 }

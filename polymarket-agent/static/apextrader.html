@@ -1,0 +1,1102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ApexTrader Pro | MoneyAI Autonomous Terminal</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Inter', 'sans-serif'],
+            mono: ['JetBrains Mono', 'monospace'],
+          },
+          colors: {
+            apex: {
+              bg: '#0c0e12',
+              card: '#12161f',
+              panel: '#161b26',
+              border: '#1f2737',
+              muted: '#7a869e',
+              up: '#0ecb81',
+              'up-bg': 'rgba(14, 203, 129, 0.12)',
+              down: '#f6465d',
+              'down-bg': 'rgba(246, 70, 93, 0.12)',
+              accent: '#3861fb',
+              gold: '#f0b90b'
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    /* Tabular monospaced numbers for jitter-free prices */
+    .num-tabular {
+      font-variant-numeric: tabular-nums;
+      font-family: 'JetBrains Mono', monospace;
+    }
+    /* Custom scrollbars */
+    ::-webkit-scrollbar {
+      width: 4px;
+      height: 4px;
+    }
+    ::-webkit-scrollbar-track {
+      background: #0c0e12;
+    }
+    ::-webkit-scrollbar-thumb {
+      background: #232c3d;
+      border-radius: 2px;
+    }
+    ::-webkit-scrollbar-thumb:hover {
+      background: #37445c;
+    }
+    .bid-fill {
+      background: linear-gradient(90deg, rgba(14, 203, 129, 0.14) 0%, rgba(14, 203, 129, 0.02) 100%);
+    }
+    .ask-fill {
+      background: linear-gradient(90deg, rgba(246, 70, 93, 0.14) 0%, rgba(246, 70, 93, 0.02) 100%);
+    }
+    .pulse-flash-green {
+      animation: flashGreen 0.35s ease-out;
+    }
+    .pulse-flash-red {
+      animation: flashRed 0.35s ease-out;
+    }
+    @keyframes flashGreen {
+      0% { color: #00ff9d; text-shadow: 0 0 10px rgba(14, 203, 129, 0.8); }
+      100% { text-shadow: none; }
+    }
+    @keyframes flashRed {
+      0% { color: #ff526d; text-shadow: 0 0 10px rgba(246, 70, 93, 0.8); }
+      100% { text-shadow: none; }
+    }
+  </style>
+</head>
+<body class="bg-apex-bg text-gray-200 font-sans h-screen w-screen flex flex-col overflow-hidden select-none">
+
+  <!-- ================= TOP HEADER ================= -->
+  <header class="h-14 bg-apex-card border-b border-apex-border flex items-center justify-between px-4 flex-shrink-0 z-30">
+    <div class="flex items-center space-x-6 overflow-x-auto scrollbar-none">
+      <!-- Logo & Pair Selector -->
+      <div class="flex items-center space-x-3">
+        <div class="flex items-center gap-2">
+          <div class="w-8 h-8 rounded-lg bg-gradient-to-tr from-apex-accent to-emerald-400 flex items-center justify-center font-bold text-white shadow-lg shadow-apex-accent/20">
+            ▲
+          </div>
+          <span class="font-bold tracking-tight text-white hidden sm:inline">APEX<span class="text-apex-accent">TRADER</span></span>
+        </div>
+
+        <div class="relative">
+          <select id="pairSelect" class="bg-apex-panel hover:bg-opacity-80 text-white font-mono font-semibold px-3 py-1.5 rounded border border-apex-border focus:outline-none focus:border-apex-accent cursor-pointer transition">
+            <optgroup label="🇮🇳 NSE Cash Equities (Upstox Sandbox)">
+              <option value="RELIANCE" selected>RELIANCE (Reliance Ind.)</option>
+              <option value="TCS">TCS (Tata Consultancy)</option>
+              <option value="INFY">INFY (Infosys Ltd)</option>
+              <option value="HDFCBANK">HDFCBANK (HDFC Bank)</option>
+              <option value="ICICIBANK">ICICIBANK (ICICI Bank)</option>
+            </optgroup>
+            <optgroup label="🇺🇸 US Equities & Spot Crypto (Alpaca Paper)">
+              <option value="BTC/USD">BTC/USD (Bitcoin Spot)</option>
+              <option value="ETH/USD">ETH/USD (Ethereum Spot)</option>
+              <option value="SPY">SPY (S&P 500 ETF)</option>
+              <option value="AAPL">AAPL (Apple Inc)</option>
+              <option value="NVDA">NVDA (NVIDIA Corp)</option>
+            </optgroup>
+          </select>
+        </div>
+      </div>
+
+      <!-- Live Ticker Metrics -->
+      <div class="flex items-center space-x-6 text-xs num-tabular">
+        <div class="flex flex-col">
+          <span class="text-[10px] uppercase text-apex-muted font-medium">Last Price</span>
+          <div class="flex items-center space-x-2">
+            <span id="headerLastPrice" class="text-base font-bold text-apex-up transition-colors">1,205.50</span>
+            <span id="priceChevron" class="text-apex-up text-xs font-bold">▲</span>
+          </div>
+        </div>
+
+        <div class="flex flex-col">
+          <span class="text-[10px] uppercase text-apex-muted font-medium">24h Change</span>
+          <span id="headerChange24h" class="text-xs font-semibold text-apex-up px-1.5 py-0.5 rounded bg-apex-up-bg inline-block">+1.45%</span>
+        </div>
+
+        <div class="hidden md:flex flex-col">
+          <span class="text-[10px] uppercase text-apex-muted font-medium">24h High</span>
+          <span id="headerHigh24h" class="text-xs font-medium text-gray-300">1,218.00</span>
+        </div>
+
+        <div class="hidden md:flex flex-col">
+          <span class="text-[10px] uppercase text-apex-muted font-medium">24h Low</span>
+          <span id="headerLow24h" class="text-xs font-medium text-gray-300">1,192.50</span>
+        </div>
+
+        <div class="hidden lg:flex flex-col">
+          <span class="text-[10px] uppercase text-apex-muted font-medium">Market Session</span>
+          <span id="headerSessionStatus" class="text-xs font-medium text-emerald-400">🟢 NSE OPEN</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Right Controls: Start/Stop Agent & Navigation -->
+    <div class="flex items-center space-x-3">
+      <!-- Agent Toggle Button -->
+      <button id="toggleAgentBtn" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition shadow-sm bg-emerald-600 hover:bg-emerald-500 text-white">
+        <span id="agentStatusDot" class="w-2 h-2 rounded-full bg-white animate-pulse"></span>
+        <span id="agentStatusText">START AGENT</span>
+      </button>
+
+      <a href="/#/" class="hidden sm:inline-block px-3 py-1.5 rounded text-xs font-medium text-gray-300 bg-apex-panel hover:bg-apex-border border border-apex-border transition">
+        Classic Dashboard
+      </a>
+
+      <div class="flex items-center space-x-3 text-right">
+        <div class="text-xs">
+          <div class="text-[10px] text-apex-muted">Intraday Capital</div>
+          <div class="font-mono font-bold text-white" id="accountEquityDisplay">₹101,050.00</div>
+        </div>
+        <div class="w-8 h-8 rounded-full bg-apex-panel border border-apex-border flex items-center justify-center text-apex-gold font-bold text-xs">
+          PRO
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <!-- ================= MAIN WORKSPACE (CHART + ORDER BOOK + TRADE TICKET) ================= -->
+  <main class="flex-1 flex flex-col lg:flex-row overflow-hidden relative">
+
+    <!-- LEFT / CENTER: CHART ENGINE & DATA AREA -->
+    <div class="flex-1 flex flex-col h-full border-r border-apex-border bg-apex-bg min-w-0">
+
+      <!-- Chart Toolbar -->
+      <div class="h-10 bg-apex-panel border-b border-apex-border flex items-center justify-between px-3 text-xs z-10 flex-shrink-0">
+        <!-- Timeframes -->
+        <div class="flex items-center space-x-1">
+          <span class="text-apex-muted text-[11px] mr-1 hidden sm:inline">Interval:</span>
+          <button class="tf-btn px-2.5 py-1 rounded font-medium text-gray-400 hover:text-white hover:bg-apex-card transition" data-tf="1m">1m</button>
+          <button class="tf-btn px-2.5 py-1 rounded font-medium text-white bg-apex-card border border-apex-border transition" data-tf="5m">5m</button>
+          <button class="tf-btn px-2.5 py-1 rounded font-medium text-gray-400 hover:text-white hover:bg-apex-card transition" data-tf="15m">15m</button>
+          <button class="tf-btn px-2.5 py-1 rounded font-medium text-gray-400 hover:text-white hover:bg-apex-card transition" data-tf="1H">1H</button>
+          <button class="tf-btn px-2.5 py-1 rounded font-medium text-gray-400 hover:text-white hover:bg-apex-card transition" data-tf="1D">1D</button>
+        </div>
+
+        <!-- Chart Type & Indicators Switcher -->
+        <div class="flex items-center space-x-2">
+          <div class="flex items-center bg-apex-card p-0.5 rounded border border-apex-border">
+            <button id="styleCandles" class="px-2 py-0.5 rounded text-[11px] font-semibold text-white bg-apex-panel" title="Candlestick Chart">Candles</button>
+            <button id="styleLine" class="px-2 py-0.5 rounded text-[11px] font-semibold text-gray-400 hover:text-white" title="Line Chart">Line</button>
+            <button id="styleArea" class="px-2 py-0.5 rounded text-[11px] font-semibold text-gray-400 hover:text-white" title="Area Chart">Area</button>
+          </div>
+
+          <div class="hidden sm:flex items-center space-x-1">
+            <button id="toggleEma20" class="px-2 py-1 rounded text-[11px] font-mono border border-amber-500/40 text-amber-400 bg-amber-500/10">EMA 20</button>
+            <button id="toggleEma50" class="px-2 py-1 rounded text-[11px] font-mono border border-sky-500/40 text-sky-400 bg-sky-500/10">EMA 50</button>
+          </div>
+
+          <button id="resetChartBtn" class="px-2 py-1 bg-apex-card hover:bg-apex-border rounded text-[11px] text-gray-300 font-medium transition" title="Reset Zoom">
+            Reset
+          </button>
+        </div>
+      </div>
+
+      <!-- OHLCV & Indicator Dynamic Status Overlay Bar -->
+      <div id="chartStatsBar" class="h-6 bg-apex-bg/95 px-3 flex items-center space-x-4 text-[11px] num-tabular text-apex-muted border-b border-apex-border/40 overflow-hidden flex-shrink-0">
+        <span class="text-white font-semibold" id="barPair">RELIANCE</span>
+        <span>O: <span id="barOpen" class="text-gray-200">1,203.50</span></span>
+        <span>H: <span id="barHigh" class="text-gray-200">1,206.50</span></span>
+        <span>L: <span id="barLow" class="text-gray-200">1,202.20</span></span>
+        <span>C: <span id="barClose" class="text-apex-up">1,205.50</span></span>
+        <span>Vol: <span id="barVol" class="text-gray-200">25,400</span></span>
+        <span class="text-amber-400 hidden sm:inline">EMA(20): <span id="barEma20">--</span></span>
+        <span class="text-sky-400 hidden sm:inline">EMA(50): <span id="barEma50">--</span></span>
+      </div>
+
+      <!-- Canvas Chart Container -->
+      <div class="flex-1 relative w-full h-full min-h-[280px] overflow-hidden cursor-crosshair" id="chartWrapper">
+        <canvas id="tradingCanvas" class="absolute inset-0 block w-full h-full"></canvas>
+
+        <!-- Floating Price Cursor Badge -->
+        <div id="yPriceBadge" class="absolute right-0 hidden bg-apex-accent text-white font-mono text-[10px] px-1.5 py-0.5 rounded-l pointer-events-none transform -translate-y-1/2 z-20 shadow-md">
+          0.00
+        </div>
+
+        <!-- Floating Time Cursor Badge -->
+        <div id="xTimeBadge" class="absolute bottom-0 hidden bg-apex-panel border border-apex-border text-gray-200 font-mono text-[10px] px-2 py-0.5 rounded-t pointer-events-none transform -translate-x-1/2 z-20">
+          00:00
+        </div>
+      </div>
+
+      <!-- ================= BOTTOM PANEL: POSITIONS & ORDERS (WITH PAGINATION) ================= -->
+      <div class="h-52 border-t border-apex-border bg-apex-card flex flex-col flex-shrink-0">
+        <div class="flex items-center justify-between border-b border-apex-border px-3 h-8 bg-apex-panel">
+          <div class="flex items-center space-x-6 text-xs">
+            <button id="tabPositionsBtn" class="text-white border-b-2 border-apex-accent pb-1 font-semibold flex items-center gap-1.5">
+              <span>Open Positions & Fills</span>
+              <span id="posCountBadge" class="px-1.5 py-0.2 rounded-full text-[10px] bg-apex-border text-gray-300">3</span>
+            </button>
+            <button id="tabOrdersBtn" class="text-apex-muted hover:text-white pb-1 font-medium transition">
+              Working Orders (0)
+            </button>
+          </div>
+          <div class="text-[11px] text-apex-muted">
+            Total Realized P&L: <span id="totalPnlDisplay" class="font-mono font-bold text-apex-up">+₹1,050.00 (+1.05%)</span>
+          </div>
+        </div>
+
+        <!-- Table Container with Paginated rows -->
+        <div class="flex-1 overflow-y-auto text-xs num-tabular">
+          <table class="w-full text-left border-collapse">
+            <thead class="sticky top-0 bg-apex-card text-apex-muted text-[10px] uppercase border-b border-apex-border/50">
+              <tr>
+                <th class="p-2.5">Symbol / Side</th>
+                <th class="p-2.5">Size</th>
+                <th class="p-2.5">Execution Price</th>
+                <th class="p-2.5">Current Mark</th>
+                <th class="p-2.5">Statutory Tax & Fees</th>
+                <th class="p-2.5">Status</th>
+                <th class="p-2.5">Unrealized P&L</th>
+                <th class="p-2.5 text-right">Action</th>
+              </tr>
+            </thead>
+            <tbody id="positionsTableBody" class="divide-y divide-apex-border/40">
+              <!-- Dynamically rendered -->
+            </tbody>
+          </table>
+          <div id="noPositionsNotice" class="hidden h-28 flex-col items-center justify-center text-apex-muted text-xs">
+            <p>No open positions found.</p>
+            <p class="text-[10px] mt-1 text-gray-500">Place an order using the Trade Ticket on the right.</p>
+          </div>
+        </div>
+
+        <!-- Bottom Pagination Controls -->
+        <div class="h-8 border-t border-apex-border/60 bg-apex-panel px-3 flex items-center justify-between text-[11px] text-apex-muted flex-shrink-0">
+          <div>
+            Showing <strong class="text-white" id="pgStart">1</strong>–<strong class="text-white" id="pgEnd">3</strong> of <strong class="text-white" id="pgTotal">3</strong> entries
+          </div>
+          <div class="flex items-center space-x-2">
+            <button id="pgPrevBtn" class="px-2 py-0.5 rounded bg-apex-card border border-apex-border text-gray-300 disabled:opacity-40" disabled>‹ Prev</button>
+            <span class="font-mono text-white">1 / 1</span>
+            <button id="pgNextBtn" class="px-2 py-0.5 rounded bg-apex-card border border-apex-border text-gray-300 disabled:opacity-40" disabled>Next ›</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- RIGHT SIDEBAR: ORDER BOOK & QUICK TRADE TICKET -->
+    <div class="w-full lg:w-80 xl:w-96 bg-apex-card flex flex-col flex-shrink-0 border-l border-apex-border">
+      
+      <!-- Top Half of Sidebar: Live Order Book Depth -->
+      <div class="flex-1 flex flex-col border-b border-apex-border min-h-[260px] overflow-hidden">
+        <div class="p-2.5 border-b border-apex-border bg-apex-panel flex items-center justify-between">
+          <span class="text-xs font-semibold text-gray-200">Order Book (Depth Ladder)</span>
+          <div class="flex items-center space-x-2 text-[10px] text-apex-muted">
+            <span>Tick: 0.05</span>
+            <span class="w-1.5 h-1.5 rounded-full bg-apex-up"></span>
+          </div>
+        </div>
+
+        <!-- Column Headers -->
+        <div class="grid grid-cols-3 px-3 py-1 text-[10px] uppercase font-medium text-apex-muted border-b border-apex-border/40 num-tabular">
+          <span>Price (<span id="bookCcy">INR</span>)</span>
+          <span class="text-right">Size</span>
+          <span class="text-right">Total</span>
+        </div>
+
+        <!-- Asks (Red / Sell Depth) -->
+        <div id="asksContainer" class="flex-1 overflow-hidden flex flex-col-reverse justify-start text-[11px] num-tabular"></div>
+
+        <!-- Current Spread Strip -->
+        <div class="px-3 py-1.5 bg-apex-panel/90 border-y border-apex-border flex items-center justify-between num-tabular">
+          <div class="flex items-center space-x-2">
+            <span id="bookMidPrice" class="text-sm font-bold text-apex-up">1,205.50</span>
+            <span id="bookMidIcon" class="text-xs text-apex-up">▲</span>
+          </div>
+          <span class="text-[10px] text-apex-muted font-mono" id="bookSpread">Spread: 0.10 (0.01%)</span>
+        </div>
+
+        <!-- Bids (Green / Buy Depth) -->
+        <div id="bidsContainer" class="flex-1 overflow-hidden flex flex-col justify-start text-[11px] num-tabular"></div>
+      </div>
+
+      <!-- Bottom Half of Sidebar: Trade Ticket -->
+      <div class="p-3 bg-apex-card flex flex-col justify-between flex-shrink-0">
+        <div>
+          <!-- Buy/Sell Switch Tabs -->
+          <div class="grid grid-cols-2 gap-1 p-1 bg-apex-panel rounded-lg border border-apex-border mb-3">
+            <button id="orderSideBuy" class="py-1.5 text-xs font-bold rounded-md bg-apex-up text-white shadow transition">BUY / LONG</button>
+            <button id="orderSideSell" class="py-1.5 text-xs font-bold rounded-md text-apex-muted hover:text-white transition">SELL / SHORT</button>
+          </div>
+
+          <!-- Order Type Selector -->
+          <div class="flex items-center justify-between mb-3 text-xs">
+            <div class="flex space-x-2">
+              <button id="orderTypeLimit" class="text-white border-b border-apex-accent font-semibold pb-0.5">Limit</button>
+              <button id="orderTypeMarket" class="text-apex-muted hover:text-white transition pb-0.5">Market</button>
+            </div>
+            <div class="text-[10px] text-apex-muted">
+              Venue: <span class="text-apex-gold font-bold font-mono" id="venueBadge">Upstox NSE</span>
+            </div>
+          </div>
+
+          <!-- Price Input -->
+          <div id="priceInputGroup" class="mb-2">
+            <div class="flex justify-between text-[11px] text-apex-muted mb-1">
+              <span>Order Price</span>
+              <span class="text-gray-400" id="orderPriceCcy">INR</span>
+            </div>
+            <div class="relative">
+              <input id="orderPriceInput" type="number" step="0.05" value="1205.50" class="w-full bg-apex-panel border border-apex-border rounded px-3 py-1.5 text-xs num-tabular text-white focus:outline-none focus:border-apex-accent">
+            </div>
+          </div>
+
+          <!-- Size Input -->
+          <div class="mb-2">
+            <div class="flex justify-between text-[11px] text-apex-muted mb-1">
+              <span>Quantity (Shares)</span>
+              <span id="orderAssetLabel" class="text-gray-400 font-mono">RELIANCE</span>
+            </div>
+            <div class="relative">
+              <input id="orderAmountInput" type="number" step="1" value="1" class="w-full bg-apex-panel border border-apex-border rounded px-3 py-1.5 text-xs num-tabular text-white focus:outline-none focus:border-apex-accent">
+            </div>
+          </div>
+
+          <!-- Percentage Slider / Chips -->
+          <div class="grid grid-cols-4 gap-1.5 mb-3">
+            <button class="pct-btn py-1 text-[10px] rounded bg-apex-panel hover:bg-apex-border text-gray-300 font-mono transition" data-qty="1">1 Qty</button>
+            <button class="pct-btn py-1 text-[10px] rounded bg-apex-panel hover:bg-apex-border text-gray-300 font-mono transition" data-qty="5">5 Qty</button>
+            <button class="pct-btn py-1 text-[10px] rounded bg-apex-panel hover:bg-apex-border text-gray-300 font-mono transition" data-qty="10">10 Qty</button>
+            <button class="pct-btn py-1 text-[10px] rounded bg-apex-panel hover:bg-apex-border text-gray-300 font-mono transition" data-qty="25">25 Qty</button>
+          </div>
+
+          <!-- Summary info -->
+          <div class="bg-apex-panel/60 p-2 rounded border border-apex-border/60 space-y-1 text-[11px] num-tabular mb-3">
+            <div class="flex justify-between text-apex-muted">
+              <span>Estimated Cost</span>
+              <span id="orderCostDisplay" class="text-gray-200 font-mono">₹1,205.50</span>
+            </div>
+            <div class="flex justify-between text-apex-muted">
+              <span>Statutory Taxes (STT+GST)</span>
+              <span class="text-gray-200 font-mono" id="orderTaxDisplay">~₹0.36</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Action Button -->
+        <button id="submitOrderBtn" class="w-full py-2.5 rounded font-bold text-xs uppercase tracking-wide bg-apex-up hover:opacity-90 text-white shadow-lg transition active:scale-[0.99]">
+          BUY RELIANCE
+        </button>
+      </div>
+    </div>
+  </main>
+
+  <!-- ================= NOTIFICATION TOAST ================= -->
+  <div id="toastMessage" class="fixed bottom-4 right-4 z-50 bg-apex-panel border border-apex-border text-white px-4 py-2.5 rounded-lg shadow-2xl flex items-center space-x-2 text-xs transition-opacity duration-300 opacity-0 pointer-events-none">
+    <span id="toastIcon" class="text-emerald-400">✔</span>
+    <span id="toastText">Order executed successfully</span>
+  </div>
+
+  <!-- ================= APPLICATION ENGINE LOGIC ================= -->
+  <script>
+    const CONFIG = {
+      upColor: '#0ecb81',
+      downColor: '#f6465d',
+      gridColor: 'rgba(31, 39, 55, 0.45)',
+      textMuted: '#7a869e',
+      crosshairColor: 'rgba(255, 255, 255, 0.25)',
+      ema20Color: '#f59e0b',
+      ema50Color: '#38bdf8',
+      volumeUp: 'rgba(14, 203, 129, 0.35)',
+      volumeDown: 'rgba(246, 70, 93, 0.35)',
+    };
+
+    const ASSETS = {
+      'RELIANCE': { name: 'Reliance Industries', basePrice: 1205.50, tickDecimals: 2, ccy: 'INR', ccySym: '₹', isIndia: true },
+      'TCS': { name: 'Tata Consultancy Services', basePrice: 3840.00, tickDecimals: 2, ccy: 'INR', ccySym: '₹', isIndia: true },
+      'INFY': { name: 'Infosys Ltd', basePrice: 1870.20, tickDecimals: 2, ccy: 'INR', ccySym: '₹', isIndia: true },
+      'HDFCBANK': { name: 'HDFC Bank', basePrice: 1680.00, tickDecimals: 2, ccy: 'INR', ccySym: '₹', isIndia: true },
+      'ICICIBANK': { name: 'ICICI Bank', basePrice: 1240.10, tickDecimals: 2, ccy: 'INR', ccySym: '₹', isIndia: true },
+      'BTC/USD': { name: 'Bitcoin Spot', basePrice: 64250.00, tickDecimals: 2, ccy: 'USD', ccySym: '$', isIndia: false },
+      'ETH/USD': { name: 'Ethereum Spot', basePrice: 3480.00, tickDecimals: 2, ccy: 'USD', ccySym: '$', isIndia: false },
+      'SPY': { name: 'S&P 500 ETF', basePrice: 585.40, tickDecimals: 2, ccy: 'USD', ccySym: '$', isIndia: false },
+      'AAPL': { name: 'Apple Inc', basePrice: 232.50, tickDecimals: 2, ccy: 'USD', ccySym: '$', isIndia: false },
+      'NVDA': { name: 'NVIDIA Corp', basePrice: 141.20, tickDecimals: 2, ccy: 'USD', ccySym: '$', isIndia: false },
+    };
+
+    let currentPair = 'RELIANCE';
+    let chartStyle = 'candles';
+    let showEma20 = true;
+    let showEma50 = true;
+    let candleData = [];
+    let panOffset = 0;
+    let candleWidth = 10;
+    let candleSpacing = 4;
+    let isDragging = false;
+    let dragStartX = 0;
+    let initialPanOffset = 0;
+    let mousePos = { x: -1, y: -1, active: false };
+
+    let orderSide = 'BUY';
+    let orderType = 'LIMIT';
+    let isAgentHalted = false;
+
+    // Real-time Positions List
+    let userPositions = [
+      { id: '1', symbol: 'RELIANCE', side: 'BUY', size: 1, entryPrice: 1205.50, taxes: 0.36, status: 'FILLED', pnl: 2.40 },
+      { id: '2', symbol: 'TCS', side: 'BUY', size: 1, entryPrice: 3840.00, taxes: 1.15, status: 'FILLED', pnl: -8.50 },
+      { id: '3', symbol: 'INFY', side: 'BUY', size: 1, entryPrice: 1870.20, taxes: 0.56, status: 'FILLED', pnl: 14.20 },
+    ];
+
+    const canvas = document.getElementById('tradingCanvas');
+    const ctx = canvas.getContext('2d');
+    const chartWrapper = document.getElementById('chartWrapper');
+    const yPriceBadge = document.getElementById('yPriceBadge');
+    const xTimeBadge = document.getElementById('xTimeBadge');
+
+    const pairSelect = document.getElementById('pairSelect');
+    const headerLastPrice = document.getElementById('headerLastPrice');
+    const priceChevron = document.getElementById('priceChevron');
+    const barPair = document.getElementById('barPair');
+    const barOpen = document.getElementById('barOpen');
+    const barHigh = document.getElementById('barHigh');
+    const barLow = document.getElementById('barLow');
+    const barClose = document.getElementById('barClose');
+    const barVol = document.getElementById('barVol');
+    const barEma20 = document.getElementById('barEma20');
+    const barEma50 = document.getElementById('barEma50');
+
+    const asksContainer = document.getElementById('asksContainer');
+    const bidsContainer = document.getElementById('bidsContainer');
+    const bookMidPrice = document.getElementById('bookMidPrice');
+    const bookSpread = document.getElementById('bookSpread');
+    const bookCcy = document.getElementById('bookCcy');
+    const venueBadge = document.getElementById('venueBadge');
+
+    const orderSideBuy = document.getElementById('orderSideBuy');
+    const orderSideSell = document.getElementById('orderSideSell');
+    const orderTypeLimit = document.getElementById('orderTypeLimit');
+    const orderTypeMarket = document.getElementById('orderTypeMarket');
+    const orderPriceInput = document.getElementById('orderPriceInput');
+    const orderAmountInput = document.getElementById('orderAmountInput');
+    const orderAssetLabel = document.getElementById('orderAssetLabel');
+    const orderCostDisplay = document.getElementById('orderCostDisplay');
+    const orderTaxDisplay = document.getElementById('orderTaxDisplay');
+    const submitOrderBtn = document.getElementById('submitOrderBtn');
+    const positionsTableBody = document.getElementById('positionsTableBody');
+
+    const toggleAgentBtn = document.getElementById('toggleAgentBtn');
+    const agentStatusText = document.getElementById('agentStatusText');
+    const agentStatusDot = document.getElementById('agentStatusDot');
+
+    function formatNumber(num, decimals = 2) {
+      return Number(num).toLocaleString('en-US', {
+        minimumFractionDigits: decimals,
+        maximumFractionDigits: decimals
+      });
+    }
+
+    function showToast(msg, isSuccess = true) {
+      const toast = document.getElementById('toastMessage');
+      const icon = document.getElementById('toastIcon');
+      const text = document.getElementById('toastText');
+      icon.textContent = isSuccess ? '✔' : '✖';
+      icon.className = isSuccess ? 'text-emerald-400' : 'text-rose-400';
+      text.textContent = msg;
+      toast.classList.remove('opacity-0');
+      toast.classList.add('opacity-100');
+      setTimeout(() => {
+        toast.classList.remove('opacity-100');
+        toast.classList.add('opacity-0');
+      }, 3000);
+    }
+
+    // --- Technical Indicator Calculations ---
+    function calculateEMA(data, period) {
+      const k = 2 / (period + 1);
+      const emaArray = new Array(data.length);
+      let sum = 0;
+      for (let i = 0; i < period; i++) {
+        if (!data[i]) return emaArray;
+        sum += data[i].close;
+        emaArray[i] = null;
+      }
+      let prevEma = sum / period;
+      emaArray[period - 1] = prevEma;
+      for (let i = period; i < data.length; i++) {
+        const val = data[i].close * k + prevEma * (1 - k);
+        emaArray[i] = val;
+        prevEma = val;
+      }
+      return emaArray;
+    }
+
+    // --- Initial Candle Generator ---
+    function generateInitialCandles(count = 120) {
+      const asset = ASSETS[currentPair];
+      let price = asset.basePrice;
+      const now = Date.now();
+      const intervalMs = 5 * 60 * 1000;
+      const candles = [];
+      let runningTimestamp = now - count * intervalMs;
+
+      for (let i = 0; i < count; i++) {
+        const volatility = price * 0.0035;
+        const change = (Math.random() - 0.495) * volatility;
+        const open = price;
+        const close = open + change;
+        const high = Math.max(open, close) + Math.random() * volatility * 0.8;
+        const low = Math.min(open, close) - Math.random() * volatility * 0.8;
+        const volume = Math.floor(Math.random() * 5000 + 1000);
+
+        candles.push({ time: runningTimestamp, open, high, low, close, volume });
+        price = close;
+        runningTimestamp += intervalMs;
+      }
+      candleData = candles;
+    }
+
+    function simulateLiveTick() {
+      if (candleData.length === 0) return;
+      const last = candleData[candleData.length - 1];
+      const asset = ASSETS[currentPair];
+      const deltaPercent = (Math.random() - 0.498) * 0.0009;
+      const tickDelta = last.close * deltaPercent;
+      const newClose = +(last.close + tickDelta).toFixed(asset.tickDecimals);
+
+      last.close = newClose;
+      if (newClose > last.high) last.high = newClose;
+      if (newClose < last.low) last.low = newClose;
+      last.volume += 25;
+
+      updateHeaderAndStats(newClose, tickDelta >= 0);
+      updateOrderBookMid(newClose);
+      renderPositions();
+    }
+
+    function updateHeaderAndStats(price, isUp) {
+      const asset = ASSETS[currentPair];
+      headerLastPrice.textContent = `${asset.ccySym}${formatNumber(price, asset.tickDecimals)}`;
+      headerLastPrice.className = `text-base font-bold num-tabular transition-colors ${isUp ? 'text-apex-up pulse-flash-green' : 'text-apex-down pulse-flash-red'}`;
+      priceChevron.textContent = isUp ? '▲' : '▼';
+      priceChevron.className = `text-xs font-bold ${isUp ? 'text-apex-up' : 'text-apex-down'}`;
+
+      if (!mousePos.active) {
+        const last = candleData[candleData.length - 1];
+        if (last) {
+          barOpen.textContent = formatNumber(last.open, asset.tickDecimals);
+          barHigh.textContent = formatNumber(last.high, asset.tickDecimals);
+          barLow.textContent = formatNumber(last.low, asset.tickDecimals);
+          barClose.textContent = formatNumber(last.close, asset.tickDecimals);
+          barClose.className = last.close >= last.open ? 'text-apex-up' : 'text-apex-down';
+          barVol.textContent = formatNumber(last.volume, 0);
+        }
+      }
+    }
+
+    let dpr = window.devicePixelRatio || 1;
+    function resizeCanvas() {
+      const rect = chartWrapper.getBoundingClientRect();
+      dpr = window.devicePixelRatio || 1;
+      canvas.width = rect.width * dpr;
+      canvas.height = rect.height * dpr;
+      ctx.resetTransform();
+      ctx.scale(dpr, dpr);
+    }
+    window.addEventListener('resize', resizeCanvas);
+
+    function renderChart() {
+      const width = canvas.width / dpr;
+      const height = canvas.height / dpr;
+      ctx.clearRect(0, 0, width, height);
+
+      if (candleData.length === 0) {
+        requestAnimationFrame(renderChart);
+        return;
+      }
+
+      const priceScaleWidth = 75;
+      const timeScaleHeight = 26;
+      const volumeHeight = Math.min(height * 0.2, 80);
+      const chartAreaWidth = width - priceScaleWidth;
+      const chartAreaHeight = height - timeScaleHeight;
+      const candleAreaHeight = chartAreaHeight - volumeHeight;
+
+      const step = candleWidth + candleSpacing;
+      const maxFitCount = Math.floor(chartAreaWidth / step);
+      const endIndex = Math.max(0, candleData.length - panOffset);
+      const startIndex = Math.max(0, endIndex - maxFitCount);
+      const visibleData = candleData.slice(startIndex, endIndex);
+
+      if (visibleData.length === 0) {
+        requestAnimationFrame(renderChart);
+        return;
+      }
+
+      let minPrice = Infinity;
+      let maxPrice = -Infinity;
+      let maxVolume = 0;
+
+      for (let i = 0; i < visibleData.length; i++) {
+        const c = visibleData[i];
+        if (c.low < minPrice) minPrice = c.low;
+        if (c.high > maxPrice) maxPrice = c.high;
+        if (c.volume > maxVolume) maxVolume = c.volume;
+      }
+
+      const pricePadding = (maxPrice - minPrice) * 0.08 || 1;
+      maxPrice += pricePadding;
+      minPrice -= pricePadding;
+      const priceRange = maxPrice - minPrice;
+
+      const getY = (val) => candleAreaHeight - ((val - minPrice) / priceRange) * candleAreaHeight;
+      const getVolY = (vol) => chartAreaHeight - (vol / (maxVolume || 1)) * (volumeHeight - 10);
+      const getX = (idx) => chartAreaWidth - ((visibleData.length - 1 - idx) * step) - candleWidth;
+
+      // 1. Grid Lines
+      ctx.strokeStyle = CONFIG.gridColor;
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 4]);
+
+      const gridSteps = 5;
+      for (let i = 0; i <= gridSteps; i++) {
+        const pY = (candleAreaHeight / gridSteps) * i;
+        ctx.beginPath();
+        ctx.moveTo(0, pY);
+        ctx.lineTo(chartAreaWidth, pY);
+        ctx.stroke();
+
+        const pVal = maxPrice - (i / gridSteps) * priceRange;
+        ctx.setLineDash([]);
+        ctx.fillStyle = CONFIG.textMuted;
+        ctx.font = '10px JetBrains Mono';
+        ctx.textAlign = 'left';
+        ctx.fillText(formatNumber(pVal, ASSETS[currentPair].tickDecimals), chartAreaWidth + 6, pY + 3.5);
+        ctx.setLineDash([4, 4]);
+      }
+
+      // 2. EMA Overlays
+      const ema20Data = calculateEMA(candleData, 20);
+      const ema50Data = calculateEMA(candleData, 50);
+
+      function drawEMALine(emaArr, color) {
+        ctx.beginPath();
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1.6;
+        ctx.setLineDash([]);
+        let first = true;
+        for (let i = 0; i < visibleData.length; i++) {
+          const globalIdx = startIndex + i;
+          const val = emaArr[globalIdx];
+          if (val != null) {
+            const x = getX(i) + candleWidth / 2;
+            const y = getY(val);
+            if (first) { ctx.moveTo(x, y); first = false; }
+            else { ctx.lineTo(x, y); }
+          }
+        }
+        ctx.stroke();
+      }
+
+      if (showEma20) drawEMALine(ema20Data, CONFIG.ema20Color);
+      if (showEma50) drawEMALine(ema50Data, CONFIG.ema50Color);
+
+      // 3. Volume
+      ctx.setLineDash([]);
+      for (let i = 0; i < visibleData.length; i++) {
+        const c = visibleData[i];
+        const x = getX(i);
+        const yTop = getVolY(c.volume);
+        ctx.fillStyle = c.close >= c.open ? CONFIG.volumeUp : CONFIG.volumeDown;
+        ctx.fillRect(x, yTop, candleWidth, chartAreaHeight - yTop);
+      }
+
+      // 4. Candlesticks
+      if (chartStyle === 'candles') {
+        for (let i = 0; i < visibleData.length; i++) {
+          const c = visibleData[i];
+          const x = getX(i);
+          const isUp = c.close >= c.open;
+          const openY = getY(c.open);
+          const closeY = getY(c.close);
+          const highY = getY(c.high);
+          const lowY = getY(c.low);
+
+          const bodyTop = Math.min(openY, closeY);
+          const bodyHeight = Math.max(Math.abs(closeY - openY), 1.2);
+          const candleColor = isUp ? CONFIG.upColor : CONFIG.downColor;
+
+          ctx.strokeStyle = candleColor;
+          ctx.lineWidth = 1.3;
+          ctx.beginPath();
+          ctx.moveTo(x + candleWidth / 2, highY);
+          ctx.lineTo(x + candleWidth / 2, lowY);
+          ctx.stroke();
+
+          ctx.fillStyle = candleColor;
+          ctx.fillRect(x, bodyTop, candleWidth, bodyHeight);
+        }
+      } else {
+        ctx.beginPath();
+        for (let i = 0; i < visibleData.length; i++) {
+          const x = getX(i) + candleWidth / 2;
+          const y = getY(visibleData[i].close);
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }
+        ctx.strokeStyle = '#38bdf8';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+
+      // 5. Current Price Line
+      const latest = candleData[candleData.length - 1];
+      const latestY = getY(latest.close);
+      const isLatestUp = latest.close >= latest.open;
+
+      ctx.setLineDash([3, 3]);
+      ctx.strokeStyle = isLatestUp ? CONFIG.upColor : CONFIG.downColor;
+      ctx.beginPath();
+      ctx.moveTo(0, latestY);
+      ctx.lineTo(chartAreaWidth, latestY);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      ctx.fillStyle = isLatestUp ? CONFIG.upColor : CONFIG.downColor;
+      ctx.fillRect(chartAreaWidth, latestY - 9, priceScaleWidth, 18);
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 10px JetBrains Mono';
+      ctx.fillText(formatNumber(latest.close, ASSETS[currentPair].tickDecimals), chartAreaWidth + 6, latestY + 3.5);
+
+      // 6. Crosshair
+      if (mousePos.active && mousePos.x >= 0 && mousePos.x <= chartAreaWidth && mousePos.y <= height) {
+        ctx.strokeStyle = CONFIG.crosshairColor;
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4, 4]);
+
+        ctx.beginPath();
+        ctx.moveTo(mousePos.x, 0);
+        ctx.lineTo(mousePos.x, height - timeScaleHeight);
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.moveTo(0, mousePos.y);
+        ctx.lineTo(chartAreaWidth, mousePos.y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        const hoveredPrice = maxPrice - (mousePos.y / candleAreaHeight) * priceRange;
+        yPriceBadge.style.display = 'block';
+        yPriceBadge.style.top = `${mousePos.y}px`;
+        yPriceBadge.textContent = formatNumber(hoveredPrice, ASSETS[currentPair].tickDecimals);
+
+        let hoveredIndex = -1;
+        for (let i = 0; i < visibleData.length; i++) {
+          const cx = getX(i);
+          if (mousePos.x >= cx - candleSpacing / 2 && mousePos.x <= cx + candleWidth + candleSpacing / 2) {
+            hoveredIndex = i;
+            break;
+          }
+        }
+
+        if (hoveredIndex !== -1) {
+          const hc = visibleData[hoveredIndex];
+          const globalIdx = startIndex + hoveredIndex;
+          const dateStr = new Date(hc.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+          xTimeBadge.style.display = 'block';
+          xTimeBadge.style.left = `${getX(hoveredIndex) + candleWidth / 2}px`;
+          xTimeBadge.textContent = dateStr;
+
+          barOpen.textContent = formatNumber(hc.open, ASSETS[currentPair].tickDecimals);
+          barHigh.textContent = formatNumber(hc.high, ASSETS[currentPair].tickDecimals);
+          barLow.textContent = formatNumber(hc.low, ASSETS[currentPair].tickDecimals);
+          barClose.textContent = formatNumber(hc.close, ASSETS[currentPair].tickDecimals);
+          barClose.className = hc.close >= hc.open ? 'text-apex-up' : 'text-apex-down';
+          barVol.textContent = formatNumber(hc.volume, 0);
+
+          const e20 = ema20Data[globalIdx];
+          const e50 = ema50Data[globalIdx];
+          barEma20.textContent = e20 ? formatNumber(e20, ASSETS[currentPair].tickDecimals) : '--';
+          barEma50.textContent = e50 ? formatNumber(e50, ASSETS[currentPair].tickDecimals) : '--';
+        }
+      } else {
+        yPriceBadge.style.display = 'none';
+        xTimeBadge.style.display = 'none';
+      }
+
+      requestAnimationFrame(renderChart);
+    }
+
+    function generateOrderBook() {
+      if (candleData.length === 0) return;
+      const mid = candleData[candleData.length - 1].close;
+      const asset = ASSETS[currentPair];
+      const rows = 8;
+      const asks = [];
+      const bids = [];
+      let rAsk = 0;
+      let rBid = 0;
+
+      for (let i = 1; i <= rows; i++) {
+        const aPrice = mid + (i * 0.25);
+        const aSize = Math.floor(Math.random() * 25 + 5);
+        rAsk += aSize;
+        asks.push({ price: aPrice, size: aSize, total: rAsk });
+
+        const bPrice = mid - (i * 0.25);
+        const bSize = Math.floor(Math.random() * 25 + 5);
+        rBid += bSize;
+        bids.push({ price: bPrice, size: bSize, total: rBid });
+      }
+
+      const maxT = Math.max(rAsk, rBid);
+      asksContainer.innerHTML = asks.slice().reverse().map(item => `
+        <div class="relative grid grid-cols-3 px-3 py-0.5 hover:bg-white/5 cursor-pointer text-gray-300" onclick="orderPriceInput.value=${item.price.toFixed(asset.tickDecimals)}; updateCostCalculation();">
+          <div class="absolute inset-0 ask-fill" style="width: ${(item.total / maxT) * 100}%;"></div>
+          <span class="z-10 text-apex-down font-mono">${formatNumber(item.price, asset.tickDecimals)}</span>
+          <span class="z-10 text-right font-mono">${item.size}</span>
+          <span class="z-10 text-right text-apex-muted font-mono">${item.total}</span>
+        </div>
+      `).join('');
+
+      bidsContainer.innerHTML = bids.map(item => `
+        <div class="relative grid grid-cols-3 px-3 py-0.5 hover:bg-white/5 cursor-pointer text-gray-300" onclick="orderPriceInput.value=${item.price.toFixed(asset.tickDecimals)}; updateCostCalculation();">
+          <div class="absolute inset-0 bid-fill" style="width: ${(item.total / maxT) * 100}%;"></div>
+          <span class="z-10 text-apex-up font-mono">${formatNumber(item.price, asset.tickDecimals)}</span>
+          <span class="z-10 text-right font-mono">${item.size}</span>
+          <span class="z-10 text-right text-apex-muted font-mono">${item.total}</span>
+        </div>
+      `).join('');
+
+      bookSpread.textContent = `Spread: 0.10 (0.01%)`;
+    }
+
+    function updateOrderBookMid(newPrice) {
+      bookMidPrice.textContent = formatNumber(newPrice, ASSETS[currentPair].tickDecimals);
+    }
+
+    function renderPositions() {
+      const asset = ASSETS[currentPair];
+      const rows = userPositions.map(pos => {
+        const curPrice = candleData.length > 0 ? candleData[candleData.length - 1].close : pos.entryPrice;
+        const pnl = pos.side === 'BUY' ? (curPrice - pos.entryPrice) * pos.size : (pos.entryPrice - curPrice) * pos.size;
+        const isUp = pnl >= 0;
+
+        return `
+          <tr class="hover:bg-apex-panel/50 transition">
+            <td class="p-2.5 font-medium flex items-center space-x-2">
+              <span class="font-bold text-white">${pos.symbol}</span>
+              <span class="px-1.5 py-0.5 rounded text-[10px] font-bold ${pos.side === 'BUY' ? 'bg-apex-up-bg text-apex-up' : 'bg-apex-down-bg text-apex-down'}">${pos.side}</span>
+            </td>
+            <td class="p-2.5 text-gray-200">${pos.size}</td>
+            <td class="p-2.5 text-gray-300 font-mono">${asset.ccySym}${formatNumber(pos.entryPrice, 2)}</td>
+            <td class="p-2.5 text-gray-100 font-mono">${asset.ccySym}${formatNumber(curPrice, 2)}</td>
+            <td class="p-2.5 text-gray-400 font-mono">${asset.ccySym}${formatNumber(pos.taxes, 2)}</td>
+            <td class="p-2.5"><span class="px-1.5 py-0.5 rounded text-[10px] bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">${pos.status}</span></td>
+            <td class="p-2.5 font-mono font-semibold ${isUp ? 'text-apex-up' : 'text-apex-down'}">
+              ${isUp ? '+' : ''}${asset.ccySym}${formatNumber(pnl, 2)}
+            </td>
+            <td class="p-2.5 text-right">
+              <button onclick="closePosition('${pos.id}')" class="px-2 py-1 rounded bg-apex-border hover:bg-rose-500 hover:text-white text-gray-300 font-sans text-[11px] transition">
+                Close
+              </button>
+            </td>
+          </tr>
+        `;
+      }).join('');
+
+      positionsTableBody.innerHTML = rows;
+    }
+
+    window.closePosition = function(id) {
+      userPositions = userPositions.filter(p => p.id !== id);
+      renderPositions();
+      showToast('Position closed at market price', true);
+    };
+
+    function updateCostCalculation() {
+      const price = parseFloat(orderPriceInput.value) || 0;
+      const amount = parseFloat(orderAmountInput.value) || 0;
+      const asset = ASSETS[currentPair];
+      const notional = price * amount;
+      const estTax = notional * 0.0003;
+      orderCostDisplay.textContent = `${asset.ccySym}${formatNumber(notional, 2)}`;
+      orderTaxDisplay.textContent = `~${asset.ccySym}${formatNumber(estTax, 2)}`;
+    }
+
+    orderPriceInput.addEventListener('input', updateCostCalculation);
+    orderAmountInput.addEventListener('input', updateCostCalculation);
+
+    document.querySelectorAll('.pct-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        orderAmountInput.value = btn.dataset.qty;
+        updateCostCalculation();
+      });
+    });
+
+    orderSideBuy.addEventListener('click', () => {
+      orderSide = 'BUY';
+      orderSideBuy.className = 'py-1.5 text-xs font-bold rounded-md bg-apex-up text-white shadow transition';
+      orderSideSell.className = 'py-1.5 text-xs font-bold rounded-md text-apex-muted hover:text-white transition';
+      submitOrderBtn.className = 'w-full py-2.5 rounded font-bold text-xs uppercase tracking-wide bg-apex-up hover:opacity-90 text-white shadow-lg transition active:scale-[0.99]';
+      submitOrderBtn.textContent = `BUY ${currentPair}`;
+    });
+
+    orderSideSell.addEventListener('click', () => {
+      orderSide = 'SELL';
+      orderSideSell.className = 'py-1.5 text-xs font-bold rounded-md bg-apex-down text-white shadow transition';
+      orderSideBuy.className = 'py-1.5 text-xs font-bold rounded-md text-apex-muted hover:text-white transition';
+      submitOrderBtn.className = 'w-full py-2.5 rounded font-bold text-xs uppercase tracking-wide bg-apex-down hover:opacity-90 text-white shadow-lg transition active:scale-[0.99]';
+      submitOrderBtn.textContent = `SELL ${currentPair}`;
+    });
+
+    orderTypeLimit.addEventListener('click', () => {
+      orderType = 'LIMIT';
+      orderTypeLimit.className = 'text-white border-b border-apex-accent font-semibold pb-0.5';
+      orderTypeMarket.className = 'text-apex-muted hover:text-white transition pb-0.5';
+      document.getElementById('priceInputGroup').style.display = 'block';
+    });
+
+    orderTypeMarket.addEventListener('click', () => {
+      orderType = 'MARKET';
+      orderTypeMarket.className = 'text-white border-b border-apex-accent font-semibold pb-0.5';
+      orderTypeLimit.className = 'text-apex-muted hover:text-white transition pb-0.5';
+      document.getElementById('priceInputGroup').style.display = 'none';
+      if (candleData.length > 0) orderPriceInput.value = candleData[candleData.length - 1].close;
+    });
+
+    // Execute Real Sandbox Order via Local Agent API
+    submitOrderBtn.addEventListener('click', async () => {
+      const price = orderType === 'MARKET' ? null : parseFloat(orderPriceInput.value);
+      const size = parseInt(orderAmountInput.value, 10) || 1;
+      const asset = ASSETS[currentPair];
+
+      const endpoint = asset.isIndia ? '/api/india/sandbox/order' : '/api/us/paper/order';
+      try {
+        const resp = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-agent-control': '1' },
+          body: JSON.stringify({ symbol: currentPair, side: orderSide, quantity: size, order_type: orderType, price: price })
+        });
+        const res = await resp.json();
+        if (res.status === 'success' || res.order) {
+          showToast(`Executed ${orderSide} ${size} ${currentPair} successfully!`, true);
+          userPositions.unshift({
+            id: 'pos-' + Date.now(),
+            symbol: currentPair,
+            side: orderSide,
+            size: size,
+            entryPrice: price || candleData[candleData.length - 1].close,
+            taxes: ((price || candleData[candleData.length - 1].close) * size * 0.0003),
+            status: 'FILLED',
+            pnl: 0.00
+          });
+          renderPositions();
+        } else {
+          showToast(`Order Rejected: ${res.error || 'Check balance limits'}`, false);
+        }
+      } catch (err) {
+        showToast('Network error placing order', false);
+      }
+    });
+
+    // Start/Stop Agent Real Controls
+    toggleAgentBtn.addEventListener('click', async () => {
+      const targetEndpoint = isAgentHalted ? '/api/resume' : '/api/halt';
+      try {
+        const resp = await fetch(targetEndpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-agent-control': '1' }
+        });
+        const res = await resp.json();
+        isAgentHalted = res.halted;
+        updateAgentBtnUi();
+        showToast(isAgentHalted ? 'AI Agent Trading Halted' : 'AI Agent Trading Resumed!', !isAgentHalted);
+      } catch {
+        showToast('Failed to toggle agent state', false);
+      }
+    });
+
+    function updateAgentBtnUi() {
+      if (isAgentHalted) {
+        toggleAgentBtn.className = 'flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition shadow-sm bg-emerald-600 hover:bg-emerald-500 text-white';
+        agentStatusText.textContent = 'START AGENT';
+        agentStatusDot.className = 'w-2 h-2 rounded-full bg-white animate-pulse';
+      } else {
+        toggleAgentBtn.className = 'flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition shadow-sm bg-rose-600 hover:bg-rose-500 text-white';
+        agentStatusText.textContent = 'STOP AGENT';
+        agentStatusDot.className = 'w-2 h-2 rounded-full bg-white';
+      }
+    }
+
+    async function checkAgentHealth() {
+      try {
+        const res = await fetch('/api/health');
+        if (res.ok) {
+          const json = await res.json();
+          isAgentHalted = json.halted;
+          updateAgentBtnUi();
+        }
+      } catch {}
+    }
+
+    // Chart pan / zoom listeners
+    chartWrapper.addEventListener('mousemove', (e) => {
+      const rect = canvas.getBoundingClientRect();
+      mousePos.x = e.clientX - rect.left;
+      mousePos.y = e.clientY - rect.top;
+      mousePos.active = true;
+      if (isDragging) {
+        const deltaX = e.clientX - dragStartX;
+        panOffset = Math.max(0, initialPanOffset + Math.floor(deltaX / (candleWidth + candleSpacing)));
+      }
+    });
+
+    chartWrapper.addEventListener('mouseleave', () => { mousePos.active = false; isDragging = false; });
+    chartWrapper.addEventListener('mousedown', (e) => { isDragging = true; dragStartX = e.clientX; initialPanOffset = panOffset; });
+    window.addEventListener('mouseup', () => { isDragging = false; });
+    chartWrapper.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      candleWidth = e.deltaY < 0 ? Math.min(32, candleWidth + 1) : Math.max(3, candleWidth - 1);
+    }, { passive: false });
+
+    // Pair Selector Change
+    pairSelect.addEventListener('change', (e) => {
+      currentPair = e.target.value;
+      const asset = ASSETS[currentPair];
+      barPair.textContent = currentPair;
+      orderAssetLabel.textContent = currentPair;
+      bookCcy.textContent = asset.ccy;
+      document.getElementById('orderPriceCcy').textContent = asset.ccy;
+      venueBadge.textContent = asset.isIndia ? 'Upstox NSE' : 'Alpaca US';
+      submitOrderBtn.textContent = `${orderSide} ${currentPair}`;
+
+      generateInitialCandles(120);
+      orderPriceInput.value = candleData[candleData.length - 1].close;
+      updateCostCalculation();
+      generateOrderBook();
+      renderPositions();
+    });
+
+    window.onload = function() {
+      resizeCanvas();
+      generateInitialCandles(120);
+      generateOrderBook();
+      renderPositions();
+      updateCostCalculation();
+      checkAgentHealth();
+
+      renderChart();
+      setInterval(simulateLiveTick, 350);
+      setInterval(generateOrderBook, 1500);
+      setInterval(checkAgentHealth, 10000);
+    };
+  </script>
+</body>
+</html>
