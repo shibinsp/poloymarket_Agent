@@ -336,6 +336,7 @@ mod tests {
                 horizon_hours: None,
                 client_order_id: Some("c-1".to_string()),
                 venue_order_id: None,
+                strategy: None,
             })
             .await
             .expect("insert");

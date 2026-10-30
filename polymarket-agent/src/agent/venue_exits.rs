@@ -53,6 +53,8 @@ impl ExitReason {
 /// Rules applied to an open position, resolved from the trade and config.
 #[derive(Debug, Clone, Copy)]
 pub struct ExitRules {
+    /// A short: the stop sits above the price and the target below it.
+    pub is_short: bool,
     pub stop_price: Option<Decimal>,
     /// The stop has been ratcheted above its entry level.
     pub stop_trailed: bool,
@@ -83,7 +85,12 @@ pub fn evaluate_exit(
         return Some(ExitReason::SessionClose);
     }
     if let Some(stop) = rules.stop_price {
-        if mark_price <= stop {
+        let hit = if rules.is_short {
+            mark_price >= stop
+        } else {
+            mark_price <= stop
+        };
+        if hit {
             return Some(if rules.stop_trailed {
                 ExitReason::TrailingStop
             } else {
@@ -92,7 +99,12 @@ pub fn evaluate_exit(
         }
     }
     if let Some(target) = rules.target_price {
-        if mark_price >= target {
+        let reached = if rules.is_short {
+            mark_price <= target
+        } else {
+            mark_price >= target
+        };
+        if reached {
             return Some(ExitReason::TakeProfit);
         }
     }
@@ -107,6 +119,26 @@ pub fn evaluate_exit(
 /// Unrealised P&L of a long position at the current mark.
 pub fn unrealized_pnl(entry: Decimal, mark: Decimal, qty: Decimal) -> Decimal {
     (mark - entry) * qty
+}
+
+/// P&L of a long or a short; `qty` is always positive.
+pub fn position_pnl(entry: Decimal, mark: Decimal, qty: Decimal, is_short: bool) -> Decimal {
+    let pnl = unrealized_pnl(entry, mark, qty);
+    if is_short {
+        -pnl
+    } else {
+        pnl
+    }
+}
+
+/// The side that closes a position, which is also the side of the book it
+/// is valued on: the bid for a long, the ask for a short.
+fn closing_side(is_short: bool) -> Side {
+    if is_short {
+        Side::Buy
+    } else {
+        Side::Sell
+    }
 }
 
 /// Mark open continuous positions to market and close any that have hit an
@@ -186,9 +218,9 @@ impl VenueExits<'_> {
         };
         let instrument_id = InstrumentId::new(venue_id, trade.symbol.clone());
         let quote = venue.quote(&instrument_id).await?;
-        let mark = quote.taker_price(Side::Sell);
+        let mark = quote.taker_price(closing_side(trade.is_short));
         let entry = trade.avg_fill_price.unwrap_or(trade.entry_price);
-        let pnl = unrealized_pnl(entry, mark, trade.quantity);
+        let pnl = position_pnl(entry, mark, trade.quantity, trade.is_short);
         self.store
             .mark_trade(trade.id, &mark.to_string(), &pnl.to_string(), now)
             .await
@@ -216,12 +248,12 @@ impl VenueExits<'_> {
 
         let instrument_id = InstrumentId::new(venue_id, trade.symbol.clone());
         let quote = venue.quote(&instrument_id).await?;
-        // Value a long at what it could be sold for, not the midpoint.
-        let mark = quote.taker_price(Side::Sell);
+        // Value a position at what closing it would get, not the midpoint.
+        let mark = quote.taker_price(closing_side(trade.is_short));
 
         let entry: Decimal = trade.avg_fill_price.unwrap_or(trade.entry_price);
         let qty = trade.quantity;
-        let pnl = unrealized_pnl(entry, mark, qty);
+        let pnl = position_pnl(entry, mark, qty, trade.is_short);
 
         self.store
             .mark_trade(trade.id, &mark.to_string(), &pnl.to_string(), now)
@@ -229,7 +261,11 @@ impl VenueExits<'_> {
 
         let is_equity = trade.asset_class.eq_ignore_ascii_case("equity");
         let is_us_alpaca_equity = is_equity && trade.venue_id.eq_ignore_ascii_case("alpaca");
+        // An opening-range breakout is intraday whatever the swing strategy
+        // is: it takes the session-close exit, never the SMA rules.
+        let is_orb_position = trade.strategy.as_deref() == Some("orb");
         let is_sma_position = is_us_alpaca_equity
+            && !is_orb_position
             && self
                 .us_strategy
                 .map(|s| s.strategy.eq_ignore_ascii_case("sma_crossover"))
@@ -302,6 +338,7 @@ impl VenueExits<'_> {
         };
 
         let rules = ExitRules {
+            is_short: trade.is_short,
             stop_price,
             stop_trailed,
             target_price: if is_sma_position {
@@ -426,8 +463,10 @@ impl VenueExits<'_> {
                     .iter()
                     .find(|p| p.instrument.symbol.eq_ignore_ascii_case(&trade.symbol))
                 {
-                    if pos.qty > Decimal::ZERO {
-                        qty.min(pos.qty)
+                    // A venue reports a short as a negative quantity.
+                    let held = if trade.is_short { -pos.qty } else { pos.qty };
+                    if held > Decimal::ZERO {
+                        qty.min(held)
                     } else {
                         // Venue explicitly returned this symbol with 0 quantity (already closed/liquidated)
                         warn!(
@@ -436,7 +475,7 @@ impl VenueExits<'_> {
                             "Venue explicitly reports 0 position for symbol — closing local trade record"
                         );
                         let entry = trade.avg_fill_price.unwrap_or(trade.entry_price);
-                        let realized = unrealized_pnl(entry, mark, qty);
+                        let realized = position_pnl(entry, mark, qty, trade.is_short);
                         self.store
                             .close_trade(
                                 trade.id,
@@ -467,7 +506,8 @@ impl VenueExits<'_> {
         // Re-resolve the instrument so lot/tick rules come from the venue
         // rather than being reconstructed from the stored row.
         let instrument = self.resolve(venue, instrument_id, instruments).await?;
-        let limit_price = instrument.round_price(mark, Side::Sell);
+        let side = closing_side(trade.is_short);
+        let limit_price = instrument.round_price(mark, side);
         let client_order_id = Uuid::new_v4().to_string();
 
         self.store
@@ -477,7 +517,7 @@ impl VenueExits<'_> {
                 venue_order_id: None,
                 venue_id: trade.venue_id.clone(),
                 symbol: trade.symbol.clone(),
-                side: Side::Sell.to_string(),
+                side: side.to_string(),
                 intent: "EXIT".to_string(),
                 trade_id: Some(trade.id),
                 limit_price: Some(limit_price.to_string()),
@@ -503,12 +543,19 @@ impl VenueExits<'_> {
             })
             .await?;
 
+        // Alpaca takes fractional-share orders as DAY orders only; a GTC exit
+        // for a fractional position is rejected, so it could never close.
+        let tif = if instrument.asset_class == crate::venue::types::AssetClass::Equity {
+            TimeInForce::Day
+        } else {
+            TimeInForce::Gtc
+        };
         let request = OrderRequest {
             instrument,
-            side: Side::Sell,
+            side,
             kind: OrderKind::Limit { price: limit_price },
             qty: exit_qty,
-            tif: TimeInForce::Gtc,
+            tif,
             extended_hours: false,
             client_order_id: client_order_id.clone(),
         };
@@ -576,7 +623,7 @@ impl VenueExits<'_> {
         if matches!(ack.state, OrderState::Filled) && ack.filled_qty > Decimal::ZERO {
             let exit_price = ack.avg_fill_price.unwrap_or(limit_price);
             let entry = trade.avg_fill_price.unwrap_or(trade.entry_price);
-            let realized = unrealized_pnl(entry, exit_price, ack.filled_qty);
+            let realized = position_pnl(entry, exit_price, ack.filled_qty, trade.is_short);
             self.store
                 .close_trade(
                     trade.id,
@@ -693,6 +740,7 @@ mod tests {
                 horizon_hours: Some(24),
                 client_order_id: Some("entry-1".to_string()),
                 venue_order_id: Some("v-entry-1".to_string()),
+                strategy: None,
             })
             .await
             .expect("insert position");
@@ -841,6 +889,7 @@ mod tests {
         deadline: Option<DateTime<Utc>>,
     ) -> ExitRules {
         ExitRules {
+            is_short: false,
             stop_price: stop,
             stop_trailed: false,
             target_price: target,
@@ -948,6 +997,36 @@ mod tests {
         assert_eq!(ExitReason::TakeProfit.as_str(), "TAKE_PROFIT");
         assert_eq!(ExitReason::MaxHold.as_str(), "MAX_HOLD");
         assert_eq!(ExitReason::TrailingStop.as_str(), "TRAILING_STOP");
+    }
+
+    #[test]
+    fn a_short_stops_out_above_and_takes_profit_below() {
+        let mut r = rules(Some(dec!(105)), Some(dec!(90)), None);
+        r.is_short = true;
+        assert_eq!(evaluate_exit(dec!(104), Utc::now(), &r), None);
+        assert_eq!(
+            evaluate_exit(dec!(105), Utc::now(), &r),
+            Some(ExitReason::StopLoss)
+        );
+        assert_eq!(
+            evaluate_exit(dec!(90), Utc::now(), &r),
+            Some(ExitReason::TakeProfit)
+        );
+        // The same levels on a long would be a stop below and a target above.
+        r.is_short = false;
+        assert_eq!(
+            evaluate_exit(dec!(104), Utc::now(), &r),
+            Some(ExitReason::StopLoss)
+        );
+    }
+
+    #[test]
+    fn a_short_profits_when_the_price_falls() {
+        assert_eq!(position_pnl(dec!(100), dec!(95), dec!(4), true), dec!(20));
+        assert_eq!(position_pnl(dec!(100), dec!(103), dec!(4), true), dec!(-12));
+        assert_eq!(position_pnl(dec!(100), dec!(103), dec!(4), false), dec!(12));
+        assert_eq!(closing_side(true), Side::Buy);
+        assert_eq!(closing_side(false), Side::Sell);
     }
 
     #[test]

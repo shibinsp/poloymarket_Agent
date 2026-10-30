@@ -346,6 +346,7 @@ fn config(alpaca: &MockServer, model: &MockServer, poly: &MockServer, db: &str) 
         }],
         us_strategy: polymarket_agent::config::UsStrategyConfig::default(),
         india_strategy: polymarket_agent::config::IndiaStrategyConfig::default(),
+        us_orb: polymarket_agent::config::UsOrbConfig::default(),
     }
 }
 

@@ -268,6 +268,18 @@ impl VenueCycle<'_> {
                 continue;
             }
 
+            // The alpaca venue also lists the ORB universe; the swing
+            // strategy scans only its own symbols.
+            let sma_symbols = &self.config.us_strategy.symbols;
+            if is_us_equity(&instrument)
+                && !sma_symbols.is_empty()
+                && !sma_symbols
+                    .iter()
+                    .any(|s| s.eq_ignore_ascii_case(instrument.symbol()))
+            {
+                continue;
+            }
+
             let Some(venue) = self.registry.get(instrument.venue()) else {
                 continue;
             };
@@ -1153,6 +1165,8 @@ impl VenueCycle<'_> {
                 horizon_hours: Some(view.horizon_hours),
                 client_order_id: Some(client_order_id.clone()),
                 venue_order_id: ack.map(|a| a.venue_order_id.clone()),
+                strategy: (use_us_paper_strategy && is_sma_crossover)
+                    .then(|| "sma_crossover".to_string()),
             })
             .await?;
 

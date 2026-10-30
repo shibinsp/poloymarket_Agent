@@ -385,7 +385,12 @@ impl Reconciler<'_> {
             return Ok(());
         };
 
-        let realized = unrealized_pnl(entry, price, filled_qty);
+        // A BUY exit closes a short.
+        let realized = if order.side.eq_ignore_ascii_case("BUY") {
+            -unrealized_pnl(entry, price, filled_qty)
+        } else {
+            unrealized_pnl(entry, price, filled_qty)
+        };
         // The reason was stored on the exit order when it was placed.
         let reason = order.reject_reason.as_deref().unwrap_or("EXIT");
         self.store
@@ -667,6 +672,7 @@ mod tests {
                 horizon_hours: Some(24),
                 client_order_id: Some("c1".to_string()),
                 venue_order_id: Some("v1".to_string()),
+                strategy: None,
             })
             .await
             .unwrap();

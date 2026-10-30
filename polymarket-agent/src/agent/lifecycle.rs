@@ -64,6 +64,8 @@ pub struct Agent {
     last_balance: Decimal,
     /// Venues from `[[venues]]`. Empty keeps the legacy Polymarket-only path.
     venues: VenueRegistry,
+    /// The U.S. opening-range breakout, when enabled in paper mode.
+    orb: Option<crate::us::orb::OrbTrader>,
     /// Consecutive cycles in which no equity figure could be established.
     unknown_equity_cycles: u32,
     /// Shared with the valuation engine; the venue cycle calls it directly
@@ -192,6 +194,46 @@ impl Agent {
         // one paper balance across both the legacy and venue paths.
         let venues = crate::venue::factory::build_registry(&config, &secrets, polymarket.clone())?;
 
+        // The U.S. opening-range breakout: paper mode only, and only with
+        // market-data keys. Every symbol must also be listed by the venue.
+        let orb = match (
+            config.us_orb.enabled && config.agent.mode == AgentMode::Paper,
+            secrets.alpaca_key_id.as_ref(),
+            secrets.alpaca_secret_key.as_ref(),
+        ) {
+            (true, Some(key), Some(secret)) => {
+                let listed = config.venue_symbols_for("alpaca");
+                let missing: Vec<&String> = config
+                    .us_orb
+                    .symbols
+                    .iter()
+                    .filter(|s| !listed.contains(s))
+                    .collect();
+                if !missing.is_empty() {
+                    warn!(
+                        ?missing,
+                        "ORB symbols not in the alpaca venue's symbols cannot be traded"
+                    );
+                }
+                let feed = std::env::var("ALPACA_FEED_TYPE")
+                    .unwrap_or_else(|_| "iex".to_string())
+                    .to_ascii_lowercase();
+                info!(universe = config.us_orb.symbols.len(), %feed, "U.S. opening-range breakout enabled (paper)");
+                Some(crate::us::orb::OrbTrader::new(
+                    crate::us::orb::AlpacaBars::new(
+                        key.expose_secret().to_string(),
+                        secret.expose_secret().to_string(),
+                        feed,
+                    ),
+                ))
+            }
+            (true, _, _) => {
+                warn!("ORB enabled but ALPACA_API_KEY_ID / ALPACA_API_SECRET_KEY are missing — disabled");
+                None
+            }
+            _ => None,
+        };
+
         // Phase 5: Initialize portfolio manager
         let portfolio = PortfolioManager::new(config.risk.clone());
 
@@ -233,6 +275,7 @@ impl Agent {
             alert_client,
             last_balance: Decimal::ZERO,
             venues,
+            orb,
             llm: llm_client,
             kill_switch,
             budget,
@@ -910,6 +953,34 @@ impl Agent {
                             )
                             .await;
                     }
+                }
+            }
+        }
+
+        // Intraday U.S. breakouts: same state gate as every entry path, but it
+        // spends no model budget, so the API budget does not gate it.
+        if self.opens_positions() {
+            if let Some(orb) = self.orb.as_mut() {
+                let capital = self
+                    .config
+                    .us_orb
+                    .capital_usd
+                    .or(self.config.risk.us_capital_allocation_usd)
+                    .unwrap_or(rust_decimal_macros::dec!(1000));
+                match orb
+                    .run(
+                        &self.venues,
+                        &self.store,
+                        &self.config.us_orb,
+                        capital,
+                        self.config.risk.us_max_trades_per_day,
+                        Utc::now(),
+                        self.cycle_number as i64,
+                    )
+                    .await
+                {
+                    Ok(placed) => trades_placed += placed as i64,
+                    Err(e) => warn!(error = %e, "ORB pass failed"),
                 }
             }
         }

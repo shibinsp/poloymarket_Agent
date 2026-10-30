@@ -439,7 +439,7 @@ impl Store {
     /// settle themselves and must be explicitly closed.
     pub async fn get_open_venue_trades(&self) -> Result<Vec<VenueOpenTrade>> {
         let rows = sqlx::query_as::<_, VenueOpenTradeRow>(
-            "SELECT id, venue_id, symbol, asset_class, entry_price, avg_fill_price, quantity, stop_pct, stop_price, target_price, horizon_hours, created_at
+            "SELECT id, venue_id, symbol, asset_class, side, strategy, entry_price, avg_fill_price, quantity, stop_pct, stop_price, target_price, horizon_hours, created_at
              FROM trades
              WHERE status IN ('OPEN', 'PARTIAL') AND asset_class != 'prediction_binary'",
         )
@@ -607,8 +607,8 @@ impl Store {
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_venue_trade(&self, trade: &VenueTradeRecord) -> Result<i64> {
         let result = sqlx::query(
-            "INSERT INTO trades (cycle, venue_id, symbol, asset_class, market_id, market_question, direction, side, entry_price, size, quantity, avg_fill_price, edge_at_entry, claude_fair_value, confidence, kelly_raw, kelly_adjusted, risk_pct, stop_pct, status, stop_price, target_price, horizon_hours, client_order_id, venue_order_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO trades (cycle, venue_id, symbol, asset_class, market_id, market_question, direction, side, entry_price, size, quantity, avg_fill_price, edge_at_entry, claude_fair_value, confidence, kelly_raw, kelly_adjusted, risk_pct, stop_pct, status, stop_price, target_price, horizon_hours, client_order_id, venue_order_id, strategy)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(trade.cycle)
         .bind(&trade.venue_id)
@@ -644,6 +644,7 @@ impl Store {
         .bind(trade.horizon_hours)
         .bind(&trade.client_order_id)
         .bind(&trade.venue_order_id)
+        .bind(&trade.strategy)
         .execute(&self.pool)
         .await
         .context("Failed to insert venue trade")?;
@@ -764,7 +765,7 @@ impl Store {
     ) -> Result<u32> {
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM trades
-             WHERE venue_id = ? AND asset_class = 'equity' AND side = 'BUY'
+             WHERE venue_id = ? AND asset_class = 'equity' AND side IN ('BUY', 'SELL')
                AND date(created_at) = ?",
         )
         .bind(venue_id)
@@ -774,6 +775,53 @@ impl Store {
         .context("Failed to count venue equity entries")?;
 
         Ok(count.max(0) as u32)
+    }
+
+    /// Today's P&L for one strategy's venue trades: realized on positions
+    /// closed today plus the latest mark on those still open.
+    pub async fn strategy_day_pnl(
+        &self,
+        strategy: &str,
+        day: chrono::NaiveDate,
+    ) -> Result<Decimal> {
+        let rows: Vec<(Option<String>, Option<String>, String)> = sqlx::query_as(
+            "SELECT realized_pnl, unrealized_pnl, status FROM trades
+             WHERE strategy = ? AND (date(closed_at) = ? OR status IN ('OPEN', 'PARTIAL'))",
+        )
+        .bind(strategy)
+        .bind(day.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read strategy day P&L")?;
+        let mut total = Decimal::ZERO;
+        for (realized, unrealized, status) in rows {
+            let v = if status == "CLOSED" {
+                realized
+            } else {
+                unrealized
+            };
+            if let Some(v) = v.as_deref().and_then(|v| Decimal::from_str(v).ok()) {
+                total += v;
+            }
+        }
+        Ok(total)
+    }
+
+    /// Symbols a strategy already entered today, open or closed: one attempt
+    /// per symbol per day.
+    pub async fn strategy_symbols_entered_on(
+        &self,
+        strategy: &str,
+        day: chrono::NaiveDate,
+    ) -> Result<Vec<String>> {
+        sqlx::query_scalar(
+            "SELECT DISTINCT symbol FROM trades WHERE strategy = ? AND date(created_at) = ?",
+        )
+        .bind(strategy)
+        .bind(day.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read strategy symbols")
     }
 
     /// How many of the most recently closed positions were losses, counting
@@ -1564,6 +1612,8 @@ struct VenueOpenTradeRow {
     venue_id: String,
     symbol: String,
     asset_class: String,
+    side: Option<String>,
+    strategy: Option<String>,
     entry_price: String,
     avg_fill_price: Option<String>,
     quantity: Option<String>,
@@ -1581,6 +1631,9 @@ pub struct VenueOpenTrade {
     pub venue_id: String,
     pub symbol: String,
     pub asset_class: String,
+    /// A SELL entry: a short, closed by buying back. Quantity stays positive.
+    pub is_short: bool,
+    pub strategy: Option<String>,
     pub entry_price: Decimal,
     pub avg_fill_price: Option<Decimal>,
     pub quantity: Decimal,
@@ -1608,6 +1661,11 @@ impl TryFrom<VenueOpenTradeRow> for VenueOpenTrade {
 
         Ok(Self {
             id: row.id,
+            is_short: row
+                .side
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case("SELL")),
+            strategy: row.strategy,
             entry_price: parse(&row.entry_price, "entry_price")?,
             avg_fill_price: parse_opt(&row.avg_fill_price, "avg_fill_price")?,
             quantity: parse_opt(&row.quantity, "quantity")?
@@ -1666,6 +1724,8 @@ pub struct VenueTradeRecord {
     pub horizon_hours: Option<i64>,
     pub client_order_id: Option<String>,
     pub venue_order_id: Option<String>,
+    /// The strategy that opened it ("orb", "sma_crossover"); None for legacy rows.
+    pub strategy: Option<String>,
 }
 
 #[cfg(test)]
@@ -1705,6 +1765,7 @@ mod tests {
                 horizon_hours: Some(24),
                 client_order_id: Some("c-1".to_string()),
                 venue_order_id: Some("v-1".to_string()),
+                strategy: None,
             })
             .await
             .expect("insert");
@@ -1732,6 +1793,69 @@ mod tests {
         assert_eq!(row.3, "0");
         assert_eq!(row.4.as_deref(), Some("0.0018"), "risk fraction");
         assert_eq!(row.5.as_deref(), Some("0.03"), "stop distance");
+    }
+
+    /// A SELL entry is a short: the open-trade view must say so, carry the
+    /// strategy that opened it, and count it as one of the day's entries.
+    #[tokio::test]
+    async fn a_sell_entry_loads_as_a_short_with_its_strategy() {
+        let store = Store::new(":memory:").await.expect("store");
+        let id = store
+            .insert_venue_trade(&VenueTradeRecord {
+                cycle: 1,
+                venue_id: "alpaca".to_string(),
+                symbol: "TSLA".to_string(),
+                asset_class: "equity".to_string(),
+                display_name: Some("Tesla".to_string()),
+                side: "SELL".to_string(),
+                entry_price: "360".to_string(),
+                quantity: "2".to_string(),
+                notional: "720".to_string(),
+                avg_fill_price: Some("360".to_string()),
+                edge_at_entry: "0".to_string(),
+                fair_value: "0".to_string(),
+                confidence: "0".to_string(),
+                risk_pct: "0.01".to_string(),
+                stop_pct: "0.01".to_string(),
+                status: "OPEN".to_string(),
+                stop_price: Some("363.6".to_string()),
+                target_price: None,
+                horizon_hours: Some(7),
+                client_order_id: Some("c-s".to_string()),
+                venue_order_id: Some("v-s".to_string()),
+                strategy: Some("orb".to_string()),
+            })
+            .await
+            .expect("insert");
+
+        let open = store.get_open_venue_trades().await.expect("open trades");
+        assert_eq!(open.len(), 1);
+        assert!(open[0].is_short);
+        assert_eq!(open[0].strategy.as_deref(), Some("orb"));
+        assert_eq!(
+            store
+                .count_venue_equity_entries_opened_on("alpaca", Utc::now().date_naive())
+                .await
+                .unwrap(),
+            1,
+            "a short is an entry too"
+        );
+        assert_eq!(
+            store
+                .strategy_symbols_entered_on("orb", Utc::now().date_naive())
+                .await
+                .unwrap(),
+            vec!["TSLA".to_string()]
+        );
+
+        store.mark_trade(id, "350", "20", Utc::now()).await.unwrap();
+        assert_eq!(
+            store
+                .strategy_day_pnl("orb", Utc::now().date_naive())
+                .await
+                .unwrap(),
+            Decimal::from(20)
+        );
     }
 
     /// A continuous position is closed by trading out of it, so it lands on
@@ -1764,6 +1888,7 @@ mod tests {
                 horizon_hours: None,
                 client_order_id: Some("c-1".to_string()),
                 venue_order_id: None,
+                strategy: None,
             })
             .await
             .expect("insert");
@@ -2238,7 +2363,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn venue_equity_daily_count_only_counts_that_venues_stock_buys() {
+    async fn venue_equity_daily_count_counts_that_venues_stock_entries_both_ways() {
         let store = Store::new(":memory:").await.unwrap();
         let today = Utc::now().date_naive();
         let trade =
@@ -2264,6 +2389,7 @@ mod tests {
                 horizon_hours: Some(24),
                 client_order_id: None,
                 venue_order_id: None,
+                strategy: None,
             };
 
         for row in [
@@ -2275,12 +2401,13 @@ mod tests {
             store.insert_venue_trade(&row).await.unwrap();
         }
 
+        // AAPL long and MSFT short; crypto and the other venue do not count.
         assert_eq!(
             store
                 .count_venue_equity_entries_opened_on("alpaca", today)
                 .await
                 .unwrap(),
-            1
+            2
         );
         assert_eq!(
             store

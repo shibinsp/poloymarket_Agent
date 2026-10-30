@@ -262,7 +262,12 @@ impl StateReconciler<'_> {
             let entry = local_qty
                 .entry(key)
                 .or_insert((Decimal::ZERO, asset_class_of(&trade.asset_class)));
-            entry.0 += trade.quantity;
+            // Venues report a short as negative; the ledger stores it positive.
+            entry.0 += if trade.is_short {
+                -trade.quantity
+            } else {
+                trade.quantity
+            };
         }
 
         let mut venue_qty: HashMap<String, Decimal> = HashMap::new();

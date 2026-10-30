@@ -32,6 +32,82 @@ pub struct AppConfig {
     /// Selectable NSE paper strategy.
     #[serde(default)]
     pub india_strategy: IndiaStrategyConfig,
+    /// Intraday opening-range breakout on U.S. stocks in play (paper only).
+    #[serde(default)]
+    pub us_orb: UsOrbConfig,
+}
+
+/// The "stocks in play" opening-range breakout. See `us::orb` for the rules
+/// and the backtest behind the defaults.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct UsOrbConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Universe scanned at the open; each must also be in the alpaca venue's symbols.
+    #[serde(default)]
+    pub symbols: Vec<String>,
+    /// First 5-minute bar's volume over its 14-session average.
+    #[serde(default = "default_orb_rvol_min")]
+    pub rvol_min: Decimal,
+    #[serde(default = "default_orb_min_price")]
+    pub min_price: Decimal,
+    /// Equal-dollar position size as a fraction of capital.
+    #[serde(default = "default_orb_position_pct")]
+    pub position_pct: Decimal,
+    #[serde(default = "default_orb_max_trades")]
+    pub max_trades_per_day: u32,
+    /// No new entries once the day's ORB P&L is below -capital x this.
+    #[serde(default = "default_orb_daily_loss_pct")]
+    pub daily_loss_pct: Decimal,
+    /// Capital the sizing and loss limit use; defaults to the U.S. allocation.
+    #[serde(default)]
+    pub capital_usd: Option<Decimal>,
+    #[serde(default = "default_true")]
+    pub allow_short: bool,
+    /// How far past the touch the marketable entry limit may fill.
+    #[serde(default = "default_orb_max_entry_slippage")]
+    pub max_entry_slippage_pct: Decimal,
+}
+
+impl Default for UsOrbConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            symbols: Vec::new(),
+            rvol_min: default_orb_rvol_min(),
+            min_price: default_orb_min_price(),
+            position_pct: default_orb_position_pct(),
+            max_trades_per_day: default_orb_max_trades(),
+            daily_loss_pct: default_orb_daily_loss_pct(),
+            capital_usd: None,
+            allow_short: true,
+            max_entry_slippage_pct: default_orb_max_entry_slippage(),
+        }
+    }
+}
+
+fn default_orb_rvol_min() -> Decimal {
+    rust_decimal_macros::dec!(2.5)
+}
+
+fn default_orb_min_price() -> Decimal {
+    rust_decimal_macros::dec!(5)
+}
+
+fn default_orb_position_pct() -> Decimal {
+    rust_decimal_macros::dec!(0.20)
+}
+
+fn default_orb_max_trades() -> u32 {
+    3
+}
+
+fn default_orb_daily_loss_pct() -> Decimal {
+    rust_decimal_macros::dec!(0.02)
+}
+
+fn default_orb_max_entry_slippage() -> Decimal {
+    rust_decimal_macros::dec!(0.002)
 }
 
 /// Which strategy drives the NSE paper book.
@@ -1609,6 +1685,9 @@ pub struct UsStrategyConfig {
     /// Moving average calculation method. Strictly "SMA" (Simple Moving Average), not EMA.
     #[serde(default = "default_moving_average_type")]
     pub moving_average_type: String,
+    /// Symbols the swing strategy trades. Empty means every alpaca symbol.
+    #[serde(default)]
+    pub symbols: Vec<String>,
     /// Golden-cross volume confirmation: signal-day volume over its 20-day
     /// average. 0 disables.
     #[serde(default = "default_min_volume_ratio")]
@@ -1655,6 +1734,7 @@ impl Default for UsStrategyConfig {
             fast_sma_period: default_fast_sma(),
             slow_sma_period: default_slow_sma(),
             moving_average_type: default_moving_average_type(),
+            symbols: Vec::new(),
             min_volume_ratio: default_min_volume_ratio(),
             min_adx: default_min_adx(),
             regime_symbol: default_regime_symbol(),

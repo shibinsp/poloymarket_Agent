@@ -133,7 +133,18 @@ base_url = "https://paper-api.alpaca.markets"
 data_url = "https://data.alpaca.markets"
 # Liquid large caps and index ETFs only: low-priced names (SIRI, NOK, LCID,
 # PLUG, NIO, SOFI) whipsaw a daily crossover and carry wider spreads.
-symbols = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA"]
+# The swing strategy trades only [us_strategy].symbols; the rest are the
+# opening-range breakout universe ([us_orb]).
+symbols = [
+    "SPY", "QQQ", "IWM", "DIA", "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "AVGO",
+    "AMD", "NFLX", "ORCL", "CRM", "ADBE", "INTC", "MU", "QCOM", "TXN", "AMAT", "LRCX", "KLAC",
+    "MRVL", "SMCI", "ARM", "PLTR", "COIN", "MSTR", "HOOD", "SHOP", "UBER", "ABNB", "SNOW", "CRWD",
+    "PANW", "NOW", "DDOG", "NET", "ZS", "MDB", "JPM", "BAC", "WFC", "GS", "MS", "C",
+    "SCHW", "V", "MA", "PYPL", "XYZ", "UNH", "LLY", "JNJ", "PFE", "MRK", "ABBV", "XOM",
+    "CVX", "OXY", "WMT", "COST", "HD", "NKE", "SBUX", "MCD", "DIS", "KO", "PEP", "BA",
+    "CAT", "GE", "DE", "SOFI", "RIVN", "LCID", "NIO", "F", "GM", "AAL", "CCL", "MARA",
+    "RIOT", "DELL", "HPQ", "CSCO", "IBM", "T", "VZ",
+]
 fee_pct = 0.0025
 #
 # Coinbase Advanced Trade — spot crypto, 24/7.
@@ -190,7 +201,10 @@ fee_pct = 0.0025
 [[venues]]
 id = "upstox_sandbox"
 kind = "upstox_sandbox"
-enabled = true
+# Off: the NSE paper book is run by the [india_strategy] worker alone. Enabled,
+# the generic venue cycle also traded it (bought BHARTIARTL on 2026-10-30 while
+# the momentum strategy was in cash). The worker uses the Upstox feed directly.
+enabled = false
 symbols = ["ITC", "TATAMOTORS", "HDFCBANK", "SBIN", "RELIANCE", "INFY", "ICICIBANK", "TCS", "BHARTIARTL", "LT", "HINDUNILVR"]
 fee_pct = 0.001
 
@@ -213,6 +227,9 @@ strategy = "sma_crossover"
 fast_sma_period = 20
 slow_sma_period = 50
 moving_average_type = "SMA"   # Explicitly Simple Moving Average (SMA), not EMA
+symbols = [
+    "SPY", "QQQ", "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA",
+]
 # Golden-cross confirmations (0 disables each). A cross is only an entry when
 # ADX(14) >= min_adx and regime_symbol closes above its regime_sma_period-day
 # SMA. Over 5 years (examples/us_sma_compare.rs) these cut drawdown at the same
@@ -226,6 +243,32 @@ regime_sma_period = 200
 # trail_atr_multiplier x ATR(14) below the highest high since entry.
 breakeven_at_r = 1.0
 trail_atr_multiplier = 3.0
+
+[us_orb]
+# "Stocks in play" opening-range breakout, intraday, long and short, paper only.
+# The 9:30 five-minute bar is the range; a stock qualifies when that bar's volume
+# is >= rvol_min x its 14-session average. Enter on the first 5-minute close
+# beyond the range, stop at the other side, flat 15 minutes before the close.
+# Backtest (91 symbols, Nov 2024 - Oct 2026, equal $ sizing, 5 bp slippage):
+# +6.3% in the first year and +21.3% in the second, which was held out.
+# Live uses Alpaca's free IEX feed (the backtest used SIP), so ranges differ a little.
+enabled = true
+rvol_min = 2.5
+position_pct = 0.20          # equal dollars per trade: $200 of the $1,000 U.S. allocation
+max_trades_per_day = 3       # shared with the U.S. daily entry limit
+daily_loss_pct = 0.02        # no new ORB entries after a 2% day loss
+allow_short = true           # whole shares only: shorts above ~$200 a share will not size
+max_entry_slippage_pct = 0.002
+symbols = [
+    "SPY", "QQQ", "IWM", "DIA", "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "AVGO",
+    "AMD", "NFLX", "ORCL", "CRM", "ADBE", "INTC", "MU", "QCOM", "TXN", "AMAT", "LRCX", "KLAC",
+    "MRVL", "SMCI", "ARM", "PLTR", "COIN", "MSTR", "HOOD", "SHOP", "UBER", "ABNB", "SNOW", "CRWD",
+    "PANW", "NOW", "DDOG", "NET", "ZS", "MDB", "JPM", "BAC", "WFC", "GS", "MS", "C",
+    "SCHW", "V", "MA", "PYPL", "XYZ", "UNH", "LLY", "JNJ", "PFE", "MRK", "ABBV", "XOM",
+    "CVX", "OXY", "WMT", "COST", "HD", "NKE", "SBUX", "MCD", "DIS", "KO", "PEP", "BA",
+    "CAT", "GE", "DE", "SOFI", "RIVN", "LCID", "NIO", "F", "GM", "AAL", "CCL", "MARA",
+    "RIOT", "DELL", "HPQ", "CSCO", "IBM", "T", "VZ",
+]
 
 [india_strategy]
 # "momentum": monthly rotation into the 4 strongest watchlist stocks by

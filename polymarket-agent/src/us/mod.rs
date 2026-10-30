@@ -7,5 +7,6 @@ pub mod chart;
 pub mod costs;
 pub mod instruments;
 pub mod market_feed;
+pub mod orb;
 pub mod session;
 pub mod sma_crossover;
