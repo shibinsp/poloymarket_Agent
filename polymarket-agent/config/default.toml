@@ -227,6 +227,14 @@ regime_sma_period = 200
 breakeven_at_r = 1.0
 trail_atr_multiplier = 3.0
 
+[india_strategy]
+# "momentum": monthly rotation into the 4 strongest watchlist stocks by
+#   9-month return, only while NIFTY 50 closes above its 200-day SMA (else cash).
+#   Beat NIFTY on 2023-2026 data the selection never saw.
+# "pullback": the original 5-minute VWAP pullback. It lost 15-32% over
+#   May-Oct 2026 in replay, before and after costs; kept only for comparison.
+strategy = "momentum"
+
 [telemetry]
 # OpenTelemetry span export. Off unless an endpoint is set here or via
 # OTEL_EXPORTER_OTLP_ENDPOINT / LANGFUSE_HOST in the environment.

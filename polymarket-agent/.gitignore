@@ -3,6 +3,8 @@
 *.db-journal
 *.db-wal
 *.db-shm
+# Runtime state of the NSE momentum worker
+india_momentum_state.json
 .env
 *.pem
 *.key

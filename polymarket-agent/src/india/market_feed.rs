@@ -97,6 +97,7 @@ struct UpstoxFeedAuthorizeResponse {
 
 #[derive(Debug, Deserialize)]
 struct UpstoxFeedAuthorizeData {
+    #[serde(alias = "authorizedRedirectUri")]
     pub authorized_redirect_uri: Option<String>,
 }
 
@@ -587,6 +588,66 @@ impl UpstoxLiveMarketFeed {
         }
 
         Ok(all_candles)
+    }
+
+    /// Completed daily closes, oldest first, for an Upstox instrument key
+    /// (an `NSE_EQ|ISIN` stock or an `NSE_INDEX|...` index). Bars dated
+    /// `today_ist` or later are dropped: today's candle is still forming.
+    pub async fn fetch_daily_closes(
+        &self,
+        instrument_key: &str,
+        sessions: usize,
+        today_ist: chrono::NaiveDate,
+    ) -> Result<Vec<Decimal>> {
+        let token = self
+            .access_token
+            .read()
+            .await
+            .clone()
+            .context("Upstox access token required to load daily history")?;
+        // Calendar days: sessions plus weekends and exchange holidays.
+        let from = today_ist - chrono::Duration::days((sessions as i64) * 3 / 2 + 30);
+        let key = urlencoding::encode(instrument_key);
+        let url =
+            format!("https://api.upstox.com/v3/historical-candle/{key}/days/1/{today_ist}/{from}");
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&token)
+            .header(ACCEPT, "application/json")
+            .send()
+            .await
+            .with_context(|| format!("Failed to fetch daily candles for {instrument_key}"))?;
+        if !resp.status().is_success() {
+            bail!(
+                "Upstox daily candles for {instrument_key} returned {}",
+                resp.status()
+            );
+        }
+        let payload: serde_json::Value = resp.json().await?;
+        let rows = payload
+            .get("data")
+            .and_then(|d| d.get("candles"))
+            .and_then(serde_json::Value::as_array)
+            .context("Upstox daily candle response had no candles")?;
+        let mut bars: Vec<(chrono::NaiveDate, Decimal)> = rows
+            .iter()
+            .filter_map(|row| {
+                let values = row.as_array()?;
+                let date = DateTime::parse_from_rfc3339(values.first()?.as_str()?)
+                    .ok()?
+                    .with_timezone(&chrono_tz::Asia::Kolkata)
+                    .date_naive();
+                let close = values.get(4)?.as_f64().and_then(Decimal::from_f64_retain)?;
+                (date < today_ist && close > Decimal::ZERO).then_some((date, close.round_dp(2)))
+            })
+            .collect();
+        bars.sort_by_key(|(d, _)| *d);
+        bars.dedup_by_key(|(d, _)| *d);
+        if bars.is_empty() {
+            bail!("No completed daily candles for {instrument_key}");
+        }
+        Ok(bars.into_iter().map(|(_, c)| c).collect())
     }
 
     /// Process incoming ticks with strict deduplication:

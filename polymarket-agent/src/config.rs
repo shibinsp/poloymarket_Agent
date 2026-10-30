@@ -29,6 +29,29 @@ pub struct AppConfig {
     /// Selectable US equity strategy configuration.
     #[serde(default)]
     pub us_strategy: UsStrategyConfig,
+    /// Selectable NSE paper strategy.
+    #[serde(default)]
+    pub india_strategy: IndiaStrategyConfig,
+}
+
+/// Which strategy drives the NSE paper book.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct IndiaStrategyConfig {
+    /// "momentum" (monthly rotation, default) | "pullback" (5-minute intraday)
+    #[serde(default = "default_india_strategy")]
+    pub strategy: String,
+}
+
+impl Default for IndiaStrategyConfig {
+    fn default() -> Self {
+        Self {
+            strategy: default_india_strategy(),
+        }
+    }
+}
+
+fn default_india_strategy() -> String {
+    "momentum".to_string()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

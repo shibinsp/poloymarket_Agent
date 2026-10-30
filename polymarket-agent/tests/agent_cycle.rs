@@ -345,6 +345,7 @@ fn config(alpaca: &MockServer, model: &MockServer, poly: &MockServer, db: &str) 
             fee_pct: dec!(0.0025),
         }],
         us_strategy: polymarket_agent::config::UsStrategyConfig::default(),
+        india_strategy: polymarket_agent::config::IndiaStrategyConfig::default(),
     }
 }
 

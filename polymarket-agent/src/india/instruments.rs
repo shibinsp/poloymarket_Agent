@@ -63,11 +63,11 @@ pub fn nse_watchlist() -> Vec<NseInstrument> {
         NseInstrument::new("INFY", "INE009A01021", "Infosys Ltd"),
         NseInstrument::new(
             "LICI",
-            "INE115A01015",
+            "INE0J1Y01017",
             "Life Insurance Corporation of India",
         ),
         NseInstrument::new("HINDUNILVR", "INE030A01027", "Hindustan Unilever Ltd"),
-        NseInstrument::new("BAJFINANCE", "INE296A01024", "Bajaj Finance Ltd"),
+        NseInstrument::new("BAJFINANCE", "INE296A01032", "Bajaj Finance Ltd"),
         NseInstrument::new("ITC", "INE154A01025", "ITC Ltd"),
         NseInstrument::new("LT", "INE018A01030", "Larsen & Toubro Ltd"),
         NseInstrument::new("TATAMOTORS", "INE155A01022", "Tata Motors Ltd"),
