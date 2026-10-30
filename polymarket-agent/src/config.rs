@@ -67,6 +67,14 @@ pub struct UsOrbConfig {
     /// How far past the touch the marketable entry limit may fill.
     #[serde(default = "default_orb_max_entry_slippage")]
     pub max_entry_slippage_pct: Decimal,
+    /// "advisory": ORION's news veto and LUNA's half size are recorded on the
+    /// decision card but do not change orders. "enforce": they do.
+    #[serde(default = "default_desk_mode")]
+    pub desk_mode: String,
+}
+
+fn default_desk_mode() -> String {
+    "advisory".to_string()
 }
 
 impl Default for UsOrbConfig {
@@ -82,6 +90,7 @@ impl Default for UsOrbConfig {
             capital_usd: None,
             allow_short: true,
             max_entry_slippage_pct: default_orb_max_entry_slippage(),
+            desk_mode: default_desk_mode(),
         }
     }
 }

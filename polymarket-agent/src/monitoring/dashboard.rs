@@ -265,6 +265,7 @@ fn build_router(state: DashboardState) -> Router {
         .route("/api/risk", get(risk_handler))
         .route("/api/halt", get(halt_status_handler))
         .route("/api/india/watchlist", get(india_watchlist_handler))
+        .route("/api/us/desk", get(us_desk_handler))
         .route(
             "/api/india/backtest/history",
             get(india_backtest_history_handler),
@@ -751,6 +752,15 @@ pub struct IndiaBacktestRunRequest {
     pub train_ratio: Option<Decimal>,
     pub val_ratio: Option<Decimal>,
     pub test_ratio: Option<Decimal>,
+}
+
+/// The trading desk's latest decision cards: one per signal, each with
+/// ATLAS, VEGA, ORION, LUNA, TITAN and NOVA's reports.
+async fn us_desk_handler(State(state): State<DashboardState>) -> impl IntoResponse {
+    match state.store.recent_desk_decisions(50).await {
+        Ok(cards) => Json(serde_json::json!({ "cards": cards })).into_response(),
+        Err(e) => rows_unavailable(e),
+    }
 }
 
 async fn india_watchlist_handler() -> impl IntoResponse {

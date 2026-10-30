@@ -29,8 +29,10 @@ use uuid::Uuid;
 
 use crate::config::UsOrbConfig;
 use crate::db::store::{OrderRecord, Store, VenueTradeRecord};
+use crate::us::desk::{self, Atlas, DecisionCard, Headline, Titan, Vega};
 use crate::venue::types::{
-    AssetClass, Instrument, OrderKind, OrderRequest, OrderState, ScanFilter, Side, TimeInForce,
+    AssetClass, Instrument, OrderKind, OrderRequest, OrderState, Quote, ScanFilter, Side,
+    TimeInForce,
 };
 use crate::venue::VenueRegistry;
 
@@ -226,6 +228,59 @@ impl AlpacaBars {
     }
 }
 
+#[derive(Deserialize)]
+struct NewsPage {
+    #[serde(default)]
+    news: Vec<RawNews>,
+}
+
+#[derive(Deserialize)]
+struct RawNews {
+    created_at: DateTime<Utc>,
+    headline: String,
+    #[serde(default)]
+    summary: String,
+    #[serde(default)]
+    source: String,
+}
+
+impl AlpacaBars {
+    /// ORION's feed: one symbol's headlines since `start`, newest first (Alpaca/Benzinga).
+    pub async fn news(&self, symbol: &str, start: DateTime<Utc>) -> Result<Vec<Headline>> {
+        let resp = self
+            .http
+            .get(format!("{}/v1beta1/news", self.base))
+            .header("APCA-API-KEY-ID", &self.key)
+            .header("APCA-API-SECRET-KEY", &self.secret)
+            .query(&[
+                ("symbols", symbol.to_string()),
+                (
+                    "start",
+                    start.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                ),
+                ("limit", "50".to_string()),
+                ("sort", "desc".to_string()),
+            ])
+            .send()
+            .await
+            .context("Alpaca news request failed")?;
+        if !resp.status().is_success() {
+            bail!("Alpaca news returned {}", resp.status());
+        }
+        let page: NewsPage = resp.json().await.context("Unreadable Alpaca news page")?;
+        Ok(page
+            .news
+            .into_iter()
+            .map(|n| Headline {
+                at: n.created_at,
+                headline: n.headline,
+                summary: n.summary,
+                source: n.source,
+            })
+            .collect())
+    }
+}
+
 // ---------------------------------------------------------------- the trader
 
 /// Today's opening ranges for the stocks in play.
@@ -237,6 +292,8 @@ struct Day {
     /// Entered, skipped as stale, or failed: no second attempt today.
     done: HashSet<String>,
     ranked: bool,
+    /// Share of the universe whose first bar closed above its open, percent.
+    breadth_up_pct: Decimal,
 }
 
 pub struct OrbTrader {
@@ -332,8 +389,27 @@ impl OrbTrader {
         if watch.is_empty() {
             return Ok(0);
         }
-        // Eight hours back always covers today's session so far.
-        let bars = self.data.bars(&watch, now - Duration::hours(8)).await?;
+        // Eight hours back always covers today's session so far. SPY rides
+        // along for LUNA's read of the market.
+        let mut fetch = watch.clone();
+        if !fetch.iter().any(|s| s == "SPY") {
+            fetch.push("SPY".to_string());
+        }
+        let bars = self.data.bars(&fetch, now - Duration::hours(8)).await?;
+        let market_move_pct = bars
+            .get("SPY")
+            .and_then(|list| {
+                let today_bars: Vec<&Bar> = list
+                    .iter()
+                    .filter(
+                        |b| matches!(session_slot(b.ts), Some((d, i)) if d == today && i < slot),
+                    )
+                    .collect();
+                let open = today_bars.first()?.open;
+                let last = today_bars.last()?.close;
+                (open > Decimal::ZERO).then(|| (last / open - Decimal::ONE) * Decimal::from(100))
+            })
+            .unwrap_or(Decimal::ZERO);
 
         // Signals in the order they fired, strongest relative volume first on a tie.
         let mut signals = Vec::new();
@@ -363,24 +439,149 @@ impl OrbTrader {
                     continue;
                 }
                 let stop = if side == Side::Buy { low } else { high };
-                signals.push((index, std::cmp::Reverse(rvol), symbol.clone(), side, stop));
+                let trigger_close = today_bars
+                    .iter()
+                    .find(|(i, _)| *i == index)
+                    .map(|(_, b)| b.close)
+                    .unwrap_or(stop);
+                let range = high - low;
+                let past = if side == Side::Buy {
+                    trigger_close - high
+                } else {
+                    low - trigger_close
+                };
+                let close_minutes = 9 * 60 + 30 + (index as i64 + 1) * BAR_MINUTES;
+                let vega = Vega {
+                    side: if side == Side::Buy { "LONG" } else { "SHORT" }.to_string(),
+                    setup: "5-minute opening-range breakout".to_string(),
+                    signal_at: format!("{:02}:{:02} ET", close_minutes / 60, close_minutes % 60),
+                    trigger_close,
+                    stop,
+                    breakout_pct_of_range: if range > Decimal::ZERO {
+                        (past / range * Decimal::from(100)).round_dp(1)
+                    } else {
+                        Decimal::ZERO
+                    },
+                };
+                signals.push((
+                    index,
+                    std::cmp::Reverse(rvol),
+                    symbol.clone(),
+                    side,
+                    stop,
+                    vega,
+                ));
             }
         }
         signals.sort_by(|a, b| (a.0, a.1, &a.2).cmp(&(b.0, b.1, &b.2)));
 
+        let enforce = cfg.desk_mode.eq_ignore_ascii_case("enforce");
+        let in_play_today = self.day.candidates.len();
+        let breadth = self.day.breadth_up_pct;
         let mut placed = 0usize;
         let mut remaining = cap.saturating_sub(entered_today) as usize;
-        for (_, std::cmp::Reverse(rvol), symbol, side, stop) in signals {
-            if remaining == 0 {
-                break;
-            }
-            if side == Side::Sell && !cfg.allow_short {
-                self.day.done.insert(symbol);
-                continue;
-            }
+        for (_, std::cmp::Reverse(rvol), symbol, side, stop, vega) in signals {
             self.day.done.insert(symbol.clone());
-            match enter(
-                registry, store, cfg, capital, &symbol, side, stop, rvol, now, cycle,
+            let (high, low, _) = self.day.candidates[&symbol];
+            let atlas = Atlas {
+                relative_volume: rvol.round_dp(2),
+                range_high: high,
+                range_low: low,
+                in_play_today,
+            };
+
+            // TITAN: every limit, then the order it would allow.
+            let prepared = if remaining == 0 {
+                Err("daily trade limit reached".to_string())
+            } else if side == Side::Sell && !cfg.allow_short {
+                Err("short selling is off".to_string())
+            } else {
+                match titan_prepare(registry, cfg, capital, &symbol, side, stop, now).await {
+                    Ok(p) => p,
+                    Err(e) => Err(format!("could not price the order: {e}")),
+                }
+            };
+            let titan = match &prepared {
+                Ok(p) => Titan {
+                    allowed: true,
+                    reason: format!(
+                        "within limits: {} of {} trades left, day P&L {}",
+                        remaining,
+                        cap,
+                        day_pnl.round_dp(2)
+                    ),
+                    qty: p.qty,
+                    notional_usd: (p.qty * p.limit).round_dp(2),
+                    risk_usd: (p.qty * (p.limit - stop).abs()).round_dp(2),
+                },
+                Err(reason) => Titan {
+                    allowed: false,
+                    reason: reason.clone(),
+                    qty: Decimal::ZERO,
+                    notional_usd: Decimal::ZERO,
+                    risk_usd: Decimal::ZERO,
+                },
+            };
+
+            // ORION and LUNA: the stock's news and the market's mood.
+            let headlines = match self.data.news(&symbol, now - Duration::hours(24)).await {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!(symbol, error = %e, "ORION could not read the news; treating as no news");
+                    Vec::new()
+                }
+            };
+            let orion = desk::orion(&headlines, now);
+            let recent: Vec<Headline> = headlines
+                .into_iter()
+                .filter(|h| now.signed_duration_since(h.at) <= Duration::hours(24))
+                .collect();
+            let luna = desk::luna(&recent, market_move_pct, breadth, side == Side::Buy);
+
+            // NOVA: the call.
+            let nova = desk::nova(&titan, &orion, &luna, enforce);
+            let card = DecisionCard {
+                at: now,
+                market: "US".to_string(),
+                strategy: ORB_STRATEGY.to_string(),
+                symbol: symbol.clone(),
+                atlas,
+                vega,
+                orion,
+                luna,
+                titan,
+                nova: nova.clone(),
+            };
+            info!(
+                symbol,
+                action = ?nova.action,
+                advisory = ?nova.advisory_action,
+                reasons = ?nova.reasons,
+                "NOVA decision"
+            );
+            if let Err(e) = store.insert_desk_decision(&card).await {
+                warn!(symbol, error = %e, "Could not record the decision card");
+            }
+
+            let Ok(mut order) = prepared else { continue };
+            match nova.action {
+                desk::Action::Skip => continue,
+                desk::Action::TradeHalf => {
+                    order.qty = if side == Side::Sell || !order.instrument.fractional {
+                        (order.qty / Decimal::from(2)).floor()
+                    } else {
+                        order
+                            .instrument
+                            .round_qty((order.qty / Decimal::from(2)).round_dp(4))
+                    };
+                    if order.qty <= Decimal::ZERO {
+                        continue;
+                    }
+                }
+                desk::Action::Trade => {}
+            }
+            match submit(
+                registry, store, order, &symbol, side, stop, rvol, capital, now, cycle,
             )
             .await
             {
@@ -407,6 +608,7 @@ impl OrbTrader {
             .bars(&cfg.symbols, now - Duration::days(30))
             .await?;
         let mut ranked = Vec::new();
+        let (mut up, mut seen) = (0u32, 0u32);
         for symbol in &cfg.symbols {
             let Some(list) = history.get(symbol) else {
                 continue;
@@ -421,6 +623,10 @@ impl OrbTrader {
                 }
             }
             let Some(first) = first_today else { continue };
+            seen += 1;
+            if first.close > first.open {
+                up += 1;
+            }
             let prior = &prior[prior.len().saturating_sub(14)..];
             let Some(rvol) = relative_volume(first.volume, prior) else {
                 continue;
@@ -433,30 +639,38 @@ impl OrbTrader {
             }
         }
         self.day.ranked = true;
+        if seen > 0 {
+            self.day.breadth_up_pct = Decimal::from(up * 100) / Decimal::from(seen);
+        }
         info!(
             stocks_in_play = ?ranked,
             universe = cfg.symbols.len(),
-            "ORB opening ranges ranked"
+            breadth_up_pct = %self.day.breadth_up_pct.round_dp(1),
+            "ATLAS: opening ranges ranked"
         );
         Ok(())
     }
 }
 
-/// Place one entry and record it like every other venue entry: the order row
-/// before the submit, then the outcome, then the trade (PENDING until filled).
-#[allow(clippy::too_many_arguments)]
-async fn enter(
+/// An order TITAN has allowed: the instrument, the quote it was priced off,
+/// the marketable limit and the size.
+struct Prepared {
+    instrument: Instrument,
+    quote: Quote,
+    limit: Decimal,
+    qty: Decimal,
+}
+
+/// TITAN's order checks for one signal: the order it allows, or why not.
+async fn titan_prepare(
     registry: &VenueRegistry,
-    store: &Store,
     cfg: &UsOrbConfig,
     capital: Decimal,
     symbol: &str,
     side: Side,
     stop: Decimal,
-    rvol: Decimal,
     now: DateTime<Utc>,
-    cycle: i64,
-) -> Result<bool> {
+) -> Result<std::result::Result<Prepared, String>> {
     let filter = ScanFilter {
         asset_classes: vec![AssetClass::Equity],
         symbols: vec![symbol.to_string()],
@@ -470,11 +684,9 @@ async fn enter(
         .into_iter()
         .find(|i| i.venue().as_str() == VENUE && i.symbol().eq_ignore_ascii_case(symbol))
     else {
-        warn!(
-            symbol,
-            "Not a tradeable Alpaca instrument — add it to the alpaca venue's symbols"
-        );
-        return Ok(false);
+        return Ok(Err(
+            "not a tradeable Alpaca instrument (add it to the alpaca venue's symbols)".to_string(),
+        ));
     };
     let venue = registry
         .get(instrument.venue())
@@ -486,8 +698,9 @@ async fn enter(
         || (side == Side::Buy && touch <= stop)
         || (side == Side::Sell && touch >= stop)
     {
-        info!(symbol, %touch, %stop, "Price is back through the stop; skipping");
-        return Ok(false);
+        return Ok(Err(format!(
+            "price {touch} is back through the stop {stop}: the breakout already failed"
+        )));
     }
     // A marketable limit: crosses the spread, but caps how far a fast market can fill us.
     let limit = instrument.round_price(
@@ -501,10 +714,48 @@ async fn enter(
     let notional = capital * cfg.position_pct;
     let qty = entry_quantity(&instrument, notional, limit, side);
     if qty <= Decimal::ZERO {
-        info!(symbol, %notional, price = %limit, side = %side, "Position size rounds to zero shares; skipping");
-        return Ok(false);
+        return Ok(Err(format!(
+            "${} buys no whole share at {limit}{}",
+            notional.round_dp(2),
+            if side == Side::Sell {
+                " (shorts must be whole shares)"
+            } else {
+                ""
+            }
+        )));
     }
+    Ok(Ok(Prepared {
+        instrument,
+        quote,
+        limit,
+        qty,
+    }))
+}
 
+/// Place one entry and record it like every other venue entry: the order row
+/// before the submit, then the outcome, then the trade (PENDING until filled).
+#[allow(clippy::too_many_arguments)]
+async fn submit(
+    registry: &VenueRegistry,
+    store: &Store,
+    order: Prepared,
+    symbol: &str,
+    side: Side,
+    stop: Decimal,
+    rvol: Decimal,
+    capital: Decimal,
+    now: DateTime<Utc>,
+    cycle: i64,
+) -> Result<bool> {
+    let Prepared {
+        instrument,
+        quote,
+        limit,
+        qty,
+    } = order;
+    let venue = registry
+        .get(instrument.venue())
+        .context("Alpaca venue missing")?;
     let client_order_id = Uuid::new_v4().to_string();
     store
         .insert_order(&OrderRecord {

@@ -777,6 +777,44 @@ impl Store {
         Ok(count.max(0) as u32)
     }
 
+    /// Record one trading-desk decision card (the full card as JSON).
+    pub async fn insert_desk_decision(
+        &self,
+        card: &crate::us::desk::DecisionCard,
+    ) -> Result<i64> {
+        let action = serde_json::to_value(card.nova.action)?;
+        let advisory = serde_json::to_value(card.nova.advisory_action)?;
+        let result = sqlx::query(
+            "INSERT INTO desk_decisions (created_at, market, strategy, symbol, action, advisory_action, card)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(card.at.to_rfc3339())
+        .bind(&card.market)
+        .bind(&card.strategy)
+        .bind(&card.symbol)
+        .bind(action.as_str().unwrap_or("UNKNOWN"))
+        .bind(advisory.as_str().unwrap_or("UNKNOWN"))
+        .bind(serde_json::to_string(card)?)
+        .execute(&self.pool)
+        .await
+        .context("Failed to record desk decision")?;
+        Ok(result.last_insert_rowid())
+    }
+
+    /// The most recent decision cards, newest first, as stored JSON.
+    pub async fn recent_desk_decisions(&self, limit: i64) -> Result<Vec<serde_json::Value>> {
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT card FROM desk_decisions ORDER BY id DESC LIMIT ?")
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+                .context("Failed to read desk decisions")?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(c,)| serde_json::from_str(&c).ok())
+            .collect())
+    }
+
     /// Today's P&L for one strategy's venue trades: realized on positions
     /// closed today plus the latest mark on those still open.
     pub async fn strategy_day_pnl(
@@ -1793,6 +1831,54 @@ mod tests {
         assert_eq!(row.3, "0");
         assert_eq!(row.4.as_deref(), Some("0.0018"), "risk fraction");
         assert_eq!(row.5.as_deref(), Some("0.03"), "stop distance");
+    }
+
+    #[tokio::test]
+    async fn desk_decision_cards_round_trip_newest_first() {
+        use crate::us::desk::*;
+        let store = Store::new(":memory:").await.expect("store");
+        let card = |symbol: &str| DecisionCard {
+            at: Utc::now(),
+            market: "US".into(),
+            strategy: "orb".into(),
+            symbol: symbol.into(),
+            atlas: Atlas {
+                relative_volume: dec!(3.1),
+                range_high: dec!(101),
+                range_low: dec!(99),
+                in_play_today: 7,
+            },
+            vega: Vega {
+                side: "LONG".into(),
+                setup: "5-minute opening-range breakout".into(),
+                signal_at: "09:40 ET".into(),
+                trigger_close: dec!(101.5),
+                stop: dec!(99),
+                breakout_pct_of_range: dec!(25),
+            },
+            orion: orion(&[], Utc::now()),
+            luna: luna(&[], dec!(0.2), dec!(52), true),
+            titan: Titan {
+                allowed: true,
+                reason: "within limits".into(),
+                qty: dec!(1.9),
+                notional_usd: dec!(200),
+                risk_usd: dec!(4.9),
+            },
+            nova: Nova {
+                action: Action::Trade,
+                advisory_action: Action::Trade,
+                enforced: false,
+                reasons: vec!["ok".into()],
+            },
+        };
+        store.insert_desk_decision(&card("AAA")).await.unwrap();
+        store.insert_desk_decision(&card("BBB")).await.unwrap();
+        let cards = store.recent_desk_decisions(10).await.unwrap();
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0]["symbol"], "BBB");
+        assert_eq!(cards[0]["nova"]["action"], "TRADE");
+        assert_eq!(cards[1]["atlas"]["in_play_today"], 7);
     }
 
     /// A SELL entry is a short: the open-trade view must say so, carry the

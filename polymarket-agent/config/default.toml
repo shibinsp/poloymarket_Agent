@@ -259,6 +259,14 @@ max_trades_per_day = 3       # shared with the U.S. daily entry limit
 daily_loss_pct = 0.02        # no new ORB entries after a 2% day loss
 allow_short = true           # whole shares only: shorts above ~$200 a share will not size
 max_entry_slippage_pct = 0.002
+# The trading desk (src/us/desk.rs): ATLAS scans, VEGA reads the chart, ORION
+# the news, LUNA the sentiment, TITAN the risk, NOVA decides and records a card
+# (GET /api/us/desk). A trading halt in the last 24h always skips the trade.
+# "advisory": ORION's earnings/merger/offering veto and LUNA's half size are
+# recorded but do not change orders; "enforce": they do. Backtested over 2,490
+# trades they were inconsistent (the veto cut the held-out year from +21% to
+# +4%), so advisory is the setting to keep.
+desk_mode = "advisory"
 symbols = [
     "SPY", "QQQ", "IWM", "DIA", "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "AVGO",
     "AMD", "NFLX", "ORCL", "CRM", "ADBE", "INTC", "MU", "QCOM", "TXN", "AMAT", "LRCX", "KLAC",
