@@ -27,6 +27,8 @@ use crate::venue::{Venue, VenueRegistry};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitReason {
     StopLoss,
+    /// A stop that has been raised above the initial stop (breakeven or trail).
+    TrailingStop,
     TakeProfit,
     MaxHold,
     SessionClose,
@@ -38,6 +40,7 @@ impl ExitReason {
     pub fn as_str(&self) -> &'static str {
         match self {
             ExitReason::StopLoss => "STOP_LOSS",
+            ExitReason::TrailingStop => "TRAILING_STOP",
             ExitReason::TakeProfit => "TAKE_PROFIT",
             ExitReason::MaxHold => "MAX_HOLD",
             ExitReason::SessionClose => "SESSION_CLOSE",
@@ -51,6 +54,8 @@ impl ExitReason {
 #[derive(Debug, Clone, Copy)]
 pub struct ExitRules {
     pub stop_price: Option<Decimal>,
+    /// The stop has been ratcheted above its entry level.
+    pub stop_trailed: bool,
     pub target_price: Option<Decimal>,
     pub max_hold_until: Option<DateTime<Utc>>,
     pub session_close_due: bool,
@@ -79,7 +84,11 @@ pub fn evaluate_exit(
     }
     if let Some(stop) = rules.stop_price {
         if mark_price <= stop {
-            return Some(ExitReason::StopLoss);
+            return Some(if rules.stop_trailed {
+                ExitReason::TrailingStop
+            } else {
+                ExitReason::StopLoss
+            });
         }
     }
     if let Some(target) = rules.target_price {
@@ -219,36 +228,62 @@ impl VenueExits<'_> {
             .await?;
 
         let is_equity = trade.asset_class.eq_ignore_ascii_case("equity");
-        let session_close_due = is_equity && venue.session().is_intraday_exit_due(now, 15);
         let is_us_alpaca_equity = is_equity && trade.venue_id.eq_ignore_ascii_case("alpaca");
-
-        let sma_exit_due = if is_us_alpaca_equity
+        let is_sma_position = is_us_alpaca_equity
             && self
                 .us_strategy
                 .map(|s| s.strategy.eq_ignore_ascii_case("sma_crossover"))
-                .unwrap_or(false)
-        {
-            if let Ok(daily_bars) = venue
+                .unwrap_or(false);
+        // Daily crossover positions are meant to survive overnight. Intraday
+        // session-close exits would invalidate the 20/50-day holding rule.
+        let session_close_due =
+            is_equity && !is_sma_position && venue.session().is_intraday_exit_due(now, 15);
+
+        let completed: Vec<crate::venue::types::Candle> = if is_sma_position {
+            venue
                 .candles(&instrument_id, crate::venue::types::CandleInterval::D1, 65)
                 .await
+                .map(|bars| {
+                    bars.into_iter()
+                        .filter(|c| c.ts + Duration::hours(24) <= now)
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        let sma_exit_due = if is_sma_position {
+            let strategy = self.us_strategy.expect("SMA position has strategy config");
+            let minimum_bars = strategy.slow_sma_period.saturating_add(1);
+            if strategy.moving_average_type.eq_ignore_ascii_case("SMA")
+                && strategy.fast_sma_period > 0
+                && strategy.fast_sma_period < strategy.slow_sma_period
+                && completed.len() >= minimum_bars
+                && crate::us::sma_crossover::validate_daily_candles(
+                    &trade.symbol,
+                    &completed,
+                    now,
+                    minimum_bars,
+                    crate::us::sma_crossover::MAX_PERMISSIBLE_STALE_DAYS,
+                )
+                .is_ok()
             {
-                let completed: Vec<crate::venue::types::Candle> = daily_bars
-                    .into_iter()
-                    .filter(|c| c.ts + Duration::hours(24) <= now)
-                    .collect();
-                if completed.len() >= 51 {
-                    let closes: Vec<Decimal> = completed.iter().map(|c| c.close).collect();
-                    let n = closes.len();
-                    if let (Some(fast_curr), Some(slow_curr), Some(fast_prev), Some(slow_prev)) = (
-                        crate::us::sma_crossover::calculate_sma(&closes[..n], 20),
-                        crate::us::sma_crossover::calculate_sma(&closes[..n], 50),
-                        crate::us::sma_crossover::calculate_sma(&closes[..n - 1], 20),
-                        crate::us::sma_crossover::calculate_sma(&closes[..n - 1], 50),
-                    ) {
-                        fast_prev >= slow_prev && fast_curr < slow_curr
-                    } else {
-                        false
-                    }
+                let closes: Vec<Decimal> = completed.iter().map(|c| c.close).collect();
+                let n = closes.len();
+                if let (Some(fast_curr), Some(slow_curr), Some(fast_prev), Some(slow_prev)) = (
+                    crate::us::sma_crossover::calculate_sma(&closes[..n], strategy.fast_sma_period),
+                    crate::us::sma_crossover::calculate_sma(&closes[..n], strategy.slow_sma_period),
+                    crate::us::sma_crossover::calculate_sma(
+                        &closes[..n - 1],
+                        strategy.fast_sma_period,
+                    ),
+                    crate::us::sma_crossover::calculate_sma(
+                        &closes[..n - 1],
+                        strategy.slow_sma_period,
+                    ),
+                ) {
+                    fast_prev >= slow_prev && fast_curr < slow_curr
                 } else {
                     false
                 }
@@ -259,12 +294,28 @@ impl VenueExits<'_> {
             false
         };
 
+        let (stop_price, stop_trailed) = if is_sma_position {
+            self.ratchet_sma_stop(trade, entry, mark, &completed)
+                .await?
+        } else {
+            (trade.stop_price, false)
+        };
+
         let rules = ExitRules {
-            stop_price: trade.stop_price,
-            target_price: trade.target_price,
-            max_hold_until: trade
-                .opened_at
-                .map(|opened| opened + Duration::hours(self.max_hold_hours)),
+            stop_price,
+            stop_trailed,
+            target_price: if is_sma_position {
+                None
+            } else {
+                trade.target_price
+            },
+            max_hold_until: if is_sma_position {
+                None
+            } else {
+                trade
+                    .opened_at
+                    .map(|opened| opened + Duration::hours(self.max_hold_hours))
+            },
             session_close_due,
             emergency_stop: self.emergency_stop,
             sma_exit_due,
@@ -297,6 +348,59 @@ impl VenueExits<'_> {
         )
         .await?;
         Ok(true)
+    }
+
+    /// Raise an SMA position's stop to breakeven and then a trailing ATR
+    /// level as the trade works, persisting any rise. Returns the stop in
+    /// force and whether it now sits above the initial stop.
+    async fn ratchet_sma_stop(
+        &self,
+        trade: &VenueOpenTrade,
+        entry: Decimal,
+        mark: Decimal,
+        completed: &[crate::venue::types::Candle],
+    ) -> Result<(Option<Decimal>, bool)> {
+        let (Some(current), Some(stop_pct), Some(opened), Some(strategy)) = (
+            trade.stop_price,
+            trade.stop_pct,
+            trade.opened_at,
+            self.us_strategy,
+        ) else {
+            return Ok((trade.stop_price, false));
+        };
+        let initial = (trade.entry_price * (Decimal::ONE - stop_pct)).round_dp(2);
+        // Daily bars are stamped at the session's start, so the entry day's
+        // bar is any bar that ends after the fill.
+        let highest_high = completed
+            .iter()
+            .filter(|c| c.ts + Duration::hours(24) > opened)
+            .map(|c| c.high)
+            .fold(mark, Decimal::max);
+        let atr =
+            crate::risk::volatility::atr(completed, crate::us::sma_crossover::TRAILING_ATR_PERIOD);
+        let managed = crate::us::sma_crossover::managed_stop(
+            entry,
+            initial,
+            highest_high,
+            atr,
+            &strategy.sma_trailing_stop(),
+        );
+        let stop = if managed > current {
+            info!(
+                trade_id = trade.id,
+                symbol = %trade.symbol,
+                from = %current,
+                to = %managed,
+                "Raising protective stop"
+            );
+            self.store
+                .update_trade_stop(trade.id, &managed.to_string())
+                .await?;
+            managed
+        } else {
+            current
+        };
+        Ok((Some(stop), stop > initial))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -738,6 +842,7 @@ mod tests {
     ) -> ExitRules {
         ExitRules {
             stop_price: stop,
+            stop_trailed: false,
             target_price: target,
             max_hold_until: deadline,
             session_close_due: false,
@@ -842,5 +947,17 @@ mod tests {
         assert_eq!(ExitReason::StopLoss.as_str(), "STOP_LOSS");
         assert_eq!(ExitReason::TakeProfit.as_str(), "TAKE_PROFIT");
         assert_eq!(ExitReason::MaxHold.as_str(), "MAX_HOLD");
+        assert_eq!(ExitReason::TrailingStop.as_str(), "TRAILING_STOP");
+    }
+
+    #[test]
+    fn a_raised_stop_reports_as_a_trailing_stop() {
+        let mut r = rules(Some(dec!(105)), None, None);
+        r.stop_trailed = true;
+        assert_eq!(
+            evaluate_exit(dec!(104), Utc::now(), &r),
+            Some(ExitReason::TrailingStop)
+        );
+        assert_eq!(evaluate_exit(dec!(106), Utc::now(), &r), None);
     }
 }

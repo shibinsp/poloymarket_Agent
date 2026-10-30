@@ -12,7 +12,7 @@ max_sleep_seconds = 3600          # longest sleep while every venue is closed
 max_markets = 1000
 min_volume_24h = 1500.0
 max_resolution_days = 14
-max_spread_pct = 0.08
+max_spread_pct = 0.03              # a wider book costs more than any edge we can price
 categories = ["weather", "sports", "crypto", "politics"]
 
 [valuation]
@@ -32,19 +32,28 @@ model = "meta/llama-3.2-11b-vision-instruct"
 max_tokens = 4096
 # input_price_per_million = 3.00
 # output_price_per_million = 15.00
-min_edge_threshold = 0.010
-high_confidence_edge = 0.010
-low_confidence_edge = 0.020
+# Edge must clear spread, fees and model error. 1-2% hurdles were below the
+# cost of crossing a typical Polymarket book, so they selected losing trades.
+min_edge_threshold = 0.05
+high_confidence_edge = 0.04
+low_confidence_edge = 0.08
 cache_ttl_seconds = 300
 
 [risk]
-kelly_fraction = 0.5
-max_position_pct = 1.0               # Allow up to 100% allocation for micro $5.00 seed capital
-max_total_exposure_pct = 1.0         # Full exposure cap for micro-capital trading
+kelly_fraction = 0.20                 # fractional Kelly: model probabilities are not well calibrated
+max_position_pct = 0.10              # no single position above 10% of bankroll
+max_total_exposure_pct = 0.50        # at most half the bankroll at risk at once
 max_positions_per_category = 3
 min_position_usd = 1.0
 india_capital_allocation_inr = 25000.0     # INR: ₹1,000 isolated paper/sandbox allocation
 us_capital_allocation_usd = 1000.0       # USD: $1,000.00 initial capital for US equities (Alpaca paper)
+us_max_position_pct = 0.20               # At most $200 of the $1,000 US allocation in one stock
+us_max_exposure_pct = 0.50               # At most $500 total US stock exposure
+us_cash_buffer_pct = 0.10                 # Keep 10% of available US stock cash uncommitted
+us_risk_per_trade_pct = 0.01              # Target at most 1% of available capital at the ATR stop
+us_max_daily_loss_usd = 20.0              # Tightest cash loss limit; pauses all entries for the day
+us_max_trades_per_day = 3
+us_max_quote_age_seconds = 120
 
 
 # --- Circuit breakers -------------------------------------------------------
@@ -67,13 +76,14 @@ us_capital_allocation_usd = 1000.0       # USD: $1,000.00 initial capital for US
 # Lost more than this fraction of the day's opening equity -> stop entries for
 # the rest of the UTC day. Lifts by itself at midnight.
 max_daily_loss_pct = 0.05
-# The same limit in cash. Set to 2000.0 (~2%) for the $100k paper account; LIVE: 5.0
-max_daily_loss_usd = 2000.0
+# The same limit in cash. Sized to the capital actually traded ($100 bankroll +
+# $1,000 US allocation), not the $100k Alpaca paper balance; LIVE: 5.0
+max_daily_loss_usd = 50.0
 # Below the all-time equity high by more than this -> stop until a human
 # resumes. Does not lift at midnight: sleeping on a drawdown changes nothing.
 max_drawdown_pct = 0.15
 # Positions opened per UTC day, and losing closes in a row. Both rest-of-day.
-max_trades_per_day = 500
+max_trades_per_day = 20
 max_consecutive_losses = 4
 # Absolute ceilings, applied only in live mode. A percentage of a paper
 # balance is a number nobody agreed to, and the first live run must not
@@ -121,7 +131,9 @@ kind = "alpaca"
 enabled = true
 base_url = "https://paper-api.alpaca.markets"
 data_url = "https://data.alpaca.markets"
-symbols = ["SIRI", "NOK", "LCID", "PLUG", "NIO", "SOFI", "BTC/USD", "ETH/USD", "SPY", "AAPL", "NVDA", "QQQ"]
+# Liquid large caps and index ETFs only: low-priced names (SIRI, NOK, LCID,
+# PLUG, NIO, SOFI) whipsaw a daily crossover and carry wider spreads.
+symbols = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA"]
 fee_pct = 0.0025
 #
 # Coinbase Advanced Trade — spot crypto, 24/7.
@@ -183,7 +195,7 @@ symbols = ["ITC", "TATAMOTORS", "HDFCBANK", "SBIN", "RELIANCE", "INFY", "ICICIBA
 fee_pct = 0.001
 
 [sizing_continuous]
-risk_per_trade_pct = 0.95           # Allow micro $5 capital allocation to size 1 full share of sub-$5 stock
+risk_per_trade_pct = 0.02           # lose at most 2% of bankroll if the stop is hit
 atr_period = 14
 atr_multiplier = 1.5            # stop distance = ATR x this, then clamped
 min_stop_pct = 0.01             # 1.0% min stop
@@ -201,6 +213,19 @@ strategy = "sma_crossover"
 fast_sma_period = 20
 slow_sma_period = 50
 moving_average_type = "SMA"   # Explicitly Simple Moving Average (SMA), not EMA
+# Golden-cross confirmations (0 disables each). A cross is only an entry when
+# ADX(14) >= min_adx and regime_symbol closes above its regime_sma_period-day
+# SMA. Over 5 years (examples/us_sma_compare.rs) these cut drawdown at the same
+# profit factor; a signal-day volume filter (min_volume_ratio = 1.2) removed
+# three quarters of trades and turned the profit factor to 0.99, so it is off.
+min_volume_ratio = 0.0
+min_adx = 20.0
+regime_symbol = "SPY"
+regime_sma_period = 200
+# Stop management: after +breakeven_at_r R the stop moves to entry, then trails
+# trail_atr_multiplier x ATR(14) below the highest high since entry.
+breakeven_at_r = 1.0
+trail_atr_multiplier = 3.0
 
 [telemetry]
 # OpenTelemetry span export. Off unless an endpoint is set here or via

@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use crate::us::costs::{UsCostConfig, UsTransactionCosts};
+use crate::us::sma_crossover::{SmaEntryFilters, SmaTrailingStop};
 use crate::venue::types::Side;
 
 /// An OHLCV market candle for US cash equities.
@@ -43,9 +44,20 @@ pub struct UsBacktestConfig {
     pub rsi_buy_threshold: Decimal,
     pub stop_loss_pct: Decimal,
     pub take_profit_pct: Decimal,
+    /// ATR settings; defaults match live continuous-asset sizing and protective stops.
+    pub atr_period: usize,
+    pub atr_multiplier: Decimal,
+    pub min_stop_pct: Decimal,
+    pub max_stop_pct: Decimal,
     pub train_split_pct: Decimal,
     pub val_split_pct: Decimal,
     pub cost_config: UsCostConfig,
+    /// Golden-cross confirmations for the SMA crossover backtest.
+    #[serde(default)]
+    pub sma_entry_filters: SmaEntryFilters,
+    /// Breakeven and trailing-stop management for the SMA crossover backtest.
+    #[serde(default)]
+    pub sma_trailing_stop: SmaTrailingStop,
 }
 
 impl Default for UsBacktestConfig {
@@ -63,9 +75,15 @@ impl Default for UsBacktestConfig {
             rsi_buy_threshold: dec!(40.0),
             stop_loss_pct: dec!(0.015),   // 1.5% stop loss
             take_profit_pct: dec!(0.030), // 3.0% take profit
-            train_split_pct: dec!(0.60),  // 60% train
-            val_split_pct: dec!(0.20),    // 20% validation, 20% test
+            atr_period: 14,
+            atr_multiplier: dec!(2.0),
+            min_stop_pct: dec!(0.03),
+            max_stop_pct: dec!(0.12),
+            train_split_pct: dec!(0.60), // 60% train
+            val_split_pct: dec!(0.20),   // 20% validation, 20% test
             cost_config: UsCostConfig::default(),
+            sma_entry_filters: SmaEntryFilters::default(),
+            sma_trailing_stop: SmaTrailingStop::default(),
         }
     }
 }

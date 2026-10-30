@@ -390,8 +390,25 @@ pub struct RiskConfig {
     pub us_capital_allocation_usd: Option<Decimal>,
     #[serde(default)]
     pub us_max_exposure_pct: Option<Decimal>,
+    /// Cash loss ceiling that also pauses all entries, using the account-wide
+    /// equity marks currently persisted by the circuit breaker.
     #[serde(default)]
     pub us_max_daily_loss_usd: Option<Decimal>,
+    /// Maximum single U.S. equity position as a fraction of its allocated capital.
+    #[serde(default)]
+    pub us_max_position_pct: Option<Decimal>,
+    /// Fraction of available U.S. equity cash held back from new orders.
+    #[serde(default)]
+    pub us_cash_buffer_pct: Option<Decimal>,
+    /// U.S. equity risk budget per trade, measured against available capital.
+    #[serde(default)]
+    pub us_risk_per_trade_pct: Option<Decimal>,
+    /// U.S. equity entries allowed per UTC day.
+    #[serde(default)]
+    pub us_max_trades_per_day: Option<u32>,
+    /// Maximum permitted age of the U.S. equity quote used to place an order.
+    #[serde(default)]
+    pub us_max_quote_age_seconds: Option<u64>,
 }
 
 fn default_max_daily_loss_pct() -> Decimal {
@@ -444,6 +461,11 @@ impl Default for RiskConfig {
             us_capital_allocation_usd: None,
             us_max_exposure_pct: None,
             us_max_daily_loss_usd: None,
+            us_max_position_pct: None,
+            us_cash_buffer_pct: None,
+            us_risk_per_trade_pct: None,
+            us_max_trades_per_day: None,
+            us_max_quote_age_seconds: None,
         }
     }
 }
@@ -1564,6 +1586,43 @@ pub struct UsStrategyConfig {
     /// Moving average calculation method. Strictly "SMA" (Simple Moving Average), not EMA.
     #[serde(default = "default_moving_average_type")]
     pub moving_average_type: String,
+    /// Golden-cross volume confirmation: signal-day volume over its 20-day
+    /// average. 0 disables.
+    #[serde(default = "default_min_volume_ratio")]
+    pub min_volume_ratio: Decimal,
+    /// Minimum ADX(14) at the cross. 0 disables.
+    #[serde(default = "default_min_adx")]
+    pub min_adx: Decimal,
+    /// Market proxy whose trend gates every new long.
+    #[serde(default = "default_regime_symbol")]
+    pub regime_symbol: String,
+    /// The proxy must close above its SMA of this many days. 0 disables.
+    #[serde(default = "default_regime_sma_period")]
+    pub regime_sma_period: usize,
+    /// Move the stop to breakeven after this many R of open profit. 0 disables.
+    #[serde(default = "default_breakeven_at_r")]
+    pub breakeven_at_r: Decimal,
+    /// After breakeven, trail this many ATRs under the highest high. 0 disables.
+    #[serde(default = "default_trail_atr_multiplier")]
+    pub trail_atr_multiplier: Decimal,
+}
+
+impl UsStrategyConfig {
+    pub fn sma_entry_filters(&self) -> crate::us::sma_crossover::SmaEntryFilters {
+        crate::us::sma_crossover::SmaEntryFilters {
+            min_volume_ratio: self.min_volume_ratio,
+            min_adx: self.min_adx,
+            regime_sma_period: self.regime_sma_period,
+            ..Default::default()
+        }
+    }
+
+    pub fn sma_trailing_stop(&self) -> crate::us::sma_crossover::SmaTrailingStop {
+        crate::us::sma_crossover::SmaTrailingStop {
+            breakeven_at_r: self.breakeven_at_r,
+            trail_atr_multiplier: self.trail_atr_multiplier,
+        }
+    }
 }
 
 impl Default for UsStrategyConfig {
@@ -1573,6 +1632,12 @@ impl Default for UsStrategyConfig {
             fast_sma_period: default_fast_sma(),
             slow_sma_period: default_slow_sma(),
             moving_average_type: default_moving_average_type(),
+            min_volume_ratio: default_min_volume_ratio(),
+            min_adx: default_min_adx(),
+            regime_symbol: default_regime_symbol(),
+            regime_sma_period: default_regime_sma_period(),
+            breakeven_at_r: default_breakeven_at_r(),
+            trail_atr_multiplier: default_trail_atr_multiplier(),
         }
     }
 }
@@ -1591,4 +1656,28 @@ fn default_slow_sma() -> usize {
 
 fn default_moving_average_type() -> String {
     "SMA".to_string()
+}
+
+fn default_min_volume_ratio() -> Decimal {
+    Decimal::ZERO
+}
+
+fn default_min_adx() -> Decimal {
+    rust_decimal_macros::dec!(20)
+}
+
+fn default_regime_symbol() -> String {
+    "SPY".to_string()
+}
+
+fn default_regime_sma_period() -> usize {
+    200
+}
+
+fn default_breakeven_at_r() -> Decimal {
+    rust_decimal_macros::dec!(1.0)
+}
+
+fn default_trail_atr_multiplier() -> Decimal {
+    rust_decimal_macros::dec!(3.0)
 }

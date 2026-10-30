@@ -32,8 +32,8 @@ use crate::valuation::fair_value::DataQuality;
 use crate::valuation::llm::LlmClient;
 use crate::venue::session::SessionKind;
 use crate::venue::types::{
-    AssetClass, Candle, CandleInterval, Instrument, OrderKind, OrderRequest, OrderState, Quote,
-    ScanFilter, Side, TimeInForce,
+    AssetClass, Candle, CandleInterval, Instrument, InstrumentId, OrderKind, OrderRequest,
+    OrderState, Quote, ScanFilter, Side, TimeInForce,
 };
 use crate::venue::{Venue, VenueRegistry};
 use rust_decimal_macros::dec;
@@ -141,11 +141,9 @@ impl VenueCycle<'_> {
 
         // Never place a second order for a symbol whose previous order hasn't
         // been resolved: that is how duplicate positions appear.
-        let busy: HashSet<String> = self
-            .store
-            .get_unresolved_orders()
-            .await?
-            .into_iter()
+        let unresolved_orders = self.store.get_unresolved_orders().await?;
+        let busy: HashSet<String> = unresolved_orders
+            .iter()
             .map(|o| format!("{}:{}", o.venue_id, o.symbol))
             .collect();
 
@@ -174,12 +172,55 @@ impl VenueCycle<'_> {
             .collect();
         let mut venue_notional: HashMap<String, Decimal> = HashMap::new();
         let mut venue_positions: HashMap<String, usize> = HashMap::new();
+        let mut unknown_reserved_exposure: HashSet<String> = HashSet::new();
         for trade in &all_open_trades {
             let cost = trade.quantity * trade.avg_fill_price.unwrap_or(trade.entry_price);
             *venue_notional
                 .entry(trade.venue_id.clone())
                 .or_insert(Decimal::ZERO) += cost;
             *venue_positions.entry(trade.venue_id.clone()).or_insert(0) += 1;
+        }
+
+        // Reserve the unfilled part of every unresolved entry order. A pending
+        // order is a potential position even before its fill is reported.
+        // Unknown order size blocks further entries for that venue.
+        for order in &unresolved_orders {
+            if !order.side.eq_ignore_ascii_case("BUY")
+                || !order.intent.eq_ignore_ascii_case("ENTRY")
+            {
+                continue;
+            }
+
+            let qty = order.qty.parse::<Decimal>();
+            let filled = order.filled_qty.parse::<Decimal>();
+            let price = order
+                .limit_price
+                .as_deref()
+                .and_then(|value| value.parse::<Decimal>().ok());
+            let (Ok(qty), Ok(filled), Some(price)) = (qty, filled, price) else {
+                unknown_reserved_exposure.insert(order.venue_id.clone());
+                continue;
+            };
+            if qty <= Decimal::ZERO
+                || filled < Decimal::ZERO
+                || filled > qty
+                || price <= Decimal::ZERO
+            {
+                unknown_reserved_exposure.insert(order.venue_id.clone());
+                continue;
+            }
+            let remaining_qty = (qty - filled).max(Decimal::ZERO);
+            if remaining_qty.is_zero() {
+                continue;
+            }
+
+            *venue_notional
+                .entry(order.venue_id.clone())
+                .or_insert(Decimal::ZERO) += remaining_qty * price;
+            let key = format!("{}:{}", order.venue_id, order.symbol);
+            if !open_symbols.contains(&key) {
+                *venue_positions.entry(order.venue_id.clone()).or_insert(0) += 1;
+            }
         }
 
         // Account for any active Indian paper sandbox positions
@@ -230,6 +271,15 @@ impl VenueCycle<'_> {
             let Some(venue) = self.registry.get(instrument.venue()) else {
                 continue;
             };
+            let venue_key = venue.id().to_string();
+            if unknown_reserved_exposure.contains(&venue_key) {
+                warn!(
+                    venue = %venue.id(),
+                    instrument = %instrument.id,
+                    "Unresolved entry has no safe notional estimate; blocking new entries for this venue"
+                );
+                continue;
+            }
 
             // Intraday equity session cutoff check: block new entries 30 mins before market close
             if matches!(instrument.asset_class, AssetClass::Equity)
@@ -279,20 +329,75 @@ impl VenueCycle<'_> {
                 continue;
             }
 
-            let venue_key = venue.id().to_string();
             let cur_notional = venue_notional
                 .get(&venue_key)
                 .copied()
                 .unwrap_or(Decimal::ZERO);
             let cur_positions = venue_positions.get(&venue_key).copied().unwrap_or(0);
 
-            if let Some(reason) =
+            let us_equity = is_us_equity(&instrument);
+            if us_equity {
+                if let Some(limit) = self.config.risk.us_max_trades_per_day {
+                    let trades_today = match self
+                        .store
+                        .count_venue_equity_entries_opened_on("alpaca", now.date_naive())
+                        .await
+                    {
+                        Ok(count) => count,
+                        Err(error) => {
+                            warn!(%error, "Could not read today's U.S. equity trade count; blocking stock entries");
+                            continue;
+                        }
+                    };
+                    if trades_today >= limit {
+                        info!(
+                            instrument = %instrument.id,
+                            trades_today,
+                            limit,
+                            "U.S. equity daily entry limit reached"
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            let exposure_base = if us_equity {
+                let tracked_capital = bankroll + cur_notional;
+                self.config
+                    .risk
+                    .us_capital_allocation_usd
+                    .unwrap_or(tracked_capital)
+                    .min(tracked_capital)
+            } else {
+                bankroll
+            };
+            let max_exposure_pct = if us_equity {
+                self.config
+                    .risk
+                    .us_max_exposure_pct
+                    .unwrap_or(self.config.risk.max_total_exposure_pct)
+            } else {
+                self.config.risk.max_total_exposure_pct
+            };
+
+            let block_reason = if us_equity {
+                portfolio_block_with_limits(
+                    cur_notional,
+                    cur_positions,
+                    exposure_base,
+                    max_exposure_pct,
+                    self.config.risk.max_positions_per_category as usize,
+                )
+            } else {
                 portfolio_block(cur_notional, cur_positions, bankroll, &self.config.risk)
-            {
+            };
+            if let Some(reason) = block_reason {
                 info!(
                     venue = %venue.id(),
                     open_notional = %cur_notional,
                     open_positions = cur_positions,
+                    exposure_base = %exposure_base,
+                    max_exposure_pct = %max_exposure_pct,
                     reason,
                     "No further entries for venue this cycle"
                 );
@@ -347,6 +452,46 @@ impl VenueCycle<'_> {
         Ok(outcome)
     }
 
+    /// Why the broad market forbids a new SMA long right now, or `None`.
+    /// Any failure to load or validate the proxy's bars blocks the entry.
+    async fn sma_regime_rejection(
+        &self,
+        venue: &dyn Venue,
+        instrument: &Instrument,
+        now: DateTime<Utc>,
+    ) -> Option<String> {
+        let strategy = &self.config.us_strategy;
+        let period = strategy.regime_sma_period;
+        if period == 0 {
+            return None;
+        }
+        let proxy = InstrumentId::new(instrument.venue().clone(), strategy.regime_symbol.clone());
+        let bars = match venue.candles(&proxy, CandleInterval::D1, period + 30).await {
+            Ok(bars) => bars,
+            Err(e) => {
+                return Some(format!(
+                    "could not load {} bars: {e:#}",
+                    strategy.regime_symbol
+                ))
+            }
+        };
+        let completed: Vec<Candle> = bars
+            .into_iter()
+            .filter(|c| c.ts + Duration::hours(24) <= now)
+            .collect();
+        if let Err(e) = crate::us::sma_crossover::validate_daily_candles(
+            &strategy.regime_symbol,
+            &completed,
+            now,
+            period,
+            crate::us::sma_crossover::MAX_PERMISSIBLE_STALE_DAYS,
+        ) {
+            return Some(e.to_string());
+        }
+        let closes: Vec<Decimal> = completed.iter().map(|c| c.close).collect();
+        crate::us::sma_crossover::regime_rejection(&closes, period)
+    }
+
     async fn evaluate_instrument(
         &self,
         venue: &dyn Venue,
@@ -361,9 +506,49 @@ impl VenueCycle<'_> {
     ) -> Result<EvaluationResult> {
         let quote = venue.quote(&instrument.id).await?;
 
-        let is_us_equity = instrument.asset_class == AssetClass::Equity
-            && instrument.quote_ccy.eq_ignore_ascii_case("USD")
-            && instrument.venue().as_str() == "alpaca";
+        let is_us_equity = is_us_equity(instrument);
+        if quote.bid <= Decimal::ZERO
+            || quote.ask <= Decimal::ZERO
+            || quote.mid <= Decimal::ZERO
+            || quote.ask < quote.bid
+        {
+            warn!(instrument = %instrument.id, "Invalid or crossed quote; blocking entry");
+            return Ok(EvaluationResult {
+                cost: Decimal::ZERO,
+                notional: Decimal::ZERO,
+                placed: false,
+            });
+        }
+        if is_us_equity {
+            let max_age = self.config.risk.us_max_quote_age_seconds.unwrap_or(120);
+            if max_age == 0 || max_age > 86_400 {
+                warn!(
+                    instrument = %instrument.id,
+                    max_age_seconds = max_age,
+                    "Invalid U.S. quote-age limit; blocking stock entry"
+                );
+                return Ok(EvaluationResult {
+                    cost: Decimal::ZERO,
+                    notional: Decimal::ZERO,
+                    placed: false,
+                });
+            }
+            let quote_age = ctx.now.signed_duration_since(quote.ts);
+            if quote_age < Duration::seconds(-5) || quote_age > Duration::seconds(max_age as i64) {
+                info!(
+                    instrument = %instrument.id,
+                    quote_at = %quote.ts,
+                    quote_age_seconds = quote_age.num_seconds(),
+                    max_age_seconds = max_age,
+                    "Quote is stale or timestamped in the future; blocking stock entry"
+                );
+                return Ok(EvaluationResult {
+                    cost: Decimal::ZERO,
+                    notional: Decimal::ZERO,
+                    placed: false,
+                });
+            }
+        }
         let use_us_paper_strategy = is_us_equity && self.config.agent.mode == AgentMode::Paper;
         let is_sma_crossover = self
             .config
@@ -404,6 +589,7 @@ impl VenueCycle<'_> {
                     moving_average_type: self.config.us_strategy.moving_average_type.clone(),
                     min_history_bars: crate::us::sma_crossover::MINIMUM_REQUIRED_DAILY_BARS,
                     max_stale_days: crate::us::sma_crossover::MAX_PERMISSIBLE_STALE_DAYS,
+                    entry_filters: self.config.us_strategy.sma_entry_filters(),
                 };
 
                 (
@@ -485,15 +671,50 @@ impl VenueCycle<'_> {
         } else {
             self.config.valuation.min_edge_threshold
         };
-        if !directional::should_trade(&view, cost_to_trade, self.config.min_p_up(), edge_threshold)
-        {
+        let is_sma_golden_cross = use_us_paper_strategy
+            && is_sma_crossover
+            && view.direction == Direction::Long
+            && view
+                .key_factors
+                .iter()
+                .any(|factor| factor == "action:LONG_ENTRY_GOLDEN_CROSS");
+        // The regime check needs the market proxy's bars, so it runs only on
+        // the rare bar that already carries a confirmed golden cross.
+        let regime_block = if is_sma_golden_cross {
+            self.sma_regime_rejection(venue, instrument, ctx.now).await
+        } else {
+            None
+        };
+        if let Some(reason) = &regime_block {
+            info!(
+                instrument = %instrument.id,
+                reason = %reason,
+                "Golden cross blocked by the market-regime filter"
+            );
+        }
+        let trade_allowed = if use_us_paper_strategy && is_sma_crossover {
+            // A crossover is the strategy's entry rule; it supplies no return
+            // forecast to satisfy the generic model edge gate. Require the
+            // explicit golden-cross event and reject unusually wide quotes.
+            is_sma_golden_cross
+                && regime_block.is_none()
+                && view.data_quality != DataQuality::Low
+                && quote
+                    .spread_pct()
+                    .map(|spread| spread <= self.config.execution.max_slippage_pct)
+                    .unwrap_or(false)
+                && estimated_slippage_pct <= self.config.execution.max_slippage_pct
+        } else {
+            directional::should_trade(&view, cost_to_trade, self.config.min_p_up(), edge_threshold)
+        };
+        if !trade_allowed {
             info!(
                 instrument = %instrument.id,
                 direction = ?view.direction,
                 p_up = %view.p_up,
                 expected_return = %view.expected_return_pct,
                 round_trip_cost = %cost_to_trade,
-                "No tradeable edge"
+                "Entry signal or execution-cost checks did not pass"
             );
             return Ok(EvaluationResult {
                 cost,
@@ -503,7 +724,7 @@ impl VenueCycle<'_> {
         }
 
         let price = quote.taker_price(Side::Buy);
-        let sizing = size_position(
+        let mut sizing = size_position(
             &SizeInputs {
                 instrument,
                 probability: view.p_up,
@@ -523,6 +744,97 @@ impl VenueCycle<'_> {
             &self.config.risk,
             &self.config.sizing_continuous,
         );
+
+        if is_us_equity
+            && sizing.should_trade()
+            && sizing
+                .stop_pct
+                .map(|stop| stop <= Decimal::ZERO)
+                .unwrap_or(true)
+        {
+            warn!(instrument = %instrument.id, "No valid protective stop distance; blocking stock entry");
+            return Ok(EvaluationResult {
+                cost,
+                notional: Decimal::ZERO,
+                placed: false,
+            });
+        }
+
+        if sizing.should_trade() {
+            let us_equity = is_us_equity;
+            let capital_base = if us_equity {
+                let tracked_capital = bankroll + open_notional;
+                self.config
+                    .risk
+                    .us_capital_allocation_usd
+                    .unwrap_or(tracked_capital)
+                    .min(tracked_capital)
+            } else {
+                bankroll
+            };
+            let max_position_pct = if us_equity {
+                self.config
+                    .risk
+                    .us_max_position_pct
+                    .unwrap_or(self.config.risk.max_position_pct)
+            } else {
+                self.config.risk.max_position_pct
+            };
+            let max_exposure_pct = if us_equity {
+                self.config
+                    .risk
+                    .us_max_exposure_pct
+                    .unwrap_or(self.config.risk.max_total_exposure_pct)
+            } else {
+                self.config.risk.max_total_exposure_pct
+            };
+            let cash_buffer_pct = if us_equity {
+                self.config.risk.us_cash_buffer_pct.unwrap_or(Decimal::ZERO)
+            } else {
+                Decimal::ZERO
+            };
+            if capital_base <= Decimal::ZERO
+                || max_position_pct <= Decimal::ZERO
+                || max_position_pct > Decimal::ONE
+                || max_exposure_pct <= Decimal::ZERO
+                || max_exposure_pct > Decimal::ONE
+                || cash_buffer_pct < Decimal::ZERO
+                || cash_buffer_pct >= Decimal::ONE
+            {
+                warn!(instrument = %instrument.id, "Invalid pre-trade risk limits; blocking entry");
+                return Ok(EvaluationResult {
+                    cost,
+                    notional: Decimal::ZERO,
+                    placed: false,
+                });
+            }
+
+            // Clamp the order to the remaining portfolio exposure, the per-
+            // position limit, and free cash after preserving the cash buffer.
+            let exposure_room =
+                (capital_base * max_exposure_pct - open_notional).max(Decimal::ZERO);
+            let cash_room = bankroll * (Decimal::ONE - cash_buffer_pct);
+            let max_order_notional = (capital_base * max_position_pct)
+                .min(exposure_room)
+                .min(cash_room);
+            sizing.position_usd = sizing.position_usd.min(max_order_notional);
+            if let Some(stop_pct) = sizing.stop_pct {
+                sizing.risk_pct = Some(sizing.position_usd * stop_pct / capital_base);
+            }
+            if sizing.position_usd < self.config.risk.min_position_usd {
+                info!(
+                    instrument = %instrument.id,
+                    allowed_notional = %sizing.position_usd,
+                    min_position = %self.config.risk.min_position_usd,
+                    "Pre-trade caps leave less than the minimum order size"
+                );
+                return Ok(EvaluationResult {
+                    cost,
+                    notional: Decimal::ZERO,
+                    placed: false,
+                });
+            }
+        }
 
         if !sizing.should_trade() {
             info!(
@@ -557,6 +869,19 @@ impl VenueCycle<'_> {
                 notional: Decimal::ZERO,
                 placed: false,
             });
+        }
+        // Quantity rounding must never push a fractional-share order above
+        // the dollar limits that were checked above.
+        if qty * limit_price > sizing.position_usd {
+            qty = instrument.round_qty(sizing.position_usd / limit_price);
+            if qty <= Decimal::ZERO || qty * limit_price > sizing.position_usd {
+                info!(instrument = %instrument.id, "Rounded quantity would exceed pre-trade notional limits");
+                return Ok(EvaluationResult {
+                    cost,
+                    notional: Decimal::ZERO,
+                    placed: false,
+                });
+            }
         }
 
         // Strict Capital Allocation Guard: Indian Paper & US Market isolations
@@ -1352,13 +1677,39 @@ fn portfolio_block(
     bankroll: Decimal,
     risk: &crate::config::RiskConfig,
 ) -> Option<&'static str> {
-    if open_notional >= bankroll * risk.max_total_exposure_pct || open_notional >= bankroll {
+    portfolio_block_with_limits(
+        open_notional,
+        open_positions,
+        bankroll,
+        risk.max_total_exposure_pct,
+        risk.max_positions_per_category as usize,
+    )
+}
+
+fn portfolio_block_with_limits(
+    open_notional: Decimal,
+    open_positions: usize,
+    exposure_base: Decimal,
+    max_exposure_pct: Decimal,
+    max_positions: usize,
+) -> Option<&'static str> {
+    if exposure_base <= Decimal::ZERO
+        || max_exposure_pct <= Decimal::ZERO
+        || open_notional >= exposure_base * max_exposure_pct
+        || open_notional >= exposure_base
+    {
         return Some("total exposure is at its cap");
     }
-    if open_positions >= risk.max_positions_per_category as usize {
+    if open_positions >= max_positions {
         return Some("at the open-position limit");
     }
     None
+}
+
+fn is_us_equity(instrument: &Instrument) -> bool {
+    instrument.asset_class == AssetClass::Equity
+        && instrument.quote_ccy.eq_ignore_ascii_case("USD")
+        && instrument.venue().as_str() == "alpaca"
 }
 
 /// Whether an order must carry the extended-hours flag.

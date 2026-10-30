@@ -161,10 +161,17 @@ pub fn evaluate(
 
     let lost = marks.starting_equity - equity;
 
-    if lost > cfg.max_daily_loss_usd {
+    // The U.S. allocation has its own dollar loss ceiling. Equity marks are
+    // account-wide, so this tighter ceiling pauses all new entries when the
+    // combined account loss reaches it; exits and reconciliation continue.
+    let daily_loss_limit_usd = cfg
+        .us_max_daily_loss_usd
+        .map(|us_limit| us_limit.min(cfg.max_daily_loss_usd))
+        .unwrap_or(cfg.max_daily_loss_usd);
+    if lost > daily_loss_limit_usd {
         return Some(BreakerTrip::DailyLossUsd {
             lost,
-            limit: cfg.max_daily_loss_usd,
+            limit: daily_loss_limit_usd,
         });
     }
 
@@ -305,6 +312,28 @@ mod tests {
                 assert_eq!(limit, dec!(5));
             }
             other => panic!("expected a cash trip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_configured_us_cash_limit_uses_the_tighter_daily_ceiling() {
+        let mut c = cfg();
+        c.max_daily_loss_usd = dec!(1000);
+        c.us_max_daily_loss_usd = Some(dec!(20));
+
+        assert_eq!(
+            evaluate(dec!(980), &day(dec!(1000), dec!(1000)), 0, 0, &c),
+            None,
+            "a loss exactly at the U.S. cash limit remains within the limit"
+        );
+        match evaluate(dec!(979), &day(dec!(1000), dec!(1000)), 0, 0, &c)
+            .expect("a $21 loss must exceed the configured $20 cap")
+        {
+            BreakerTrip::DailyLossUsd { lost, limit } => {
+                assert_eq!(lost, dec!(21));
+                assert_eq!(limit, dec!(20));
+            }
+            other => panic!("expected the tighter cash limit, got {other:?}"),
         }
     }
 

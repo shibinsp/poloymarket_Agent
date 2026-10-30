@@ -1,6 +1,6 @@
 #![allow(clippy::double_must_use)]
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::Parser;
 
@@ -9,7 +9,9 @@ use polymarket_agent::config::{self, AgentMode, AppConfig, ExposeSecret};
 use polymarket_agent::db::store::Store;
 use polymarket_agent::monitoring;
 use polymarket_agent::monitoring::alerts::{AlertLevel, AnomalyKind};
-use polymarket_agent::monitoring::dashboard::{spawn_dashboard, DashboardState};
+use polymarket_agent::monitoring::dashboard::{
+    spawn_dashboard, spawn_us_backtest_server, DashboardState,
+};
 use polymarket_agent::monitoring::logger;
 use rust_decimal_macros::dec;
 
@@ -30,6 +32,10 @@ struct CliArgs {
     /// Run a quick validation check (single cycle, no trades)
     #[arg(long)]
     dry_run: bool,
+
+    /// Run only the loopback US historical backtest API; no trading loop or order routes.
+    #[arg(long)]
+    us_backtest_server: bool,
 }
 
 #[derive(Debug, Clone, clap::ValueEnum)]
@@ -59,6 +65,12 @@ async fn main() -> Result<()> {
     // Override mode from CLI if provided
     if let Some(mode) = args.mode.clone() {
         config.agent.mode = mode.into();
+    }
+
+    if args.us_backtest_server {
+        config.agent.mode = AgentMode::Backtest;
+        config.telemetry.enabled = Some(false);
+        config.telemetry.otlp_endpoint = None;
     }
 
     // Held for the lifetime of the process; `shutdown` flushes pending spans.
@@ -92,6 +104,9 @@ async fn main() -> Result<()> {
 /// Run whichever mode was selected. Separated from `main` only so that every
 /// return path passes back through the flush above.
 async fn dispatch(args: CliArgs, config: AppConfig, secrets: config::Secrets) -> Result<()> {
+    if args.us_backtest_server {
+        return run_us_backtest_server(&config, &secrets).await;
+    }
     if args.dry_run {
         return run_dry_run(&config, &secrets).await;
     }
@@ -106,6 +121,54 @@ async fn dispatch(args: CliArgs, config: AppConfig, secrets: config::Secrets) ->
         AgentMode::Backtest => run_backtest(&config),
         AgentMode::Paper | AgentMode::Live => run_agent(config, secrets).await,
     }
+}
+
+/// Serve only the US backtest routes without constructing or running an agent.
+async fn run_us_backtest_server(config: &AppConfig, secrets: &config::Secrets) -> Result<()> {
+    let store = Store::new(&config.database.path).await?;
+    let alpaca_feed = std::sync::Arc::new(
+        polymarket_agent::us::market_feed::AlpacaLiveMarketFeed::new(
+            secrets
+                .alpaca_key_id
+                .as_ref()
+                .map(|key| key.expose_secret().to_string()),
+            secrets
+                .alpaca_secret_key
+                .as_ref()
+                .map(|secret| secret.expose_secret().to_string()),
+            None,
+        ),
+    );
+    let kill_switch = std::sync::Arc::new(polymarket_agent::agent::kill_switch::KillSwitch::new(
+        config.database.halt_file(),
+    ));
+    let dashboard_state = DashboardState::new(
+        store,
+        monitoring::health::HealthState::new(),
+        config.agent.initial_paper_balance,
+        None,
+        kill_switch,
+        config.risk.clone(),
+        AgentMode::Backtest,
+        false,
+        config.valuation.model.clone(),
+    )
+    .with_alpaca_feed(alpaca_feed);
+    let _server = spawn_us_backtest_server(
+        dashboard_state,
+        "127.0.0.1",
+        config.monitoring.dashboard_port,
+    )
+    .await?;
+
+    tracing::info!(
+        port = config.monitoring.dashboard_port,
+        "US backtest-only service started; no agent, trading, or order-management routes are active"
+    );
+    tokio::signal::ctrl_c()
+        .await
+        .context("Could not wait for shutdown signal")?;
+    Ok(())
 }
 
 /// Quick dry-run validation: tests connectivity and pipeline without placing trades.

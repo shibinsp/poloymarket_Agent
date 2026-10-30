@@ -439,7 +439,7 @@ impl Store {
     /// settle themselves and must be explicitly closed.
     pub async fn get_open_venue_trades(&self) -> Result<Vec<VenueOpenTrade>> {
         let rows = sqlx::query_as::<_, VenueOpenTradeRow>(
-            "SELECT id, venue_id, symbol, asset_class, entry_price, avg_fill_price, quantity, stop_price, target_price, horizon_hours, created_at
+            "SELECT id, venue_id, symbol, asset_class, entry_price, avg_fill_price, quantity, stop_pct, stop_price, target_price, horizon_hours, created_at
              FROM trades
              WHERE status IN ('OPEN', 'PARTIAL') AND asset_class != 'prediction_binary'",
         )
@@ -469,6 +469,17 @@ impl Store {
         .execute(&self.pool)
         .await
         .context("Failed to mark trade")?;
+        Ok(())
+    }
+
+    /// Move an open position's protective stop. Callers only ever raise it.
+    pub async fn update_trade_stop(&self, id: i64, stop_price: &str) -> Result<()> {
+        sqlx::query("UPDATE trades SET stop_price = ? WHERE id = ?")
+            .bind(stop_price)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to update trade stop")?;
         Ok(())
     }
 
@@ -739,6 +750,30 @@ impl Store {
                 .unwrap_or(0);
         let total = (count_legacy + count_us + count_india).max(0);
         Ok(total as u32)
+    }
+
+    /// Count U.S. equity entry attempts for one venue on a UTC date.
+    ///
+    /// The venue path persists a trade row for every submitted entry, including
+    /// a pending order, so this remains reliable across restarts and counts
+    /// orders whose acknowledgement was lost as well as completed fills.
+    pub async fn count_venue_equity_entries_opened_on(
+        &self,
+        venue_id: &str,
+        day: chrono::NaiveDate,
+    ) -> Result<u32> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM trades
+             WHERE venue_id = ? AND asset_class = 'equity' AND side = 'BUY'
+               AND date(created_at) = ?",
+        )
+        .bind(venue_id)
+        .bind(day.to_string())
+        .fetch_one(&self.pool)
+        .await
+        .context("Failed to count venue equity entries")?;
+
+        Ok(count.max(0) as u32)
     }
 
     /// How many of the most recently closed positions were losses, counting
@@ -1532,6 +1567,7 @@ struct VenueOpenTradeRow {
     entry_price: String,
     avg_fill_price: Option<String>,
     quantity: Option<String>,
+    stop_pct: Option<String>,
     stop_price: Option<String>,
     target_price: Option<String>,
     horizon_hours: Option<i64>,
@@ -1548,6 +1584,8 @@ pub struct VenueOpenTrade {
     pub entry_price: Decimal,
     pub avg_fill_price: Option<Decimal>,
     pub quantity: Decimal,
+    /// Stop distance at entry as a fraction of the entry price; 1R.
+    pub stop_pct: Option<Decimal>,
     pub stop_price: Option<Decimal>,
     pub target_price: Option<Decimal>,
     pub horizon_hours: Option<i64>,
@@ -1574,6 +1612,13 @@ impl TryFrom<VenueOpenTradeRow> for VenueOpenTrade {
             avg_fill_price: parse_opt(&row.avg_fill_price, "avg_fill_price")?,
             quantity: parse_opt(&row.quantity, "quantity")?
                 .context("trade is missing a quantity")?,
+            // Legacy rows may carry an empty or unparseable stop_pct; it only
+            // feeds stop management, so treat it as unknown rather than fail.
+            stop_pct: row
+                .stop_pct
+                .as_deref()
+                .and_then(|v| Decimal::from_str(v).ok())
+                .filter(|v| *v > Decimal::ZERO && *v < Decimal::ONE),
             stop_price: parse_opt(&row.stop_price, "stop_price")?,
             target_price: parse_opt(&row.target_price, "target_price")?,
             horizon_hours: row.horizon_hours,
@@ -2189,6 +2234,60 @@ mod tests {
                 .unwrap(),
             0,
             "and must not be counted against yesterday"
+        );
+    }
+
+    #[tokio::test]
+    async fn venue_equity_daily_count_only_counts_that_venues_stock_buys() {
+        let store = Store::new(":memory:").await.unwrap();
+        let today = Utc::now().date_naive();
+        let trade =
+            |venue_id: &str, symbol: &str, asset_class: &str, side: &str| VenueTradeRecord {
+                cycle: 1,
+                venue_id: venue_id.to_string(),
+                symbol: symbol.to_string(),
+                asset_class: asset_class.to_string(),
+                display_name: Some(symbol.to_string()),
+                side: side.to_string(),
+                entry_price: "100".to_string(),
+                quantity: "1".to_string(),
+                notional: "100".to_string(),
+                avg_fill_price: Some("100".to_string()),
+                edge_at_entry: "0".to_string(),
+                fair_value: "0.5".to_string(),
+                confidence: "0.5".to_string(),
+                risk_pct: "0.01".to_string(),
+                stop_pct: "0.03".to_string(),
+                status: "OPEN".to_string(),
+                stop_price: Some("97".to_string()),
+                target_price: None,
+                horizon_hours: Some(24),
+                client_order_id: None,
+                venue_order_id: None,
+            };
+
+        for row in [
+            trade("alpaca", "AAPL", "equity", "BUY"),
+            trade("alpaca", "BTC/USD", "crypto_spot", "BUY"),
+            trade("alpaca", "MSFT", "equity", "SELL"),
+            trade("coinbase", "AAPL", "equity", "BUY"),
+        ] {
+            store.insert_venue_trade(&row).await.unwrap();
+        }
+
+        assert_eq!(
+            store
+                .count_venue_equity_entries_opened_on("alpaca", today)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .count_venue_equity_entries_opened_on("coinbase", today)
+                .await
+                .unwrap(),
+            1
         );
     }
 

@@ -17,7 +17,7 @@ use crate::agent::self_funding::{
 };
 use crate::agent::venue_cycle::{CycleOutcome, VenueCycle};
 use crate::agent::venue_exits::VenueExits;
-use crate::config::{AppConfig, ExposeSecret, Secrets};
+use crate::config::{AgentMode, AppConfig, ExposeSecret, Secrets};
 use crate::data::crypto::CryptoSource;
 use crate::data::news::NewsSource;
 use crate::data::sports::SportsSource;
@@ -740,7 +740,11 @@ impl Agent {
                 max_hold_hours: self.config.exits_continuous.max_hold_hours,
                 order_ttl_seconds: self.config.execution.order_ttl_seconds as i64,
                 emergency_stop: self.config.risk.emergency_stop,
-                us_strategy: Some(&self.config.us_strategy),
+                // The selectable rule strategy is paper-only. Do not let its
+                // swing exits alter live positions created by the generic
+                // valuation path.
+                us_strategy: (self.config.agent.mode == AgentMode::Paper)
+                    .then_some(&self.config.us_strategy),
             };
             match exits
                 .run(chrono::Utc::now(), self.cycle_number as i64)

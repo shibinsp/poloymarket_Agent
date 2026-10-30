@@ -202,7 +202,7 @@ fn test_us_backtest_simulation_with_zero_lookahead() {
 fn test_us_sma_crossover_strategy_golden_cross_and_exit_signals() {
     use chrono::{Duration, TimeZone, Utc};
     use polymarket_agent::us::sma_crossover::{
-        evaluate_sma_crossover, SmaCrossoverConfig, SmaSignalAction,
+        evaluate_sma_crossover, SmaCrossoverConfig, SmaEntryFilters, SmaSignalAction,
     };
     use polymarket_agent::venue::types::{
         Candle, Instrument, InstrumentId, InstrumentMeta, VenueId,
@@ -237,7 +237,11 @@ fn test_us_sma_crossover_strategy_golden_cross_and_exit_signals() {
         });
     }
 
-    let config = SmaCrossoverConfig::default();
+    // Raw crossover detection; the entry filters have their own unit tests.
+    let config = SmaCrossoverConfig {
+        entry_filters: SmaEntryFilters::disabled(),
+        ..SmaCrossoverConfig::default()
+    };
     let now = candles.last().unwrap().ts + Duration::hours(2);
 
     // 1. Golden Cross

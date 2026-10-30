@@ -180,6 +180,49 @@ pub fn spawn_dashboard(
     }))
 }
 
+/// Start an isolated, loopback-only server for historical U.S. backtests.
+///
+/// This intentionally exposes no trading, paper-order, halt/resume, or agent
+/// control routes. It can therefore fetch and persist backtests without
+/// starting the trading loop or reconciling/cancelling resting orders.
+pub async fn spawn_us_backtest_server(
+    state: DashboardState,
+    bind: &str,
+    port: u16,
+) -> Result<JoinHandle<()>> {
+    let ip = if bind.eq_ignore_ascii_case("localhost") {
+        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    } else {
+        bind.parse::<IpAddr>()?
+    };
+    if !ip.is_loopback() {
+        bail!("The isolated US backtest server must bind to loopback");
+    }
+
+    let app = Router::new()
+        .route(
+            "/",
+            get(|| async { axum::response::Html(include_str!("../../static/index.html")) }),
+        )
+        .route(
+            "/api/health",
+            get(|| async { Json(serde_json::json!({"status": "ok", "mode": "us_backtest_only"})) }),
+        )
+        .route("/api/us/backtest/history", get(us_backtest_history_handler))
+        .route("/api/us/backtest/run", post(us_backtest_run_handler))
+        .with_state(state);
+
+    let address = std::net::SocketAddr::new(ip, port);
+    let listener = tokio::net::TcpListener::bind(address).await?;
+    info!(%address, "Isolated US backtest server listening; trading routes are disabled");
+
+    Ok(tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, app).await {
+            warn!(%error, "Isolated US backtest server stopped");
+        }
+    }))
+}
+
 /// A non-loopback bind with no token would expose every trade to the network:
 /// refuse it in live mode, fall back to loopback otherwise.
 fn resolve_bind(bind: &str, has_token: bool, mode: AgentMode) -> Result<String> {
@@ -595,8 +638,6 @@ async fn resume_handler(State(state): State<DashboardState>) -> impl IntoRespons
         )
             .into_response();
     }
-
-
 
     info!(?cleared, "Resumed over the API");
     Json(serde_json::json!({
@@ -1684,6 +1725,8 @@ pub struct UsBacktestRunRequest {
     pub name: Option<String>,
     pub csv_path: Option<String>,
     pub csv_content: Option<String>,
+    pub symbols: Option<Vec<String>>,
+    pub history_years: Option<u32>,
     pub initial_capital: Option<Decimal>,
     pub risk_pct_per_trade: Option<Decimal>,
     pub stop_loss_pct: Option<Decimal>,
@@ -1697,45 +1740,140 @@ async fn us_backtest_run_handler(
 ) -> impl IntoResponse {
     use crate::us::backtest::{parse_and_validate_us_csv, run_us_backtest, UsBacktestConfig};
 
-    let strategy_choice = req.strategy.as_deref().unwrap_or("sma_crossover");
-
-    let default_csv = if strategy_choice.eq_ignore_ascii_case("sma_crossover") {
-        "data/us_daily_sample_data.csv"
-    } else {
-        "data/us_sample_data.csv"
-    };
-
-    let content_res = if let Some(content) = req.csv_content {
-        Ok(content)
-    } else {
-        let path = req.csv_path.as_deref().unwrap_or(default_csv);
-        std::fs::read_to_string(path)
+    const DEFAULT_SYMBOLS: &[&str] = &[
+        "SPY", "QQQ", "DIA", "IWM", "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "AMD",
+    ];
+    let is_sma = req
+        .strategy
+        .as_deref()
+        .map(|strategy| strategy.eq_ignore_ascii_case("sma_crossover"))
+        .unwrap_or(true);
+    let history_years = req.history_years.unwrap_or(10);
+    let (candles, data_source, symbols, used_history_years) = if let Some(csv_content) =
+        req.csv_content
+    {
+        match parse_and_validate_us_csv(&csv_content) {
+            Ok(candles) => (candles, "csv_upload".to_string(), Vec::new(), None),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": format!("Invalid US OHLCV CSV: {e:#}") })),
+                )
+                    .into_response();
+            }
+        }
+    } else if let Some(path) = req.csv_path.as_deref() {
+        match std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("Failed to read CSV at {path}: {e}"))
-    };
-
-    let csv_content = match content_res {
-        Ok(c) => c,
-        Err(e) => {
+            .and_then(|content| parse_and_validate_us_csv(&content))
+        {
+            Ok(candles) => (candles, "csv_file".to_string(), Vec::new(), None),
+            Err(e) => {
+                return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": format!("Could not load US OHLCV CSV: {e:#}") })),
+                    )
+                        .into_response();
+            }
+        }
+    } else if is_sma {
+        if !(1..=10).contains(&history_years) {
+            return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "Historical lookback must be between 1 and 10 years" })),
+                )
+                    .into_response();
+        }
+        let requested = req.symbols.unwrap_or_else(|| {
+            DEFAULT_SYMBOLS
+                .iter()
+                .map(|symbol| (*symbol).to_string())
+                .collect()
+        });
+        let mut symbols = Vec::new();
+        for symbol in requested {
+            let symbol = symbol.trim().to_ascii_uppercase();
+            if symbol.is_empty()
+                || symbol.len() > 15
+                || !symbol
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+            {
+                return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": format!("Invalid US stock symbol: {symbol}") })),
+                    )
+                        .into_response();
+            }
+            if !symbols.contains(&symbol) {
+                symbols.push(symbol);
+            }
+        }
+        if symbols.is_empty() || symbols.len() > 20 {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": e.to_string() })),
+                Json(serde_json::json!({ "error": "Select between 1 and 20 distinct symbols" })),
             )
                 .into_response();
         }
-    };
-
-    let candles = match parse_and_validate_us_csv(&csv_content) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": format!("Invalid US OHLCV CSV: {e:#}") })),
-            )
-                .into_response();
+        let feed = state.alpaca_feed.clone();
+        let fetched = futures_util::future::try_join_all(symbols.iter().map(|symbol| {
+            let feed = feed.clone();
+            let symbol = symbol.clone();
+            async move {
+                feed.fetch_daily_history_candles(&symbol, history_years)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{symbol}: {e:#}"))
+            }
+        }))
+        .await;
+        match fetched {
+            Ok(per_symbol) => (
+                per_symbol.into_iter().flatten().collect(),
+                format!(
+                    "alpaca_{}_1day_split_adjusted",
+                    state
+                        .alpaca_feed
+                        .feed_type
+                        .read()
+                        .await
+                        .to_ascii_lowercase()
+                ),
+                symbols,
+                Some(history_years),
+            ),
+            Err(e) => {
+                return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({
+                            "error": format!("Could not load complete Alpaca daily history: {e:#}. No bundled sample data was substituted."),
+                        })),
+                    )
+                        .into_response();
+            }
+        }
+    } else {
+        let path = "data/us_sample_data.csv";
+        match std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("Failed to read CSV at {path}: {e}"))
+            .and_then(|content| parse_and_validate_us_csv(&content))
+        {
+            Ok(candles) => (candles, "bundled_demo_csv".to_string(), Vec::new(), None),
+            Err(e) => {
+                return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": format!("Could not load US OHLCV CSV: {e:#}") })),
+                    )
+                        .into_response();
+            }
         }
     };
 
     let mut config = UsBacktestConfig::default();
+    if is_sma {
+        config.fast_sma_period = crate::us::sma_crossover::DEFAULT_FAST_SMA_PERIOD;
+        config.slow_sma_period = crate::us::sma_crossover::DEFAULT_SLOW_SMA_PERIOD;
+    }
     if let Some(c) = req.initial_capital {
         config.initial_capital_usd = c;
     }
@@ -1749,15 +1887,74 @@ async fn us_backtest_run_handler(
         config.take_profit_pct = t;
     }
 
+    let mut candle_symbols: Vec<String> = candles.iter().map(|c| c.symbol.clone()).collect();
+    candle_symbols.sort();
+    candle_symbols.dedup();
+    let symbols = if symbols.is_empty() {
+        candle_symbols
+    } else {
+        symbols
+    };
+    let start_date = candles.iter().map(|c| c.timestamp).min();
+    let end_date = candles.iter().map(|c| c.timestamp).max();
+    let benchmark_symbol = symbols
+        .iter()
+        .find(|symbol| symbol.as_str() == "SPY")
+        .cloned()
+        .or_else(|| symbols.first().cloned());
+    let data_metadata = serde_json::json!({
+        "source": data_source.clone(),
+        "symbols": symbols.clone(),
+        "bar_count": candles.len(),
+        "start_date": start_date,
+        "end_date": end_date,
+        "history_years": used_history_years,
+        "adjustment": if data_source.starts_with("alpaca_") { Some("split") } else { None },
+        "benchmark_symbol": benchmark_symbol,
+    });
     let run_name = req.name.unwrap_or_else(|| {
         format!(
-            "US Backtest {}",
+            "US {} Backtest {}",
+            if is_sma { "SMA 20/50" } else { "" },
             chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")
         )
     });
 
-    let result = if strategy_choice.eq_ignore_ascii_case("sma_crossover") {
-        match crate::us::sma_crossover::run_us_sma_crossover_backtest(&candles, &config) {
+    // The SMA strategy's regime filter reads SPY. When SPY was not selected,
+    // load it separately so it gates entries without being traded itself.
+    let regime_candles = if is_sma
+        && config.sma_entry_filters.regime_sma_period > 0
+        && !candles.iter().any(|c| c.symbol == "SPY")
+    {
+        match used_history_years {
+            Some(years) => match state
+                .alpaca_feed
+                .fetch_daily_history_candles("SPY", years)
+                .await
+            {
+                Ok(bars) => Some(bars),
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({
+                            "error": format!("Could not load SPY history for the market-regime filter: {e:#}"),
+                        })),
+                    )
+                        .into_response();
+                }
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    let result = if is_sma {
+        match crate::us::sma_crossover::run_us_sma_crossover_backtest_with_regime(
+            &candles,
+            regime_candles.as_deref(),
+            &config,
+        ) {
             Ok(r) => r,
             Err(e) => {
                 return (
@@ -1783,8 +1980,16 @@ async fn us_backtest_run_handler(
     };
 
     let id = format!("us-bt-{}", uuid::Uuid::new_v4().simple());
-    let config_json = serde_json::to_string(&config).unwrap_or_default();
-    let results_json = serde_json::to_string(&result).unwrap_or_default();
+    let mut config_value = serde_json::to_value(&config).unwrap_or_default();
+    if let Some(config_object) = config_value.as_object_mut() {
+        config_object.insert("data".to_string(), data_metadata.clone());
+    }
+    let mut result_value = serde_json::to_value(&result).unwrap_or_default();
+    if let Some(result_object) = result_value.as_object_mut() {
+        result_object.insert("data".to_string(), data_metadata);
+    }
+    let config_json = serde_json::to_string(&config_value).unwrap_or_default();
+    let results_json = serde_json::to_string(&result_value).unwrap_or_default();
 
     if let Err(e) = state
         .store
@@ -1794,7 +1999,7 @@ async fn us_backtest_run_handler(
         warn!(error = %e, "Failed to persist US backtest run");
     }
 
-    Json(serde_json::to_value(&result).unwrap_or_default()).into_response()
+    Json(result_value).into_response()
 }
 
 /// Calculates cumulative realized profit, capital tied up in open positions,
@@ -2326,6 +2531,12 @@ async fn intraday_status_handler(State(state): State<DashboardState>) -> impl In
             "capital_allocation_usd": cap_usd,
             "max_exposure_pct": state.risk.us_max_exposure_pct,
             "max_daily_loss_usd": state.risk.us_max_daily_loss_usd,
+            "daily_loss_scope": "combined_account_equity",
+            "max_position_pct": state.risk.us_max_position_pct,
+            "cash_buffer_pct": state.risk.us_cash_buffer_pct,
+            "risk_per_trade_pct": state.risk.us_risk_per_trade_pct,
+            "max_trades_per_day": state.risk.us_max_trades_per_day,
+            "max_quote_age_seconds": state.risk.us_max_quote_age_seconds,
         }
     }))
 }

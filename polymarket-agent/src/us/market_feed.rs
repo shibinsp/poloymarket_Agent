@@ -24,7 +24,16 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 
 use crate::strategy::pullback::FiveMinCandle;
+use crate::us::backtest::UsCandle;
 use crate::us::session::{detect_us_session, UsSessionInfo};
+
+#[derive(Debug, Deserialize)]
+struct AlpacaDailyBarsPage {
+    #[serde(default)]
+    bars: Vec<crate::venue::alpaca::models::AlpacaBar>,
+    #[serde(default)]
+    next_page_token: Option<String>,
+}
 
 /// An individual live price tick for a US equity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -432,6 +441,144 @@ impl AlpacaLiveMarketFeed {
         if candles.is_empty() {
             bail!("Alpaca returned no completed regular-session 5-minute bars for {symbol}");
         }
+        Ok(candles)
+    }
+
+    /// Fetch split-adjusted, completed daily bars from Alpaca for the US SMA
+    /// backtest. This path never substitutes bundled sample data.
+    pub async fn fetch_daily_history_candles(
+        &self,
+        symbol: &str,
+        history_years: u32,
+    ) -> anyhow::Result<Vec<UsCandle>> {
+        use anyhow::{bail, Context};
+        use chrono::Duration;
+
+        let symbol = symbol.trim().to_uppercase();
+        if symbol.is_empty()
+            || symbol.len() > 15
+            || !symbol
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+        {
+            bail!("Invalid US stock symbol");
+        }
+        if !(1..=10).contains(&history_years) {
+            bail!("Historical lookback must be between 1 and 10 years");
+        }
+
+        let key =
+            self.key_id.read().await.clone().context(
+                "Alpaca API key is not configured; add paper-market data credentials first",
+            )?;
+        let secret = self.secret_key.read().await.clone().context(
+            "Alpaca API secret is not configured; add paper-market data credentials first",
+        )?;
+        let feed = self.feed_type.read().await.to_lowercase();
+        if !matches!(feed.as_str(), "iex" | "sip") {
+            bail!("Unsupported Alpaca stock data feed: {feed}");
+        }
+
+        let now = Utc::now();
+        let start = (now - Duration::days(i64::from(history_years) * 365)).to_rfc3339();
+        let end = now.to_rfc3339();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .context("Could not initialize Alpaca daily history client")?;
+        let mut page_token: Option<String> = None;
+        let mut candles = Vec::new();
+
+        for page_index in 0..20 {
+            let mut request = client
+                .get(format!(
+                    "https://data.alpaca.markets/v2/stocks/{symbol}/bars"
+                ))
+                .header("APCA-API-KEY-ID", &key)
+                .header("APCA-API-SECRET-KEY", &secret)
+                .query(&[
+                    ("timeframe", "1Day".to_string()),
+                    ("start", start.clone()),
+                    ("end", end.clone()),
+                    ("limit", "10000".to_string()),
+                    ("feed", feed.clone()),
+                    ("adjustment", "split".to_string()),
+                    ("sort", "asc".to_string()),
+                ]);
+            if let Some(token) = page_token.as_ref() {
+                request = request.query(&[("page_token", token)]);
+            }
+
+            let response = request
+                .send()
+                .await
+                .context("Alpaca historical daily bars request failed")?;
+            let status = response.status();
+            if !status.is_success() {
+                bail!("Alpaca daily history returned HTTP {status}; check credentials and {feed} feed access");
+            }
+            let page: AlpacaDailyBarsPage = response
+                .json()
+                .await
+                .context("Alpaca daily history response was not valid")?;
+
+            for bar in page.bars {
+                // Alpaca daily bars are timestamped at the start of the
+                // New York trading day. Wait a full day so today's partial
+                // bar cannot leak into a historical signal.
+                if bar.ts + Duration::hours(24) > now {
+                    continue;
+                }
+                let volume = bar.volume.unwrap_or(Decimal::ZERO);
+                if bar.open <= Decimal::ZERO
+                    || bar.low <= Decimal::ZERO
+                    || bar.close <= Decimal::ZERO
+                    || bar.high < bar.low
+                    || bar.high < bar.open.max(bar.close)
+                    || bar.low > bar.open.min(bar.close)
+                    || volume < Decimal::ZERO
+                {
+                    bail!(
+                        "Alpaca returned a malformed daily bar for {symbol} at {}",
+                        bar.ts
+                    );
+                }
+                candles.push(UsCandle {
+                    timestamp: bar.ts,
+                    symbol: symbol.clone(),
+                    open: bar.open,
+                    high: bar.high,
+                    low: bar.low,
+                    close: bar.close,
+                    volume,
+                });
+            }
+
+            page_token = page.next_page_token;
+            if page_token.is_none() {
+                break;
+            }
+            if page_index == 19 {
+                bail!("Alpaca daily history exceeded the supported page limit for {symbol}");
+            }
+        }
+
+        candles.sort_by_key(|candle| candle.timestamp);
+        candles.dedup_by_key(|candle| candle.timestamp);
+        if candles.len() < 51 {
+            bail!(
+                "Alpaca returned only {} completed daily bars for {symbol}; at least 51 are required for a 20/50 crossover",
+                candles.len()
+            );
+        }
+        let latest = candles
+            .last()
+            .expect("daily candle count was checked above")
+            .timestamp;
+        if now - latest > Duration::days(crate::us::sma_crossover::MAX_PERMISSIBLE_STALE_DAYS) {
+            bail!("Alpaca's latest completed daily bar for {symbol} is stale: {latest}");
+        }
+
         Ok(candles)
     }
 
