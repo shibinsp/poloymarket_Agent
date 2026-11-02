@@ -27,7 +27,7 @@
 //! checked is that the venue reports an equity figure at all, because the
 //! circuit breaker is blind without one.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -36,7 +36,7 @@ use rust_decimal_macros::dec;
 use tracing::{info, instrument, warn};
 
 use crate::db::store::Store;
-use crate::venue::types::AssetClass;
+use crate::venue::types::{AssetClass, OrderRef};
 use crate::venue::{Venue, VenueRegistry};
 
 /// What one venue's audit concluded.
@@ -227,7 +227,7 @@ impl StateReconciler<'_> {
         &self,
         venue: &dyn Venue,
         local: &[&crate::db::store::VenueOpenTrade],
-        _now: DateTime<Utc>,
+        now: DateTime<Utc>,
     ) -> VenueReconcileReport {
         let venue_id = venue.id().to_string();
 
@@ -318,6 +318,15 @@ impl StateReconciler<'_> {
                 });
             }
         }
+
+        self.excuse_orders_in_flight(
+            venue,
+            now,
+            &mut missing_locally,
+            &mut missing_on_venue,
+            &mut qty_mismatches,
+        )
+        .await;
 
         // Resting orders the ledger has never heard of. An orphan from a
         // crash between "submitted" and "recorded" shows up here and nowhere
@@ -451,6 +460,69 @@ impl StateReconciler<'_> {
         }
     }
 
+    /// Drop differences that an order still being worked explains.
+    ///
+    /// Orders are resolved just before this audit, but one can fill in the
+    /// second between the two reads. The ledger then disagrees for a moment
+    /// that the next pass ends, and halting on that needs a human to undo.
+    /// Only until the order's deadline: a difference that outlives it is real.
+    async fn excuse_orders_in_flight(
+        &self,
+        venue: &dyn Venue,
+        now: DateTime<Utc>,
+        missing_locally: &mut Vec<OrphanPosition>,
+        missing_on_venue: &mut Vec<OrphanPosition>,
+        qty_mismatches: &mut Vec<QtyMismatch>,
+    ) {
+        if missing_locally.is_empty() && missing_on_venue.is_empty() && qty_mismatches.is_empty() {
+            return;
+        }
+        let orders = match self.store.get_unresolved_orders().await {
+            Ok(orders) => orders,
+            Err(e) => {
+                warn!(venue = %venue.id(), error = %e, "Could not read local orders during reconciliation");
+                return;
+            }
+        };
+
+        let mut in_flight = HashSet::new();
+        let mut stops = Vec::new();
+        for order in orders.iter().filter(|o| o.venue_id == venue.id().as_str()) {
+            let symbol = order.symbol.to_ascii_uppercase();
+            if order.is_protective_stop() {
+                stops.push((symbol, order));
+            } else if order
+                .expires_at
+                .as_deref()
+                .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+                .is_some_and(|deadline| deadline > now)
+            {
+                in_flight.insert(symbol);
+            }
+        }
+        // A stop rests all day, so its presence explains nothing. Only the
+        // venue saying that it fired does.
+        for (symbol, order) in stops {
+            if missing_on_venue.iter().any(|p| p.symbol == symbol) {
+                let reference = match &order.venue_order_id {
+                    Some(id) => OrderRef::Venue(id.clone()),
+                    None => OrderRef::Client(order.client_order_id.clone()),
+                };
+                if matches!(venue.get_order(&reference).await, Ok(ack) if ack.filled_qty > Decimal::ZERO)
+                {
+                    in_flight.insert(symbol);
+                }
+            }
+        }
+
+        if !in_flight.is_empty() {
+            info!(venue = %venue.id(), symbols = ?in_flight, "Order in flight — not treating its symbol as a mismatch");
+        }
+        missing_locally.retain(|p| !in_flight.contains(&p.symbol));
+        missing_on_venue.retain(|p| !in_flight.contains(&p.symbol));
+        qty_mismatches.retain(|m| !in_flight.contains(&m.symbol));
+    }
+
     async fn persist(&self, report: &VenueReconcileReport, cycle: i64) -> Result<()> {
         self.store
             .insert_reconciliation_run(
@@ -517,6 +589,91 @@ mod tests {
             Some(dec!(275.50)),
             "but equity is a separate call, and it answered"
         );
+    }
+
+    /// An open position the stub venue does not hold, plus an exit order for
+    /// it with the given deadline: an exit that has filled but is not yet
+    /// written down.
+    async fn audit_with_exit_in_flight(deadline: DateTime<Utc>) -> Vec<VenueReconcileReport> {
+        let store = crate::db::store::Store::new(":memory:").await.unwrap();
+        let trade_id = store
+            .insert_venue_trade(&crate::db::store::VenueTradeRecord {
+                cycle: 1,
+                venue_id: "stub".to_string(),
+                symbol: "MSTR".to_string(),
+                asset_class: "equity".to_string(),
+                display_name: None,
+                side: "BUY".to_string(),
+                entry_price: "100".to_string(),
+                quantity: "1".to_string(),
+                notional: "100".to_string(),
+                avg_fill_price: Some("100".to_string()),
+                edge_at_entry: "0".to_string(),
+                fair_value: "0".to_string(),
+                confidence: "0".to_string(),
+                risk_pct: "0.01".to_string(),
+                stop_pct: "0.05".to_string(),
+                status: "OPEN".to_string(),
+                stop_price: Some("95".to_string()),
+                target_price: None,
+                horizon_hours: Some(7),
+                client_order_id: Some("entry".to_string()),
+                venue_order_id: Some("v-entry".to_string()),
+                strategy: Some("orb".to_string()),
+            })
+            .await
+            .unwrap();
+        store
+            .insert_order(&crate::db::store::OrderRecord {
+                id: None,
+                client_order_id: "exit".to_string(),
+                venue_order_id: Some("v-exit".to_string()),
+                venue_id: "stub".to_string(),
+                symbol: "MSTR".to_string(),
+                side: "SELL".to_string(),
+                intent: "EXIT".to_string(),
+                trade_id: Some(trade_id),
+                limit_price: Some("99".to_string()),
+                qty: "1".to_string(),
+                filled_qty: "0".to_string(),
+                avg_fill_price: None,
+                state: "ACCEPTED".to_string(),
+                reject_reason: Some("SESSION_CLOSE".to_string()),
+                cycle: Some(1),
+                mid_at_submit: None,
+                submitted_at: None,
+                updated_at: None,
+                expires_at: Some(deadline.to_rfc3339()),
+            })
+            .await
+            .unwrap();
+        let registry = crate::venue::VenueRegistry::new(vec![Box::new(StubVenue::new(
+            "stub",
+            TradingSession::Always,
+            &["MSTR"],
+            false,
+        ))]);
+        StateReconciler {
+            registry: &registry,
+            store: &store,
+        }
+        .run(Utc::now(), 1)
+        .await
+        .unwrap()
+    }
+
+    /// Both entries of 30 Oct 2026 halted the agent this way, and needed a
+    /// person to resume it, over a difference that lasted one cycle.
+    #[tokio::test]
+    async fn a_difference_explained_by_a_working_order_is_not_a_mismatch() {
+        let reports = audit_with_exit_in_flight(Utc::now() + chrono::Duration::minutes(5)).await;
+        assert_eq!(reports[0].verdict, Verdict::Clean, "{}", reports[0].detail);
+    }
+
+    #[tokio::test]
+    async fn a_difference_that_outlives_the_order_is_a_mismatch() {
+        let reports = audit_with_exit_in_flight(Utc::now() - chrono::Duration::minutes(5)).await;
+        assert_eq!(reports[0].verdict, Verdict::Mismatch);
     }
 
     fn equity_report(venue_id: &str, equity: Option<Decimal>) -> VenueReconcileReport {

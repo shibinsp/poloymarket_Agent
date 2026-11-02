@@ -313,15 +313,26 @@ impl UpstoxLiveMarketFeed {
             .await
             .context("Failed to authorize Upstox V3 Market Data Feed")?;
 
-        let body: UpstoxFeedAuthorizeResponse = resp
-            .json()
+        let status = resp.status();
+        let text = resp
+            .text()
             .await
-            .context("Failed to parse Upstox V3 feed authorize JSON")?;
+            .context("Failed to read authorize response body")?;
+        if !status.is_success() {
+            anyhow::bail!("Upstox feed authorize HTTP error {status}: {text}");
+        }
+        let val: serde_json::Value = serde_json::from_str(&text)
+            .with_context(|| format!("Failed to parse Upstox V3 feed authorize JSON: {text}"))?;
 
-        let ws_uri = body
-            .data
-            .and_then(|d| d.authorized_redirect_uri)
-            .context("No authorized_redirect_uri provided in Upstox feed response")?;
+        let ws_uri = val
+            .get("data")
+            .and_then(|d| {
+                d.get("authorized_redirect_uri")
+                    .or_else(|| d.get("authorizedRedirectUri"))
+            })
+            .and_then(|u| u.as_str())
+            .context("No authorized_redirect_uri provided in Upstox feed response")?
+            .to_string();
 
         let mut stored = self.websocket_uri.write().await;
         *stored = Some(ws_uri.clone());
@@ -894,7 +905,21 @@ impl UpstoxLiveMarketFeed {
                 match self.authorize_websocket_stream().await {
                     Ok(ws_uri) => {
                         debug!("Upstox V3 WebSocket feed authorized, connecting: {ws_uri}");
-                        match tokio_tungstenite::connect_async(&ws_uri).await {
+                        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+                        let mut req = match ws_uri.as_str().into_client_request() {
+                            Ok(r) => r,
+                            Err(e) => {
+                                warn!("Failed to construct Upstox WS handshake request: {e}");
+                                continue;
+                            }
+                        };
+                        req.headers_mut().insert(
+                            "User-Agent",
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                                .parse()
+                                .unwrap(),
+                        );
+                        match tokio_tungstenite::connect_async(req).await {
                             Ok((mut ws_stream, _response)) => {
                                 info!(
                                     "Upstox Market Data Feed V3 WebSocket connected successfully"
@@ -1224,6 +1249,9 @@ fn parse_ltpc(buf: &[u8], ltp: &mut Option<f64>, ltt: &mut Option<i64>, cp: &mut
     }
 }
 
+/// `FullFeed` holds one of `marketFF` (field 1, stocks) or `indexFF` (field 2,
+/// indices). Both carry `ltpc` at field 1; the day's OHLC sits at field 4 for a
+/// stock and field 2 for an index, and only a stock has traded volume (field 6).
 #[allow(clippy::too_many_arguments)]
 fn parse_full_feed(
     buf: &[u8],
@@ -1244,16 +1272,14 @@ fn parse_full_feed(
         let tag = tag_wire >> 3;
         let wire = (tag_wire & 0x07) as u8;
         match (tag, wire) {
-            (1, 2) => {
-                if let Some(ltpc_buf) = read_length_delimited(buf, &mut pos) {
-                    parse_ltpc(ltpc_buf, ltp, ltt, cp);
-                }
-            }
-            (4, 0) => *vtt = read_varint(buf, &mut pos).map(|v| v as i64),
-            (12, 2) => {
-                if let Some(item_info_buf) = read_length_delimited(buf, &mut pos) {
-                    parse_item_info(item_info_buf, open, high, low, close);
-                }
+            (1 | 2, 2) => {
+                let Some(inner) = read_length_delimited(buf, &mut pos) else {
+                    break;
+                };
+                let (ohlc_field, has_volume) = if tag == 1 { (4, true) } else { (2, false) };
+                parse_instrument_feed(
+                    inner, ohlc_field, has_volume, ltp, ltt, cp, vtt, open, high, low, close,
+                );
             }
             (_, w) => {
                 if skip_field(w, buf, &mut pos).is_none() {
@@ -1264,7 +1290,47 @@ fn parse_full_feed(
     }
 }
 
-fn parse_item_info(
+/// One `MarketFullFeed` or `IndexFullFeed` message.
+#[allow(clippy::too_many_arguments)]
+fn parse_instrument_feed(
+    buf: &[u8],
+    ohlc_field: u64,
+    has_volume: bool,
+    ltp: &mut Option<f64>,
+    ltt: &mut Option<i64>,
+    cp: &mut Option<f64>,
+    vtt: &mut Option<i64>,
+    open: &mut Option<f64>,
+    high: &mut Option<f64>,
+    low: &mut Option<f64>,
+    close: &mut Option<f64>,
+) {
+    let mut pos = 0;
+    while pos < buf.len() {
+        let Some(tag_wire) = read_varint(buf, &mut pos) else {
+            break;
+        };
+        let tag = tag_wire >> 3;
+        let wire = (tag_wire & 0x07) as u8;
+        if tag == 1 && wire == 2 {
+            if let Some(ltpc_buf) = read_length_delimited(buf, &mut pos) {
+                parse_ltpc(ltpc_buf, ltp, ltt, cp);
+            }
+        } else if tag == ohlc_field && wire == 2 {
+            if let Some(ohlc_buf) = read_length_delimited(buf, &mut pos) {
+                parse_market_ohlc(ohlc_buf, open, high, low, close);
+            }
+        } else if has_volume && tag == 6 && wire == 0 {
+            *vtt = read_varint(buf, &mut pos).map(|v| v as i64);
+        } else if skip_field(wire, buf, &mut pos).is_none() {
+            break;
+        }
+    }
+}
+
+/// `MarketOHLC`: repeated `OHLC` at field 1, one per interval. Only the
+/// day's bar ("1d") is the session open, high, low and close.
+fn parse_market_ohlc(
     buf: &[u8],
     open: &mut Option<f64>,
     high: &mut Option<f64>,
@@ -1282,14 +1348,14 @@ fn parse_item_info(
             if let Some(ohlc_buf) = read_length_delimited(buf, &mut pos) {
                 parse_ohlc(ohlc_buf, open, high, low, close);
             }
-        } else {
-            if skip_field(wire, buf, &mut pos).is_none() {
-                break;
-            }
+        } else if skip_field(wire, buf, &mut pos).is_none() {
+            break;
         }
     }
 }
 
+/// `OHLC`: interval (1, string), open (2), high (3), low (4), close (5),
+/// volume (6), ts (7). Bars other than the day's are ignored.
 fn parse_ohlc(
     buf: &[u8],
     open: &mut Option<f64>,
@@ -1298,6 +1364,8 @@ fn parse_ohlc(
     close: &mut Option<f64>,
 ) {
     let mut pos = 0;
+    let mut interval: Option<&[u8]> = None;
+    let (mut o, mut h, mut l, mut c) = (None, None, None, None);
     while pos < buf.len() {
         let Some(tag_wire) = read_varint(buf, &mut pos) else {
             break;
@@ -1305,16 +1373,20 @@ fn parse_ohlc(
         let tag = tag_wire >> 3;
         let wire = (tag_wire & 0x07) as u8;
         match (tag, wire) {
-            (1, 1) => *open = read_f64(buf, &mut pos),
-            (2, 1) => *high = read_f64(buf, &mut pos),
-            (3, 1) => *low = read_f64(buf, &mut pos),
-            (4, 1) => *close = read_f64(buf, &mut pos),
+            (1, 2) => interval = read_length_delimited(buf, &mut pos),
+            (2, 1) => o = read_f64(buf, &mut pos),
+            (3, 1) => h = read_f64(buf, &mut pos),
+            (4, 1) => l = read_f64(buf, &mut pos),
+            (5, 1) => c = read_f64(buf, &mut pos),
             (_, w) => {
                 if skip_field(w, buf, &mut pos).is_none() {
                     break;
                 }
             }
         }
+    }
+    if interval == Some(b"1d".as_slice()) {
+        (*open, *high, *low, *close) = (o, h, l, c);
     }
 }
 
@@ -1372,9 +1444,9 @@ mod tests {
         entry_buf.push(feed_buf.len() as u8);
         entry_buf.extend_from_slice(&feed_buf);
 
-        // Top-level message: tag 1, wire 2 -> map entry
+        // Top-level FeedResponse: feeds map entry at field 2, wire 2
         let mut top_buf = Vec::new();
-        top_buf.push((1 << 3) | 2);
+        top_buf.push((2 << 3) | 2);
         top_buf.push(entry_buf.len() as u8);
         top_buf.extend_from_slice(&entry_buf);
 
@@ -1382,5 +1454,55 @@ mod tests {
         assert_eq!(ticks.len(), 1);
         assert_eq!(ticks[0].symbol, "RELIANCE");
         assert_eq!(ticks[0].last_price, dec!(2500.50));
+    }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// A FeedResponse with these map entries at field 2, as Upstox sends them.
+    fn frame(entries: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = vec![1 << 3, 1]; // type = live_feed
+        for e in entries {
+            out.push((2 << 3) | 2);
+            let mut len = e.len();
+            while len >= 0x80 {
+                out.push(((len & 0x7F) as u8) | 0x80);
+                len >>= 7;
+            }
+            out.push(len as u8);
+            out.extend_from_slice(e);
+        }
+        out
+    }
+
+    // Map entries captured from the live V3 stream ("full" mode) after the
+    // close on 2 Nov 2026: RELIANCE (marketFF) and NIFTY 50 (indexFF).
+    const RELIANCE_ENTRY: &str = "0a134e53455f45517c494e4530303241303130313812d10112cc010ac9010a1b09000000000050944010efbfbade9934180a219a9999999933924012170a0d18b895032100000000005094400a000a000a000a001a00226c0a340a02316411666666666630934019000000000050944021cdccccccccf8924029000000000050944030a1be822a38c0c880c399340a340a02493111000000000050944019000000000050944021000000000050944029000000000050944030d2acfd0438a0d5cadd9934291f85eb51b882934030a1be822a51000000000057e940616666666666d693408001012001";
+    const NIFTY_ENTRY: &str = "0a124e53455f494e4445587c4e69667479203530128601128101127f0a19093333333333e4d64010c098bcde993421666666664683d64012620a2f0a023164113333333393add640193333333333e4d6402133333333c3a9d640293333333333e4d64038c0c880c399340a2f0a024931113333333333e4d640193333333333e4d640213333333333e4d640293333333333e4d6403880aacedd99342001";
+
+    #[test]
+    fn a_real_full_mode_frame_yields_stock_and_index_ticks() {
+        let ticks =
+            parse_upstox_protobuf_feed(&frame(&[unhex(RELIANCE_ENTRY), unhex(NIFTY_ENTRY)]));
+        assert_eq!(ticks.len(), 2);
+
+        let r = &ticks[0];
+        assert_eq!(r.instrument_token, "NSE_EQ|INE002A01018");
+        assert_eq!(r.last_price, dec!(1300));
+        assert_eq!(r.open, Decimal::from_f64_retain(1228.1).unwrap());
+        assert_eq!(r.high, dec!(1300));
+        assert_eq!(r.low, Decimal::from_f64_retain(1214.2).unwrap());
+        assert_eq!(r.volume, 88_121_121);
+        assert_eq!(r.source, "UPSTOX_V3_LIVE");
+
+        let n = &ticks[1];
+        assert_eq!(n.instrument_token, "NSE_INDEX|Nifty 50");
+        assert_eq!(n.last_price, Decimal::from_f64_retain(23440.8).unwrap());
+        assert_eq!(n.open, Decimal::from_f64_retain(23222.3).unwrap());
+        assert_eq!(n.volume, 0);
     }
 }

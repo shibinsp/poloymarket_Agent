@@ -122,15 +122,24 @@ fn default_orb_max_entry_slippage() -> Decimal {
 /// Which strategy drives the NSE paper book.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct IndiaStrategyConfig {
-    /// "momentum" (monthly rotation, default) | "pullback" (5-minute intraday)
+    /// "orb" (intraday breakout) | "momentum" (monthly rotation, default) |
+    /// "pullback" (5-minute intraday)
     #[serde(default = "default_india_strategy")]
     pub strategy: String,
+    /// Paper capital of the intraday breakout book, in rupees.
+    #[serde(default = "default_india_intraday_capital")]
+    pub intraday_capital_inr: Decimal,
+}
+
+fn default_india_intraday_capital() -> Decimal {
+    rust_decimal_macros::dec!(2500)
 }
 
 impl Default for IndiaStrategyConfig {
     fn default() -> Self {
         Self {
             strategy: default_india_strategy(),
+            intraday_capital_inr: default_india_intraday_capital(),
         }
     }
 }

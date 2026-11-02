@@ -545,7 +545,10 @@ impl VenueCycle<'_> {
                     placed: false,
                 });
             }
-            let quote_age = ctx.now.signed_duration_since(quote.ts);
+            // The clock now, not the cycle's start: `ctx.now` is minutes old by
+            // the end of a scan over the whole universe, which made every fresh
+            // quote look like it came from the future.
+            let quote_age = Utc::now().signed_duration_since(quote.ts);
             if quote_age < Duration::seconds(-5) || quote_age > Duration::seconds(max_age as i64) {
                 info!(
                     instrument = %instrument.id,

@@ -18,8 +18,10 @@ use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
 use crate::db::store::{OrderRecord, Store, VenueOpenTrade};
+use crate::venue::session::SessionKind;
 use crate::venue::types::{
     Instrument, InstrumentId, OrderKind, OrderRequest, OrderState, Side, TimeInForce, VenueId,
+    PROTECTIVE_STOP_PREFIX,
 };
 use crate::venue::{Venue, VenueRegistry};
 
@@ -169,14 +171,27 @@ impl VenueExits<'_> {
         // `VenueCycle::run`; the exit side needs it just as much, and the
         // consequence here is worse — an entry duplicate is an unwanted
         // position, a duplicate exit inverts the one you have.
-        let exiting: HashSet<i64> = self
-            .store
-            .get_unresolved_orders()
-            .await?
-            .into_iter()
-            .filter(|o| o.intent == "EXIT")
+        let unresolved = self.store.get_unresolved_orders().await?;
+        // A resting stop is not an exit under way: the exit it guards against
+        // may still be due.
+        let exiting: HashSet<i64> = unresolved
+            .iter()
+            .filter(|o| o.intent == "EXIT" && !o.is_protective_stop())
             .filter_map(|o| o.trade_id)
             .collect();
+        // An entry still working can add to the position, so its stop waits
+        // until the size is final.
+        let entering: HashSet<i64> = unresolved
+            .iter()
+            .filter(|o| o.intent == "ENTRY")
+            .filter_map(|o| o.trade_id)
+            .collect();
+        let mut stops: HashMap<i64, Vec<OrderRecord>> = HashMap::new();
+        for order in unresolved.into_iter().filter(|o| o.is_protective_stop()) {
+            if let Some(trade_id) = order.trade_id {
+                stops.entry(trade_id).or_default().push(order);
+            }
+        }
 
         let mut instruments: HashMap<String, Vec<Instrument>> = HashMap::new();
 
@@ -193,9 +208,30 @@ impl VenueExits<'_> {
                 }
                 continue;
             }
-            match self.process(&trade, now, cycle, &mut instruments).await {
+            let trade_stops = stops.get(&trade.id).map(Vec::as_slice).unwrap_or(&[]);
+            match self
+                .process(&trade, trade_stops, now, cycle, &mut instruments)
+                .await
+            {
                 Ok(true) => closed += 1,
-                Ok(false) => {}
+                Ok(false) => {
+                    if trade.strategy.as_deref() == Some("orb")
+                        && trade_stops.is_empty()
+                        && !entering.contains(&trade.id)
+                    {
+                        if let Err(e) = self
+                            .place_resting_stop(&trade, now, cycle, &mut instruments)
+                            .await
+                        {
+                            warn!(
+                                trade_id = trade.id,
+                                symbol = %trade.symbol,
+                                error = %format!("{e:#}"),
+                                "Could not place a resting stop — the agent's own check still covers it"
+                            );
+                        }
+                    }
+                }
                 Err(e) => warn!(
                     trade_id = trade.id,
                     symbol = %trade.symbol,
@@ -218,7 +254,7 @@ impl VenueExits<'_> {
         };
         let instrument_id = InstrumentId::new(venue_id, trade.symbol.clone());
         let quote = venue.quote(&instrument_id).await?;
-        let mark = quote.taker_price(closing_side(trade.is_short));
+        let mark = quote.fair_price(closing_side(trade.is_short));
         let entry = trade.avg_fill_price.unwrap_or(trade.entry_price);
         let pnl = position_pnl(entry, mark, trade.quantity, trade.is_short);
         self.store
@@ -230,6 +266,8 @@ impl VenueExits<'_> {
     async fn process(
         &self,
         trade: &VenueOpenTrade,
+        // The position's protective stops still unresolved at the venue.
+        stops: &[OrderRecord],
         now: DateTime<Utc>,
         cycle: i64,
         instruments: &mut HashMap<String, Vec<Instrument>>,
@@ -248,8 +286,10 @@ impl VenueExits<'_> {
 
         let instrument_id = InstrumentId::new(venue_id, trade.symbol.clone());
         let quote = venue.quote(&instrument_id).await?;
-        // Value a position at what closing it would get, not the midpoint.
-        let mark = quote.taker_price(closing_side(trade.is_short));
+        // Value a position at what closing it would get, not the midpoint,
+        // unless the book is too wide for that side to mean anything.
+        let side = closing_side(trade.is_short);
+        let mark = quote.fair_price(side);
 
         let entry: Decimal = trade.avg_fill_price.unwrap_or(trade.entry_price);
         let qty = trade.quantity;
@@ -337,9 +377,19 @@ impl VenueExits<'_> {
             (trade.stop_price, false)
         };
 
+        // A stop resting at the venue fires on real trades. Checking the same
+        // level against a thin quote here could only add false alarms.
+        let stop_rests_at_venue = stops
+            .iter()
+            .any(|o| o.state == "ACCEPTED" || o.state == "PARTIALLY_FILLED");
+
         let rules = ExitRules {
             is_short: trade.is_short,
-            stop_price,
+            stop_price: if stop_rests_at_venue {
+                None
+            } else {
+                stop_price
+            },
             stop_trailed,
             target_price: if is_sma_position {
                 None
@@ -372,11 +422,17 @@ impl VenueExits<'_> {
             "Exit triggered"
         );
 
+        // The stop holds the shares, so Alpaca refuses a sale until it is gone.
+        if !self.clear_resting_stops(venue, stops, now).await? {
+            return Ok(false);
+        }
+
         self.submit_exit(
             venue,
             trade,
             &instrument_id,
-            mark,
+            // The exit has to cross the spread to fill, however wide it is.
+            quote.taker_price(side),
             Some(quote.mid),
             qty,
             reason,
@@ -385,6 +441,157 @@ impl VenueExits<'_> {
         )
         .await?;
         Ok(true)
+    }
+
+    /// Take a position's resting stops down. Returns whether the way is clear
+    /// to exit: not if a stop fired first, which has already closed the trade,
+    /// or if one has not finished cancelling, which the next cycle retries.
+    async fn clear_resting_stops(
+        &self,
+        venue: &dyn Venue,
+        stops: &[OrderRecord],
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let reconciler = crate::agent::reconcile::Reconciler {
+            registry: self.registry,
+            store: self.store,
+            order_ttl: Duration::seconds(self.order_ttl_seconds),
+        };
+        let mut clear = true;
+        for stop in stops {
+            if let Some(id) = &stop.venue_order_id {
+                // A refusal usually means it just filled, which the read below
+                // will show.
+                if let Err(e) = venue.cancel_order(id).await {
+                    warn!(venue_order_id = %id, error = %format!("{e:#}"), "Could not cancel a resting stop");
+                }
+            }
+            let report = reconciler.resolve_one(stop, now).await?;
+            clear &= report.filled == 0 && report.still_open == 0;
+        }
+        Ok(clear)
+    }
+
+    /// Put a stop at the venue, so an open position stays protected when this
+    /// process is not running: on 30 Oct 2026 the laptop slept for nearly three
+    /// hours with MSTR open and nothing checking its stop.
+    ///
+    /// A refusal is not retried. It would be refused again every minute, and
+    /// the agent's own check goes on covering the position either way.
+    async fn place_resting_stop(
+        &self,
+        trade: &VenueOpenTrade,
+        now: DateTime<Utc>,
+        cycle: i64,
+        instruments: &mut HashMap<String, Vec<Instrument>>,
+    ) -> Result<()> {
+        let venue_id = VenueId::new(trade.venue_id.clone());
+        let (Some(stop_price), Some(venue)) = (trade.stop_price, self.registry.get(&venue_id))
+        else {
+            return Ok(());
+        };
+        // Outside regular hours it would only queue, and stops do not trigger then.
+        if venue.session_state(now).kind() != Some(SessionKind::Regular)
+            || self.store.protective_stop_rejected(trade.id).await?
+        {
+            return Ok(());
+        }
+
+        let instrument_id = InstrumentId::new(venue_id, trade.symbol.clone());
+        let instrument = self.resolve(venue, &instrument_id, instruments).await?;
+        let side = closing_side(trade.is_short);
+        let client_order_id = format!("{PROTECTIVE_STOP_PREFIX}{}", Uuid::new_v4());
+
+        self.store
+            .insert_order(&OrderRecord {
+                id: None,
+                client_order_id: client_order_id.clone(),
+                venue_order_id: None,
+                venue_id: trade.venue_id.clone(),
+                symbol: trade.symbol.clone(),
+                side: side.to_string(),
+                intent: "EXIT".to_string(),
+                trade_id: Some(trade.id),
+                limit_price: Some(stop_price.to_string()),
+                qty: trade.quantity.to_string(),
+                filled_qty: "0".to_string(),
+                avg_fill_price: None,
+                state: "PENDING".to_string(),
+                reject_reason: Some(ExitReason::StopLoss.as_str().to_string()),
+                cycle: Some(cycle),
+                mid_at_submit: None,
+                submitted_at: None,
+                updated_at: None,
+                // Long enough to outlast the session; the DAY ones end with it.
+                expires_at: Some((now + Duration::hours(24)).to_rfc3339()),
+            })
+            .await?;
+
+        let request = OrderRequest {
+            instrument,
+            side,
+            kind: OrderKind::Stop { price: stop_price },
+            qty: trade.quantity,
+            // Alpaca takes fractional stops as DAY orders only. A whole-share
+            // stop can stay on overnight if this process is not there to close.
+            tif: if trade.quantity.fract().is_zero() {
+                TimeInForce::Gtc
+            } else {
+                TimeInForce::Day
+            },
+            extended_hours: false,
+            client_order_id: client_order_id.clone(),
+        };
+
+        let ack = match venue.place_order(&request).await {
+            Ok(ack) => ack,
+            Err(e) => {
+                let detail = format!("{e:#}");
+                let refused = detail.contains("HTTP 4") || detail.contains("rejected");
+                self.store
+                    .update_order_state(
+                        &client_order_id,
+                        if refused { "REJECTED" } else { "UNKNOWN" },
+                        None,
+                        "0",
+                        None,
+                        Some(&detail),
+                    )
+                    .await?;
+                return Err(e);
+            }
+        };
+
+        // Any fill is left for reconciliation to find, which closes the trade
+        // the same way however the stop came to fire.
+        let state = if crate::agent::reconcile::is_terminal(&ack.state) && ack.filled_qty.is_zero()
+        {
+            crate::agent::reconcile::state_name(&ack.state)
+        } else {
+            "ACCEPTED"
+        };
+        self.store
+            .update_order_state(
+                &client_order_id,
+                state,
+                Some(&ack.venue_order_id),
+                "0",
+                None,
+                match &ack.state {
+                    OrderState::Rejected(reason) => Some(reason.as_str()),
+                    _ => None,
+                },
+            )
+            .await?;
+        info!(
+            trade_id = trade.id,
+            symbol = %trade.symbol,
+            stop = %stop_price,
+            qty = %trade.quantity,
+            state,
+            "Resting stop placed at the venue"
+        );
+        Ok(())
     }
 
     /// Raise an SMA position's stop to breakeven and then a trailing ATR
@@ -881,6 +1088,181 @@ mod tests {
             .find(|o| o.client_order_id == "exit-1")
             .expect("order");
         assert_eq!(order.reject_reason.as_deref(), Some("STOP_LOSS"));
+    }
+
+    /// An opening-range position, plus a stub venue with it listed.
+    async fn orb_position() -> (Store, i64) {
+        let store = Store::new(":memory:").await.expect("in-memory store");
+        let trade_id = store
+            .insert_venue_trade(&VenueTradeRecord {
+                cycle: 1,
+                venue_id: "stub".to_string(),
+                symbol: "MSTR".to_string(),
+                asset_class: "crypto_spot".to_string(),
+                display_name: None,
+                side: "BUY".to_string(),
+                entry_price: "100".to_string(),
+                quantity: "1.5".to_string(),
+                notional: "150".to_string(),
+                avg_fill_price: Some("100".to_string()),
+                edge_at_entry: "0".to_string(),
+                fair_value: "0".to_string(),
+                confidence: "0".to_string(),
+                risk_pct: "0.01".to_string(),
+                stop_pct: "0.03".to_string(),
+                status: "OPEN".to_string(),
+                stop_price: Some("97".to_string()),
+                target_price: None,
+                horizon_hours: Some(7),
+                client_order_id: Some("entry-1".to_string()),
+                venue_order_id: Some("v-entry-1".to_string()),
+                strategy: Some("orb".to_string()),
+            })
+            .await
+            .expect("insert position");
+        (store, trade_id)
+    }
+
+    fn orb_stub(mark: Decimal, ack: OrderAck) -> StubVenue {
+        StubVenue::with_classes(
+            "stub",
+            TradingSession::Always,
+            &[("MSTR", AssetClass::CryptoSpot)],
+            false,
+        )
+        .quoting(mark)
+        .acking(ack)
+    }
+
+    fn exits<'a>(registry: &'a VenueRegistry, store: &'a Store) -> VenueExits<'a> {
+        VenueExits {
+            registry,
+            store,
+            max_hold_hours: 72,
+            order_ttl_seconds: 300,
+            emergency_stop: false,
+            us_strategy: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_orb_position_gets_one_resting_stop() {
+        let (store, _) = orb_position().await;
+        let registry = VenueRegistry::new(vec![Box::new(orb_stub(
+            dec!(100),
+            ack(OrderState::Accepted, Decimal::ZERO),
+        ))]);
+        let exits = exits(&registry, &store);
+
+        exits.run(Utc::now(), 1).await.unwrap();
+        exits.run(Utc::now(), 2).await.unwrap();
+
+        let orders = store.get_unresolved_orders().await.unwrap();
+        assert_eq!(orders.len(), 1, "no second stop: {orders:?}");
+        assert!(orders[0].is_protective_stop());
+        assert_eq!(store.get_open_venue_trades().await.unwrap().len(), 1);
+    }
+
+    /// Thin quotes must not trip what the venue is already watching on real
+    /// trades, which is the whole point of having it there.
+    #[tokio::test]
+    async fn a_resting_stop_replaces_the_agents_own_check() {
+        let (store, _) = orb_position().await;
+        let registry = VenueRegistry::new(vec![Box::new(orb_stub(
+            dec!(100),
+            ack(OrderState::Accepted, Decimal::ZERO),
+        ))]);
+        exits(&registry, &store).run(Utc::now(), 1).await.unwrap();
+
+        // The stub's mark is now through the 97 stop.
+        let registry = VenueRegistry::new(vec![Box::new(orb_stub(
+            dec!(90),
+            ack(OrderState::Accepted, Decimal::ZERO),
+        ))]);
+        let closed = exits(&registry, &store).run(Utc::now(), 2).await.unwrap();
+
+        assert_eq!(closed, 0);
+        let orders = store.get_unresolved_orders().await.unwrap();
+        assert!(orders.iter().all(|o| o.is_protective_stop()), "{orders:?}");
+    }
+
+    /// A refused stop would be refused again every minute, so it is not retried
+    /// and the agent's own check stays in charge.
+    #[tokio::test]
+    async fn a_refused_stop_is_not_retried_and_the_agent_still_checks() {
+        let (store, _) = orb_position().await;
+        let stub = orb_stub(
+            dec!(100),
+            ack(OrderState::Rejected("no".to_string()), Decimal::ZERO),
+        );
+        let registry = VenueRegistry::new(vec![Box::new(stub)]);
+        let exits_pass = exits(&registry, &store);
+        exits_pass.run(Utc::now(), 1).await.unwrap();
+        exits_pass.run(Utc::now(), 2).await.unwrap();
+        assert!(store.get_unresolved_orders().await.unwrap().is_empty());
+
+        let registry = VenueRegistry::new(vec![Box::new(orb_stub(
+            dec!(90),
+            ack(OrderState::Accepted, Decimal::ZERO),
+        ))]);
+        let closed = exits(&registry, &store).run(Utc::now(), 3).await.unwrap();
+        assert_eq!(closed, 1, "the stop at 97 is breached and nothing rests");
+    }
+
+    /// The stop fired in the moment before the exit was due: the position is
+    /// closed as a stop, and a second sale would open a short.
+    #[tokio::test]
+    async fn a_stop_that_fired_first_closes_the_trade_with_no_exit_order() {
+        let (store, _) = orb_position().await;
+        let registry = VenueRegistry::new(vec![Box::new(orb_stub(
+            dec!(100),
+            ack(OrderState::Accepted, Decimal::ZERO),
+        ))]);
+        let exits_pass = exits(&registry, &store);
+        exits_pass.run(Utc::now(), 1).await.unwrap();
+        let stop = store.get_unresolved_orders().await.unwrap().remove(0);
+
+        let filled = OrderAck {
+            avg_fill_price: Some(dec!(96.5)),
+            ..ack(OrderState::Filled, dec!(1.5))
+        };
+        let registry = VenueRegistry::new(vec![Box::new(
+            orb_stub(dec!(90), ack(OrderState::Accepted, Decimal::ZERO)).answering_orders(filled),
+        )]);
+        let venue = registry.all().next().unwrap();
+        let clear = exits(&registry, &store)
+            .clear_resting_stops(venue, &[stop], Utc::now())
+            .await
+            .unwrap();
+
+        assert!(!clear, "nothing is left to exit");
+        assert!(store.get_open_venue_trades().await.unwrap().is_empty());
+        assert!(store.get_unresolved_orders().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_stop_clears_the_way_to_exit() {
+        let (store, _) = orb_position().await;
+        let registry = VenueRegistry::new(vec![Box::new(orb_stub(
+            dec!(100),
+            ack(OrderState::Accepted, Decimal::ZERO),
+        ))]);
+        let exits_pass = exits(&registry, &store);
+        exits_pass.run(Utc::now(), 1).await.unwrap();
+        let stop = store.get_unresolved_orders().await.unwrap().remove(0);
+
+        let registry = VenueRegistry::new(vec![Box::new(
+            orb_stub(dec!(100), ack(OrderState::Accepted, Decimal::ZERO))
+                .answering_orders(ack(OrderState::Cancelled, Decimal::ZERO)),
+        )]);
+        let venue = registry.all().next().unwrap();
+        let clear = exits(&registry, &store)
+            .clear_resting_stops(venue, &[stop], Utc::now())
+            .await
+            .unwrap();
+
+        assert!(clear);
+        assert_eq!(store.get_open_venue_trades().await.unwrap().len(), 1);
     }
 
     fn rules(

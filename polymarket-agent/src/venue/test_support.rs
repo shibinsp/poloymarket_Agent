@@ -35,6 +35,8 @@ pub struct StubVenue {
     /// What `place_order` answers with. Lets a test drive the accepted,
     /// partially-filled and filled paths, which are handled very differently.
     ack: Option<OrderAck>,
+    /// What `get_order` answers with, when configured.
+    order_lookup: Option<OrderAck>,
     /// Every order this venue was asked to place, so a test can assert that a
     /// second one was never sent.
     pub placed: Mutex<Vec<OrderRequest>>,
@@ -123,6 +125,7 @@ impl StubVenue {
             mark: None,
             no_balance: false,
             ack: None,
+            order_lookup: None,
             placed: Mutex::new(Vec::new()),
             cancel_all_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
@@ -163,6 +166,12 @@ impl StubVenue {
     /// Answer `place_order` with this ack.
     pub fn acking(mut self, ack: OrderAck) -> Self {
         self.ack = Some(ack);
+        self
+    }
+
+    /// Answer `get_order` with this ack.
+    pub fn answering_orders(mut self, ack: OrderAck) -> Self {
+        self.order_lookup = Some(ack);
         self
     }
 
@@ -235,7 +244,10 @@ impl Venue for StubVenue {
         }
     }
     async fn get_order(&self, _o: &OrderRef) -> Result<OrderAck> {
-        anyhow::bail!("not implemented")
+        match &self.order_lookup {
+            Some(a) => Ok(a.clone()),
+            None => anyhow::bail!("not implemented"),
+        }
     }
     async fn cancel_order(&self, _id: &str) -> Result<()> {
         Ok(())

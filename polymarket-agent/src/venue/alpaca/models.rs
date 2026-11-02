@@ -248,6 +248,8 @@ pub struct NewOrder {
     pub time_in_force: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit_price: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_price: Option<String>,
     pub extended_hours: bool,
     /// The whole point of the idempotency story: a retry after a timeout
     /// carries the same id and Alpaca rejects the duplicate instead of

@@ -165,6 +165,7 @@ impl Venue for UpstoxSandboxVenue {
         let (order_type, price) = match request.kind {
             OrderKind::Limit { price } => ("LIMIT", price),
             OrderKind::Market => ("MARKET", Decimal::ZERO),
+            OrderKind::Stop { .. } => bail!("Upstox stop orders are not supported here"),
         };
 
         let transaction_type = match request.side {

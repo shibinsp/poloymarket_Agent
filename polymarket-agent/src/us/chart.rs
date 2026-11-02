@@ -380,52 +380,6 @@ pub fn generate_us_chart(
         });
     }
 
-    // Default demonstration markers if none yet exist for this symbol
-    if trade_markers.is_empty() {
-        let buy_p = (current_price - dec!(1.80)).max(dec!(0.50)).round_dp(2);
-        let buy_val = buy_p * dec!(1.0);
-        let buy_cost = cost_cfg.calculate(buy_val, dec!(1.0), Side::Buy);
-
-        let sell_p = (current_price + dec!(0.90)).round_dp(2);
-        let sell_val = sell_p * dec!(1.0);
-        let sell_cost = cost_cfg.calculate(sell_val, dec!(1.0), Side::Sell);
-
-        trade_markers.push(ChartTradeMarker {
-            id: format!("us-mkr-{}-buy", symbol_upper.to_lowercase()),
-            order_id: format!("US-PPR-{}-1001-BUY", symbol_upper),
-            side: "BUY".to_string(),
-            price: buy_p,
-            shares: 1,
-            time: "10:15 ET".to_string(),
-            timestamp: (now - Duration::hours(3)).to_rfc3339(),
-            total_value: buy_val,
-            sec_fee: buy_cost.sec_fee,
-            finra_taf: buy_cost.finra_taf,
-            total_regulatory_fees: buy_cost.total,
-            status: "FILLED".to_string(),
-            marker_color: "blue".to_string(),
-            signal_reason: Some(
-                "Confirmed 5m Pullback Rebound: Price > VWAP & EMA20 > EMA50".to_string(),
-            ),
-        });
-
-        trade_markers.push(ChartTradeMarker {
-            id: format!("us-mkr-{}-sell", symbol_upper.to_lowercase()),
-            order_id: format!("US-PPR-{}-1002-SELL", symbol_upper),
-            side: "SELL".to_string(),
-            price: sell_p,
-            shares: 1,
-            time: "14:20 ET".to_string(),
-            timestamp: (now - Duration::minutes(40)).to_rfc3339(),
-            total_value: sell_val,
-            sec_fee: sell_cost.sec_fee,
-            finra_taf: sell_cost.finra_taf,
-            total_regulatory_fees: sell_cost.total,
-            status: "FILLED".to_string(),
-            marker_color: "black".to_string(),
-            signal_reason: Some("Planned reward target (1.5:1 ratio) reached".to_string()),
-        });
-    }
 
     // Build itemized detailed trades
     let detailed_trades = build_detailed_trades(&symbol_upper, &trade_markers, name);

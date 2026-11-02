@@ -59,6 +59,9 @@ pub struct DashboardState {
     pub upstox_feed: Arc<crate::india::market_feed::UpstoxLiveMarketFeed>,
     pub alpaca_feed: Arc<crate::us::market_feed::AlpacaLiveMarketFeed>,
     pub dynamic_caps: Arc<tokio::sync::RwLock<DynamicCapitalCaps>>,
+    /// Capital the NSE intraday breakout trades with, on its own ledger. The
+    /// sandbox allocation above is a different, older book.
+    india_intraday_capital_inr: Option<Decimal>,
 }
 
 impl DashboardState {
@@ -100,6 +103,7 @@ impl DashboardState {
                 india_capital_allocation_inr: init_india,
                 us_capital_allocation_usd: init_us,
             })),
+            india_intraday_capital_inr: None,
             // Trim before storing: the page sends a trimmed token, so keeping
             // stray whitespace here would 401 every request with an
             // apparently-correct token.
@@ -123,6 +127,11 @@ impl DashboardState {
         feed: Arc<crate::us::market_feed::AlpacaLiveMarketFeed>,
     ) -> Self {
         self.alpaca_feed = feed;
+        self
+    }
+
+    pub fn with_india_intraday_capital(mut self, capital_inr: Decimal) -> Self {
+        self.india_intraday_capital_inr = Some(capital_inr);
         self
     }
 }
@@ -266,6 +275,9 @@ fn build_router(state: DashboardState) -> Router {
         .route("/api/halt", get(halt_status_handler))
         .route("/api/india/watchlist", get(india_watchlist_handler))
         .route("/api/us/desk", get(us_desk_handler))
+        .route("/api/us/orb/trades", get(us_orb_trades_handler))
+        .route("/api/india/desk", get(india_desk_handler))
+        .route("/api/india/intraday", get(india_intraday_handler))
         .route(
             "/api/india/backtest/history",
             get(india_backtest_history_handler),
@@ -754,10 +766,52 @@ pub struct IndiaBacktestRunRequest {
     pub test_ratio: Option<Decimal>,
 }
 
+/// The U.S. opening-range breakout's own trades, from the main ledger.
+async fn us_orb_trades_handler(State(state): State<DashboardState>) -> impl IntoResponse {
+    match state
+        .store
+        .recent_strategy_trades("alpaca", crate::us::orb::ORB_STRATEGY, 100)
+        .await
+    {
+        Ok(trades) => Json(serde_json::json!({ "trades": trades })).into_response(),
+        Err(e) => rows_unavailable(e),
+    }
+}
+
 /// The trading desk's latest decision cards: one per signal, each with
 /// ATLAS, VEGA, ORION, LUNA, TITAN and NOVA's reports.
 async fn us_desk_handler(State(state): State<DashboardState>) -> impl IntoResponse {
-    match state.store.recent_desk_decisions(50).await {
+    match state.store.recent_desk_decisions("US", 50).await {
+        Ok(cards) => Json(serde_json::json!({ "cards": cards })).into_response(),
+        Err(e) => rows_unavailable(e),
+    }
+}
+
+/// The NSE intraday paper book: its trades, newest first, and total P&L.
+async fn india_intraday_handler(State(state): State<DashboardState>) -> impl IntoResponse {
+    let day = chrono::Utc::now()
+        .with_timezone(&chrono_tz::Asia::Kolkata)
+        .date_naive()
+        .to_string();
+    match (
+        state.store.recent_intraday_trades(100).await,
+        state.store.intraday_totals(&day).await,
+    ) {
+        (Ok(trades), Ok((today, today_pnl, total_pnl))) => Json(serde_json::json!({
+            "capital_inr": state.india_intraday_capital_inr,
+            "trades_today": today,
+            "pnl_today_inr": today_pnl,
+            "pnl_total_inr": total_pnl,
+            "trades": trades,
+        }))
+        .into_response(),
+        (Err(e), _) | (_, Err(e)) => rows_unavailable(e),
+    }
+}
+
+/// The India desk's decision cards (monthly momentum, intraday breakout).
+async fn india_desk_handler(State(state): State<DashboardState>) -> impl IntoResponse {
+    match state.store.recent_desk_decisions("IN", 24).await {
         Ok(cards) => Json(serde_json::json!({ "cards": cards })).into_response(),
         Err(e) => rows_unavailable(e),
     }
@@ -2520,6 +2574,7 @@ async fn intraday_status_handler(State(state): State<DashboardState>) -> impl In
             "test_mode": "Historical Backtest & Upstox Sandbox (Live Blocked)",
             "live_orders_blocked": true,
             "capital_allocation_inr": cap_inr,
+            "intraday_capital_inr": state.india_intraday_capital_inr,
             "max_exposure_pct": state.risk.india_max_exposure_pct,
             "max_daily_loss_inr": state.risk.india_max_daily_loss_inr,
         },

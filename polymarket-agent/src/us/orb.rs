@@ -20,7 +20,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Duration, NaiveDate, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Timelike, Utc, Weekday};
 use chrono_tz::America::New_York;
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -39,6 +39,8 @@ use crate::venue::VenueRegistry;
 pub const ORB_STRATEGY: &str = "orb";
 const VENUE: &str = "alpaca";
 const BAR_MINUTES: i64 = 5;
+/// Earlier sessions read for relative volume, a few past the 14 it averages.
+const OPENING_SESSIONS: usize = 15;
 /// Bar 70 starts 15:20 and closes 15:30: the last bar that may trigger.
 const LAST_SIGNAL_BAR: usize = 70;
 
@@ -164,6 +166,96 @@ impl AlpacaBars {
         symbols: &[String],
         start: DateTime<Utc>,
     ) -> Result<HashMap<String, Vec<Bar>>> {
+        self.bars_between(symbols, start, None).await
+    }
+
+    /// One session's opening bar for each symbol. A tiny request, unlike a
+    /// month of bars, which a poor connection cannot finish.
+    async fn opening_bars_on(
+        &self,
+        symbols: &[String],
+        day: NaiveDate,
+    ) -> Result<HashMap<String, Vec<Bar>>> {
+        let open = day
+            .and_hms_opt(9, 30, 0)
+            .and_then(|t| New_York.from_local_datetime(&t).earliest())
+            .context("no 9:30 in New York that day")?
+            .with_timezone(&Utc);
+        self.bars_between(symbols, open, Some(open + Duration::minutes(4)))
+            .await
+    }
+
+    /// The opening bars of `today` and of enough earlier sessions for relative
+    /// volume, walking back past weekends and holidays.
+    pub async fn opening_bars(
+        &self,
+        symbols: &[String],
+        today: NaiveDate,
+    ) -> Result<HashMap<String, Vec<Bar>>> {
+        let mut out = self.opening_bars_on(symbols, today).await?;
+        let mut sessions = 0;
+        for back in 1..=30 {
+            if sessions >= OPENING_SESSIONS {
+                break;
+            }
+            let day = today - Duration::days(back);
+            if matches!(day.weekday(), Weekday::Sat | Weekday::Sun) {
+                continue;
+            }
+            let bars = self.opening_bars_on(symbols, day).await?;
+            if !bars.is_empty() {
+                sessions += 1;
+            }
+            for (symbol, list) in bars {
+                out.entry(symbol).or_default().extend(list);
+            }
+        }
+        for list in out.values_mut() {
+            list.sort_by_key(|b| b.ts);
+        }
+        Ok(out)
+    }
+
+    /// One page of bars, retried: a dropped connection is routine at home.
+    async fn page(&self, query: &[(&str, String)]) -> Result<BarsPage> {
+        let mut last = None;
+        for attempt in 0..3 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            let result = async {
+                let resp = self
+                    .http
+                    .get(format!("{}/v2/stocks/bars", self.base))
+                    .header("APCA-API-KEY-ID", &self.key)
+                    .header("APCA-API-SECRET-KEY", &self.secret)
+                    .query(query)
+                    .send()
+                    .await
+                    .context("Alpaca bars request failed")?;
+                if !resp.status().is_success() {
+                    bail!("Alpaca bars returned {}", resp.status());
+                }
+                resp.json::<BarsPage>()
+                    .await
+                    .context("Unreadable Alpaca bars page")
+            }
+            .await;
+            match result {
+                Ok(page) => return Ok(page),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.expect("three attempts were made"))
+    }
+
+    async fn bars_between(
+        &self,
+        symbols: &[String],
+        start: DateTime<Utc>,
+        end: Option<DateTime<Utc>>,
+    ) -> Result<HashMap<String, Vec<Bar>>> {
+        let stamp = |t: DateTime<Utc>| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let mut out: HashMap<String, Vec<Bar>> = HashMap::new();
         for chunk in symbols.chunks(50) {
             let mut token: Option<String> = None;
@@ -171,31 +263,19 @@ impl AlpacaBars {
                 let mut query = vec![
                     ("symbols", chunk.join(",")),
                     ("timeframe", "5Min".to_string()),
-                    (
-                        "start",
-                        start.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                    ),
+                    ("start", stamp(start)),
                     ("limit", "10000".to_string()),
                     ("adjustment", "split".to_string()),
                     ("feed", self.feed.clone()),
                     ("sort", "asc".to_string()),
                 ];
+                if let Some(e) = end {
+                    query.push(("end", stamp(e)));
+                }
                 if let Some(t) = &token {
                     query.push(("page_token", t.clone()));
                 }
-                let resp = self
-                    .http
-                    .get(format!("{}/v2/stocks/bars", self.base))
-                    .header("APCA-API-KEY-ID", &self.key)
-                    .header("APCA-API-SECRET-KEY", &self.secret)
-                    .query(&query)
-                    .send()
-                    .await
-                    .context("Alpaca bars request failed")?;
-                if !resp.status().is_success() {
-                    bail!("Alpaca bars returned {}", resp.status());
-                }
-                let page: BarsPage = resp.json().await.context("Unreadable Alpaca bars page")?;
+                let page = self.page(&query).await?;
                 for (symbol, raw) in page.bars {
                     let list = out.entry(symbol).or_default();
                     for b in raw {
@@ -336,7 +416,7 @@ impl OrbTrader {
             return Ok(0);
         }
         if !self.day.ranked {
-            self.rank(cfg, today, now).await?;
+            self.rank(cfg, today).await?;
         }
         if self.day.candidates.is_empty() {
             return Ok(0);
@@ -597,16 +677,8 @@ impl OrbTrader {
     }
 
     /// Opening ranges and relative volume for the whole universe, once a day.
-    async fn rank(
-        &mut self,
-        cfg: &UsOrbConfig,
-        today: NaiveDate,
-        now: DateTime<Utc>,
-    ) -> Result<()> {
-        let history = self
-            .data
-            .bars(&cfg.symbols, now - Duration::days(30))
-            .await?;
+    async fn rank(&mut self, cfg: &UsOrbConfig, today: NaiveDate) -> Result<()> {
+        let history = self.data.opening_bars(&cfg.symbols, today).await?;
         let mut ranked = Vec::new();
         let (mut up, mut seen) = (0u32, 0u32);
         for symbol in &cfg.symbols {
@@ -692,7 +764,9 @@ async fn titan_prepare(
         .get(instrument.venue())
         .context("Alpaca venue missing")?;
     let quote = venue.quote(&instrument.id).await?;
-    let touch = quote.taker_price(side);
+    // Normally the side we would cross; on a very wide IEX book, the midpoint,
+    // or the limit below would cap nothing.
+    let touch = quote.fair_price(side);
     // Never enter on the wrong side of the stop: the breakout has already failed.
     if touch <= Decimal::ZERO
         || (side == Side::Buy && touch <= stop)
@@ -915,7 +989,6 @@ async fn submit(
 mod tests {
     use super::*;
     use crate::venue::types::{InstrumentId, InstrumentMeta, VenueId};
-    use chrono::TimeZone;
     use rust_decimal_macros::dec;
 
     fn at(h: u32, m: u32) -> DateTime<Utc> {

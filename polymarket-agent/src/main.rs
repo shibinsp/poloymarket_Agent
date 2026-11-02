@@ -522,7 +522,15 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
         .risk
         .india_capital_allocation_inr
         .unwrap_or(dec!(1000.0));
-    let _india_strategy_worker = if config
+    let _india_strategy_worker = if config.india_strategy.strategy.eq_ignore_ascii_case("orb") {
+        tracing::info!("NSE paper strategy: intraday opening-range breakout");
+        polymarket_agent::india::orb::spawn_india_orb_worker(
+            upstox_feed.clone(),
+            store.clone_for_parallel(),
+            kill_switch.clone(),
+            config.india_strategy.intraday_capital_inr,
+        )
+    } else if config
         .india_strategy
         .strategy
         .eq_ignore_ascii_case("pullback")
@@ -575,7 +583,8 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
         config.valuation.model.clone(),
     )
     .with_upstox_feed(upstox_feed)
-    .with_alpaca_feed(alpaca_feed);
+    .with_alpaca_feed(alpaca_feed)
+    .with_india_intraday_capital(config.india_strategy.intraday_capital_inr);
     let dashboard_handle = spawn_dashboard(
         dashboard_state,
         &config.monitoring.dashboard_bind,

@@ -387,6 +387,58 @@ impl Agent {
         self.apply_pending_halt().await;
     }
 
+    /// Resolve outstanding orders before anything else looks at positions. An
+    /// exit that filled since the last cycle must be on the books before the
+    /// exit pass runs, or it re-sells a position that is already gone; an entry
+    /// that filled must be visible before the audit and before the cycle
+    /// decides what to buy. This also releases the per-symbol block that
+    /// unresolved orders hold.
+    async fn resolve_outstanding_orders(&self) {
+        if self.venues.is_empty() {
+            return;
+        }
+        let reconciler = Reconciler {
+            registry: &self.venues,
+            store: &self.store,
+            order_ttl: chrono::Duration::seconds(self.config.execution.order_ttl_seconds as i64),
+        };
+        match reconciler.run(chrono::Utc::now()).await {
+            // An order the venue will not talk about keeps blocking its
+            // symbol, which is the safe direction but not a free one: the
+            // agent stops trading that symbol entirely until someone
+            // looks. Silence here is indistinguishable from working.
+            Ok(report) if report.unqueryable > 0 => {
+                let _ = self
+                    .alert_client
+                    .anomaly(
+                        AlertLevel::Warning,
+                        AnomalyKind::OrderStateUnknown,
+                        "reconcile",
+                        &format!(
+                            "{} of {} orders could not be resolved — those symbols stay blocked",
+                            report.unqueryable, report.checked
+                        ),
+                    )
+                    .await;
+            }
+            Ok(_) => {}
+            // The pass itself failing is worse than any single finding:
+            // nothing is checking whether the ledger still matches the
+            // venue, so every later decision runs on unverified state.
+            Err(e) => {
+                let _ = self
+                    .alert_client
+                    .anomaly(
+                        AlertLevel::Critical,
+                        AnomalyKind::ReconciliationMismatch,
+                        "reconcile",
+                        &format!("Reconciliation pass failed — ledger is unverified: {e}"),
+                    )
+                    .await;
+            }
+        }
+    }
+
     /// Ask every venue whether the ledger still describes reality.
     ///
     /// Returns the total account equity the venues reported, which is what
@@ -678,6 +730,12 @@ impl Agent {
         // inside its risk limits? Both can halt, so both run before the state
         // is settled — deciding to trade and *then* discovering the books
         // disagree is the ordering this exists to prevent.
+        //
+        // Outstanding orders are resolved first, because a fill not yet written
+        // down looks exactly like a position nobody owns. Auditing first halted
+        // the agent on both entries of 30 Oct 2026: each order filled in under
+        // two seconds and the next cycle's audit found it before this pass did.
+        self.resolve_outstanding_orders().await;
         let venue_equity = self.audit_venue_state(now).await;
         let equity = self.account_equity(venue_equity).await;
         self.check_breakers(now, equity).await;
@@ -728,55 +786,6 @@ impl Agent {
         // state: being unable to open new positions must never mean being
         // unable to close existing ones.
         if !self.venues.is_empty() {
-            // Resolve outstanding orders before anything else looks at
-            // positions. An exit that filled since the last cycle must be on
-            // the books before the exit pass runs, or it re-sells a position
-            // that is already gone; an entry that filled must be visible
-            // before the cycle decides what to buy. This also releases the
-            // per-symbol block that unresolved orders hold.
-            let reconciler = Reconciler {
-                registry: &self.venues,
-                store: &self.store,
-                order_ttl: chrono::Duration::seconds(
-                    self.config.execution.order_ttl_seconds as i64,
-                ),
-            };
-            match reconciler.run(chrono::Utc::now()).await {
-                // An order the venue will not talk about keeps blocking its
-                // symbol, which is the safe direction but not a free one: the
-                // agent stops trading that symbol entirely until someone
-                // looks. Silence here is indistinguishable from working.
-                Ok(report) if report.unqueryable > 0 => {
-                    let _ = self
-                        .alert_client
-                        .anomaly(
-                            AlertLevel::Warning,
-                            AnomalyKind::OrderStateUnknown,
-                            "reconcile",
-                            &format!(
-                                "{} of {} orders could not be resolved — those symbols stay blocked",
-                                report.unqueryable, report.checked
-                            ),
-                        )
-                        .await;
-                }
-                Ok(_) => {}
-                // The pass itself failing is worse than any single finding:
-                // nothing is checking whether the ledger still matches the
-                // venue, so every later decision runs on unverified state.
-                Err(e) => {
-                    let _ = self
-                        .alert_client
-                        .anomaly(
-                            AlertLevel::Critical,
-                            AnomalyKind::ReconciliationMismatch,
-                            "reconcile",
-                            &format!("Reconciliation pass failed — ledger is unverified: {e}"),
-                        )
-                        .await;
-                }
-            }
-
             let exits = VenueExits {
                 registry: &self.venues,
                 store: &self.store,

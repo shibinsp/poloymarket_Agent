@@ -6,6 +6,8 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{FromRow, SqlitePool};
 use std::str::FromStr;
 
+use crate::venue::types::PROTECTIVE_STOP_PREFIX;
+
 pub struct Store {
     pool: SqlitePool,
 }
@@ -435,6 +437,19 @@ impl Store {
         .context("Failed to fetch unresolved orders")
     }
 
+    /// Whether the venue has refused a protective stop for this trade.
+    pub async fn protective_stop_rejected(&self, trade_id: i64) -> Result<bool> {
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM orders WHERE trade_id = ? AND state = 'REJECTED' AND client_order_id LIKE ?",
+        )
+        .bind(trade_id)
+        .bind(format!("{PROTECTIVE_STOP_PREFIX}%"))
+        .fetch_one(&self.pool)
+        .await
+        .context("Failed to look up rejected protective stops")?;
+        Ok(count > 0)
+    }
+
     /// Open continuous-asset positions, which unlike prediction markets never
     /// settle themselves and must be explicitly closed.
     pub async fn get_open_venue_trades(&self) -> Result<Vec<VenueOpenTrade>> {
@@ -777,6 +792,165 @@ impl Store {
         Ok(count.max(0) as u32)
     }
 
+    /// Open a position in the NSE intraday paper book.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_intraday_trade(
+        &self,
+        day: &str,
+        symbol: &str,
+        is_buy: bool,
+        qty: i64,
+        entry_price: &str,
+        stop_price: &str,
+        capital: &str,
+        at: DateTime<Utc>,
+    ) -> Result<i64> {
+        let result = sqlx::query(
+            "INSERT INTO india_intraday_trades (day, symbol, is_buy, qty, entry_price, stop_price, capital, entry_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(day)
+        .bind(symbol)
+        .bind(is_buy)
+        .bind(qty)
+        .bind(entry_price)
+        .bind(stop_price)
+        .bind(capital)
+        .bind(at.to_rfc3339())
+        .execute(&self.pool)
+        .await
+        .context("Failed to open intraday trade")?;
+        Ok(result.last_insert_rowid())
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub async fn open_intraday_trades(&self) -> Result<Vec<IntradayOpen>> {
+        let rows: Vec<(i64, String, String, bool, i64, String, String, String)> = sqlx::query_as(
+            "SELECT id, day, symbol, is_buy, qty, entry_price, stop_price, entry_at
+             FROM india_intraday_trades WHERE exit_at IS NULL ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read open intraday trades")?;
+        rows.into_iter()
+            .map(|(id, day, symbol, is_buy, qty, entry, stop, at)| {
+                Ok(IntradayOpen {
+                    id,
+                    day,
+                    symbol,
+                    is_buy,
+                    qty,
+                    entry_price: Decimal::from_str(&entry).context("bad intraday entry price")?,
+                    stop_price: Decimal::from_str(&stop).context("bad intraday stop price")?,
+                    entry_at: DateTime::parse_from_rfc3339(&at)
+                        .context("bad intraday entry time")?
+                        .with_timezone(&Utc),
+                })
+            })
+            .collect()
+    }
+
+    pub async fn close_intraday_trade(
+        &self,
+        id: i64,
+        exit_price: &str,
+        reason: &str,
+        charges: &str,
+        pnl: &str,
+        at: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE india_intraday_trades SET exit_price = ?, exit_reason = ?, charges = ?, pnl = ?, exit_at = ? WHERE id = ?",
+        )
+        .bind(exit_price)
+        .bind(reason)
+        .bind(charges)
+        .bind(pnl)
+        .bind(at.to_rfc3339())
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .context("Failed to close intraday trade")?;
+        Ok(())
+    }
+
+    /// (trades opened on `day`, P&L closed on `day`, P&L closed ever).
+    pub async fn intraday_totals(&self, day: &str) -> Result<(i64, Decimal, Decimal)> {
+        let rows: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT day, pnl FROM india_intraday_trades")
+                .fetch_all(&self.pool)
+                .await
+                .context("Failed to read intraday totals")?;
+        let (mut count, mut today, mut all) = (0i64, Decimal::ZERO, Decimal::ZERO);
+        for (d, pnl) in rows {
+            let v = pnl
+                .as_deref()
+                .and_then(|p| Decimal::from_str(p).ok())
+                .unwrap_or_default();
+            all += v;
+            if d == day {
+                count += 1;
+                today += v;
+            }
+        }
+        Ok((count, today, all))
+    }
+
+    /// The latest intraday trades as JSON, newest first.
+    pub async fn recent_intraday_trades(&self, limit: i64) -> Result<Vec<serde_json::Value>> {
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(String, String, bool, i64, String, String, String, Option<String>, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT day, symbol, is_buy, qty, entry_price, stop_price, entry_at, exit_price, exit_reason, charges, pnl
+             FROM india_intraday_trades ORDER BY id DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read intraday trades")?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                serde_json::json!({
+                    "day": r.0, "symbol": r.1, "side": if r.2 { "LONG" } else { "SHORT" }, "qty": r.3,
+                    "entry_price": r.4, "stop_price": r.5, "entry_at": r.6, "exit_price": r.7,
+                    "exit_reason": r.8, "charges": r.9, "pnl": r.10,
+                })
+            })
+            .collect())
+    }
+
+    /// One strategy's trades on one venue, newest first, for the dashboard. A
+    /// closed trade's mark is its exit price.
+    pub async fn recent_strategy_trades(
+        &self,
+        venue_id: &str,
+        strategy: &str,
+        limit: i64,
+    ) -> Result<Vec<serde_json::Value>> {
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(i64, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT id, symbol, side, quantity, COALESCE(avg_fill_price, entry_price), stop_price, mark_price,
+                    realized_pnl, unrealized_pnl, close_reason, status, created_at, closed_at
+             FROM trades WHERE venue_id = ? AND strategy = ? ORDER BY id DESC LIMIT ?",
+        )
+        .bind(venue_id)
+        .bind(strategy)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read strategy trades")?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.0, "symbol": r.1, "side": r.2, "qty": r.3, "entry_price": r.4,
+                    "stop_price": r.5, "mark_price": r.6, "realized_pnl": r.7, "unrealized_pnl": r.8,
+                    "close_reason": r.9, "status": r.10, "entry_at": r.11, "closed_at": r.12,
+                })
+            })
+            .collect())
+    }
+
     /// Record one trading-desk decision card (the full card as JSON).
     pub async fn insert_desk_decision(
         &self,
@@ -784,31 +958,57 @@ impl Store {
     ) -> Result<i64> {
         let action = serde_json::to_value(card.nova.action)?;
         let advisory = serde_json::to_value(card.nova.advisory_action)?;
+        self.insert_desk_card(
+            card.at,
+            &card.market,
+            &card.strategy,
+            &card.symbol,
+            action.as_str().unwrap_or("UNKNOWN"),
+            advisory.as_str().unwrap_or("UNKNOWN"),
+            &serde_json::to_value(card)?,
+        )
+        .await
+    }
+
+    /// Record any market's decision card.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_desk_card(
+        &self,
+        at: DateTime<Utc>,
+        market: &str,
+        strategy: &str,
+        symbol: &str,
+        action: &str,
+        advisory_action: &str,
+        card: &serde_json::Value,
+    ) -> Result<i64> {
         let result = sqlx::query(
             "INSERT INTO desk_decisions (created_at, market, strategy, symbol, action, advisory_action, card)
              VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
-        .bind(card.at.to_rfc3339())
-        .bind(&card.market)
-        .bind(&card.strategy)
-        .bind(&card.symbol)
-        .bind(action.as_str().unwrap_or("UNKNOWN"))
-        .bind(advisory.as_str().unwrap_or("UNKNOWN"))
-        .bind(serde_json::to_string(card)?)
+        .bind(at.to_rfc3339())
+        .bind(market)
+        .bind(strategy)
+        .bind(symbol)
+        .bind(action)
+        .bind(advisory_action)
+        .bind(card.to_string())
         .execute(&self.pool)
         .await
         .context("Failed to record desk decision")?;
         Ok(result.last_insert_rowid())
     }
 
-    /// The most recent decision cards, newest first, as stored JSON.
-    pub async fn recent_desk_decisions(&self, limit: i64) -> Result<Vec<serde_json::Value>> {
-        let rows: Vec<(String,)> =
-            sqlx::query_as("SELECT card FROM desk_decisions ORDER BY id DESC LIMIT ?")
-                .bind(limit)
-                .fetch_all(&self.pool)
-                .await
-                .context("Failed to read desk decisions")?;
+    /// One market's most recent decision cards, newest first, as stored JSON.
+    pub async fn recent_desk_decisions(&self, market: &str, limit: i64) -> Result<Vec<serde_json::Value>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT card FROM desk_decisions WHERE market = ? ORDER BY id DESC LIMIT ?",
+        )
+        .bind(market)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read desk decisions")?;
         Ok(rows
             .into_iter()
             .filter_map(|(c,)| serde_json::from_str(&c).ok())
@@ -1643,6 +1843,14 @@ pub struct OrderRecord {
     pub expires_at: Option<String>,
 }
 
+impl OrderRecord {
+    /// A stop resting at the venue for an open position. Stored as an EXIT,
+    /// since a fill closes the trade the same way, and told apart by its id.
+    pub fn is_protective_stop(&self) -> bool {
+        self.client_order_id.starts_with(PROTECTIVE_STOP_PREFIX)
+    }
+}
+
 /// Raw row for an open venue position; decimals arrive as TEXT.
 #[derive(Debug, Clone, FromRow)]
 struct VenueOpenTradeRow {
@@ -1660,6 +1868,19 @@ struct VenueOpenTradeRow {
     target_price: Option<String>,
     horizon_hours: Option<i64>,
     created_at: Option<String>,
+}
+
+/// An open position in the NSE intraday paper book.
+#[derive(Debug, Clone)]
+pub struct IntradayOpen {
+    pub id: i64,
+    pub day: String,
+    pub symbol: String,
+    pub is_buy: bool,
+    pub qty: i64,
+    pub entry_price: Decimal,
+    pub stop_price: Decimal,
+    pub entry_at: DateTime<Utc>,
 }
 
 /// An open continuous-asset position, with decimals parsed.
@@ -1874,11 +2095,38 @@ mod tests {
         };
         store.insert_desk_decision(&card("AAA")).await.unwrap();
         store.insert_desk_decision(&card("BBB")).await.unwrap();
-        let cards = store.recent_desk_decisions(10).await.unwrap();
+        let cards = store.recent_desk_decisions("US", 10).await.unwrap();
+        assert!(store.recent_desk_decisions("IN", 10).await.unwrap().is_empty());
         assert_eq!(cards.len(), 2);
         assert_eq!(cards[0]["symbol"], "BBB");
         assert_eq!(cards[0]["nova"]["action"], "TRADE");
         assert_eq!(cards[1]["atlas"]["in_play_today"], 7);
+    }
+
+    #[tokio::test]
+    async fn the_intraday_book_opens_closes_and_totals() {
+        let store = Store::new(":memory:").await.unwrap();
+        store
+            .insert_intraday_trade("2026-11-02", "ITC", false, 9, "250", "255", "2500", Utc::now())
+            .await
+            .unwrap();
+        let open = store.open_intraday_trades().await.unwrap();
+        assert_eq!(open.len(), 1);
+        assert!(!open[0].is_buy);
+        store
+            .close_intraday_trade(open[0].id, "245", "FLAT_1515", "3.50", "41.50", Utc::now())
+            .await
+            .unwrap();
+        assert!(store.open_intraday_trades().await.unwrap().is_empty());
+        assert_eq!(
+            store.intraday_totals("2026-11-02").await.unwrap(),
+            (1, dec!(41.50), dec!(41.50))
+        );
+        assert_eq!(
+            store.intraday_totals("2026-11-03").await.unwrap(),
+            (0, Decimal::ZERO, dec!(41.50))
+        );
+        assert_eq!(store.recent_intraday_trades(5).await.unwrap()[0]["side"], "SHORT");
     }
 
     /// A SELL entry is a short: the open-trade view must say so, carry the

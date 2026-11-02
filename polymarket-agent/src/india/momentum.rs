@@ -341,6 +341,52 @@ async fn rebalance(
         portfolio.available_cash_inr,
         config.top_n,
     );
+
+    // The desk's card for the month: what every agent saw and NOVA's call.
+    let extras =
+        crate::india::desk::gather(feed, &decision, &holdings, config, &nifty, today_ist).await;
+    let card = crate::india::desk::assemble(&crate::india::desk::DeskInputs {
+        decision: &decision,
+        holdings: &holdings,
+        sells: &sells,
+        buys: &buys,
+        prices: &prices,
+        closes: &closes,
+        news: &extras.news,
+        india_vix: extras.india_vix,
+        shadow_top: extras.shadow_top,
+        slot_inr: portfolio.total_equity_inr / Decimal::from(config.top_n.max(1)),
+        now: chrono::Utc::now(),
+    });
+    info!(
+        action = %card.nova.action,
+        reasons = ?card.nova.reasons,
+        advisory = ?card.nova.advisory,
+        "NOVA (India) decision"
+    );
+    match serde_json::to_value(&card) {
+        Ok(json) => {
+            if let Err(e) = store
+                .insert_desk_card(
+                    card.at,
+                    "IN",
+                    "momentum",
+                    "PORTFOLIO",
+                    &card.nova.action,
+                    if card.nova.advisory.is_empty() {
+                        "NONE"
+                    } else {
+                        "FLAGGED"
+                    },
+                    &json,
+                )
+                .await
+            {
+                warn!(error = %e, "Could not record the India decision card");
+            }
+        }
+        Err(e) => warn!(error = %e, "Could not serialise the India decision card"),
+    }
     for (side, list) in [("SELL", &sells), ("BUY", &buys)] {
         for (symbol, qty) in list {
             let price = prices[symbol];

@@ -88,6 +88,20 @@ impl Reconciler<'_> {
         Ok(report)
     }
 
+    /// Ask about one order, for a caller that has to know its fate now.
+    pub async fn resolve_one(
+        &self,
+        order: &OrderRecord,
+        now: DateTime<Utc>,
+    ) -> Result<ReconcileReport> {
+        let mut report = ReconcileReport {
+            checked: 1,
+            ..Default::default()
+        };
+        self.resolve(order, now, &mut report).await?;
+        Ok(report)
+    }
+
     async fn resolve(
         &self,
         order: &OrderRecord,
@@ -117,7 +131,19 @@ impl Reconciler<'_> {
                 // before it submits, so a local failure — a quantity that
                 // rounds below the venue minimum, say — leaves exactly this
                 // shape behind.
-                if order.venue_order_id.is_none() && is_expired(order, now, self.order_ttl) {
+                //
+                // Only when the venue actually said it has no such order. An
+                // outage also lands here, and an order whose acknowledgement
+                // was lost may well be live: on 30 Oct 2026 an AMZN exit filled
+                // at 13:31:03 UTC with its ack lost to a network drop, and was
+                // then written off here as never having reached the venue.
+                //
+                // A protective stop need not wait out its long deadline, since
+                // the session-close exit is waiting on it being resolved.
+                if order.venue_order_id.is_none()
+                    && venue_has_no_such_order(&e)
+                    && (order.is_protective_stop() || is_expired(order, now, self.order_ttl))
+                {
                     warn!(
                         client_order_id = %order.client_order_id,
                         symbol = %order.symbol,
@@ -183,20 +209,75 @@ impl Reconciler<'_> {
         // Still live at the venue. Cancel it if it has rested too long — an
         // order left resting is exposure the agent has stopped reasoning about.
         if is_expired(order, now, self.order_ttl) {
-            venue.cancel_order(&ack.venue_order_id).await?;
+            // The answer above may already be out of date: the order can fill
+            // before the cancel lands, and a cancel only requests. So the
+            // cancel's own result proves nothing either way, and the order's
+            // fate is read back afterwards. A refused cancel usually means it
+            // filled just now.
+            let cancelled = venue.cancel_order(&ack.venue_order_id).await;
+            let last = venue
+                .get_order(&OrderRef::Venue(ack.venue_order_id.clone()))
+                .await?;
+
+            if last.filled_qty > ack.filled_qty {
+                report.filled += 1;
+                // Filled so far is what the venue said above, or this fill
+                // would record that part as a second execution.
+                let seen = OrderRecord {
+                    filled_qty: ack.filled_qty.to_string(),
+                    avg_fill_price: ack.avg_fill_price.map(|p| p.to_string()),
+                    ..order.clone()
+                };
+                self.apply_fill(
+                    &seen,
+                    last.filled_qty,
+                    last.avg_fill_price,
+                    last.fees,
+                    &last.state,
+                    now,
+                )
+                .await?;
+            }
+
+            if !is_terminal(&last.state) {
+                // Still cancelling, or the cancel failed. Not finished, so not
+                // written off; the next pass asks again.
+                self.store
+                    .update_order_state(
+                        &order.client_order_id,
+                        state_name(&last.state),
+                        Some(&last.venue_order_id),
+                        &last.filled_qty.to_string(),
+                        last.avg_fill_price.map(|p| p.to_string()).as_deref(),
+                        None,
+                    )
+                    .await?;
+                cancelled?;
+                report.still_open += 1;
+                return Ok(());
+            }
+
+            let (state, reason) = if matches!(last.state, OrderState::Filled) {
+                ("FILLED", None)
+            } else {
+                ("EXPIRED", Some("order TTL elapsed"))
+            };
             self.store
                 .update_order_state(
                     &order.client_order_id,
-                    "EXPIRED",
-                    Some(&ack.venue_order_id),
-                    &ack.filled_qty.to_string(),
-                    ack.avg_fill_price.map(|p| p.to_string()).as_deref(),
-                    Some("order TTL elapsed"),
+                    state,
+                    Some(&last.venue_order_id),
+                    &last.filled_qty.to_string(),
+                    last.avg_fill_price.map(|p| p.to_string()).as_deref(),
+                    reason,
                 )
                 .await?;
-            report.expired += 1;
             report.resolved += 1;
-            if ack.filled_qty.is_zero() {
+            if matches!(last.state, OrderState::Filled) {
+                return Ok(());
+            }
+            report.expired += 1;
+            if last.filled_qty.is_zero() {
                 self.abandon(order, &OrderState::Expired).await?;
             }
             info!(
@@ -439,6 +520,12 @@ impl Reconciler<'_> {
             return Ok(());
         };
 
+        // Cancelled to make way for an exit, or expired with the day. The exit
+        // pass puts it back if the position is still there.
+        if order.is_protective_stop() {
+            return Ok(());
+        }
+
         if order.intent == "EXIT" {
             // Deliberately does not touch the trade: the position is still
             // live and the next cycle's exit check must see it that way.
@@ -467,6 +554,15 @@ impl Reconciler<'_> {
         }
         Ok(())
     }
+}
+
+/// Whether a failed lookup is the venue saying the order does not exist, as
+/// opposed to the lookup itself failing.
+fn venue_has_no_such_order(error: &anyhow::Error) -> bool {
+    let detail = format!("{error:#}").to_ascii_lowercase();
+    ["http 404", "not found", "unknown order", "does not exist"]
+        .iter()
+        .any(|phrase| detail.contains(phrase))
 }
 
 /// Whether an order has rested past the deadline recorded when it was placed.
@@ -545,6 +641,10 @@ mod tests {
         session: TradingSession,
         reply: Mutex<Option<OrderAck>>,
         cancelled: Mutex<Vec<String>>,
+        /// What `get_order` says once a cancel has been sent; by default, cancelled.
+        after_cancel: Mutex<Option<OrderAck>>,
+        /// What `get_order` fails with when `reply` is empty.
+        lookup_error: &'static str,
     }
 
     impl ScriptedVenue {
@@ -558,8 +658,13 @@ mod tests {
                     supports_candles: true,
                 },
                 session: TradingSession::Always,
+                after_cancel: Mutex::new(Some(OrderAck {
+                    state: OrderState::Cancelled,
+                    ..ack.clone()
+                })),
                 reply: Mutex::new(Some(ack)),
                 cancelled: Mutex::new(Vec::new()),
+                lookup_error: "venue is down",
             }
         }
     }
@@ -608,10 +713,11 @@ mod tests {
                 .lock()
                 .unwrap()
                 .clone()
-                .ok_or_else(|| anyhow::anyhow!("venue is down"))
+                .ok_or_else(|| anyhow::anyhow!(self.lookup_error))
         }
         async fn cancel_order(&self, id: &str) -> Result<()> {
             self.cancelled.lock().unwrap().push(id.to_string());
+            *self.reply.lock().unwrap() = self.after_cancel.lock().unwrap().clone();
             Ok(())
         }
         async fn cancel_all(&self) -> Result<()> {
@@ -864,6 +970,78 @@ mod tests {
         assert!(store.get_unresolved_orders().await.unwrap().is_empty());
         let (_, status) = store.trade_for_order("c1").await.unwrap().unwrap();
         assert_eq!(status, "CANCELLED");
+    }
+
+    /// The order fills in the moment between being read and being cancelled.
+    /// Trusting the first read cancelled the trade with a live position behind it.
+    #[tokio::test]
+    async fn a_fill_that_beats_the_ttl_cancel_is_still_recorded() {
+        let store = Store::new(":memory:").await.unwrap();
+        let past = (Utc::now() - Duration::hours(1)).to_rfc3339();
+        pending_entry(&store, Some(past)).await;
+
+        let venue = ScriptedVenue::answering(ack(OrderState::Accepted, Decimal::ZERO, None));
+        *venue.after_cancel.lock().unwrap() =
+            Some(ack(OrderState::Filled, dec!(1), Some(dec!(100))));
+        let registry = VenueRegistry::new(vec![Box::new(venue)]);
+        let report = reconciler(&registry, &store).run(Utc::now()).await.unwrap();
+
+        assert_eq!((report.filled, report.expired), (1, 0));
+        let open = store.get_open_venue_trades().await.unwrap();
+        assert_eq!(open.len(), 1, "the fill is a live position");
+        assert_eq!(store.get_fills(10).await.unwrap().len(), 1);
+    }
+
+    /// A cancel only requests. The order can still fill until the venue says
+    /// otherwise, so it is not written off yet.
+    #[tokio::test]
+    async fn an_order_still_cancelling_stays_unresolved() {
+        let store = Store::new(":memory:").await.unwrap();
+        let past = (Utc::now() - Duration::hours(1)).to_rfc3339();
+        pending_entry(&store, Some(past)).await;
+
+        let venue = ScriptedVenue::answering(ack(OrderState::Accepted, Decimal::ZERO, None));
+        *venue.after_cancel.lock().unwrap() = Some(ack(OrderState::Accepted, Decimal::ZERO, None));
+        let registry = VenueRegistry::new(vec![Box::new(venue)]);
+        let report = reconciler(&registry, &store).run(Utc::now()).await.unwrap();
+
+        assert_eq!((report.still_open, report.expired), (1, 0));
+        assert_eq!(store.get_unresolved_orders().await.unwrap().len(), 1);
+    }
+
+    /// An order with no venue id, past its deadline, with the given lookup failure.
+    async fn resolve_unacknowledged(lookup_error: &'static str) -> usize {
+        let store = Store::new(":memory:").await.unwrap();
+        store
+            .insert_order(&OrderRecord {
+                state: "UNKNOWN".to_string(),
+                venue_order_id: None,
+                expires_at: Some((Utc::now() - Duration::hours(1)).to_rfc3339()),
+                ..order(None)
+            })
+            .await
+            .unwrap();
+        let mut venue = ScriptedVenue::answering(ack(OrderState::Accepted, Decimal::ZERO, None));
+        *venue.reply.get_mut().unwrap() = None;
+        venue.lookup_error = lookup_error;
+        let registry = VenueRegistry::new(vec![Box::new(venue)]);
+        reconciler(&registry, &store).run(Utc::now()).await.unwrap();
+        store.get_unresolved_orders().await.unwrap().len()
+    }
+
+    /// The AMZN exit of 30 Oct 2026: it filled with its ack lost to an outage,
+    /// and the failed lookups were taken as proof that it never arrived.
+    #[tokio::test]
+    async fn an_outage_is_not_proof_an_order_never_arrived() {
+        assert_eq!(resolve_unacknowledged("connection reset").await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_venue_saying_it_has_no_such_order_releases_it() {
+        assert_eq!(
+            resolve_unacknowledged("Alpaca GET failed: HTTP 404 Not Found: {}").await,
+            0
+        );
     }
 
     #[tokio::test]

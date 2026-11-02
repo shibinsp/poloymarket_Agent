@@ -38,7 +38,7 @@ use crate::venue::session::{SessionKind, SessionState, TradingSession};
 use crate::venue::types::{
     AssetClass, Balance, Candle, CandleInterval, Instrument, InstrumentId, InstrumentMeta,
     OrderAck, OrderKind, OrderRef, OrderRequest, Position, Quote, ScanFilter, Settlement,
-    TimeInForce, VenueCapabilities, VenueId,
+    TimeInForce, VenueCapabilities, VenueId, PROTECTIVE_STOP_PREFIX,
 };
 use crate::venue::Venue;
 
@@ -671,7 +671,7 @@ fn build_new_order(request: &OrderRequest) -> Result<NewOrder> {
         whole
     };
 
-    let (order_type, limit_price) = match request.kind {
+    let (order_type, limit_price, stop_price) = match request.kind {
         OrderKind::Limit { price } => {
             if price <= Decimal::ZERO {
                 bail!("Alpaca limit price must be positive, got {price} for {symbol}");
@@ -682,9 +682,21 @@ fn build_new_order(request: &OrderRequest) -> Result<NewOrder> {
                     "Limit price {price} for {symbol} rounds to zero against the venue's                      tick size"
                 );
             }
-            ("limit", Some(ticked.normalize().to_string()))
+            ("limit", Some(ticked.normalize().to_string()), None)
         }
-        OrderKind::Market => ("market", None),
+        OrderKind::Market => ("market", None, None),
+        OrderKind::Stop { price } => {
+            if crypto {
+                bail!(
+                    "Alpaca stop-market orders are not available on crypto; {symbol} asked for one"
+                );
+            }
+            if price <= Decimal::ZERO {
+                bail!("Alpaca stop price must be positive, got {price} for {symbol}");
+            }
+            let ticked = request.instrument.round_price(price, request.side);
+            ("stop", None, Some(ticked.normalize().to_string()))
+        }
     };
 
     let extended_hours = if crypto {
@@ -730,6 +742,7 @@ fn build_new_order(request: &OrderRequest) -> Result<NewOrder> {
         order_type,
         time_in_force: tif,
         limit_price,
+        stop_price,
         extended_hours,
         client_order_id: request.client_order_id.clone(),
     })
@@ -1171,6 +1184,50 @@ impl Venue for AlpacaVenue {
         Ok(())
     }
 
+    /// One order at a time when a protective stop is resting, since the bulk
+    /// endpoint cannot leave one behind. If the book cannot be read, clearing
+    /// everything is the safer failure: the exit pass puts the stops back.
+    #[instrument(skip(self), fields(venue = %self.id))]
+    async fn cancel_all_except_protective(&self) -> Result<()> {
+        let open = match self.open_orders().await {
+            Ok(open) => open,
+            Err(e) => {
+                warn!(error = %format!("{e:#}"), "Could not list open orders — cancelling them all");
+                return self.cancel_all().await;
+            }
+        };
+        if !open
+            .iter()
+            .any(|o| o.client_order_id.starts_with(PROTECTIVE_STOP_PREFIX))
+        {
+            return self.cancel_all().await;
+        }
+
+        let mut failed = Vec::new();
+        for order in open
+            .iter()
+            .filter(|o| !o.client_order_id.starts_with(PROTECTIVE_STOP_PREFIX))
+        {
+            if let Err(e) = self.cancel_order(&order.venue_order_id).await {
+                let detail = format!("{e:#}");
+                // Same as the bulk endpoint: already gone or already done.
+                if detail.contains("HTTP 404") || detail.contains("HTTP 422") {
+                    warn!(order_id = %order.venue_order_id, "Order was no longer cancelable");
+                } else {
+                    failed.push(order.venue_order_id.clone());
+                }
+            }
+        }
+        if !failed.is_empty() {
+            bail!(
+                "Alpaca could not cancel {} order(s): {}",
+                failed.len(),
+                failed.join(", ")
+            );
+        }
+        Ok(())
+    }
+
     #[instrument(skip(self), fields(venue = %self.id))]
     async fn open_orders(&self) -> Result<Vec<OrderAck>> {
         if self.is_paper {
@@ -1359,6 +1416,22 @@ mod tests {
                 base: "BTC".to_string(),
             },
         }
+    }
+
+    #[test]
+    fn a_stop_is_sent_as_a_stop_price_with_no_limit() {
+        let payload = build_new_order(&order(
+            equity_instrument(),
+            OrderKind::Stop {
+                price: dec!(124.73),
+            },
+            TimeInForce::Day,
+            false,
+        ))
+        .unwrap();
+        assert_eq!(payload.order_type, "stop");
+        assert_eq!(payload.stop_price.as_deref(), Some("124.73"));
+        assert_eq!(payload.limit_price, None);
     }
 
     fn order(instrument: Instrument, kind: OrderKind, tif: TimeInForce, ext: bool) -> OrderRequest {

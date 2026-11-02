@@ -279,12 +279,16 @@ symbols = [
 ]
 
 [india_strategy]
+# "orb": intraday opening-range breakout on the NIFTY 50, long and short, paper
+#   only, no leverage: see src/india/orb.rs. Roughly break-even in replay on
+#   Rs 2,500 (-9.4% then +7.6%), so this is an experiment, not a proven edge.
 # "momentum": monthly rotation into the 4 strongest watchlist stocks by
 #   9-month return, only while NIFTY 50 closes above its 200-day SMA (else cash).
 #   Beat NIFTY on 2023-2026 data the selection never saw.
 # "pullback": the original 5-minute VWAP pullback. It lost 15-32% over
 #   May-Oct 2026 in replay, before and after costs; kept only for comparison.
-strategy = "momentum"
+strategy = "orb"
+intraday_capital_inr = 2500.0
 
 [telemetry]
 # OpenTelemetry span export. Off unless an endpoint is set here or via
