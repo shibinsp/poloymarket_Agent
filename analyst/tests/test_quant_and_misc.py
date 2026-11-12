@@ -145,11 +145,28 @@ def test_parse_bhavcopy_delivery():
 # -- universe tagging ------------------------------------------------------------------------------------
 
 
-def test_universe_tags_company_names(universe):
-    assert universe.tag("Reliance Industries shares jump") == ("RELIANCE",)
-    assert universe.tag("Larsen & Toubro wins order") == ("LT",)
-    assert universe.tag("State Bank of India and Infosys in focus") == ("INFY", "SBIN")
-    assert universe.tag("An alternative fuel startup") == ()
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("Reliance Industries shares jump", ("RELIANCE",)),
+        ("Reliance shares jump", ("RELIANCE",)),
+        ("Larsen & Toubro wins order", ("LT",)),
+        ("State Bank of India and Infosys in focus", ("INFY", "SBIN")),
+        ("An alternative fuel startup", ()),
+        ("Coal India hikes prices", ("COALINDIA",)),
+        ("Coal imports fall; power plants face probe", ()),
+        ("Life insurance sector sees record premiums", ()),
+        ("LIC and Life Insurance Corporation of India news", ("LICI",)),
+        ("Eternal shares jump after Q2", ()),  # ordinary word: only the ticker tags it
+        ("ETERNAL Q2 results", ("ETERNAL",)),
+        ("Tata Power shares rise 2% after Q2 results", ("TATAPOWER",)),
+        ("M&M sales rise 12%", ("M&M",)),
+        ("Adani Ports raises funds", ()),  # no bare "Adani" alias for ADANIENT
+        ("itc ltd hosts meet", ()),  # ticker match is case-sensitive
+    ],
+)
+def test_universe_tagging(universe, text, expected):
+    assert universe.tag(text) == expected
 
 
 # -- scheduler -------------------------------------------------------------------------------------------
@@ -166,6 +183,16 @@ def test_universe_tags_company_names(universe):
 )
 def test_next_run_at(now, expected):
     assert next_run_at(now, 15) == expected
+
+
+def test_split_download_handles_single_and_multi_ticker_shapes():
+    one = frame([100.0] * 40)
+    multi = pd.concat({"TCS.NS": one, "INFY.NS": one}, axis=1)
+    single_multiindex = pd.concat({"TCS.NS": one}, axis=1)
+    from moneyai_analyst.sources.market import split_download
+    assert set(split_download(multi, ["TCS.NS", "INFY.NS", "GONE.NS"])) == {"TCS.NS", "INFY.NS"}
+    assert list(split_download(single_multiindex, ["TCS.NS"])) == ["TCS.NS"]
+    assert list(split_download(one, ["TCS.NS"])) == ["TCS.NS"]
 
 
 def test_yahoo_symbol_keeps_punctuation():

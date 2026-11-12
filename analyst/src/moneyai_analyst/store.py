@@ -57,6 +57,9 @@ class Store:
         self.db = sqlite3.connect(state_dir / "analyst.db")
         self.db.executescript(SCHEMA)
 
+    def close(self) -> None:
+        self.db.close()
+
     # -- LLM cache -----------------------------------------------------------
     def cache_get(self, key: str) -> str | None:
         row = self.db.execute("SELECT response FROM llm_cache WHERE key = ?", (key,)).fetchone()
@@ -114,7 +117,10 @@ class Store:
         self.db.commit()
 
     def contexts(self) -> list[AnalystContext]:
-        rows = self.db.execute("SELECT context FROM runs WHERE context IS NOT NULL ORDER BY started_at").fetchall()
+        """Contexts that were actually published (dry runs and fallbacks excluded)."""
+        rows = self.db.execute(
+            "SELECT context FROM runs WHERE status = 'published' AND context IS NOT NULL ORDER BY started_at"
+        ).fetchall()
         return [AnalystContext.model_validate_json(r[0]) for r in rows]
 
 

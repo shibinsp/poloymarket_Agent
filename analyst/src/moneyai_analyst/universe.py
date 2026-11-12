@@ -16,13 +16,16 @@ from pathlib import Path
 
 import httpx
 
-_SUFFIXES = re.compile(
-    r"\b(limited|ltd\.?|corporation|corp\.?|company|co\.?|india|of|the|and|&|\(india\))\b",
-    re.IGNORECASE,
-)
-# Short or generic name stems that would tag unrelated headlines.
-_STOP_ALIASES = {"state", "bank", "power", "life", "steel", "motors", "industries", "finance"}
-
+# Only legal-form suffixes are stripped. Words such as "India" or "Corporation"
+# are kept because removing them turns names into generic words ("Coal India" ->
+# "Coal", "Life Insurance Corporation of India" -> "Life Insurance").
+_LEGAL = re.compile(r"\b(limited|ltd\.?|the)\b|[.,]", re.IGNORECASE)
+# Single-word names that are also ordinary words; only the ticker tags these.
+_GENERIC_WORDS = {
+    "eternal", "coal", "life", "state", "bank", "power", "steel", "cement", "energy",
+    "gas", "oil", "motors", "industries", "finance", "info", "titan",
+}
+_TRAILING = {"co", "company", "corp", "corporation", "ltd", "limited"}
 
 @dataclass(frozen=True)
 class Company:
@@ -38,7 +41,9 @@ class Universe:
         self.companies = {c.symbol: c for c in companies}
         self._patterns: list[tuple[re.Pattern[str], str]] = []
         for c in companies:
-            for alias in _aliases(c):
+            # Tickers are matched case-sensitively: "ETERNAL" is a ticker, "eternal" is a word.
+            self._patterns.append((re.compile(rf"(?<![\w&-]){re.escape(c.symbol)}(?![\w&-])"), c.symbol))
+            for alias in _name_aliases(c):
                 self._patterns.append((re.compile(rf"(?<![\w&]){re.escape(alias)}(?![\w&])", re.IGNORECASE), c.symbol))
 
     @property
@@ -65,17 +70,20 @@ class Universe:
         return cls(companies)
 
 
-def _aliases(c: Company) -> set[str]:
-    aliases = {c.symbol}
-    stem = _SUFFIXES.sub(" ", c.name)
-    stem = re.sub(r"\s+", " ", stem).strip(" .,-")
-    if len(stem) >= 4 and stem.lower() not in _STOP_ALIASES:
-        aliases.add(stem)
-    full = c.name.replace(" Ltd.", "").replace(" Limited", "").strip()
-    if len(full) >= 4:
-        aliases.add(full)
-    # Bare symbols shorter than 3 characters ("LT") are too noisy outside ticker context.
-    return {a for a in aliases if len(a) >= 3}
+def _name_aliases(c: Company) -> set[str]:
+    """Company-name aliases: the name without its legal suffix, plus a shorter
+    stem without a trailing "Industries" when that stem is
+    still at least two words or a non-generic single word."""
+    words = re.sub(r"\s+", " ", _LEGAL.sub(" ", c.name)).strip().split()
+    while len(words) > 1 and words[-1].lower() in _TRAILING:
+        words.pop()
+    full = " ".join(words)
+    aliases = {full} if len(full) >= 4 else set()
+    if len(words) >= 2 and words[-1].lower() in {"industries", "inds"}:
+        stem = " ".join(words[:-1])
+        if len(stem.split()) >= 2 or (len(stem) >= 4 and stem.lower() not in _GENERIC_WORDS):
+            aliases.add(stem)
+    return {a for a in aliases if a.lower() not in _GENERIC_WORDS}
 
 
 def load_universe(cache_dir: Path, csv_path: str | None, url: str, timeout_s: float, today: date) -> Universe:

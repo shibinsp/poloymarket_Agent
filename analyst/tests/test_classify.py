@@ -161,3 +161,18 @@ def test_extra_body_is_sent_but_cannot_override_core_fields():
     asyncio.run(c.complete("s", "u", 10))
     assert seen[0]["chat_template_kwargs"] == {"enable_thinking": False}
     assert seen[0]["temperature"] == 0.0
+
+
+def test_llm_latency_excludes_queueing(tmp_path):
+    class Slow(FakeClient):
+        async def complete(self, system, user, max_tokens):
+            await asyncio.sleep(0.05)
+            return json.dumps(good(item_id=user.split('"id": "')[-1].split('"')[0]))
+
+    clf = LlmClassifier(Slow([]), None, 300, 1)  # concurrency 1: items queue
+    items = [make_item(f"n{i}", "x") for i in range(6)]
+
+    async def go():
+        return await asyncio.gather(*(clf.classify(i, [], TODAY) for i in items))
+    asyncio.run(go())
+    assert len(clf.latencies) == 6 and max(clf.latencies) < 0.2  # queueing would reach ~0.3s

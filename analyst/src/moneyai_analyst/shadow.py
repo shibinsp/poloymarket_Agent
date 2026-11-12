@@ -64,7 +64,7 @@ def load_fills(db_path: str) -> list[Fill]:
     for sym, side, qty, fqty, price, avg, status, created in rows:
         if (status or "").upper() not in FILLED:
             continue
-        q = int(fqty or 0) or int(qty or 0)
+        q = int(fqty or 0)  # only what actually filled; never the order quantity
         try:
             px = float(avg or price)
         except (TypeError, ValueError):

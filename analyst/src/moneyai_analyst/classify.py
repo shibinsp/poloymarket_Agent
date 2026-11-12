@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import json
 import re
+import time
 from datetime import date
 
 from pydantic import ValidationError
@@ -155,6 +156,10 @@ class LlmClassifier:
         self.store = store
         self.max_tokens = max_tokens
         self.sem = asyncio.Semaphore(concurrency)
+        self.latencies: list[float] = []  # model-call time only, excluding queueing and cache hits
+
+    async def aclose(self) -> None:
+        await self.client.aclose()
 
     @property
     def name(self) -> str:
@@ -174,7 +179,11 @@ class LlmClassifier:
         if cached is not None:
             return validate_classification(json.loads(cached), item, allowed, self.name)
         async with self.sem:
-            text = await self.client.complete(SYSTEM_PROMPT, build_user_prompt(item, background, today), self.max_tokens)
+            t0 = time.perf_counter()
+            try:
+                text = await self.client.complete(SYSTEM_PROMPT, build_user_prompt(item, background, today), self.max_tokens)
+            finally:
+                self.latencies.append(time.perf_counter() - t0)
         try:
             raw = extract_json(text)
         except ValueError as exc:

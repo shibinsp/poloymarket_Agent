@@ -137,6 +137,6 @@ def test_validate_rejects_unknown_source_ids(universe, now):
 
 
 def test_validate_rejects_symbols_outside_universe(universe, now):
-    ctx = AnalystContext(**ctx_kwargs(now, exclude=["ADANIENT"]))
+    ctx = AnalystContext(**ctx_kwargs(now, exclude=["ADANIPORTS"]))
     with pytest.raises(InvalidContext):
         validate_context(ctx, universe, set())

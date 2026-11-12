@@ -100,7 +100,8 @@ async def evaluate(golden: list[GoldenItem], classifier, today: date, exclude_se
     second = await asyncio.gather(*(run(g, False) for g in golden)) if repeat else []
     valid = ev = sev = excl = 0
     failures = 0
-    lat = sorted(t for _, t, _ in first)
+    # Model-call latency excludes time spent queueing for a concurrency slot.
+    lat = sorted(getattr(classifier, "latencies", None) or [t for _, t, _ in first])
     for g, (c, _, failed) in zip(golden, first):
         failures += failed
         if c is None:

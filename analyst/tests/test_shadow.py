@@ -56,11 +56,15 @@ def test_fifo_pairing_and_engine_db_read(tmp_path):
         ("2", "SELL", 4, "110", "ACKNOWLEDGED", "2026-11-12T05:00:00Z"),
         ("3", "SELL", 6, "90", "ACKNOWLEDGED", "2026-11-12T05:30:00Z"),
         ("4", "BUY", 5, "100", "REJECTED", "2026-11-12T06:00:00Z"),
+        ("5", "BUY", 7, "100", "ACKNOWLEDGED", "2026-11-12T06:10:00Z"),  # acknowledged, nothing filled
     ]
     for oid, side, q, px, st, ts in rows:
+        filled = 0 if oid == "5" else q
         con.execute("INSERT INTO india_sandbox_orders VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (oid, oid, None, "SBIN", side, "LIMIT", q, px, None, st, q, px, None, ts, ts))
+                    (oid, oid, None, "SBIN", side, "LIMIT", q, px, None, st, filled, px, None, ts, ts))
     con.commit()
     con.close()
-    trips = pair_round_trips(load_fills(str(db)))
+    fills = load_fills(str(db))
+    assert [f.qty for f in fills] == [10, 4, 6]  # the unfilled order contributes nothing
+    trips = pair_round_trips(fills)
     assert [(t.qty, round(t.net + intraday_costs(t.qty * 100, t.qty * (110 if t.qty == 4 else 90)), 2)) for t in trips] == [(4, 40.0), (6, -60.0)]

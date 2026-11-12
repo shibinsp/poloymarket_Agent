@@ -22,12 +22,24 @@ def download_daily(tickers: list[str], period: str = "2y") -> dict[str, pd.DataF
     """Daily OHLCV per ticker. Missing tickers are omitted, never filled."""
     import yfinance as yf  # optional dependency: pip install .[data]
 
-    out: dict[str, pd.DataFrame] = {}
     raw = yf.download(tickers, period=period, interval="1d", group_by="ticker", auto_adjust=True, progress=False, threads=True)
+    return split_download(raw, tickers)
+
+
+def split_download(raw: pd.DataFrame, tickers: list[str]) -> dict[str, pd.DataFrame]:
+    """Per-ticker frames from a yfinance download, whether its columns are a
+    (ticker, field) MultiIndex (any count with group_by="ticker") or flat."""
+    out: dict[str, pd.DataFrame] = {}
     for t in tickers:
-        try:
-            df = raw[t] if len(tickers) > 1 else raw
-        except KeyError:
+        if isinstance(raw.columns, pd.MultiIndex):
+            if t not in raw.columns.get_level_values(0):
+                continue
+            df = raw[t]
+        elif len(tickers) == 1:
+            df = raw
+        else:
+            continue
+        if "Close" not in df.columns:
             continue
         df = df.dropna(subset=["Close"])
         if len(df) >= 30:

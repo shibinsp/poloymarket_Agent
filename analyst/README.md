@@ -38,7 +38,10 @@ A Python sidecar that reads news, filings and market regime data. Every 15 minut
   - is about the wrong item;
   - cites evidence that was not supplied;
   - names a company that is not tagged on the item.
-- Any run-level failure is a **fallback**: nothing new is published. The run is recorded, the context expires after 20 minutes, and the engine runs on its default rules.
+- **A model outage never weakens restrictions.** Any item the model fails on, or answers invalidly, is classified by the keyword baseline instead, and the run is marked `degraded`.
+- **Calendar events are never sent to a model.** Results days and ex-dates are always excluded.
+- **Any other run-level failure is a fallback:** nothing new is published. Examples are no universe, or a context that fails validation. The run is recorded, any previous context expires after 20 minutes, and the engine runs on its default rules.
+- **Dry runs** (`--no-publish`) are recorded as `recorded`, and `shadow-report` ignores them.
 
 **Consumer rule (for the Rust engine, later):**
 - Read the file and validate it.
@@ -89,10 +92,10 @@ Every run is recorded in `state/analyst.db`, in these tables:
 ## Test
 
 ```bash
-.venv/bin/pytest          # 86 tests, offline, no keys needed
+.venv/bin/pytest          # 109 tests, offline, no keys needed
 ```
 
-These tests also run in CI as the `analyst (python)` job. Before merging a change to any guard, do a **mutation check**: delete or flip the guard, and confirm a test fails. All 28 guards in this package were checked this way when it was written.
+These tests also run in CI as the `analyst (python)` job. Before merging a change to any guard, do a **mutation check**: delete or flip the guard, and confirm a test fails. All 39 guards in this package were checked this way, including the fixes from code review.
 
 ## Tune (DEV_PLAN.md §5)
 

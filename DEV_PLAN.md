@@ -197,7 +197,7 @@ Each phase gets one branch, one PR, a `/code-review`, and a squash-merge.
 
 > **Status (12 Nov 2026): the analyst is built in `analyst/`, ahead of schedule and off the trading path. See `analyst/README.md`.**
 >
-> **Done:** the pipeline, the restrict-only schema, the validator, fallback, cache, audit DB, golden-eval, shadow-report, the filings RAG, volatility bands and the regime (India VIX, Nifty, FII/DII). All 28 guards are mutation-checked.
+> **Done:** the pipeline, the restrict-only schema, the validator, fallback, cache, audit DB, golden-eval, shadow-report, the filings RAG, volatility bands and the regime (India VIX, Nifty, FII/DII). All 39 guards are mutation-checked.
 >
 > **Still open:**
 > - the real 200-300 item golden set (it needs hand labelling);

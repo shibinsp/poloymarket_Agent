@@ -31,6 +31,18 @@ LOOKBACK = timedelta(hours=18)
 SESSION_CLOSE = time(15, 30)
 
 
+def lookback_start(now: datetime) -> datetime:
+    """Earlier of 18 hours ago and the previous weekday's close, so Monday's
+    pre-market run still sees Saturday's results and Sunday's news.
+    (Exchange holidays are not modelled; extend via an events calendar.)"""
+    local = now.astimezone(IST)
+    day = local.date() - timedelta(days=1)
+    while day.weekday() >= 5:
+        day -= timedelta(days=1)
+    prev_close = datetime.combine(day, SESSION_CLOSE, IST)
+    return min(now - LOOKBACK, prev_close)
+
+
 @dataclass
 class Gathered:
     items: list[SourceItem] = field(default_factory=list)
@@ -43,7 +55,7 @@ class Gathered:
 @dataclass
 class RunResult:
     run_id: str
-    status: str  # published | fallback
+    status: str  # published | recorded (dry run) | fallback
     context: AnalystContext | None
     classifications: list[Classification]
     rejected: list[str]
@@ -136,7 +148,7 @@ def prefilter(items: list[SourceItem], universe: Universe, now: datetime, max_it
             continue
         if it.kind == "calendar":
             calendar.append(it)
-        elif now - LOOKBACK <= it.published_at <= now + timedelta(minutes=5):
+        elif lookback_start(now) <= it.published_at <= now + timedelta(minutes=5):
             rest.append(it)
     return (calendar + rest)[:max_items] if max_items > len(calendar) else calendar
 
@@ -144,29 +156,40 @@ def prefilter(items: list[SourceItem], universe: Universe, now: datetime, max_it
 # -- step 3: classify ------------------------------------------------------------------
 
 
+_BASELINE = KeywordClassifier()
+
+
 async def classify_all(
     items: list[SourceItem], classifier, store: Store, today, use_cache: bool = True
 ) -> tuple[list[Classification], list[str], int]:
-    """Returns (classifications, rejection notes, number of model failures)."""
+    """Returns (classifications, notes, number of items the model did not answer).
+
+    * Calendar items are always classified in code: a scheduled results day or
+      ex-date is an exclusion whatever a model thinks of it.
+    * An item the model fails on or answers invalidly is classified by the keyword
+      baseline instead, so a partial outage never publishes fewer restrictions
+      than the offline baseline would."""
     if isinstance(classifier, KeywordClassifier):
         return [classifier.classify(i) for i in items], [], 0
 
     async def one(item: SourceItem):
-        background = retrieve(store, item.symbols[0], item.title) if len(item.symbols) == 1 else []
+        if item.kind == "calendar":
+            return _BASELINE.classify(item), None
         try:
-            return await classifier.classify(item, background, today, use_cache=use_cache), None, False
+            background = retrieve(store, item.symbols[0], item.title) if len(item.symbols) == 1 else []
+            return await classifier.classify(item, background, today, use_cache=use_cache), None
         except RejectedOutput as exc:
-            return None, f"{item.id}: rejected: {exc}", False
+            note = f"{item.id}: rejected: {exc}"
         except LlmError as exc:
-            return None, f"{item.id}: model failed: {exc}", True
-        except Exception as exc:  # one malformed answer must not sink the run
-            return None, f"{item.id}: rejected: {type(exc).__name__}: {exc}", False
+            note = f"{item.id}: model failed: {exc}"
+        except Exception as exc:  # one malformed answer or bad document must not sink the run
+            note = f"{item.id}: error: {type(exc).__name__}: {exc}"
+        fallback = _BASELINE.classify(item).model_copy(update={"classifier": f"{_BASELINE.name} (fallback)"})
+        return fallback, f"{note}; used keyword baseline"
 
     results = await asyncio.gather(*(one(i) for i in items))
-    ok = [c for c, _, _ in results if c is not None]
-    notes = [n for _, n, _ in results if n]
-    failures = sum(1 for _, _, f in results if f)
-    return ok, notes, failures
+    notes = [n for _, n in results if n]
+    return [c for c, _ in results], notes, len(notes)
 
 
 # -- the run -----------------------------------------------------------------------------
@@ -196,6 +219,7 @@ async def run_once(
     items: list[SourceItem] = []
     ctx: AnalystContext | None = None
     model_name = "none"
+    owns_classifier = classifier is None
     try:
         universe = universe or load_universe(
             cfg.state_path / "cache", cfg.sources.universe_csv, cfg.sources.universe_url,
@@ -209,22 +233,30 @@ async def run_once(
         classifications, rejected, failures = await asyncio.wait_for(
             classify_all(items, classifier, store, now.astimezone(IST).date()), cfg.run_budget_s
         )
-        if items and failures == len(items):
-            raise LlmError(f"model failed on all {failures} items")
+        if failures:
+            errors.append(f"degraded: keyword baseline used for {failures}/{len(items)} items")
         ctx = compose(
             run_id, now, universe, {i.id: i for i in items}, classifications,
             g.regime, g.vol_bands, cfg.compose, model_name, g.unusual_volume,
         )
         if publish:
             publish_context(cfg.state_path, ctx)
-        status = "published"
+            status = "published"
+        else:
+            status = "recorded"  # dry run: never counted by shadow-report
     except Exception as exc:  # fallback: engine runs on default rules
         errors.append(f"fallback: {type(exc).__name__}: {exc}")
         ctx = None
         status = "fallback"
+    finally:
+        if owns_classifier and hasattr(classifier, "aclose"):
+            await classifier.aclose()
     meta = {i.id: {"title": i.title, "source": i.source, "url": i.url} for i in items}
-    store.record_run(
-        run_id, now, status, model_name, PROMPT_VERSION, SCHEMA_VERSION, len(items),
-        [(c, meta.get(c.item_id, {})) for c in classifications], len(rejected), errors + rejected, ctx,
-    )
+    try:
+        store.record_run(
+            run_id, now, status, model_name, PROMPT_VERSION, SCHEMA_VERSION, len(items),
+            [(c, meta.get(c.item_id, {})) for c in classifications], len(rejected), errors + rejected, ctx,
+        )
+    finally:
+        store.close()
     return RunResult(run_id, status, ctx, classifications, rejected, errors)
