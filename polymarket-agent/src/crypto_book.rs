@@ -65,8 +65,14 @@ pub fn momentum_holds(closes: &[Decimal], lookback: usize) -> Option<bool> {
 /// (book, short description of the rule)
 pub const RIVALS: [(&str, &str); 3] = [
     ("crypto_sma50", "above its 50-day average"),
-    ("crypto_donchian", "20-day closing high in, 10-day closing low out"),
-    ("crypto_mom_sma20", "above 60 days ago or above its 20-day average"),
+    (
+        "crypto_donchian",
+        "20-day closing high in, 10-day closing low out",
+    ),
+    (
+        "crypto_mom_sma20",
+        "above 60 days ago or above its 20-day average",
+    ),
 ];
 
 /// Whether a rival book wants to hold, from completed daily closes (oldest
@@ -74,7 +80,9 @@ pub const RIVALS: [(&str, &str); 3] = [
 pub fn rival_wants(book: &str, closes: &[Decimal], holding: bool) -> Option<bool> {
     let n = closes.len();
     let last = *closes.last()?;
-    let avg = |k: usize| (n >= k).then(|| closes[n - k..].iter().sum::<Decimal>() / Decimal::from(k as i64));
+    let avg = |k: usize| {
+        (n >= k).then(|| closes[n - k..].iter().sum::<Decimal>() / Decimal::from(k as i64))
+    };
     match book {
         "crypto_sma50" => Some(last > avg(50)?),
         "crypto_donchian" => {
@@ -117,8 +125,16 @@ pub fn parse_news_read(text: &str) -> Option<NewsRead> {
                     if risk == "normal" || risk == "severe" {
                         best = Some(NewsRead {
                             risk,
-                            reason: v.get("reason").and_then(|r| r.as_str()).unwrap_or("").to_string(),
-                            view: v.get("view").and_then(|r| r.as_str()).unwrap_or("").to_string(),
+                            reason: v
+                                .get("reason")
+                                .and_then(|r| r.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            view: v
+                                .get("view")
+                                .and_then(|r| r.as_str())
+                                .unwrap_or("")
+                                .to_string(),
                         });
                     }
                 }
@@ -209,10 +225,17 @@ impl CryptoApi {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            bail!("Alpaca {status}: {}", body.chars().take(300).collect::<String>());
+            bail!(
+                "Alpaca {status}: {}",
+                body.chars().take(300).collect::<String>()
+            );
         }
-        serde_json::from_str(&body)
-            .with_context(|| format!("unreadable Alpaca reply: {}", body.chars().take(200).collect::<String>()))
+        serde_json::from_str(&body).with_context(|| {
+            format!(
+                "unreadable Alpaca reply: {}",
+                body.chars().take(200).collect::<String>()
+            )
+        })
     }
 
     /// Completed daily closes, oldest first (today's unfinished bar dropped).
@@ -249,13 +272,21 @@ impl CryptoApi {
             .context("no latest trade")
     }
 
-    async fn buy_notional(&self, symbol: &str, usd: Decimal, client_order_id: &str) -> Result<OrderAck> {
+    async fn buy_notional(
+        &self,
+        symbol: &str,
+        usd: Decimal,
+        client_order_id: &str,
+    ) -> Result<OrderAck> {
         let body = json!({
             "symbol": symbol, "notional": usd.round_dp(2).to_string(), "side": "buy",
             "type": "market", "time_in_force": "gtc", "client_order_id": client_order_id,
         });
-        self.send(self.req(reqwest::Method::POST, format!("{}/v2/orders", self.trading)).json(&body))
-            .await
+        self.send(
+            self.req(reqwest::Method::POST, format!("{}/v2/orders", self.trading))
+                .json(&body),
+        )
+        .await
     }
 
     /// Sell the whole position (Alpaca's own close, so no dust is left behind).
@@ -266,17 +297,28 @@ impl CryptoApi {
 
     async fn position_qty(&self, symbol: &str) -> Result<Option<Decimal>> {
         let url = format!("{}/v2/positions/{}", self.trading, symbol.replace('/', ""));
-        let resp = self.req(reqwest::Method::GET, url).send().await.context("position request failed")?;
+        let resp = self
+            .req(reqwest::Method::GET, url)
+            .send()
+            .await
+            .context("position request failed")?;
         if resp.status().as_u16() == 404 {
             return Ok(None);
         }
         let body = resp.text().await.unwrap_or_default();
-        Ok(Some(serde_json::from_str::<PositionRow>(&body).context("unreadable position")?.qty))
+        Ok(Some(
+            serde_json::from_str::<PositionRow>(&body)
+                .context("unreadable position")?
+                .qty,
+        ))
     }
 
     async fn order(&self, id: &str) -> Result<OrderAck> {
-        self.send(self.req(reqwest::Method::GET, format!("{}/v2/orders/{id}", self.trading)))
-            .await
+        self.send(self.req(
+            reqwest::Method::GET,
+            format!("{}/v2/orders/{id}", self.trading),
+        ))
+        .await
     }
 
     /// Poll a market order until it fills (up to a minute).
@@ -291,7 +333,11 @@ impl CryptoApi {
             tokio::time::sleep(StdDuration::from_secs(5)).await;
             ack = self.order(&ack.id).await?;
         }
-        bail!("order {} not filled after a minute ({})", ack.id, ack.status)
+        bail!(
+            "order {} not filled after a minute ({})",
+            ack.id,
+            ack.status
+        )
     }
 
     /// The day's headlines for a coin from Google News (titles only).
@@ -312,7 +358,13 @@ impl CryptoApi {
             .filter_map(|item| {
                 let s = item.find("<title>")? + 7;
                 let e = item.find("</title>")?;
-                (s < e).then(|| item[s..e].replace("<![CDATA[", "").replace("]]>", "").trim().to_string())
+                (s < e).then(|| {
+                    item[s..e]
+                        .replace("<![CDATA[", "")
+                        .replace("]]>", "")
+                        .trim()
+                        .to_string()
+                })
             })
             .take(12)
             .collect()
@@ -338,8 +390,18 @@ Most days are normal. Reply with JSON only, no other text: \
 
 /// Words that usually mean a specific event rather than price chatter.
 const RED_FLAGS: [&str; 12] = [
-    "hack", "heist", "exploit", "stolen", "drained", "depeg", "insolven", "bankrupt",
-    "halts withdrawals", "suspends withdrawals", "ban", "liquidation cascade",
+    "hack",
+    "heist",
+    "exploit",
+    "stolen",
+    "drained",
+    "depeg",
+    "insolven",
+    "bankrupt",
+    "halts withdrawals",
+    "suspends withdrawals",
+    "ban",
+    "liquidation cascade",
 ];
 
 /// The headlines carrying a red-flag word, so the model is pointed at them.
@@ -353,7 +415,8 @@ pub fn red_flag_headlines(headlines: &[String]) -> Vec<&String> {
             RED_FLAGS.iter().any(|w| {
                 // "ban" only as a word, not inside "bank" or "urban".
                 if *w == "ban" {
-                    l.split(|c: char| !c.is_ascii_alphabetic()).any(|t| t == "ban" || t == "bans" || t == "banned")
+                    l.split(|c: char| !c.is_ascii_alphabetic())
+                        .any(|t| t == "ban" || t == "bans" || t == "banned")
                 } else {
                     l.contains(w)
                 }
@@ -369,14 +432,21 @@ async fn read_news(
     chg: (Option<Decimal>, Option<Decimal>, Option<Decimal>),
     headlines: &[String],
 ) -> NewsRead {
-    let unknown = |reason: &str| NewsRead { risk: "unknown".into(), reason: reason.into(), view: String::new() };
+    let unknown = |reason: &str| NewsRead {
+        risk: "unknown".into(),
+        reason: reason.into(),
+        view: String::new(),
+    };
     let Some(llm) = llm else {
         return unknown("no model configured");
     };
     if headlines.is_empty() {
         return unknown("no headlines could be fetched");
     }
-    let pct = |x: Option<Decimal>| x.map(|v| format!("{:+.1}%", v * Decimal::ONE_HUNDRED)).unwrap_or("n/a".into());
+    let pct = |x: Option<Decimal>| {
+        x.map(|v| format!("{:+.1}%", v * Decimal::ONE_HUNDRED))
+            .unwrap_or("n/a".into())
+    };
     let flagged = red_flag_headlines(headlines);
     let flag_note = if flagged.is_empty() {
         String::new()
@@ -395,7 +465,8 @@ async fn read_news(
         headlines.join("\n- ")
     );
     match llm.complete(NEWS_SYSTEM, &user, None).await {
-        Ok(resp) => parse_news_read(&resp.text).unwrap_or_else(|| unknown("the model's reply had no verdict")),
+        Ok(resp) => parse_news_read(&resp.text)
+            .unwrap_or_else(|| unknown("the model's reply had no verdict")),
         Err(e) => {
             warn!(coin, error = %format!("{e:#}"), "Crypto news read failed");
             unknown("the model did not answer")
@@ -416,7 +487,17 @@ pub fn spawn_crypto_worker(
         loop {
             let now = Utc::now();
             for symbol in &config.symbols {
-                if let Err(e) = tick(&api, llm.as_deref(), &store, &kill_switch, &config, symbol, now).await {
+                if let Err(e) = tick(
+                    &api,
+                    llm.as_deref(),
+                    &store,
+                    &kill_switch,
+                    &config,
+                    symbol,
+                    now,
+                )
+                .await
+                {
                     warn!(symbol = %symbol, error = %format!("{e:#}"), "Crypto book check failed");
                 }
             }
@@ -450,7 +531,9 @@ async fn tick(
             .await?
             .or(store.crypto_last_check(symbol, "daily").await?)
             .and_then(|(_, at)| DateTime::parse_from_rfc3339(&at).ok())
-            .is_none_or(|at| now - at.with_timezone(&Utc) >= Duration::minutes(60));
+            .map_or(true, |at| {
+                now - at.with_timezone(&Utc) >= Duration::minutes(60)
+            });
     if !daily_due && !hourly_due {
         return Ok(());
     }
@@ -464,11 +547,19 @@ async fn tick(
         change(&closes, 7, price),
         change(&closes, config.lookback_days, price),
     );
-    let heads = if config.news_guard { api.headlines(coin_name(symbol)).await } else { Vec::new() };
+    let heads = if config.news_guard {
+        api.headlines(coin_name(symbol)).await
+    } else {
+        Vec::new()
+    };
     let news = if config.news_guard {
         read_news(llm, coin_name(symbol), price, chg, &heads).await
     } else {
-        NewsRead { risk: "unknown".into(), reason: "news guard off".into(), view: String::new() }
+        NewsRead {
+            risk: "unknown".into(),
+            reason: "news guard off".into(),
+            view: String::new(),
+        }
     };
     let severe = news.risk == "severe";
     let rule_says = if rule { "HOLD" } else { "CASH" };
@@ -476,12 +567,39 @@ async fn tick(
 
     if daily_due {
         // The shadow book: the rule alone, filled at this price less the fee.
-        paper_fill(store, config, SHADOW, symbol, rule, price, "above 60 days ago", &mut actions).await?;
+        paper_fill(
+            store,
+            config,
+            SHADOW,
+            symbol,
+            rule,
+            price,
+            "above 60 days ago",
+            &mut actions,
+        )
+        .await?;
         for (book, about) in RIVALS {
             let holding = store.crypto_open(book, symbol).await?.is_some();
             match rival_wants(book, &closes, holding) {
-                Some(want) => paper_fill(store, config, book, symbol, want, price, about, &mut actions).await?,
-                None => warn!(book, symbol, closes = closes.len(), "Not enough history for a rival crypto rule"),
+                Some(want) => {
+                    paper_fill(
+                        store,
+                        config,
+                        book,
+                        symbol,
+                        want,
+                        price,
+                        about,
+                        &mut actions,
+                    )
+                    .await?
+                }
+                None => warn!(
+                    book,
+                    symbol,
+                    closes = closes.len(),
+                    "Not enough history for a rival crypto rule"
+                ),
             }
         }
     }
@@ -493,42 +611,90 @@ async fn tick(
             let budget = budget(store, BOOK, config).await?;
             // A buy whose fill was not confirmed last time is already held:
             // adopt it rather than buy a second one.
-            let held = api.position_qty(symbol).await?.filter(|q| *q > Decimal::ZERO);
+            let held = api
+                .position_qty(symbol)
+                .await?
+                .filter(|q| *q > Decimal::ZERO);
             if let Some(qty) = held {
-                store.crypto_insert_open(BOOK, symbol, qty, budget, price, "adopted the position already held", None).await?;
+                store
+                    .crypto_insert_open(
+                        BOOK,
+                        symbol,
+                        qty,
+                        budget,
+                        price,
+                        "adopted the position already held",
+                        None,
+                    )
+                    .await?;
                 actions.push(format!("crypto adopted {qty} already held"));
             } else if kill_switch.is_tripped() {
                 actions.push("crypto: no buy, the agent is halted".into());
             } else if budget < MIN_ORDER_USD {
-                actions.push(format!("crypto: no buy, ${} left to trade", budget.round_dp(2)));
+                actions.push(format!(
+                    "crypto: no buy, ${} left to trade",
+                    budget.round_dp(2)
+                ));
             } else {
-                let cid = format!("crypto-{}-{}", symbol.replace('/', "").to_lowercase(), now.timestamp());
-                let ack = api.wait_fill(api.buy_notional(symbol, budget, &cid).await?).await?;
+                let cid = format!(
+                    "crypto-{}-{}",
+                    symbol.replace('/', "").to_lowercase(),
+                    now.timestamp()
+                );
+                let ack = api
+                    .wait_fill(api.buy_notional(symbol, budget, &cid).await?)
+                    .await?;
                 let fill = ack.filled_avg_price.unwrap_or(price);
                 let qty = match api.position_qty(symbol).await {
                     Ok(Some(q)) => q,
                     _ => ack.filled_qty.unwrap_or_default(),
                 };
-                store.crypto_insert_open(BOOK, symbol, qty, budget, fill, "rule: above 60 days ago; news normal", Some(&cid)).await?;
+                store
+                    .crypto_insert_open(
+                        BOOK,
+                        symbol,
+                        qty,
+                        budget,
+                        fill,
+                        "rule: above 60 days ago; news normal",
+                        Some(&cid),
+                    )
+                    .await?;
                 info!(symbol, usd = %budget.round_dp(2), price = %fill, "Crypto book bought");
-                actions.push(format!("crypto bought ${} at {}", budget.round_dp(2), fill.round_dp(2)));
+                actions.push(format!(
+                    "crypto bought ${} at {}",
+                    budget.round_dp(2),
+                    fill.round_dp(2)
+                ));
             }
         }
-        None if rule && severe && daily_due => actions.push(format!("crypto: buy vetoed by news ({})", news.reason)),
+        None if rule && severe && daily_due => {
+            actions.push(format!("crypto: buy vetoed by news ({})", news.reason))
+        }
         Some((id, _, cost)) if !want => {
-            let why = if severe { format!("news: {}", news.reason) } else { "rule: below 60 days ago".to_string() };
+            let why = if severe {
+                format!("news: {}", news.reason)
+            } else {
+                "rule: below 60 days ago".to_string()
+            };
             let ack = api.wait_fill(api.close_position(symbol).await?).await?;
             let fill = ack.filled_avg_price.unwrap_or(price);
             let proceeds = ack.filled_qty.unwrap_or_default() * fill;
             let cid = (!ack.client_order_id.is_empty()).then_some(ack.client_order_id.as_str());
-            store.crypto_close(id, fill, proceeds, cost, &why, cid).await?;
+            store
+                .crypto_close(id, fill, proceeds, cost, &why, cid)
+                .await?;
             info!(symbol, proceeds = %proceeds.round_dp(2), reason = %why, "Crypto book sold");
             actions.push(format!("crypto sold for ${} ({why})", proceeds.round_dp(2)));
         }
         _ => {}
     }
 
-    let action = if actions.is_empty() { "no change".to_string() } else { actions.join("; ") };
+    let action = if actions.is_empty() {
+        "no change".to_string()
+    } else {
+        actions.join("; ")
+    };
     info!(symbol, kind = if daily_due { "daily" } else { "hourly" }, rule = rule_says, news = %news.risk,
           price = %price, action = %action, "Crypto check");
     store
@@ -542,7 +708,12 @@ async fn tick(
             &news.risk,
             &news.reason,
             &news.view,
-            &heads.iter().take(5).cloned().collect::<Vec<_>>().join(" | "),
+            &heads
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" | "),
             &action,
         )
         .await
@@ -565,13 +736,30 @@ async fn paper_fill(
         (true, None) if budget >= MIN_ORDER_USD => {
             let qty = budget * (Decimal::ONE - FEE) / price;
             store
-                .crypto_insert_open(book, symbol, qty.round_dp(9), budget, price, &format!("rule: {about}"), None)
+                .crypto_insert_open(
+                    book,
+                    symbol,
+                    qty.round_dp(9),
+                    budget,
+                    price,
+                    &format!("rule: {about}"),
+                    None,
+                )
                 .await?;
             actions.push(format!("{book} bought ${}", budget.round_dp(2)));
         }
         (false, Some((id, qty, cost))) => {
             let proceeds = qty * price * (Decimal::ONE - FEE);
-            store.crypto_close(id, price, proceeds, cost, &format!("rule no longer: {about}"), None).await?;
+            store
+                .crypto_close(
+                    id,
+                    price,
+                    proceeds,
+                    cost,
+                    &format!("rule no longer: {about}"),
+                    None,
+                )
+                .await?;
             actions.push(format!("{book} sold for ${}", proceeds.round_dp(2)));
         }
         _ => {}
@@ -597,26 +785,43 @@ mod tests {
     #[test]
     fn holds_only_above_the_close_lookback_days_earlier() {
         assert_eq!(momentum_holds(&closes(&[100, 90, 95, 101]), 3), Some(true));
-        assert_eq!(momentum_holds(&closes(&[100, 120, 130, 99]), 3), Some(false));
-        assert_eq!(momentum_holds(&closes(&[100, 101]), 3), None, "not enough history");
+        assert_eq!(
+            momentum_holds(&closes(&[100, 120, 130, 99]), 3),
+            Some(false)
+        );
+        assert_eq!(
+            momentum_holds(&closes(&[100, 101]), 3),
+            None,
+            "not enough history"
+        );
     }
 
     #[test]
     fn rival_rules_read_the_closes_as_backtested() {
         // 59 closes at 100, then 60 at 90: below the 50-day average and 60 days ago.
-        let mut c: Vec<Decimal> = std::iter::repeat_n(dec!(100), 59).chain(std::iter::repeat_n(dec!(90), 60)).collect();
+        let mut c: Vec<Decimal> = std::iter::repeat_n(dec!(100), 59)
+            .chain(std::iter::repeat_n(dec!(90), 60))
+            .collect();
         assert_eq!(rival_wants("crypto_sma50", &c, false), Some(false));
         assert_eq!(rival_wants("crypto_mom_sma20", &c, false), Some(false));
         // A jump to a new 20-day high: in on all three.
         c.push(dec!(95));
         assert_eq!(rival_wants("crypto_donchian", &c, false), Some(true));
-        assert_eq!(rival_wants("crypto_mom_sma20", &c, false), Some(true), "above the 20-day average");
+        assert_eq!(
+            rival_wants("crypto_mom_sma20", &c, false),
+            Some(true),
+            "above the 20-day average"
+        );
         // Held, it stays in until a close under the 10 closes before it.
         c.push(dec!(91));
         assert_eq!(rival_wants("crypto_donchian", &c, true), Some(true));
         c.push(dec!(89));
         assert_eq!(rival_wants("crypto_donchian", &c, true), Some(false));
-        assert_eq!(rival_wants("crypto_sma50", &c[..10], false), None, "not enough history");
+        assert_eq!(
+            rival_wants("crypto_sma50", &c[..10], false),
+            None,
+            "not enough history"
+        );
         assert_eq!(rival_wants("crypto_unknown", &c, false), None);
     }
 
@@ -632,7 +837,10 @@ mod tests {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        let flagged: Vec<&str> = red_flag_headlines(&h).into_iter().map(|s| s.as_str()).collect();
+        let flagged: Vec<&str> = red_flag_headlines(&h)
+            .into_iter()
+            .map(|s| s.as_str())
+            .collect();
         assert_eq!(flagged, vec![h[0].as_str(), h[3].as_str(), h[4].as_str()]);
     }
 
@@ -642,7 +850,10 @@ mod tests {
         assert_eq!(r.risk, "severe");
         assert_eq!(r.reason, "exchange hacked");
         assert!(parse_news_read("no json here").is_none());
-        assert!(parse_news_read("{\"risk\": \"maybe\"}").is_none(), "only normal or severe count");
+        assert!(
+            parse_news_read("{\"risk\": \"maybe\"}").is_none(),
+            "only normal or severe count"
+        );
     }
 
     #[test]
@@ -658,11 +869,39 @@ mod tests {
         let store = Store::new(":memory:").await.unwrap();
         let cfg = CryptoConfig::default();
         assert_eq!(budget(&store, BOOK, &cfg).await.unwrap(), dec!(10));
-        let id = store.crypto_insert_open(BOOK, "BTC/USD", dec!(0.0001), dec!(10), dec!(100000), "t", None).await.unwrap();
-        store.crypto_close(id, dec!(80000), dec!(8), dec!(10), "t", None).await.unwrap();
-        assert_eq!(budget(&store, BOOK, &cfg).await.unwrap(), dec!(9), "a $2 loss comes off the $20");
-        let id = store.crypto_insert_open(BOOK, "ETH/USD", dec!(0.01), dec!(9), dec!(900), "t", None).await.unwrap();
-        store.crypto_close(id, dec!(1500), dec!(15), dec!(9), "t", None).await.unwrap();
-        assert_eq!(budget(&store, BOOK, &cfg).await.unwrap(), dec!(9), "the $6 profit is set aside");
+        let id = store
+            .crypto_insert_open(
+                BOOK,
+                "BTC/USD",
+                dec!(0.0001),
+                dec!(10),
+                dec!(100000),
+                "t",
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .crypto_close(id, dec!(80000), dec!(8), dec!(10), "t", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            budget(&store, BOOK, &cfg).await.unwrap(),
+            dec!(9),
+            "a $2 loss comes off the $20"
+        );
+        let id = store
+            .crypto_insert_open(BOOK, "ETH/USD", dec!(0.01), dec!(9), dec!(900), "t", None)
+            .await
+            .unwrap();
+        store
+            .crypto_close(id, dec!(1500), dec!(15), dec!(9), "t", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            budget(&store, BOOK, &cfg).await.unwrap(),
+            dec!(9),
+            "the $6 profit is set aside"
+        );
     }
 }

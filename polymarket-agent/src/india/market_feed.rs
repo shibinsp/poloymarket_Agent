@@ -101,6 +101,7 @@ struct UpstoxFeedAuthorizeResponse {
 #[derive(Debug, Deserialize)]
 struct UpstoxFeedAuthorizeData {
     #[serde(alias = "authorizedRedirectUri")]
+    #[allow(dead_code)] // part of Upstox's reply; kept for completeness
     pub authorized_redirect_uri: Option<String>,
 }
 
@@ -973,7 +974,11 @@ impl UpstoxLiveMarketFeed {
                                 loop {
                                     if minute_start.elapsed().as_secs() >= 60 {
                                         if detect_nse_session(Utc::now()).is_trading_active {
-                                            info!(frames, ticks = stream_ticks, "Upstox V3 stream, last minute");
+                                            info!(
+                                                frames,
+                                                ticks = stream_ticks,
+                                                "Upstox V3 stream, last minute"
+                                            );
                                         }
                                         minute_start = std::time::Instant::now();
                                         frames = 0;

@@ -888,7 +888,11 @@ pub struct IndiaBacktestRunRequest {
 async fn us_orb_trades_handler(State(state): State<DashboardState>) -> impl IntoResponse {
     let mut trades = Vec::new();
     for strategy in [crate::us::orb::ORB_STRATEGY, crate::us::orb::BURST_STRATEGY] {
-        match state.store.recent_strategy_trades("alpaca", strategy, 100).await {
+        match state
+            .store
+            .recent_strategy_trades("alpaca", strategy, 100)
+            .await
+        {
             Ok(t) => trades.extend(t),
             Err(e) => return rows_unavailable(e),
         }
@@ -902,8 +906,14 @@ async fn us_orb_trades_handler(State(state): State<DashboardState>) -> impl Into
             let strategies = [crate::us::orb::ORB_STRATEGY, crate::us::orb::BURST_STRATEGY];
             let today = chrono::Utc::now().date_naive();
             match (
-                state.store.strategies_realized_since(&strategies, since).await,
-                state.store.strategies_realized_since(&strategies, Some(today)).await,
+                state
+                    .store
+                    .strategies_realized_since(&strategies, since)
+                    .await,
+                state
+                    .store
+                    .strategies_realized_since(&strategies, Some(today))
+                    .await,
             ) {
                 (Ok(realized), Ok(today_pnl)) => serde_json::json!({
                     "capital_usd": capital,
@@ -987,10 +997,19 @@ async fn target_handler(State(state): State<DashboardState>) -> impl IntoRespons
         Ok(rows) => rows,
         Err(e) => return rows_unavailable(e),
     };
-    let india = state.store.india_real_pnl_by_day(&t.since).await.unwrap_or_default();
-    let poly = state.store.polymarket_pnl_by_day(&t.since).await.unwrap_or_default();
+    let india = state
+        .store
+        .india_real_pnl_by_day(&t.since)
+        .await
+        .unwrap_or_default();
+    let poly = state
+        .store
+        .polymarket_pnl_by_day(&t.since)
+        .await
+        .unwrap_or_default();
     let dec = |s: &str| s.parse::<Decimal>().unwrap_or_default();
-    let mut days: std::collections::BTreeMap<String, (Decimal, Decimal, Decimal)> = Default::default();
+    let mut days: std::collections::BTreeMap<String, (Decimal, Decimal, Decimal)> =
+        Default::default();
     for r in equity.iter().filter(|r| r.day.as_str() >= t.since.as_str()) {
         if let Some(close) = r.closing_equity.as_deref() {
             days.entry(r.day.clone()).or_default().0 = dec(close) - dec(&r.starting_equity);
@@ -1019,7 +1038,10 @@ async fn target_handler(State(state): State<DashboardState>) -> impl IntoRespons
         })
         .collect();
     let n = Decimal::from(rows.len().max(1) as i64);
-    let sum: Decimal = days.values().map(|(us, inr, pm)| (*us + *pm) * t.usd_inr + *inr).sum();
+    let sum: Decimal = days
+        .values()
+        .map(|(us, inr, pm)| (*us + *pm) * t.usd_inr + *inr)
+        .sum();
     Json(serde_json::json!({
         "target_inr": t.daily_inr,
         "usd_inr": t.usd_inr,
@@ -1049,11 +1071,18 @@ async fn us_news_handler(
         return Json(serde_json::json!({ "status": "OFF", "items": [] }));
     };
     let b = news.read().await;
-    let symbol = q.symbol.map(|s| s.trim().to_ascii_uppercase()).filter(|s| !s.is_empty());
+    let symbol = q
+        .symbol
+        .map(|s| s.trim().to_ascii_uppercase())
+        .filter(|s| !s.is_empty());
     let items: Vec<&crate::us::news_stream::NewsItem> = b
         .items
         .iter()
-        .filter(|i| symbol.as_ref().is_none_or(|s| i.symbols.iter().any(|x| x == s)))
+        .filter(|i| {
+            symbol
+                .as_ref()
+                .map_or(true, |s| i.symbols.iter().any(|x| x == s))
+        })
         .take(q.limit.unwrap_or(200).min(500))
         .collect();
     Json(serde_json::json!({
@@ -1081,7 +1110,8 @@ async fn range_scanner_handler(State(state): State<DashboardState>) -> impl Into
 /// at their last check's price, trades and the market checks, newest first.
 async fn crypto_handler(State(state): State<DashboardState>) -> impl IntoResponse {
     let Some(capital) = state.crypto_capital_usd else {
-        return Json(serde_json::json!({ "books": [], "trades": [], "checks": [] })).into_response();
+        return Json(serde_json::json!({ "books": [], "trades": [], "checks": [] }))
+            .into_response();
     };
     let (trades, checks) = match state.store.crypto_recent(100).await {
         Ok(x) => x,
@@ -1093,10 +1123,13 @@ async fn crypto_handler(State(state): State<DashboardState>) -> impl IntoRespons
             .unwrap_or_default()
     };
     // The latest price per coin, from its newest check.
-    let mut last_price: std::collections::HashMap<String, Decimal> = std::collections::HashMap::new();
+    let mut last_price: std::collections::HashMap<String, Decimal> =
+        std::collections::HashMap::new();
     for c in &checks {
         if let Some(sym) = c["symbol"].as_str() {
-            last_price.entry(sym.to_string()).or_insert_with(|| dec(&c["price"]));
+            last_price
+                .entry(sym.to_string())
+                .or_insert_with(|| dec(&c["price"]));
         }
     }
     let mut books = Vec::new();
@@ -1110,8 +1143,15 @@ async fn crypto_handler(State(state): State<DashboardState>) -> impl IntoRespons
         };
         let mut open_value = Decimal::ZERO;
         let mut open_cost = Decimal::ZERO;
-        for t in trades.iter().filter(|t| t["book"] == book && t["status"] == "OPEN") {
-            let px = t["symbol"].as_str().and_then(|s| last_price.get(s)).copied().unwrap_or_default();
+        for t in trades
+            .iter()
+            .filter(|t| t["book"] == book && t["status"] == "OPEN")
+        {
+            let px = t["symbol"]
+                .as_str()
+                .and_then(|s| last_price.get(s))
+                .copied()
+                .unwrap_or_default();
             open_value += dec(&t["qty"]) * px;
             open_cost += dec(&t["cost"]);
         }
@@ -1144,7 +1184,10 @@ async fn us_desk_handler(State(state): State<DashboardState>) -> impl IntoRespon
 /// The US "buy a weak close" (IBS) paper book: money, what is held, trades.
 async fn us_ibs_handler(State(state): State<DashboardState>) -> impl IntoResponse {
     use crate::us::ibs::{CAPITAL_USD, FUNDS, THRESHOLD};
-    match (state.store.ibs_realized().await, state.store.ibs_trades(100).await) {
+    match (
+        state.store.ibs_realized().await,
+        state.store.ibs_trades(100).await,
+    ) {
         (Ok(realized), Ok(trades)) => {
             let losses: Decimal = trades
                 .iter()
@@ -1167,10 +1210,18 @@ async fn us_ibs_handler(State(state): State<DashboardState>) -> impl IntoRespons
 /// The US pre-FOMC drift paper book (SPY): money, what is held, trades, next meeting.
 async fn us_prefomc_handler(State(state): State<DashboardState>) -> impl IntoResponse {
     use crate::us::prefomc::{decision_days, CAPITAL_USD, SYMBOL};
-    match (state.store.prefomc_realized().await, state.store.prefomc_trades(100).await) {
+    match (
+        state.store.prefomc_realized().await,
+        state.store.prefomc_trades(100).await,
+    ) {
         (Ok(realized), Ok(trades)) => {
-            let today = chrono::Utc::now().with_timezone(&chrono_tz::America::New_York).date_naive();
-            let next = decision_days().into_iter().find(|d| *d >= today).map(|d| d.to_string());
+            let today = chrono::Utc::now()
+                .with_timezone(&chrono_tz::America::New_York)
+                .date_naive();
+            let next = decision_days()
+                .into_iter()
+                .find(|d| *d >= today)
+                .map(|d| d.to_string());
             Json(serde_json::json!({
                 "capital_usd": CAPITAL_USD, "symbol": SYMBOL, "next_decision": next,
                 "pnl_total_usd": realized.round_dp(2),
@@ -1187,7 +1238,10 @@ async fn us_prefomc_handler(State(state): State<DashboardState>) -> impl IntoRes
 /// The US Turnaround Tuesday paper book (DIA): money, what is held, trades.
 async fn us_turnaround_handler(State(state): State<DashboardState>) -> impl IntoResponse {
     use crate::us::turnaround::{CAPITAL_USD, SMA_DAYS, SYMBOL};
-    match (state.store.turnaround_realized().await, state.store.turnaround_trades(100).await) {
+    match (
+        state.store.turnaround_realized().await,
+        state.store.turnaround_trades(100).await,
+    ) {
         (Ok(realized), Ok(trades)) => {
             let losses: Decimal = trades
                 .iter()
@@ -1226,7 +1280,10 @@ async fn us_ladder_handler(State(state): State<DashboardState>) -> impl IntoResp
             let pnl = |r: &(String, String, String)| Decimal::from_str(&r.2).unwrap_or_default();
             let total: Decimal = rows.iter().map(pnl).sum();
             let today_pnl: Decimal = rows.iter().filter(|r| r.0 == today).map(pnl).sum();
-            let taken = rows.iter().filter(|r| Decimal::from_str(&r.1).unwrap_or_default() > Decimal::ZERO).count();
+            let taken = rows
+                .iter()
+                .filter(|r| Decimal::from_str(&r.1).unwrap_or_default() > Decimal::ZERO)
+                .count();
             out.push(serde_json::json!({
                 "book": book, "capital_usd": amount,
                 "trades_taken": taken, "trades_too_small": rows.len() - taken,
@@ -1249,8 +1306,13 @@ async fn india_intraday_handler(State(state): State<DashboardState>) -> impl Int
     };
     let books = state.india_books();
     let mut out = Vec::new();
-    let (mut capital, mut count, mut today_pnl, mut total_pnl, mut losses) =
-        (Decimal::ZERO, 0i64, Decimal::ZERO, Decimal::ZERO, Decimal::ZERO);
+    let (mut capital, mut count, mut today_pnl, mut total_pnl, mut losses) = (
+        Decimal::ZERO,
+        0i64,
+        Decimal::ZERO,
+        Decimal::ZERO,
+        Decimal::ZERO,
+    );
     for (strategy, cap) in &books {
         let totals = state.store.intraday_totals(strategy, &day).await;
         let lost = state.store.intraday_losses(strategy).await;
@@ -1276,8 +1338,14 @@ async fn india_intraday_handler(State(state): State<DashboardState>) -> impl Int
     // of the totals above, which are real books only.
     let mut shadow = Vec::new();
     for (book, ledger) in [
-        (crate::india::orb::STRATEGY, crate::india::timesfm::ORB_SHADOW),
-        (crate::india::burst::STRATEGY, crate::india::timesfm::BURST_SHADOW),
+        (
+            crate::india::orb::STRATEGY,
+            crate::india::timesfm::ORB_SHADOW,
+        ),
+        (
+            crate::india::burst::STRATEGY,
+            crate::india::timesfm::BURST_SHADOW,
+        ),
         (crate::india::orb::STRATEGY, crate::india::orb::TRACK),
     ] {
         match state.store.intraday_totals(ledger, &day).await {
@@ -3121,7 +3189,11 @@ async fn intraday_status_handler(State(state): State<DashboardState>) -> impl In
     // aside. An unreadable ledger counts as no losses here, display only.
     let mut intraday_trading = Decimal::ZERO;
     for (strategy, cap) in &books {
-        let lost = state.store.intraday_losses(strategy).await.unwrap_or_default();
+        let lost = state
+            .store
+            .intraday_losses(strategy)
+            .await
+            .unwrap_or_default();
         intraday_trading += crate::india::orb::trading_cash(*cap, lost);
     }
     let intraday_capital_inr = (!books.is_empty()).then_some(intraday_trading);
@@ -3305,7 +3377,9 @@ async fn venue_toggle_handler(
     .into_response()
 }
 
-async fn logs_handler(axum::extract::Query(query): axum::extract::Query<LogsQuery>) -> impl IntoResponse {
+async fn logs_handler(
+    axum::extract::Query(query): axum::extract::Query<LogsQuery>,
+) -> impl IntoResponse {
     const LOG_PATH: &str = "/tmp/moneyai.log";
     const MAX_LINES: usize = 1_000;
     const READ_BYTES: u64 = 512 * 1024;
@@ -3328,7 +3402,7 @@ async fn logs_handler(axum::extract::Query(query): axum::extract::Query<LogsQuer
             return vec!["[error reading log file]".to_string()];
         }
         let content = if offset > 0 {
-            buf.splitn(2, '\n').nth(1).unwrap_or("")
+            buf.split_once('\n').map_or("", |(_, rest)| rest)
         } else {
             &buf
         };

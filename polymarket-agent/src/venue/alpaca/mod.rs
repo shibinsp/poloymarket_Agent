@@ -523,7 +523,8 @@ impl AlpacaVenue {
                     let mut fetched = Vec::with_capacity(wanted.len());
                     for chunk in wanted.chunks(8) {
                         let results =
-                            futures_util::future::join_all(chunk.iter().map(|s| self.asset(s))).await;
+                            futures_util::future::join_all(chunk.iter().map(|s| self.asset(s)))
+                                .await;
                         fetched.extend(chunk.iter().cloned().zip(results));
                     }
                     let mut known = self.symbol_assets.write().await;

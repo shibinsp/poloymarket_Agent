@@ -217,7 +217,10 @@ pub(crate) async fn fetch_market_resolution(
 /// `None` unless the prices are a clean settlement: one side at least 0.99
 /// and the other at most 0.01. First outcome is YES, second is NO.
 fn settled_yes_won(prices: &[String]) -> Option<bool> {
-    let p: Vec<Decimal> = prices.iter().filter_map(|s| Decimal::from_str(s).ok()).collect();
+    let p: Vec<Decimal> = prices
+        .iter()
+        .filter_map(|s| Decimal::from_str(s).ok())
+        .collect();
     if p.len() != 2 {
         return None;
     }
@@ -383,15 +386,19 @@ mod tests {
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::query_param("condition_ids", "0xohio"))
             .and(wiremock::matchers::query_param("closed", "true"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"conditionId": "0xohio", "closed": true, "outcomePrices": "[\"1\", \"0\"]"}
-            ])))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {"conditionId": "0xohio", "closed": true, "outcomePrices": "[\"1\", \"0\"]"}
+                ])),
+            )
             .mount(&server)
             .await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"conditionId": "0xother", "closed": true, "outcomePrices": "[\"0\", \"1\"]"}
-            ])))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {"conditionId": "0xother", "closed": true, "outcomePrices": "[\"0\", \"1\"]"}
+                ])),
+            )
             .mount(&server)
             .await;
 

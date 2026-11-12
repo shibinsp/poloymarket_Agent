@@ -73,7 +73,7 @@ pub fn burst_side(open: Decimal, close: Decimal, rvol: Decimal) -> Option<(bool,
 /// direction, loudest first.
 pub fn pick(bursts: Vec<Burst>, nifty_up: bool, n: usize) -> Vec<Burst> {
     let mut with_nifty: Vec<Burst> = bursts.into_iter().filter(|b| b.buy == nifty_up).collect();
-    with_nifty.sort_by(|a, b| b.rvol.cmp(&a.rvol));
+    with_nifty.sort_by_key(|b| std::cmp::Reverse(b.rvol));
     with_nifty.truncate(n);
     with_nifty
 }
@@ -194,7 +194,19 @@ async fn look_for_entry(
             info!(symbol = %p.symbol, "Burst entry after the 9:20 bar; skipping");
             continue;
         }
-        if let Err(e) = enter(data, store, capital, slice, today, now, &p, bursts.len(), tfm_veto).await {
+        if let Err(e) = enter(
+            data,
+            store,
+            capital,
+            slice,
+            today,
+            now,
+            &p,
+            bursts.len(),
+            tfm_veto,
+        )
+        .await
+        {
             warn!(symbol = %p.symbol, error = %e, "Burst entry failed");
         }
     }
@@ -259,8 +271,11 @@ async fn enter(
     };
     let tfm_skip = tfm_veto && tfm.is_some_and(|v| !v.agrees);
 
-
-    let action = if blocked.is_some() || tfm_skip { "SKIP" } else { "TRADE" };
+    let action = if blocked.is_some() || tfm_skip {
+        "SKIP"
+    } else {
+        "TRADE"
+    };
     let card = serde_json::json!({
         "at": now,
         "market": "IN",
@@ -304,7 +319,17 @@ async fn enter(
         .await?;
     if !tfm_skip {
         info!(symbol = %p.symbol, buy, qty, %price, %stop, rvol = %p.rvol, "NSE opening-burst paper entry; no live order was sent");
-        crate::india::ladder::mirror_entry(store, STRATEGY, &today.to_string(), &p.symbol, buy, price, stop, now).await;
+        crate::india::ladder::mirror_entry(
+            store,
+            STRATEGY,
+            &today.to_string(),
+            &p.symbol,
+            buy,
+            price,
+            stop,
+            now,
+        )
+        .await;
     }
     Ok(())
 }
@@ -327,10 +352,24 @@ mod tests {
 
     #[test]
     fn a_burst_needs_a_one_percent_move_on_three_times_the_volume() {
-        assert_eq!(burst_side(dec!(100), dec!(101), dec!(3)), Some((true, dec!(0.01))));
-        assert_eq!(burst_side(dec!(100), dec!(98.5), dec!(4)), Some((false, dec!(-0.015))));
-        assert_eq!(burst_side(dec!(100), dec!(100.9), dec!(9)), None, "move too small");
-        assert_eq!(burst_side(dec!(100), dec!(102), dec!(2.9)), None, "volume too low");
+        assert_eq!(
+            burst_side(dec!(100), dec!(101), dec!(3)),
+            Some((true, dec!(0.01)))
+        );
+        assert_eq!(
+            burst_side(dec!(100), dec!(98.5), dec!(4)),
+            Some((false, dec!(-0.015)))
+        );
+        assert_eq!(
+            burst_side(dec!(100), dec!(100.9), dec!(9)),
+            None,
+            "move too small"
+        );
+        assert_eq!(
+            burst_side(dec!(100), dec!(102), dec!(2.9)),
+            None,
+            "volume too low"
+        );
     }
 
     #[test]

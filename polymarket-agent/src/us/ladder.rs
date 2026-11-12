@@ -49,9 +49,7 @@ fn dec(s: &str) -> Decimal {
 pub fn ny_day(ts: &str) -> Option<String> {
     let t = DateTime::parse_from_rfc3339(ts)
         .map(|t| t.with_timezone(&Utc))
-        .or_else(|_| {
-            NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S%.f").map(|n| n.and_utc())
-        })
+        .or_else(|_| NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S%.f").map(|n| n.and_utc()))
         .ok()?;
     Some(t.with_timezone(&New_York).date_naive().to_string())
 }
@@ -66,7 +64,11 @@ pub fn contracts(cash: Decimal, premium: Decimal) -> i64 {
     if premium <= Decimal::ZERO {
         return 0;
     }
-    (cash / (premium * dec!(100))).floor().to_i64().unwrap_or(0).max(0)
+    (cash / (premium * dec!(100)))
+        .floor()
+        .to_i64()
+        .unwrap_or(0)
+        .max(0)
 }
 
 /// Spreads handed out one at a time across the day's trades while the cash
@@ -126,7 +128,9 @@ pub async fn sync(store: &Store, now: DateTime<Utc>) -> Result<usize> {
         if done.contains(&id) {
             continue;
         }
-        let Some(day) = ny_day(&created) else { continue };
+        let Some(day) = ny_day(&created) else {
+            continue;
+        };
         let notional = dec(&qty).abs() * dec(&fill);
         if notional <= Decimal::ZERO {
             continue;
@@ -134,13 +138,18 @@ pub async fn sync(store: &Store, now: DateTime<Utc>) -> Result<usize> {
         let ret = dec(&pnl) / notional;
         let n = Decimal::from((*per_night.get(&day).unwrap_or(&1)).max(1));
         for amount in AMOUNTS {
-            let c = cash(Decimal::from(amount), realized_before(store, ORB, amount, &day).await?) / n;
+            let c = cash(
+                Decimal::from(amount),
+                realized_before(store, ORB, amount, &day).await?,
+            ) / n;
             let (units, p) = if c >= Decimal::ONE {
                 ((c / dec(&fill)).round_dp(6), c * ret)
             } else {
                 (Decimal::ZERO, Decimal::ZERO)
             };
-            store.insert_us_ladder(ORB, amount, id, &day, &symbol, units, p, now).await?;
+            store
+                .insert_us_ladder(ORB, amount, id, &day, &symbol, units, p, now)
+                .await?;
         }
         added += 1;
     }
@@ -153,10 +162,24 @@ pub async fn sync(store: &Store, now: DateTime<Utc>) -> Result<usize> {
         }
         let (e, x) = (dec(&entry), dec(&exit));
         for amount in AMOUNTS {
-            let c = cash(Decimal::from(amount), realized_all(store, OPTIONS, amount).await?);
+            let c = cash(
+                Decimal::from(amount),
+                realized_all(store, OPTIONS, amount).await?,
+            );
             let k = contracts(c, e);
             let p = (x - e) * dec!(100) * Decimal::from(k);
-            store.insert_us_ladder(OPTIONS, amount, id, &day, &contract, Decimal::from(k), p, now).await?;
+            store
+                .insert_us_ladder(
+                    OPTIONS,
+                    amount,
+                    id,
+                    &day,
+                    &contract,
+                    Decimal::from(k),
+                    p,
+                    now,
+                )
+                .await?;
         }
         added += 1;
     }
@@ -174,13 +197,18 @@ pub async fn sync(store: &Store, now: DateTime<Utc>) -> Result<usize> {
         let ret = dec(&pnl) / notional;
         let parts = Decimal::from(crate::us::ibs::FUNDS.len() as u32);
         for amount in AMOUNTS {
-            let c = cash(Decimal::from(amount), realized_before(store, IBS, amount, &day).await?) / parts;
+            let c = cash(
+                Decimal::from(amount),
+                realized_before(store, IBS, amount, &day).await?,
+            ) / parts;
             let (units, p) = if c >= Decimal::ONE {
                 ((c / dec(&entry)).round_dp(6), c * ret)
             } else {
                 (Decimal::ZERO, Decimal::ZERO)
             };
-            store.insert_us_ladder(IBS, amount, id, &day, &symbol, units, p, now).await?;
+            store
+                .insert_us_ladder(IBS, amount, id, &day, &symbol, units, p, now)
+                .await?;
         }
         added += 1;
     }
@@ -207,13 +235,26 @@ pub async fn sync(store: &Store, now: DateTime<Utc>) -> Result<usize> {
             .map(|r| (dec(&r.4) - dec(&r.3) - dec(r.5.as_deref().unwrap_or("0"))) * dec!(100))
             .collect();
         for amount in AMOUNTS {
-            let c = cash(Decimal::from(amount), realized_before(store, SPREADS, amount, &day).await?);
+            let c = cash(
+                Decimal::from(amount),
+                realized_before(store, SPREADS, amount, &day).await?,
+            );
             let n = allocate_spreads(c, &need);
             for (r, k) in closed.iter().zip(n) {
-                let per = (dec(r.5.as_deref().unwrap_or("0")) - dec(r.6.as_deref().unwrap_or("0"))) * dec!(100);
+                let per = (dec(r.5.as_deref().unwrap_or("0")) - dec(r.6.as_deref().unwrap_or("0")))
+                    * dec!(100);
                 let label = format!("{} {}/{}", r.2, r.3, r.4);
                 store
-                    .insert_us_ladder(SPREADS, amount, r.0, &day, &label, Decimal::from(k), per * Decimal::from(k), now)
+                    .insert_us_ladder(
+                        SPREADS,
+                        amount,
+                        r.0,
+                        &day,
+                        &label,
+                        Decimal::from(k),
+                        per * Decimal::from(k),
+                        now,
+                    )
                     .await?;
             }
         }
@@ -229,7 +270,10 @@ pub fn spawn_us_ladder_worker(store: Store) -> JoinHandle<()> {
         loop {
             match sync(&store, Utc::now()).await {
                 Ok(0) => {}
-                Ok(n) => info!(trades = n, "US capital ladder: closed trades re-sized at every amount"),
+                Ok(n) => info!(
+                    trades = n,
+                    "US capital ladder: closed trades re-sized at every amount"
+                ),
                 Err(e) => warn!(error = %format!("{e:#}"), "US capital ladder sync failed"),
             }
             tokio::time::sleep(Duration::from_secs(60)).await;
@@ -244,7 +288,10 @@ mod tests {
     #[test]
     fn ny_day_handles_both_timestamp_shapes() {
         assert_eq!(ny_day("2026-11-10 02:00:00").as_deref(), Some("2026-11-09"));
-        assert_eq!(ny_day("2026-11-09T15:00:00+00:00").as_deref(), Some("2026-11-09"));
+        assert_eq!(
+            ny_day("2026-11-09T15:00:00+00:00").as_deref(),
+            Some("2026-11-09")
+        );
     }
 
     #[test]
@@ -261,9 +308,18 @@ mod tests {
 
     #[test]
     fn spreads_go_out_one_at_a_time() {
-        assert_eq!(allocate_spreads(dec!(400), &[dec!(170), dec!(180)]), vec![1, 1]);
-        assert_eq!(allocate_spreads(dec!(500), &[dec!(170), dec!(180)]), vec![1, 1]);
-        assert_eq!(allocate_spreads(dec!(530), &[dec!(170), dec!(180)]), vec![2, 1]);
+        assert_eq!(
+            allocate_spreads(dec!(400), &[dec!(170), dec!(180)]),
+            vec![1, 1]
+        );
+        assert_eq!(
+            allocate_spreads(dec!(500), &[dec!(170), dec!(180)]),
+            vec![1, 1]
+        );
+        assert_eq!(
+            allocate_spreads(dec!(530), &[dec!(170), dec!(180)]),
+            vec![2, 1]
+        );
         assert_eq!(allocate_spreads(dec!(100), &[dec!(170)]), vec![0]);
     }
 }

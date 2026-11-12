@@ -89,7 +89,11 @@ pub fn project(
     low_so_far: f64,
     range: f64,
 ) -> Option<Projection> {
-    let table = model().get(market)?.iter().rev().find(|t| t.minute <= minute)?;
+    let table = model()
+        .get(market)?
+        .iter()
+        .rev()
+        .find(|t| t.minute <= minute)?;
     let unit = range * price;
     if unit <= 0.0 {
         return None;
@@ -148,8 +152,16 @@ struct Session {
     close: u32,
 }
 
-const INDIA: Session = Session { tz: Kolkata, open: 9 * 60 + 15, close: 15 * 60 + 30 };
-const US: Session = Session { tz: New_York, open: 9 * 60 + 30, close: 16 * 60 };
+const INDIA: Session = Session {
+    tz: Kolkata,
+    open: 9 * 60 + 15,
+    close: 15 * 60 + 30,
+};
+const US: Session = Session {
+    tz: New_York,
+    open: 9 * 60 + 30,
+    close: 16 * 60,
+};
 
 impl Session {
     /// The local date and minutes since the open, on a weekday in session.
@@ -159,12 +171,19 @@ impl Session {
             return None;
         }
         let m = local.hour() * 60 + local.minute();
-        (self.open..self.close).contains(&m).then(|| (local.date_naive(), m - self.open))
+        (self.open..self.close)
+            .contains(&m)
+            .then(|| (local.date_naive(), m - self.open))
     }
 
     fn open_utc(&self, day: NaiveDate) -> Option<DateTime<Utc>> {
         let t = day.and_hms_opt(self.open / 60, self.open % 60, 0)?;
-        Some(self.tz.from_local_datetime(&t).earliest()?.with_timezone(&Utc))
+        Some(
+            self.tz
+                .from_local_datetime(&t)
+                .earliest()?
+                .with_timezone(&Utc),
+        )
     }
 }
 
@@ -188,7 +207,13 @@ fn so_far(bars: &[Bar], s: &Session, day: NaiveDate) -> Option<(f64, f64, f64, D
     ))
 }
 
-fn row(symbol: &str, market: &str, s: &Session, range: f64, hlp: (f64, f64, f64, DateTime<Utc>)) -> Option<RangeRow> {
+fn row(
+    symbol: &str,
+    market: &str,
+    s: &Session,
+    range: f64,
+    hlp: (f64, f64, f64, DateTime<Utc>),
+) -> Option<RangeRow> {
     let (high, low, price, at) = hlp;
     let (_, minute) = s.minute(at - Duration::seconds(1))?;
     let p = project(market, minute + 1, price, high, low, range)?;
@@ -228,7 +253,11 @@ pub fn spawn_range_scanner(
     let handle = tokio::spawn(async move {
         let upstox = UpstoxBars::new(upstox_token);
         let mut ranges: HashMap<String, (NaiveDate, f64)> = HashMap::new();
-        info!(us = us_symbols.len(), india = NIFTY50.len(), "Range scanner started (display only)");
+        info!(
+            us = us_symbols.len(),
+            india = NIFTY50.len(),
+            "Range scanner started (display only)"
+        );
         loop {
             let now = Utc::now();
             if let Some((day, _)) = INDIA.minute(now) {
@@ -240,7 +269,9 @@ pub fn spawn_range_scanner(
                     Ok(scan) => {
                         out.write().await.insert("us", scan);
                     }
-                    Err(e) => warn!(error = %format!("{e:#}"), "Range scanner: U.S. bars unavailable"),
+                    Err(e) => {
+                        warn!(error = %format!("{e:#}"), "Range scanner: U.S. bars unavailable")
+                    }
                 }
             }
             tokio::time::sleep(StdDuration::from_secs(300)).await;
@@ -249,14 +280,21 @@ pub fn spawn_range_scanner(
     (scans, handle)
 }
 
-async fn scan_india(upstox: &UpstoxBars, ranges: &mut HashMap<String, (NaiveDate, f64)>, day: NaiveDate) -> MarketScan {
+async fn scan_india(
+    upstox: &UpstoxBars,
+    ranges: &mut HashMap<String, (NaiveDate, f64)>,
+    day: NaiveDate,
+) -> MarketScan {
     let mut rows = Vec::new();
     let mut as_of = None;
     let mut failed = 0;
     for (symbol, key) in NIFTY50 {
         let cache = format!("in:{symbol}");
-        if ranges.get(&cache).is_none_or(|(d, _)| *d != day) {
-            match upstox.daily(key, day - Duration::days(40), day - Duration::days(1)).await {
+        if ranges.get(&cache).map_or(true, |(d, _)| *d != day) {
+            match upstox
+                .daily(key, day - Duration::days(40), day - Duration::days(1))
+                .await
+            {
                 Ok(bars) => {
                     let daily: Vec<_> = bars
                         .iter()
@@ -270,7 +308,9 @@ async fn scan_india(upstox: &UpstoxBars, ranges: &mut HashMap<String, (NaiveDate
                 Err(_) => failed += 1,
             }
         }
-        let Some(&(_, range)) = ranges.get(&cache) else { continue };
+        let Some(&(_, range)) = ranges.get(&cache) else {
+            continue;
+        };
         match upstox.today(key, 5).await {
             Ok(bars) => {
                 if let Some(hlp) = so_far(&bars, &INDIA, day) {
@@ -297,7 +337,11 @@ async fn scan_us(
 ) -> anyhow::Result<MarketScan> {
     let missing: Vec<String> = symbols
         .iter()
-        .filter(|s| ranges.get(&format!("us:{s}")).is_none_or(|(d, _)| *d != day))
+        .filter(|s| {
+            ranges
+                .get(&format!("us:{s}"))
+                .map_or(true, |(d, _)| *d != day)
+        })
         .cloned()
         .collect();
     if !missing.is_empty() {
@@ -318,7 +362,9 @@ async fn scan_us(
     let mut rows = Vec::new();
     let mut as_of = None;
     for symbol in symbols {
-        let (Some(&(_, range)), Some(list)) = (ranges.get(&format!("us:{symbol}")), bars.get(symbol)) else {
+        let (Some(&(_, range)), Some(list)) =
+            (ranges.get(&format!("us:{symbol}")), bars.get(symbol))
+        else {
             continue;
         };
         if let Some(hlp) = so_far(list, &US, day) {
@@ -341,7 +387,10 @@ mod tests {
     fn the_model_has_both_markets_from_the_first_half_hour() {
         assert_eq!(model()["india"][0].minute, 15);
         assert_eq!(model()["us"][0].minute, 15);
-        assert!(project("india", 10, 100.0, 101.0, 99.0, 0.02).is_none(), "no table before 9:30");
+        assert!(
+            project("india", 10, 100.0, 101.0, 99.0, 0.02).is_none(),
+            "no table before 9:30"
+        );
     }
 
     #[test]
@@ -350,7 +399,10 @@ mod tests {
         let p = project("india", 75, 100.0, 100.0, 98.5, 0.02).unwrap();
         assert!(p.likely_high > 100.0 && p.likely_low < 98.5);
         assert!(p.p_new_high > 0.7, "at the high, a new high is likely");
-        assert!(p.p_new_low < p.p_new_high, "far above the low, a new low is less likely");
+        assert!(
+            p.p_new_low < p.p_new_high,
+            "far above the low, a new low is less likely"
+        );
         assert!((p.range_used - 0.75).abs() < 1e-9);
         // Late in the day the band is narrower.
         let late = project("india", 345, 100.0, 100.0, 98.5, 0.02).unwrap();

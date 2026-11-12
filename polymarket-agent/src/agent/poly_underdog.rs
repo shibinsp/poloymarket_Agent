@@ -59,9 +59,7 @@ pub fn pick(c: &MarketCandidate, now: DateTime<Utc>) -> Option<(Side, Decimal)> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::market::models::{
-        Market, MarketCategory, OrderBookSnapshot, PriceLevel, TokenInfo,
-    };
+    use crate::market::models::{Market, MarketCategory, OrderBookSnapshot, PriceLevel, TokenInfo};
     use chrono::Duration;
 
     fn cand(hours: i64, bid: Decimal, ask: Decimal) -> MarketCandidate {
@@ -72,8 +70,16 @@ mod tests {
                 question: "Q?".into(),
                 outcomes: vec!["Yes".into(), "No".into()],
                 tokens: vec![
-                    TokenInfo { token_id: "y".into(), outcome: "Yes".into(), price: ask },
-                    TokenInfo { token_id: "n".into(), outcome: "No".into(), price: Decimal::ONE - bid },
+                    TokenInfo {
+                        token_id: "y".into(),
+                        outcome: "Yes".into(),
+                        price: ask,
+                    },
+                    TokenInfo {
+                        token_id: "n".into(),
+                        outcome: "No".into(),
+                        price: Decimal::ONE - bid,
+                    },
                 ],
                 end_date: now + Duration::hours(hours) + Duration::minutes(30),
                 category: MarketCategory::Politics,
@@ -82,8 +88,14 @@ mod tests {
             },
             order_book: OrderBookSnapshot {
                 token_id: "y".into(),
-                bids: vec![PriceLevel { price: bid, size: dec!(500) }],
-                asks: vec![PriceLevel { price: ask, size: dec!(500) }],
+                bids: vec![PriceLevel {
+                    price: bid,
+                    size: dec!(500),
+                }],
+                asks: vec![PriceLevel {
+                    price: ask,
+                    size: dec!(500),
+                }],
                 spread: ask - bid,
                 midpoint: (ask + bid) / dec!(2),
                 implied_probability: (ask + bid) / dec!(2),

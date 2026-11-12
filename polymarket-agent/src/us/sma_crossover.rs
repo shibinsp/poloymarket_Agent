@@ -1709,8 +1709,10 @@ mod tests {
         let candles = sample_daily_candles(55, dec!(100.0), dec!(0.5));
         let instrument = test_equity("SPY");
         let now = candles.last().unwrap().ts + Duration::hours(2);
-        let mut config = SmaCrossoverConfig::default();
-        config.moving_average_type = "EMA".to_string();
+        let mut config = SmaCrossoverConfig {
+            moving_average_type: "EMA".to_string(),
+            ..SmaCrossoverConfig::default()
+        };
         assert!(matches!(
             evaluate_sma_crossover(&instrument, &candles, now, &config),
             Err(SmaValidationError::InvalidConfiguration(_))

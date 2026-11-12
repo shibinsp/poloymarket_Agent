@@ -109,7 +109,10 @@ fn label(
         .unwrap_or_else(|| "an unknown amount".into());
     let gross = t.pnl + t.charges.unwrap_or_default();
     if t.pnl > Decimal::ZERO {
-        return ("WIN", format!("Worked: it went as far as {best} in our favour."));
+        return (
+            "WIN",
+            format!("Worked: it went as far as {best} in our favour."),
+        );
     }
     if t.charges.is_some() && gross >= Decimal::ZERO {
         return (
@@ -163,12 +166,19 @@ pub async fn review_pending(
     let ist = chrono_tz::Asia::Kolkata;
     let today_ist = now.with_timezone(&ist).date_naive();
     for t in store.unreviewed_intraday_trades().await? {
-        let Some(key) = NIFTY50.iter().find(|(s, _)| *s == t.symbol).map(|(_, k)| *k) else {
+        let Some(key) = NIFTY50
+            .iter()
+            .find(|(s, _)| *s == t.symbol)
+            .map(|(_, k)| *k)
+        else {
             continue;
         };
         let day = t.entry_at.with_timezone(&ist).date_naive();
         let (stock, nifty) = if day == today_ist {
-            (upstox.today(key, 1).await, upstox.today(NIFTY_50_KEY, 1).await)
+            (
+                upstox.today(key, 1).await,
+                upstox.today(NIFTY_50_KEY, 1).await,
+            )
         } else {
             (
                 upstox.history(key, 1, day, day).await,
@@ -190,8 +200,14 @@ pub async fn review_pending(
     }
 
     if let Some(alpaca) = alpaca {
-        let mut pending = store.unreviewed_venue_trades("alpaca", ORB_STRATEGY).await?;
-        pending.extend(store.unreviewed_venue_trades("alpaca", BURST_STRATEGY).await?);
+        let mut pending = store
+            .unreviewed_venue_trades("alpaca", ORB_STRATEGY)
+            .await?;
+        pending.extend(
+            store
+                .unreviewed_venue_trades("alpaca", BURST_STRATEGY)
+                .await?,
+        );
         for t in pending {
             if now - t.exit_at < chrono::Duration::minutes(US_SETTLE_MINUTES) {
                 continue;
@@ -252,7 +268,14 @@ mod tests {
     }
 
     fn bar(h: u32, m: u32, hi: Decimal, lo: Decimal, c: Decimal) -> Bar {
-        Bar { ts: at(h, m), open: c, high: hi, low: lo, close: c, volume: dec!(100) }
+        Bar {
+            ts: at(h, m),
+            open: c,
+            high: hi,
+            low: lo,
+            close: c,
+            volume: dec!(100),
+        }
     }
 
     fn trade(pnl: Decimal, reason: &str, minutes: i64) -> ClosedTrade {
@@ -295,7 +318,11 @@ mod tests {
         let flat = vec![bar(4, 1, dec!(100.5), dec!(98), dec!(99))];
         let a = |t: &ClosedTrade, idx: &[Bar]| assess(t, &flat, idx, 1, IST).label;
         assert_eq!(a(&trade(dec!(4), "FLAT_1515", 60), &[]), "WIN");
-        assert_eq!(a(&trade(dec!(-1), "FLAT_1515", 60), &[]), "COSTS", "gross +2 before charges of 3");
+        assert_eq!(
+            a(&trade(dec!(-1), "FLAT_1515", 60), &[]),
+            "COSTS",
+            "gross +2 before charges of 3"
+        );
         assert_eq!(a(&trade(dec!(-10), "STOP", 10), &[]), "FALSE_BREAKOUT");
         assert_eq!(a(&trade(dec!(-10), "STOP", 90), &[]), "STOPPED_LATER");
         assert_eq!(a(&trade(dec!(-10), "FLAT_1515", 90), &[]), "FADED");
@@ -303,7 +330,11 @@ mod tests {
             bar(4, 1, dec!(1000), dec!(1000), dec!(1000)),
             bar(4, 30, dec!(995), dec!(995), dec!(995)),
         ];
-        assert_eq!(a(&trade(dec!(-10), "STOP", 90), &falling), "FOUGHT_MARKET", "index -0.5% against a long");
+        assert_eq!(
+            a(&trade(dec!(-10), "STOP", 90), &falling),
+            "FOUGHT_MARKET",
+            "index -0.5% against a long"
+        );
     }
 
     #[test]

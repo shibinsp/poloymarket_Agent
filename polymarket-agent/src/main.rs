@@ -600,7 +600,10 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
             .find(|v| v.kind == "alpaca" && v.enabled)
             .and_then(|v| v.base_url.clone())
             .unwrap_or_else(|| "https://paper-api.alpaca.markets".to_string());
-        match (secrets.alpaca_key_id.as_ref(), secrets.alpaca_secret_key.as_ref()) {
+        match (
+            secrets.alpaca_key_id.as_ref(),
+            secrets.alpaca_secret_key.as_ref(),
+        ) {
             (Some(k), Some(s)) => match polymarket_agent::us::options::AlpacaOptions::paper(
                 k.expose_secret().to_string(),
                 s.expose_secret().to_string(),
@@ -667,7 +670,11 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
                         feed.to_string(),
                     )
                 };
-                polymarket_agent::us::turnaround::spawn_us_turnaround_worker(store.clone_for_parallel(), make("sip"), make("iex"))
+                polymarket_agent::us::turnaround::spawn_us_turnaround_worker(
+                    store.clone_for_parallel(),
+                    make("sip"),
+                    make("iex"),
+                )
             })
     } else {
         None
@@ -704,7 +711,10 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
             .find(|v| v.kind == "alpaca" && v.enabled)
             .and_then(|v| v.base_url.clone())
             .unwrap_or_else(|| "https://paper-api.alpaca.markets".to_string());
-        match (secrets.alpaca_key_id.as_ref(), secrets.alpaca_secret_key.as_ref()) {
+        match (
+            secrets.alpaca_key_id.as_ref(),
+            secrets.alpaca_secret_key.as_ref(),
+        ) {
             (Some(k), Some(s)) => match polymarket_agent::us::options::AlpacaOptions::paper(
                 k.expose_secret().to_string(),
                 s.expose_secret().to_string(),
@@ -731,61 +741,65 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
     };
 
     // BTC + ETH on the 60-day rule with a news guard, $20 books of their own.
-    let _crypto_worker = if config.crypto.enabled
-        && config.agent.mode == polymarket_agent::config::AgentMode::Paper
-    {
-        let trading = config
-            .venues
-            .iter()
-            .find(|v| v.kind == "alpaca" && v.enabled)
-            .and_then(|v| v.base_url.clone())
-            .unwrap_or_else(|| "https://paper-api.alpaca.markets".to_string());
-        // The news read runs on the Polymarket model (same NVIDIA host, so the
-        // main key), which answers in seconds; the main model otherwise.
-        let same_host = config.valuation.polymarket.as_ref().is_some_and(|o| {
-            o.base_url.is_none() || o.base_url == config.valuation.base_url
-        });
-        let llm_config = if same_host {
-            config.valuation.for_polymarket()
-        } else {
-            config.valuation.clone()
-        };
-        let llm = secrets.llm_api_key.as_ref().and_then(|key| {
-            polymarket_agent::valuation::llm::LlmClient::new(
-                key.expose_secret().to_string(),
-                &llm_config,
-                store.clone_for_parallel(),
-            )
-            .map_err(|e| tracing::warn!(error = %e, "Crypto news guard has no model"))
-            .ok()
-            .map(std::sync::Arc::new)
-        });
-        match (secrets.alpaca_key_id.as_ref(), secrets.alpaca_secret_key.as_ref()) {
-            (Some(k), Some(s)) => match polymarket_agent::crypto_book::CryptoApi::paper(
-                k.expose_secret().to_string(),
-                s.expose_secret().to_string(),
-                trading,
-            ) {
-                Ok(api) => Some(polymarket_agent::crypto_book::spawn_crypto_worker(
-                    api,
-                    llm,
+    let _crypto_worker =
+        if config.crypto.enabled && config.agent.mode == polymarket_agent::config::AgentMode::Paper
+        {
+            let trading = config
+                .venues
+                .iter()
+                .find(|v| v.kind == "alpaca" && v.enabled)
+                .and_then(|v| v.base_url.clone())
+                .unwrap_or_else(|| "https://paper-api.alpaca.markets".to_string());
+            // The news read runs on the Polymarket model (same NVIDIA host, so the
+            // main key), which answers in seconds; the main model otherwise.
+            let same_host =
+                config.valuation.polymarket.as_ref().is_some_and(|o| {
+                    o.base_url.is_none() || o.base_url == config.valuation.base_url
+                });
+            let llm_config = if same_host {
+                config.valuation.for_polymarket()
+            } else {
+                config.valuation.clone()
+            };
+            let llm = secrets.llm_api_key.as_ref().and_then(|key| {
+                polymarket_agent::valuation::llm::LlmClient::new(
+                    key.expose_secret().to_string(),
+                    &llm_config,
                     store.clone_for_parallel(),
-                    kill_switch.clone(),
-                    config.crypto.clone(),
-                )),
-                Err(e) => {
-                    tracing::warn!(error = %e, "Crypto book not started");
+                )
+                .map_err(|e| tracing::warn!(error = %e, "Crypto news guard has no model"))
+                .ok()
+                .map(std::sync::Arc::new)
+            });
+            match (
+                secrets.alpaca_key_id.as_ref(),
+                secrets.alpaca_secret_key.as_ref(),
+            ) {
+                (Some(k), Some(s)) => match polymarket_agent::crypto_book::CryptoApi::paper(
+                    k.expose_secret().to_string(),
+                    s.expose_secret().to_string(),
+                    trading,
+                ) {
+                    Ok(api) => Some(polymarket_agent::crypto_book::spawn_crypto_worker(
+                        api,
+                        llm,
+                        store.clone_for_parallel(),
+                        kill_switch.clone(),
+                        config.crypto.clone(),
+                    )),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Crypto book not started");
+                        None
+                    }
+                },
+                _ => {
+                    tracing::warn!("Crypto book needs Alpaca keys; not started");
                     None
                 }
-            },
-            _ => {
-                tracing::warn!("Crypto book needs Alpaca keys; not started");
-                None
             }
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
 
     // Post-mortems of closed trades. Reviews read bars after the close, so the
     // free plan's SIP history (15 minutes late) is the better source.

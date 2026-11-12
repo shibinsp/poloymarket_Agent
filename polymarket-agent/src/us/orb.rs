@@ -50,7 +50,12 @@ const BURST_MOVE_MIN: Decimal = rust_decimal_macros::dec!(0.01);
 /// right after its signal), or late only when it fired before the stocks in
 /// play could be ranked, this is the first bar after the ranking, and the
 /// last bar still closed beyond the range.
-pub fn late_entry_allowed(signal: usize, slot: usize, ready_slot: usize, still_beyond: bool) -> bool {
+pub fn late_entry_allowed(
+    signal: usize,
+    slot: usize,
+    ready_slot: usize,
+    still_beyond: bool,
+) -> bool {
     slot == signal + 1 || (signal + 1 < ready_slot && slot == ready_slot && still_beyond)
 }
 
@@ -629,13 +634,8 @@ impl OrbTrader {
                     .iter()
                     .find(|(i, _)| *i + 1 == slot)
                     .map(|(_, b)| b.close);
-                let still_beyond = last_close.is_some_and(|c| {
-                    if side == Side::Buy {
-                        c > high
-                    } else {
-                        c < low
-                    }
-                });
+                let still_beyond =
+                    last_close.is_some_and(|c| if side == Side::Buy { c > high } else { c < low });
                 let late_ok = late_entry_allowed(index, slot, self.ready_slot, still_beyond);
                 if slot > index + 1 && !late_ok {
                     info!(
@@ -867,14 +867,15 @@ impl OrbTrader {
         // close. Replayed May - Oct 2026: 25 trades, +$37 at $150, where the
         // IEX pick at 9:35 lost $2.
         if self.ready_slot > 1 {
-            let bars = self.data.bars(&[symbol.clone()], now - Duration::hours(8)).await?;
-            let last_close = bars
-                .get(&symbol)
-                .and_then(|l| {
-                    l.iter()
-                        .find(|b| session_slot(b.ts) == Some((today, slot - 1)))
-                        .map(|b| b.close)
-                });
+            let bars = self
+                .data
+                .bars(std::slice::from_ref(&symbol), now - Duration::hours(8))
+                .await?;
+            let last_close = bars.get(&symbol).and_then(|l| {
+                l.iter()
+                    .find(|b| session_slot(b.ts) == Some((today, slot - 1)))
+                    .map(|b| b.close)
+            });
             let going = last_close.is_some_and(|c| {
                 if side == Side::Buy {
                     c > first.close
@@ -939,7 +940,10 @@ impl OrbTrader {
             },
             vega: Vega {
                 side: if side == Side::Buy { "LONG" } else { "SHORT" }.to_string(),
-                setup: format!("opening burst: 9:30 bar {move_pct}% on {}x volume", rvol.round_dp(1)),
+                setup: format!(
+                    "opening burst: 9:30 bar {move_pct}% on {}x volume",
+                    rvol.round_dp(1)
+                ),
                 signal_at: {
                     let m = 9 * 60 + 30 + self.ready_slot as i64 * BAR_MINUTES;
                     format!("{:02}:{:02} ET", m / 60, m % 60)
@@ -957,7 +961,9 @@ impl OrbTrader {
             warn!(symbol, error = %e, "Could not record the burst's decision card");
         }
         self.day.done.insert(symbol.clone());
-        let Ok(order) = prepared else { return Ok(false) };
+        let Ok(order) = prepared else {
+            return Ok(false);
+        };
         if matches!(nova.action, desk::Action::Skip) {
             return Ok(false);
         }
@@ -1338,8 +1344,14 @@ mod tests {
             ("EEE".to_string(), first(dec!(100), dec!(103)), dec!(2.9)),  // volume too low
             ("SPY".to_string(), first(dec!(500), dec!(510)), dec!(30)),   // never itself
         ];
-        assert_eq!(pick_burst(&bars, true), Some(("BBB".into(), Side::Buy, dec!(49.5))));
-        assert_eq!(pick_burst(&bars, false), Some(("DDD".into(), Side::Sell, dec!(100.5))));
+        assert_eq!(
+            pick_burst(&bars, true),
+            Some(("BBB".into(), Side::Buy, dec!(49.5)))
+        );
+        assert_eq!(
+            pick_burst(&bars, false),
+            Some(("DDD".into(), Side::Sell, dec!(100.5)))
+        );
         assert_eq!(pick_burst(&bars[2..3], true), None);
     }
 
@@ -1351,8 +1363,14 @@ mod tests {
         // Fired at 9:35 or 9:40, before the 9:50 ranking: once, at 9:50, if still beyond.
         assert!(late_entry_allowed(1, ready, ready, true));
         assert!(late_entry_allowed(2, ready, ready, true));
-        assert!(!late_entry_allowed(1, ready, ready, false), "faded back inside the range");
-        assert!(!late_entry_allowed(1, ready + 1, ready, true), "only the first bar after the ranking");
+        assert!(
+            !late_entry_allowed(1, ready, ready, false),
+            "faded back inside the range"
+        );
+        assert!(
+            !late_entry_allowed(1, ready + 1, ready, true),
+            "only the first bar after the ranking"
+        );
         // A signal after the ranking that was missed stays missed.
         assert!(!late_entry_allowed(5, 7, ready, true));
         // With real-time SIP (ready slot 1) nothing is late.

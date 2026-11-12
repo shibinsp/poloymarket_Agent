@@ -44,12 +44,23 @@ const DECIDE_TO: u32 = 15 * 60 + 59;
 /// and on 28 Oct 2026 the chair said one 2027 meeting will discuss strategy
 /// only, with no rate vote: re-check this list against the Fed calendar.
 pub const DECISION_DAYS: [&str; 10] = [
-    "2026-12-09", "2027-01-27", "2027-03-17", "2027-04-28", "2027-06-09",
-    "2027-07-28", "2027-09-15", "2027-10-27", "2027-12-08", "2028-01-26",
+    "2026-12-09",
+    "2027-01-27",
+    "2027-03-17",
+    "2027-04-28",
+    "2027-06-09",
+    "2027-07-28",
+    "2027-09-15",
+    "2027-10-27",
+    "2027-12-08",
+    "2028-01-26",
 ];
 
 pub fn decision_days() -> Vec<NaiveDate> {
-    DECISION_DAYS.iter().filter_map(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok()).collect()
+    DECISION_DAYS
+        .iter()
+        .filter_map(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+        .collect()
 }
 
 /// The trading day before `d` (skipping weekends and market holidays).
@@ -88,7 +99,14 @@ async fn last_price(iex: &AlpacaBars, day: NaiveDate, now: DateTime<Utc>) -> Res
         .context("no bars to 15:45 yet")
 }
 
-async fn act(store: &Store, iex: &AlpacaBars, today: NaiveDate, fomc: NaiveDate, buy: bool, now: DateTime<Utc>) -> Result<()> {
+async fn act(
+    store: &Store,
+    iex: &AlpacaBars,
+    today: NaiveDate,
+    fomc: NaiveDate,
+    buy: bool,
+    now: DateTime<Utc>,
+) -> Result<()> {
     let last = last_price(iex, today, now).await?;
     if buy {
         if store.prefomc_has(SYMBOL, &fomc.to_string()).await? {
@@ -98,14 +116,28 @@ async fn act(store: &Store, iex: &AlpacaBars, today: NaiveDate, fomc: NaiveDate,
         let capital = (CAPITAL_USD + realized).min(CAPITAL_USD);
         let price = (last * (Decimal::ONE + SLIPPAGE)).round_dp(4);
         let qty = (capital / price).round_dp(6);
-        store.prefomc_open_trade(SYMBOL, qty, &fomc.to_string(), &today.to_string(), price, now).await?;
+        store
+            .prefomc_open_trade(
+                SYMBOL,
+                qty,
+                &fomc.to_string(),
+                &today.to_string(),
+                price,
+                now,
+            )
+            .await?;
         info!(symbol = SYMBOL, fomc = %fomc, %price, %qty, "Pre-FOMC book: bought at the close before the Fed decision (paper, simulated)");
     } else {
         let price = (last * (Decimal::ONE - SLIPPAGE)).round_dp(4);
         for (id, qty, entry) in store.prefomc_open().await? {
-            let (qty, entry) = (Decimal::from_str_exact(&qty)?, Decimal::from_str_exact(&entry)?);
+            let (qty, entry) = (
+                Decimal::from_str_exact(&qty)?,
+                Decimal::from_str_exact(&entry)?,
+            );
             let pnl = (price - entry) * qty;
-            store.prefomc_close_trade(id, &today.to_string(), price, pnl, now).await?;
+            store
+                .prefomc_close_trade(id, &today.to_string(), price, pnl, now)
+                .await?;
             info!(symbol = SYMBOL, %entry, %price, pnl = %pnl.round_dp(2), "Pre-FOMC book: sold at the Fed decision day's close (paper, simulated)");
         }
     }
@@ -116,7 +148,9 @@ async fn act(store: &Store, iex: &AlpacaBars, today: NaiveDate, fomc: NaiveDate,
 /// Fed decision (buy) and on the decision day (sell).
 pub fn spawn_us_prefomc_worker(store: Store, iex: AlpacaBars) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let next = decision_days().into_iter().find(|d| *d >= Utc::now().with_timezone(&New_York).date_naive());
+        let next = decision_days()
+            .into_iter()
+            .find(|d| *d >= Utc::now().with_timezone(&New_York).date_naive());
         info!(capital = %CAPITAL_USD, symbol = SYMBOL, next_decision = ?next, "US pre-FOMC drift book started (paper, simulated)");
         let mut done: Option<NaiveDate> = None;
         loop {
@@ -151,8 +185,14 @@ mod tests {
 
     #[test]
     fn buys_the_day_before_and_sells_on_the_decision_day() {
-        assert_eq!(today_action(d("2026-12-08"), &[]), Some((d("2026-12-09"), true)));
-        assert_eq!(today_action(d("2026-12-09"), &[]), Some((d("2026-12-09"), false)));
+        assert_eq!(
+            today_action(d("2026-12-08"), &[]),
+            Some((d("2026-12-09"), true))
+        );
+        assert_eq!(
+            today_action(d("2026-12-09"), &[]),
+            Some((d("2026-12-09"), false))
+        );
         assert_eq!(today_action(d("2026-12-10"), &[]), None);
     }
 
@@ -160,7 +200,10 @@ mod tests {
     fn the_day_before_skips_weekends_and_holidays() {
         // 2027-01-27 is a Wednesday; a Tuesday holiday pushes the buy to Monday
         assert_eq!(previous_trading_day(d("2027-01-27"), &[]), d("2027-01-26"));
-        assert_eq!(previous_trading_day(d("2027-01-27"), &[d("2027-01-26")]), d("2027-01-25"));
+        assert_eq!(
+            previous_trading_day(d("2027-01-27"), &[d("2027-01-26")]),
+            d("2027-01-25")
+        );
         // a Monday decision would buy on the Friday before
         assert_eq!(previous_trading_day(d("2026-11-16"), &[]), d("2026-11-13"));
     }

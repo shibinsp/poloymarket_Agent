@@ -67,7 +67,12 @@ fn ny_minutes(now: DateTime<Utc>) -> Option<(NaiveDate, u32)> {
 
 /// The two strikes: the first listed strike at least `otm_pct` above `price`,
 /// and the strike exactly `width` above it. None when either is not listed.
-pub fn pick_strikes(strikes: &[Decimal], price: Decimal, otm_pct: Decimal, width: Decimal) -> Option<(Decimal, Decimal)> {
+pub fn pick_strikes(
+    strikes: &[Decimal],
+    price: Decimal,
+    otm_pct: Decimal,
+    width: Decimal,
+) -> Option<(Decimal, Decimal)> {
     let floor = price * (Decimal::ONE + otm_pct);
     let short = strikes.iter().copied().filter(|k| *k >= floor).min()?;
     let long = short + width;
@@ -82,7 +87,12 @@ pub fn natural_credit(short_bid: Decimal, long_ask: Decimal) -> Decimal {
 
 /// The credit at the middle of both legs' quotes, rounded down to a cent and
 /// never under the natural credit.
-pub fn mid_credit(short_bid: Decimal, short_ask: Decimal, long_bid: Decimal, long_ask: Decimal) -> Decimal {
+pub fn mid_credit(
+    short_bid: Decimal,
+    short_ask: Decimal,
+    long_bid: Decimal,
+    long_ask: Decimal,
+) -> Decimal {
     let mid = (short_bid + short_ask) / dec!(2) - (long_bid + long_ask) / dec!(2);
     mid.round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToZero)
         .max(natural_credit(short_bid, long_ask))
@@ -92,7 +102,9 @@ pub fn mid_credit(short_bid: Decimal, short_ask: Decimal, long_bid: Decimal, lon
 /// least a cent, plus a step per earlier try, never more than the width.
 pub fn buyback_debit(short_ask: Decimal, long_bid: Decimal, tries: i64, width: Decimal) -> Decimal {
     let base = (short_ask - long_bid).max(dec!(0.01));
-    (base + EXIT_STEP * Decimal::from(tries)).min(width).round_dp(2)
+    (base + EXIT_STEP * Decimal::from(tries))
+        .min(width)
+        .round_dp(2)
 }
 
 /// Dollars made on a spread: credit less debit, a hundred shares a contract.
@@ -108,14 +120,23 @@ pub fn value_at_expiry(price: Decimal, short: Decimal, long: Decimal) -> Decimal
 impl AlpacaOptions {
     /// One multi-leg limit order. Alpaca reads `limit_price` as a debit when
     /// positive and a credit when negative.
-    async fn mleg(&self, legs: serde_json::Value, qty: i64, limit_price: Decimal, client_order_id: &str) -> Result<OrderAck> {
+    async fn mleg(
+        &self,
+        legs: serde_json::Value,
+        qty: i64,
+        limit_price: Decimal,
+        client_order_id: &str,
+    ) -> Result<OrderAck> {
         let body = json!({
             "order_class": "mleg", "qty": qty.to_string(), "type": "limit",
             "limit_price": limit_price.round_dp(2).to_string(), "time_in_force": "day",
             "client_order_id": client_order_id, "legs": legs,
         });
-        self.send(self.req(reqwest::Method::POST, format!("{}/v2/orders", self.trading)).json(&body))
-            .await
+        self.send(
+            self.req(reqwest::Method::POST, format!("{}/v2/orders", self.trading))
+                .json(&body),
+        )
+        .await
     }
 }
 
@@ -187,15 +208,33 @@ async fn enter(
     let skip = |why: String| async move {
         info!(%underlying, %price, reason = %why, "Spread book: no spread today");
         let row = store
-            .insert_spread_trade(day_s, underlying, "-", "-", "0", "0", &price.to_string(), 0, "0",
-                                 &format!("spr-skip-{underlying}-{today}"), now)
+            .insert_spread_trade(
+                day_s,
+                underlying,
+                "-",
+                "-",
+                "0",
+                "0",
+                &price.to_string(),
+                0,
+                "0",
+                &format!("spr-skip-{underlying}-{today}"),
+                now,
+            )
             .await?;
-        store.spread_cancelled(row, &format!("skipped: {why}")).await
+        store
+            .spread_cancelled(row, &format!("skipped: {why}"))
+            .await
     };
     let Some((ks, kl)) = pick_strikes(&strikes, price, config.otm_pct, config.width) else {
         return skip("no same-day strikes at the distance and width".into()).await;
     };
-    let symbol_of = |k: Decimal| listed.iter().find(|c| c.strike_price == k).map(|c| c.symbol.clone());
+    let symbol_of = |k: Decimal| {
+        listed
+            .iter()
+            .find(|c| c.strike_price == k)
+            .map(|c| c.symbol.clone())
+    };
     let (Some(short), Some(long)) = (symbol_of(ks), symbol_of(kl)) else {
         return skip("strike symbols missing".into()).await;
     };
@@ -215,8 +254,19 @@ async fn enter(
     let credit = mid_credit(sb, sa, lb, la);
     let cid = format!("spr-{underlying}-{}", now.timestamp());
     let row = store
-        .insert_spread_trade(&day, underlying, &short, &long, &ks.to_string(), &kl.to_string(),
-                             &price.to_string(), config.qty, &credit.to_string(), &cid, now)
+        .insert_spread_trade(
+            &day,
+            underlying,
+            &short,
+            &long,
+            &ks.to_string(),
+            &kl.to_string(),
+            &price.to_string(),
+            config.qty,
+            &credit.to_string(),
+            &cid,
+            now,
+        )
         .await?;
     let legs = json!([
         { "symbol": short, "ratio_qty": "1", "side": "sell", "position_intent": "sell_to_open" },
@@ -245,7 +295,9 @@ async fn natural_retry(
     t: &SpreadTrade,
     now: DateTime<Utc>,
 ) -> Result<()> {
-    let quotes = api.quotes(&[t.short_contract.clone(), t.long_contract.clone()]).await?;
+    let quotes = api
+        .quotes(&[t.short_contract.clone(), t.long_contract.clone()])
+        .await?;
     let natural = match (
         quotes.get(&t.short_contract).and_then(|q| q.bp),
         quotes.get(&t.long_contract).and_then(|q| q.ap),
@@ -255,7 +307,9 @@ async fn natural_retry(
     };
     if natural < config.min_credit {
         info!(underlying = %t.underlying, %natural, "Spread book: mid unfilled and the natural credit is too small; no trade");
-        return store.spread_cancelled(t.id, &format!("mid unfilled; natural credit {natural}")).await;
+        return store
+            .spread_cancelled(t.id, &format!("mid unfilled; natural credit {natural}"))
+            .await;
     }
     let cid = format!("{NATURAL_PREFIX}{}-{}", t.underlying, now.timestamp());
     let legs = json!([
@@ -265,10 +319,15 @@ async fn natural_retry(
     match api.mleg(legs, t.qty, -natural, &cid).await {
         Ok(ack) => {
             info!(underlying = %t.underlying, %natural, "Spread book: mid unfilled; sent at the natural credit");
-            store.spread_resend(t.id, &natural.to_string(), &cid, &ack.id, now).await
+            store
+                .spread_resend(t.id, &natural.to_string(), &cid, &ack.id, now)
+                .await
         }
         Err(e) => {
-            let why: String = format!("natural order refused: {e:#}").chars().take(200).collect();
+            let why: String = format!("natural order refused: {e:#}")
+                .chars()
+                .take(200)
+                .collect();
             store.spread_cancelled(t.id, &why).await?;
             Err(e)
         }
@@ -305,10 +364,16 @@ struct ClosedOrder {
 /// The price of a stand-alone buy of the short call filled after the entry:
 /// an order Alpaca itself sent (our own buy-back is a two-leg order, whose
 /// top-level symbol is empty). None while the short call is still held.
-fn short_buyback_price(orders: &[ClosedOrder], short_contract: &str, entry_at: &str) -> Option<Decimal> {
+fn short_buyback_price(
+    orders: &[ClosedOrder],
+    short_contract: &str,
+    entry_at: &str,
+) -> Option<Decimal> {
     orders
         .iter()
-        .filter(|o| o.symbol.as_deref() == Some(short_contract) && o.side == "buy" && o.status == "filled")
+        .filter(|o| {
+            o.symbol.as_deref() == Some(short_contract) && o.side == "buy" && o.status == "filled"
+        })
         .filter(|o| o.filled_at.as_deref().is_some_and(|f| f > entry_at))
         .find_map(|o| o.filled_avg_price.as_deref()?.parse::<Decimal>().ok())
 }
@@ -339,23 +404,35 @@ async fn manage_one(
             let ack = api.order(id).await?;
             match ack.status.as_str() {
                 "filled" => {
-                    let credit = ack.filled_avg_price.map(|p| p.abs()).context("filled with no price")?;
+                    let credit = ack
+                        .filled_avg_price
+                        .map(|p| p.abs())
+                        .context("filled with no price")?;
                     info!(underlying = %t.underlying, %credit, "Spread book: spread sold");
                     store.spread_opened(t.id, &credit.to_string()).await
                 }
-                "canceled" | "expired" if !t.client_order_id.starts_with(NATURAL_PREFIX) && ack.status == "canceled" => {
+                "canceled" | "expired"
+                    if !t.client_order_id.starts_with(NATURAL_PREFIX)
+                        && ack.status == "canceled" =>
+                {
                     // The mid went unfilled: once more at the natural credit.
                     natural_retry(api, store, config, t, now).await
                 }
                 "canceled" | "expired" | "rejected" | "done_for_day" => {
                     info!(underlying = %t.underlying, status = %ack.status, "Spread book: entry not filled, no trade");
-                    store.spread_cancelled(t.id, &format!("entry {}", ack.status)).await
+                    store
+                        .spread_cancelled(t.id, &format!("entry {}", ack.status))
+                        .await
                 }
                 _ => {
                     let sent = DateTime::parse_from_rfc3339(&t.entry_at)
                         .map(|d| d.with_timezone(&Utc))
                         .unwrap_or(now);
-                    let wait = if t.client_order_id.starts_with(NATURAL_PREFIX) { ENTRY_WAIT_SECS } else { MID_WAIT_SECS };
+                    let wait = if t.client_order_id.starts_with(NATURAL_PREFIX) {
+                        ENTRY_WAIT_SECS
+                    } else {
+                        MID_WAIT_SECS
+                    };
                     if (now - sent).num_seconds() > wait {
                         api.cancel(id).await?;
                     }
@@ -364,7 +441,7 @@ async fn manage_one(
             }
         }
         "OPEN" => {
-            let stale = ny.is_none_or(|(d, _)| d.to_string() != t.day);
+            let stale = ny.map_or(true, |(d, _)| d.to_string() != t.day);
             let short: Decimal = t.short_strike.parse()?;
             let long: Decimal = t.long_strike.parse()?;
             let credit: Decimal = t.entry_credit.as_deref().unwrap_or("0").parse()?;
@@ -386,7 +463,13 @@ async fn manage_one(
                 info!(underlying = %t.underlying, %credit, %short_fill, %long_value, pnl = %p, "Spread book: Alpaca bought the short call back; spread closed");
                 exit_sent.remove(&t.id);
                 return store
-                    .spread_closed(t.id, &debit.to_string(), &p.round_dp(2).to_string(), "ALPACA_EXPIRY_CLOSE", now)
+                    .spread_closed(
+                        t.id,
+                        &debit.to_string(),
+                        &p.round_dp(2).to_string(),
+                        "ALPACA_EXPIRY_CLOSE",
+                        now,
+                    )
                     .await;
             }
             if stale {
@@ -397,16 +480,30 @@ async fn manage_one(
                 let p = pnl(credit, debit, t.qty);
                 warn!(underlying = %t.underlying, %px, %debit, pnl = %p, "Spread book: spread expired before it was bought back");
                 return store
-                    .spread_closed(t.id, &debit.to_string(), &p.round_dp(2).to_string(), "EXPIRED", now)
+                    .spread_closed(
+                        t.id,
+                        &debit.to_string(),
+                        &p.round_dp(2).to_string(),
+                        "EXPIRED",
+                        now,
+                    )
                     .await;
             }
             let Some((_, mins)) = ny else { return Ok(()) };
-            if mins < config.exit_minute || mins >= CLOSE || mins < OPEN {
+            if mins < config.exit_minute || !(OPEN..CLOSE).contains(&mins) {
                 return Ok(());
             }
-            let quotes = api.quotes(&[t.short_contract.clone(), t.long_contract.clone()]).await?;
-            let short_ask = quotes.get(&t.short_contract).and_then(|q| q.ap).unwrap_or(config.width);
-            let long_bid = quotes.get(&t.long_contract).and_then(|q| q.bp).unwrap_or(Decimal::ZERO);
+            let quotes = api
+                .quotes(&[t.short_contract.clone(), t.long_contract.clone()])
+                .await?;
+            let short_ask = quotes
+                .get(&t.short_contract)
+                .and_then(|q| q.ap)
+                .unwrap_or(config.width);
+            let long_bid = quotes
+                .get(&t.long_contract)
+                .and_then(|q| q.bp)
+                .unwrap_or(Decimal::ZERO);
             let debit = buyback_debit(short_ask, long_bid, t.exit_tries, config.width);
             let cid = format!("spr-x-{}-{}", t.id, now.timestamp());
             let legs = json!([
@@ -425,13 +522,22 @@ async fn manage_one(
             let ack = api.order(id).await?;
             match ack.status.as_str() {
                 "filled" => {
-                    let debit = ack.filled_avg_price.map(|p| p.abs()).context("exit filled with no price")?;
+                    let debit = ack
+                        .filled_avg_price
+                        .map(|p| p.abs())
+                        .context("exit filled with no price")?;
                     let credit: Decimal = t.entry_credit.as_deref().unwrap_or("0").parse()?;
                     let p = pnl(credit, debit, t.qty);
                     info!(underlying = %t.underlying, %credit, %debit, pnl = %p, "Spread book: closed");
                     exit_sent.remove(&t.id);
                     store
-                        .spread_closed(t.id, &debit.to_string(), &p.round_dp(2).to_string(), "FLAT_1550", now)
+                        .spread_closed(
+                            t.id,
+                            &debit.to_string(),
+                            &p.round_dp(2).to_string(),
+                            "FLAT_1550",
+                            now,
+                        )
                         .await
                 }
                 "canceled" | "expired" | "rejected" | "done_for_day" => {
@@ -458,11 +564,31 @@ mod tests {
 
     #[test]
     fn strikes_are_the_first_far_enough_and_one_width_above() {
-        let ks = [dec!(765), dec!(766), dec!(767), dec!(768), dec!(769), dec!(770), dec!(771), dec!(772)];
+        let ks = [
+            dec!(765),
+            dec!(766),
+            dec!(767),
+            dec!(768),
+            dec!(769),
+            dec!(770),
+            dec!(771),
+            dec!(772),
+        ];
         // 762.40 x 1.006 = 766.97: the first strike at or above is 767.
-        assert_eq!(pick_strikes(&ks, dec!(762.40), dec!(0.006), dec!(2)), Some((dec!(767), dec!(769))));
-        assert_eq!(pick_strikes(&ks, dec!(768.50), dec!(0.006), dec!(2)), None, "no 775 listed");
-        assert_eq!(pick_strikes(&ks, dec!(790), dec!(0.006), dec!(2)), None, "nothing far enough");
+        assert_eq!(
+            pick_strikes(&ks, dec!(762.40), dec!(0.006), dec!(2)),
+            Some((dec!(767), dec!(769)))
+        );
+        assert_eq!(
+            pick_strikes(&ks, dec!(768.50), dec!(0.006), dec!(2)),
+            None,
+            "no 775 listed"
+        );
+        assert_eq!(
+            pick_strikes(&ks, dec!(790), dec!(0.006), dec!(2)),
+            None,
+            "nothing far enough"
+        );
     }
 
     #[test]
@@ -473,25 +599,51 @@ mod tests {
     #[test]
     fn the_mid_credit_sits_between_the_quotes_and_never_under_the_natural() {
         // short 1.06 x 1.10, long 0.66 x 0.70: mid 1.08 - 0.68 = 0.40, natural 0.36.
-        assert_eq!(mid_credit(dec!(1.06), dec!(1.10), dec!(0.66), dec!(0.70)), dec!(0.40));
+        assert_eq!(
+            mid_credit(dec!(1.06), dec!(1.10), dec!(0.66), dec!(0.70)),
+            dec!(0.40)
+        );
         // half cents round down
-        assert_eq!(mid_credit(dec!(1.05), dec!(1.10), dec!(0.66), dec!(0.70)), dec!(0.39));
-        assert_eq!(mid_credit(dec!(0.40), dec!(0.40), dec!(0.20), dec!(0.20)), dec!(0.20));
+        assert_eq!(
+            mid_credit(dec!(1.05), dec!(1.10), dec!(0.66), dec!(0.70)),
+            dec!(0.39)
+        );
+        assert_eq!(
+            mid_credit(dec!(0.40), dec!(0.40), dec!(0.20), dec!(0.20)),
+            dec!(0.20)
+        );
     }
 
     #[test]
     fn buyback_starts_at_the_natural_debit_and_steps_up_to_the_width() {
-        assert_eq!(buyback_debit(dec!(0.06), dec!(0.02), 0, dec!(2)), dec!(0.04));
-        assert_eq!(buyback_debit(dec!(0.01), dec!(0.03), 0, dec!(2)), dec!(0.01), "never below a cent");
-        assert_eq!(buyback_debit(dec!(0.06), dec!(0.02), 2, dec!(2)), dec!(0.14));
-        assert_eq!(buyback_debit(dec!(2.10), dec!(0.05), 3, dec!(2)), dec!(2), "never above the width");
+        assert_eq!(
+            buyback_debit(dec!(0.06), dec!(0.02), 0, dec!(2)),
+            dec!(0.04)
+        );
+        assert_eq!(
+            buyback_debit(dec!(0.01), dec!(0.03), 0, dec!(2)),
+            dec!(0.01),
+            "never below a cent"
+        );
+        assert_eq!(
+            buyback_debit(dec!(0.06), dec!(0.02), 2, dec!(2)),
+            dec!(0.14)
+        );
+        assert_eq!(
+            buyback_debit(dec!(2.10), dec!(0.05), 3, dec!(2)),
+            dec!(2),
+            "never above the width"
+        );
     }
 
     #[test]
     fn pnl_and_expiry_value() {
         assert_eq!(pnl(dec!(0.24), dec!(0.04), 1), dec!(20));
         assert_eq!(pnl(dec!(0.24), dec!(2), 1), dec!(-176));
-        assert_eq!(value_at_expiry(dec!(766), dec!(767), dec!(769)), Decimal::ZERO);
+        assert_eq!(
+            value_at_expiry(dec!(766), dec!(767), dec!(769)),
+            Decimal::ZERO
+        );
         assert_eq!(value_at_expiry(dec!(768), dec!(767), dec!(769)), dec!(1));
         assert_eq!(value_at_expiry(dec!(775), dec!(767), dec!(769)), dec!(2));
     }
@@ -511,7 +663,13 @@ mod tests {
         let short = "QQQ261109C00683000";
         let entry = "2026-11-09T16:01:39+00:00";
         let orders = vec![
-            order("QQQ261109C00685000", "buy", "filled", "0.21", "2026-11-09T16:01:39.9Z"),
+            order(
+                "QQQ261109C00685000",
+                "buy",
+                "filled",
+                "0.21",
+                "2026-11-09T16:01:39.9Z",
+            ),
             order(short, "buy", "canceled", "0.10", "2026-11-09T20:40:00Z"),
             order(short, "buy", "filled", "0.06", "2026-11-09T20:45:03.33Z"),
         ];

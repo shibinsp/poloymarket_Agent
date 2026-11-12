@@ -204,19 +204,34 @@ impl AlpacaOptions {
             .header("APCA-API-SECRET-KEY", &self.secret)
     }
 
-    pub(crate) async fn send<T: for<'de> Deserialize<'de>>(&self, rb: reqwest::RequestBuilder) -> Result<T> {
+    pub(crate) async fn send<T: for<'de> Deserialize<'de>>(
+        &self,
+        rb: reqwest::RequestBuilder,
+    ) -> Result<T> {
         let resp = rb.send().await.context("Alpaca options request failed")?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            bail!("Alpaca {status}: {}", body.chars().take(300).collect::<String>());
+            bail!(
+                "Alpaca {status}: {}",
+                body.chars().take(300).collect::<String>()
+            );
         }
-        serde_json::from_str(&body).with_context(|| format!("unreadable Alpaca reply: {}", body.chars().take(200).collect::<String>()))
+        serde_json::from_str(&body).with_context(|| {
+            format!(
+                "unreadable Alpaca reply: {}",
+                body.chars().take(200).collect::<String>()
+            )
+        })
     }
 
     pub(crate) async fn last_price(&self, symbol: &str) -> Result<Decimal> {
         let url = format!("{}/v2/stocks/{symbol}/trades/latest?feed=iex", self.data);
-        Ok(self.send::<LatestTrade>(self.req(reqwest::Method::GET, url)).await?.trade.p)
+        Ok(self
+            .send::<LatestTrade>(self.req(reqwest::Method::GET, url))
+            .await?
+            .trade
+            .p)
     }
 
     pub(crate) async fn contracts(
@@ -236,45 +251,77 @@ impl AlpacaOptions {
             band.0.round_dp(2),
             band.1.round_dp(2),
         );
-        Ok(self.send::<Contracts>(self.req(reqwest::Method::GET, url)).await?.option_contracts)
+        Ok(self
+            .send::<Contracts>(self.req(reqwest::Method::GET, url))
+            .await?
+            .option_contracts)
     }
 
-    pub(crate) async fn quotes(&self, symbols: &[String]) -> Result<std::collections::HashMap<String, OptionQuote>> {
+    pub(crate) async fn quotes(
+        &self,
+        symbols: &[String],
+    ) -> Result<std::collections::HashMap<String, OptionQuote>> {
         let url = format!(
             "{}/v1beta1/options/quotes/latest?symbols={}&feed=indicative",
             self.data,
             symbols.join(",")
         );
-        Ok(self.send::<QuotesResponse>(self.req(reqwest::Method::GET, url)).await?.quotes)
+        Ok(self
+            .send::<QuotesResponse>(self.req(reqwest::Method::GET, url))
+            .await?
+            .quotes)
     }
 
-    async fn buy_limit(&self, contract: &str, qty: i64, limit: Decimal, client_order_id: &str) -> Result<OrderAck> {
+    async fn buy_limit(
+        &self,
+        contract: &str,
+        qty: i64,
+        limit: Decimal,
+        client_order_id: &str,
+    ) -> Result<OrderAck> {
         let body = json!({
             "symbol": contract, "qty": qty.to_string(), "side": "buy", "type": "limit",
             "limit_price": limit.to_string(), "time_in_force": "day",
             "client_order_id": client_order_id,
         });
-        self.send(self.req(reqwest::Method::POST, format!("{}/v2/orders", self.trading)).json(&body))
-            .await
+        self.send(
+            self.req(reqwest::Method::POST, format!("{}/v2/orders", self.trading))
+                .json(&body),
+        )
+        .await
     }
 
-    async fn sell_market(&self, contract: &str, qty: i64, client_order_id: &str) -> Result<OrderAck> {
+    async fn sell_market(
+        &self,
+        contract: &str,
+        qty: i64,
+        client_order_id: &str,
+    ) -> Result<OrderAck> {
         let body = json!({
             "symbol": contract, "qty": qty.to_string(), "side": "sell", "type": "market",
             "time_in_force": "day", "client_order_id": client_order_id,
         });
-        self.send(self.req(reqwest::Method::POST, format!("{}/v2/orders", self.trading)).json(&body))
-            .await
+        self.send(
+            self.req(reqwest::Method::POST, format!("{}/v2/orders", self.trading))
+                .json(&body),
+        )
+        .await
     }
 
     pub(crate) async fn order(&self, id: &str) -> Result<OrderAck> {
-        self.send(self.req(reqwest::Method::GET, format!("{}/v2/orders/{id}", self.trading)))
-            .await
+        self.send(self.req(
+            reqwest::Method::GET,
+            format!("{}/v2/orders/{id}", self.trading),
+        ))
+        .await
     }
 
     pub(crate) async fn cancel(&self, id: &str) -> Result<()> {
         let resp = self
-            .req(reqwest::Method::DELETE, format!("{}/v2/orders/{id}", self.trading))
+            .req(
+                reqwest::Method::DELETE,
+                format!("{}/v2/orders/{id}", self.trading),
+            )
             .send()
             .await
             .context("Alpaca cancel failed")?;
@@ -354,7 +401,9 @@ async fn manage_one(
                         store.option_opened(t.id, &px.to_string(), filled).await
                     } else {
                         info!(contract = %t.contract, status = %ack.status, "Options book: entry not filled, no trade");
-                        store.option_cancelled(t.id, &format!("entry {}", ack.status)).await
+                        store
+                            .option_cancelled(t.id, &format!("entry {}", ack.status))
+                            .await
                     }
                 }
                 _ => {
@@ -381,11 +430,17 @@ async fn manage_one(
             if (stock_open && !late) || !in_session {
                 return Ok(());
             }
-            let reason = if stock_open { "FLAT_1550" } else { "STOCK_EXIT" };
+            let reason = if stock_open {
+                "FLAT_1550"
+            } else {
+                "STOCK_EXIT"
+            };
             let cid = format!("opt-x-{}-{}", t.id, now.timestamp());
             let ack = api.sell_market(&t.contract, t.qty, &cid).await?;
             info!(contract = %t.contract, qty = t.qty, reason, "Options book: selling");
-            store.option_closing(t.id, &cid, Some(&ack.id), reason).await
+            store
+                .option_closing(t.id, &cid, Some(&ack.id), reason)
+                .await
         }
         "CLOSING" => {
             let Some(id) = t.exit_order_id.as_deref() else {
@@ -398,9 +453,13 @@ async fn manage_one(
                     let entry: Decimal = t.entry_price.as_deref().unwrap_or("0").parse()?;
                     let p = pnl(entry, exit, t.qty);
                     info!(contract = %t.contract, %entry, %exit, pnl = %p, "Options book: closed");
-                    store.option_closed(t.id, &exit.to_string(), &p.round_dp(2).to_string(), now).await
+                    store
+                        .option_closed(t.id, &exit.to_string(), &p.round_dp(2).to_string(), now)
+                        .await
                 }
-                "canceled" | "expired" | "rejected" | "done_for_day" => store.option_reopen(t.id).await,
+                "canceled" | "expired" | "rejected" | "done_for_day" => {
+                    store.option_reopen(t.id).await
+                }
                 _ => Ok(()),
             }
         }
@@ -443,7 +502,11 @@ async fn mirror_entries(
             info!(%symbol, "Options book: calls only; no put on a short breakdown");
             continue;
         }
-        if let Err(e) = enter(api, store, config, today, now, stock_id, &symbol, is_call, budget).await {
+        if let Err(e) = enter(
+            api, store, config, today, now, stock_id, &symbol, is_call, budget,
+        )
+        .await
+        {
             warn!(%symbol, error = %format!("{e:#}"), "Options book: entry failed");
         }
     }
@@ -496,12 +559,30 @@ async fn enter(
         .collect();
     let Some((contract, ask, qty)) = choose(&quoted, price, budget, config.max_spread_pct) else {
         info!(%symbol, %budget, "Options book: nothing affordable with a tight spread; skipping");
-        return store_skip(store, today, stock_id, symbol, is_call, now, "nothing affordable").await;
+        return store_skip(
+            store,
+            today,
+            stock_id,
+            symbol,
+            is_call,
+            now,
+            "nothing affordable",
+        )
+        .await;
     };
     let cid = format!("opt-{stock_id}-{}", now.timestamp());
     let row = store
         .insert_option_trade(
-            &today.to_string(), stock_id, symbol, &contract, is_call, qty, &ask.to_string(), &cid, None, now,
+            &today.to_string(),
+            stock_id,
+            symbol,
+            &contract,
+            is_call,
+            qty,
+            &ask.to_string(),
+            &cid,
+            None,
+            now,
         )
         .await?;
     match api.buy_limit(&contract, qty, ask, &cid).await {
@@ -528,9 +609,22 @@ async fn store_skip(
     why: &str,
 ) -> Result<()> {
     let row = store
-        .insert_option_trade(&today.to_string(), stock_id, symbol, "-", is_call, 0, "0", &format!("opt-skip-{stock_id}"), None, now)
+        .insert_option_trade(
+            &today.to_string(),
+            stock_id,
+            symbol,
+            "-",
+            is_call,
+            0,
+            "0",
+            &format!("opt-skip-{stock_id}"),
+            None,
+            now,
+        )
         .await?;
-    store.option_cancelled(row, &format!("skipped: {why}")).await
+    store
+        .option_cancelled(row, &format!("skipped: {why}"))
+        .await
 }
 
 #[cfg(test)]
@@ -548,7 +642,10 @@ mod tests {
     fn the_daily_limit_stops_entries_once_reached() {
         assert!(!daily_limit_hit(dec!(-99.99), dec!(100)));
         assert!(daily_limit_hit(dec!(-100), dec!(100)));
-        assert!(!daily_limit_hit(dec!(250), dec!(100)), "profits never stop it");
+        assert!(
+            !daily_limit_hit(dec!(250), dec!(100)),
+            "profits never stop it"
+        );
     }
 
     #[test]

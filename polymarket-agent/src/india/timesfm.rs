@@ -11,6 +11,7 @@
 //!   lost Rs 2,125 (83), in both halves.
 //! - Burst: agreed +Rs 963 (13), disagreed +Rs 49 (29); too few to trust,
 //!   added the same day at the user's request to gather more.
+//!
 //! Its plain direction calls were a coin flip (50.3%) and on US trades and
 //! gap-and-go the split was reversed. A test, not an edge. When the service
 //! is down the books trade as before.
@@ -98,7 +99,12 @@ pub async fn view_at_bar(
     buy: bool,
 ) -> Result<View> {
     let history = data
-        .history(key, 5, today - chrono::Duration::days(14), today - chrono::Duration::days(1))
+        .history(
+            key,
+            5,
+            today - chrono::Duration::days(14),
+            today - chrono::Duration::days(1),
+        )
         .await?;
     let mut past: Vec<&Bar> = history
         .iter()
@@ -121,7 +127,10 @@ mod tests {
     fn a_forecast_must_back_the_side_of_the_trade() {
         assert!(agrees(true, dec!(3110), dec!(3125)));
         assert!(!agrees(true, dec!(3110), dec!(3095)));
-        assert!(!agrees(true, dec!(3110), dec!(3110)), "flat is not agreement");
+        assert!(
+            !agrees(true, dec!(3110), dec!(3110)),
+            "flat is not agreement"
+        );
         assert!(agrees(false, dec!(100), dec!(99)));
         assert!(!agrees(false, dec!(100), dec!(101)));
     }

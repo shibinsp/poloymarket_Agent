@@ -52,7 +52,9 @@ const EXIT_TO: u32 = 15 * 60 + 59;
 pub fn signal(daily: &[Bar], monday: NaiveDate) -> Option<(Decimal, Decimal)> {
     let closes: Vec<Decimal> = daily
         .iter()
-        .filter(|b| b.ts.with_timezone(&New_York).date_naive() < monday && b.ts.date_naive() < monday)
+        .filter(|b| {
+            b.ts.with_timezone(&New_York).date_naive() < monday && b.ts.date_naive() < monday
+        })
         .map(|b| b.close)
         .collect();
     if closes.len() < SMA_DAYS {
@@ -71,16 +73,33 @@ pub fn tradable_week(monday: NaiveDate, holidays: &[NaiveDate]) -> bool {
         && !holidays.contains(&(monday + chrono::Duration::days(1)))
 }
 
-async fn enter(store: &Store, sip: &AlpacaBars, monday: NaiveDate, now: DateTime<Utc>) -> Result<()> {
-    if store.turnaround_entered_on(SYMBOL, &monday.to_string()).await? {
+async fn enter(
+    store: &Store,
+    sip: &AlpacaBars,
+    monday: NaiveDate,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    if store
+        .turnaround_entered_on(SYMBOL, &monday.to_string())
+        .await?
+    {
         return Ok(());
     }
     let symbols = vec![SYMBOL.to_string()];
-    let start = Utc.from_utc_datetime(&(monday - chrono::Duration::days(60)).and_hms_opt(0, 0, 0).context("midnight")?);
+    let start = Utc.from_utc_datetime(
+        &(monday - chrono::Duration::days(60))
+            .and_hms_opt(0, 0, 0)
+            .context("midnight")?,
+    );
     let daily = sip.daily_bars(&symbols, start).await?;
     let Some((friday, sma)) = daily.get(SYMBOL).and_then(|d| signal(d, monday)) else {
-        info!(symbol = SYMBOL, "Turnaround Tuesday: Friday closed at or above its 25-day average; no trade this week");
-        store.turnaround_mark_skip(SYMBOL, &monday.to_string()).await?;
+        info!(
+            symbol = SYMBOL,
+            "Turnaround Tuesday: Friday closed at or above its 25-day average; no trade this week"
+        );
+        store
+            .turnaround_mark_skip(SYMBOL, &monday.to_string())
+            .await?;
         return Ok(());
     };
     let open = New_York
@@ -88,7 +107,9 @@ async fn enter(store: &Store, sip: &AlpacaBars, monday: NaiveDate, now: DateTime
         .earliest()
         .context("no 9:30 that day")?
         .with_timezone(&Utc);
-    let bars = sip.bars_between(&symbols, open, Some(open + chrono::Duration::minutes(5))).await?;
+    let bars = sip
+        .bars_between(&symbols, open, Some(open + chrono::Duration::minutes(5)))
+        .await?;
     let Some(first) = bars.get(SYMBOL).and_then(|b| b.first()) else {
         anyhow::bail!("no 9:30 bar for {SYMBOL} yet");
     };
@@ -96,13 +117,20 @@ async fn enter(store: &Store, sip: &AlpacaBars, monday: NaiveDate, now: DateTime
     let capital = (CAPITAL_USD + realized).min(CAPITAL_USD);
     let price = (first.open * (Decimal::ONE + SLIPPAGE)).round_dp(4);
     let qty = (capital / price).round_dp(6);
-    store.turnaround_open_trade(SYMBOL, qty, &monday.to_string(), price, friday, sma, now).await?;
+    store
+        .turnaround_open_trade(SYMBOL, qty, &monday.to_string(), price, friday, sma, now)
+        .await?;
     info!(symbol = SYMBOL, %friday, sma = %sma.round_dp(2), %price, %qty,
           "Turnaround Tuesday: Friday below its 25-day average; bought at Monday's open (paper, simulated)");
     Ok(())
 }
 
-async fn exit(store: &Store, iex: &AlpacaBars, tuesday: NaiveDate, now: DateTime<Utc>) -> Result<()> {
+async fn exit(
+    store: &Store,
+    iex: &AlpacaBars,
+    tuesday: NaiveDate,
+    now: DateTime<Utc>,
+) -> Result<()> {
     let open_trades = store.turnaround_open().await?;
     if open_trades.is_empty() {
         return Ok(());
@@ -118,16 +146,25 @@ async fn exit(store: &Store, iex: &AlpacaBars, tuesday: NaiveDate, now: DateTime
     };
     let price = (last * (Decimal::ONE - SLIPPAGE)).round_dp(4);
     for (id, _sym, qty, entry, _day) in open_trades {
-        let (qty, entry) = (Decimal::from_str_exact(&qty)?, Decimal::from_str_exact(&entry)?);
+        let (qty, entry) = (
+            Decimal::from_str_exact(&qty)?,
+            Decimal::from_str_exact(&entry)?,
+        );
         let pnl = (price - entry) * qty;
-        store.turnaround_close_trade(id, &tuesday.to_string(), price, pnl, now).await?;
+        store
+            .turnaround_close_trade(id, &tuesday.to_string(), price, pnl, now)
+            .await?;
         info!(symbol = SYMBOL, %entry, %price, pnl = %pnl.round_dp(2), "Turnaround Tuesday: sold at Tuesday's close (paper, simulated)");
     }
     Ok(())
 }
 
 /// Check every 30 seconds. Monday 9:51-11:00: decide and enter. Tuesday 15:55: exit.
-pub fn spawn_us_turnaround_worker(store: Store, sip: AlpacaBars, iex: AlpacaBars) -> JoinHandle<()> {
+pub fn spawn_us_turnaround_worker(
+    store: Store,
+    sip: AlpacaBars,
+    iex: AlpacaBars,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         info!(capital = %CAPITAL_USD, symbol = SYMBOL, "US Turnaround Tuesday book started (paper, simulated)");
         let mut entered: Option<NaiveDate> = None;
@@ -139,7 +176,10 @@ pub fn spawn_us_turnaround_worker(store: Store, sip: AlpacaBars, iex: AlpacaBars
             let day = ny.date_naive();
             let minute = ny.hour() * 60 + ny.minute();
             let holidays = us_market_holidays();
-            if day.weekday() == Weekday::Mon && entered != Some(day) && (ENTRY_FROM..ENTRY_TO).contains(&minute) {
+            if day.weekday() == Weekday::Mon
+                && entered != Some(day)
+                && (ENTRY_FROM..ENTRY_TO).contains(&minute)
+            {
                 if !tradable_week(day, &holidays) {
                     entered = Some(day);
                     info!("Turnaround Tuesday: holiday on Monday or Tuesday; no trade this week");
@@ -147,13 +187,21 @@ pub fn spawn_us_turnaround_worker(store: Store, sip: AlpacaBars, iex: AlpacaBars
                 }
                 match enter(&store, &sip, day, now).await {
                     Ok(()) => entered = Some(day),
-                    Err(e) => warn!(error = %format!("{e:#}"), "Turnaround Tuesday entry failed; retrying"),
+                    Err(e) => {
+                        warn!(error = %format!("{e:#}"), "Turnaround Tuesday entry failed; retrying")
+                    }
                 }
             }
-            if day.weekday() == Weekday::Tue && exited != Some(day) && (EXIT_FROM..EXIT_TO).contains(&minute) && !holidays.contains(&day) {
+            if day.weekday() == Weekday::Tue
+                && exited != Some(day)
+                && (EXIT_FROM..EXIT_TO).contains(&minute)
+                && !holidays.contains(&day)
+            {
                 match exit(&store, &iex, day, now).await {
                     Ok(()) => exited = Some(day),
-                    Err(e) => warn!(error = %format!("{e:#}"), "Turnaround Tuesday exit failed; retrying"),
+                    Err(e) => {
+                        warn!(error = %format!("{e:#}"), "Turnaround Tuesday exit failed; retrying")
+                    }
                 }
             }
         }
@@ -173,7 +221,14 @@ mod tests {
                 let d = last_day - chrono::Duration::days(n - 1 - i as i64);
                 // Alpaca stamps daily bars at 00:00 or 04:00/05:00 UTC of the session date
                 let ts = Utc.from_utc_datetime(&d.and_hms_opt(5, 0, 0).unwrap());
-                Bar { ts, open: *c, high: *c, low: *c, close: *c, volume: dec!(1) }
+                Bar {
+                    ts,
+                    open: *c,
+                    high: *c,
+                    low: *c,
+                    close: *c,
+                    volume: dec!(1),
+                }
             })
             .collect()
     }
@@ -207,7 +262,10 @@ mod tests {
         let monday = NaiveDate::from_ymd_opt(2026, 11, 16).unwrap();
         assert!(tradable_week(monday, &[]));
         assert!(!tradable_week(monday, &[monday]));
-        assert!(!tradable_week(monday, &[monday + chrono::Duration::days(1)]));
+        assert!(!tradable_week(
+            monday,
+            &[monday + chrono::Duration::days(1)]
+        ));
         assert!(!tradable_week(monday + chrono::Duration::days(1), &[]));
     }
 }

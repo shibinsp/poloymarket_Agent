@@ -102,7 +102,10 @@ async fn previous_close(data: &UpstoxBars, key: &str, day: NaiveDate) -> Result<
 async fn scan(data: &UpstoxBars, day: NaiveDate) -> Vec<Gap> {
     let mut out = Vec::new();
     for (symbol, key) in NIFTY50 {
-        let (prev, today) = match (previous_close(data, key, day).await, data.today(key, 5).await) {
+        let (prev, today) = match (
+            previous_close(data, key, day).await,
+            data.today(key, 5).await,
+        ) {
             (Ok(Some(p)), Ok(t)) => (p, t),
             (Ok(None), _) => continue,
             (Err(e), _) | (_, Err(e)) => {
@@ -238,7 +241,6 @@ async fn enter(
         None
     };
 
-
     let action = if blocked.is_some() { "SKIP" } else { "TRADE" };
     let card = serde_json::json!({
         "at": now,
@@ -271,7 +273,17 @@ async fn enter(
         )
         .await?;
     info!(symbol = %p.symbol, buy, qty, %price, %stop, gap = %p.gap, "NSE gap-and-go paper entry; no live order was sent");
-    crate::india::ladder::mirror_entry(store, STRATEGY, &today.to_string(), &p.symbol, buy, price, stop, now).await;
+    crate::india::ladder::mirror_entry(
+        store,
+        STRATEGY,
+        &today.to_string(),
+        &p.symbol,
+        buy,
+        price,
+        stop,
+        now,
+    )
+    .await;
     Ok(())
 }
 
@@ -292,13 +304,39 @@ mod tests {
 
     #[test]
     fn a_gap_needs_two_percent_and_a_first_bar_that_keeps_going() {
-        assert_eq!(gap_side(dec!(100), dec!(102), dec!(102.5)), Some((true, dec!(0.02))));
-        assert_eq!(gap_side(dec!(100), dec!(101.5), dec!(102)), None, "1.5% is too small");
-        assert_eq!(gap_side(dec!(100), dec!(98), dec!(97.5)), Some((false, dec!(-0.02))));
-        assert_eq!(gap_side(dec!(100), dec!(101.9), dec!(103)), None, "gap too small");
-        assert_eq!(gap_side(dec!(100), dec!(102), dec!(101.5)), None, "gap up being sold");
-        assert_eq!(gap_side(dec!(100), dec!(98), dec!(98.5)), None, "gap down being bought");
-        assert_eq!(gap_side(dec!(100), dec!(102), dec!(102)), None, "a flat first bar");
+        assert_eq!(
+            gap_side(dec!(100), dec!(102), dec!(102.5)),
+            Some((true, dec!(0.02)))
+        );
+        assert_eq!(
+            gap_side(dec!(100), dec!(101.5), dec!(102)),
+            None,
+            "1.5% is too small"
+        );
+        assert_eq!(
+            gap_side(dec!(100), dec!(98), dec!(97.5)),
+            Some((false, dec!(-0.02)))
+        );
+        assert_eq!(
+            gap_side(dec!(100), dec!(101.9), dec!(103)),
+            None,
+            "gap too small"
+        );
+        assert_eq!(
+            gap_side(dec!(100), dec!(102), dec!(101.5)),
+            None,
+            "gap up being sold"
+        );
+        assert_eq!(
+            gap_side(dec!(100), dec!(98), dec!(98.5)),
+            None,
+            "gap down being bought"
+        );
+        assert_eq!(
+            gap_side(dec!(100), dec!(102), dec!(102)),
+            None,
+            "a flat first bar"
+        );
     }
 
     #[test]

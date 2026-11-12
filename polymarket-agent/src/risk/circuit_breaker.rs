@@ -118,7 +118,11 @@ impl std::fmt::Display for BreakerTrip {
                 write!(f, "down ${lost} on the day, limit ${limit}")
             }
             Self::UsBookLoss { lost, limit } => {
-                write!(f, "U.S. stock books down ${} today, limit ${limit}", lost.round_dp(2))
+                write!(
+                    f,
+                    "U.S. stock books down ${} today, limit ${limit}",
+                    lost.round_dp(2)
+                )
             }
             Self::Drawdown {
                 drawdown_pct,
@@ -190,10 +194,16 @@ pub fn evaluate(
     if let Some(us_limit) = cfg.us_max_daily_loss_usd {
         match us_book_day_pnl {
             Some(pnl) if -pnl > us_limit => {
-                return Some(BreakerTrip::UsBookLoss { lost: -pnl, limit: us_limit });
+                return Some(BreakerTrip::UsBookLoss {
+                    lost: -pnl,
+                    limit: us_limit,
+                });
             }
             None if lost > us_limit => {
-                return Some(BreakerTrip::DailyLossUsd { lost, limit: us_limit });
+                return Some(BreakerTrip::DailyLossUsd {
+                    lost,
+                    limit: us_limit,
+                });
             }
             _ => {}
         }
@@ -346,7 +356,10 @@ mod tests {
         c.max_daily_loss_usd = dec!(50);
         c.us_max_daily_loss_usd = Some(dec!(20));
         let marks = day(dec!(2006.14), dec!(2014.71));
-        assert_eq!(evaluate(dec!(1956.94), &marks, 3, 0, Some(dec!(-4.43)), &c), None);
+        assert_eq!(
+            evaluate(dec!(1956.94), &marks, 3, 0, Some(dec!(-4.43)), &c),
+            None
+        );
         match evaluate(dec!(1980), &marks, 3, 0, Some(dec!(-21)), &c).expect("stocks down $21") {
             BreakerTrip::UsBookLoss { lost, limit } => {
                 assert_eq!((lost, limit), (dec!(21), dec!(20)));

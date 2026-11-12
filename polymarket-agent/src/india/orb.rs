@@ -372,7 +372,9 @@ pub fn spawn_india_orb_worker(
             if kill_switch.is_tripped() || !detect_nse_session(now).allows_order_entry {
                 continue;
             }
-            if let Err(e) = look_for_entry(&data, &store, &mut day, capital, book, longs_only, now).await {
+            if let Err(e) =
+                look_for_entry(&data, &store, &mut day, capital, book, longs_only, now).await
+            {
                 warn!(error = %e, "Intraday entry pass failed");
             }
         }
@@ -573,8 +575,11 @@ async fn look_for_entry(
         };
         let tfm_skip = tfm.is_some_and(|v| !v.agrees);
 
-
-        let action = if blocked.is_some() || tfm_skip { "SKIP" } else { "TRADE" };
+        let action = if blocked.is_some() || tfm_skip {
+            "SKIP"
+        } else {
+            "TRADE"
+        };
         let card = serde_json::json!({
             "at": now,
             "market": "IN",
@@ -636,7 +641,17 @@ async fn look_for_entry(
             continue;
         }
         if book == STRATEGY {
-            crate::india::ladder::mirror_entry(store, book, &today.to_string(), &p.symbol, buy, price, stop, now).await;
+            crate::india::ladder::mirror_entry(
+                store,
+                book,
+                &today.to_string(),
+                &p.symbol,
+                buy,
+                price,
+                stop,
+                now,
+            )
+            .await;
         }
         break; // one position at a time
     }

@@ -165,7 +165,11 @@ async fn backfill(
 }
 
 /// Streams Alpaca news for the life of the agent, reconnecting on any drop.
-pub fn spawn_news_stream(key: String, secret: String, watch: Vec<String>) -> (LiveNews, JoinHandle<()>) {
+pub fn spawn_news_stream(
+    key: String,
+    secret: String,
+    watch: Vec<String>,
+) -> (LiveNews, JoinHandle<()>) {
     let board: LiveNews = Arc::new(RwLock::new(NewsBoard {
         status: "CONNECTING".to_string(),
         ..Default::default()
@@ -185,16 +189,22 @@ pub fn spawn_news_stream(key: String, secret: String, watch: Vec<String>) -> (Li
             match connect_async(STREAM_URL).await {
                 Ok((ws, _)) => {
                     let (mut write, mut read) = ws.split();
-                    let auth = serde_json::json!({ "action": "auth", "key": key, "secret": secret });
+                    let auth =
+                        serde_json::json!({ "action": "auth", "key": key, "secret": secret });
                     let sub = serde_json::json!({ "action": "subscribe", "news": ["*"] });
-                    let mut ok = write.send(Message::Text(auth.to_string().into())).await.is_ok();
+                    let mut ok = write
+                        .send(Message::Text(auth.to_string().into()))
+                        .await
+                        .is_ok();
                     let mut subscribed = false;
                     while ok {
                         let Some(msg) = read.next().await else { break };
                         match msg {
                             Ok(Message::Text(txt)) => {
                                 let now = Utc::now();
-                                let Ok(records) = serde_json::from_str::<Vec<serde_json::Value>>(&txt) else {
+                                let Ok(records) =
+                                    serde_json::from_str::<Vec<serde_json::Value>>(&txt)
+                                else {
                                     continue;
                                 };
                                 for rec in records {
@@ -203,7 +213,10 @@ pub fn spawn_news_stream(key: String, secret: String, watch: Vec<String>) -> (Li
                                     match kind {
                                         "success" if m == "authenticated" && !subscribed => {
                                             subscribed = true;
-                                            ok = write.send(Message::Text(sub.to_string().into())).await.is_ok();
+                                            ok = write
+                                                .send(Message::Text(sub.to_string().into()))
+                                                .await
+                                                .is_ok();
                                         }
                                         "subscription" => {
                                             let mut b = board.write().await;
@@ -215,12 +228,14 @@ pub fn spawn_news_stream(key: String, secret: String, watch: Vec<String>) -> (Li
                                         "error" => {
                                             warn!(response = %rec, "Live news stream error");
                                             if m.contains("auth") {
-                                                board.write().await.status = "AUTH_REQUIRED".to_string();
+                                                board.write().await.status =
+                                                    "AUTH_REQUIRED".to_string();
                                             }
                                             ok = false;
                                         }
                                         "n" => {
-                                            if let Ok(raw) = serde_json::from_value::<RawItem>(rec) {
+                                            if let Ok(raw) = serde_json::from_value::<RawItem>(rec)
+                                            {
                                                 debug_assert_eq!(raw.kind, "n");
                                                 if let Some(item) = to_item(raw, now, &watch) {
                                                     let mut b = board.write().await;
@@ -293,9 +308,18 @@ mod tests {
     fn the_board_keeps_newest_first_and_drops_repeats() {
         let mut b = NewsBoard::default();
         let w: Vec<String> = vec![];
-        assert!(insert(&mut b, to_item(raw(1, 10, "older", &[]), Utc::now(), &w).unwrap()));
-        assert!(insert(&mut b, to_item(raw(2, 1, "newer", &[]), Utc::now(), &w).unwrap()));
-        assert!(!insert(&mut b, to_item(raw(1, 10, "older", &[]), Utc::now(), &w).unwrap()));
+        assert!(insert(
+            &mut b,
+            to_item(raw(1, 10, "older", &[]), Utc::now(), &w).unwrap()
+        ));
+        assert!(insert(
+            &mut b,
+            to_item(raw(2, 1, "newer", &[]), Utc::now(), &w).unwrap()
+        ));
+        assert!(!insert(
+            &mut b,
+            to_item(raw(1, 10, "older", &[]), Utc::now(), &w).unwrap()
+        ));
         assert_eq!(b.items.iter().map(|i| i.id).collect::<Vec<_>>(), vec![2, 1]);
         assert!(to_item(raw(3, 0, "  ", &[]), Utc::now(), &w).is_none());
     }

@@ -385,14 +385,19 @@ impl VenueExits<'_> {
                     mark = %mark,
                     "Up 1R: moving the stop to break-even"
                 );
-                self.store.update_trade_stop(trade.id, &be.to_string()).await?;
+                self.store
+                    .update_trade_stop(trade.id, &be.to_string())
+                    .await?;
                 // The old stop holds the shares; it must be gone before the
                 // new one can rest. If it fired or is still cancelling, the
                 // next pass sees that and places the new one.
                 if self.clear_resting_stops(venue, stops, now).await? {
                     let mut moved = trade.clone();
                     moved.stop_price = Some(be);
-                    if let Err(e) = self.place_resting_stop(&moved, now, cycle, instruments).await {
+                    if let Err(e) = self
+                        .place_resting_stop(&moved, now, cycle, instruments)
+                        .await
+                    {
                         warn!(
                             trade_id = trade.id,
                             symbol = %trade.symbol,
@@ -537,7 +542,9 @@ impl VenueExits<'_> {
             // the next pass retries the exit. A sale whose fate is unknown may
             // be live and holding the shares; reconciliation settles that one.
             if failed_exit_record(&format!("{e:#}")).0 == "REJECTED" {
-                if let Err(stop_err) = self.place_resting_stop(trade, now, cycle, instruments).await
+                if let Err(stop_err) = self
+                    .place_resting_stop(trade, now, cycle, instruments)
+                    .await
                 {
                     warn!(
                         trade_id = trade.id,
@@ -1387,13 +1394,30 @@ mod tests {
     fn the_stop_moves_to_break_even_at_one_r_and_only_once() {
         use rust_decimal_macros::dec;
         let (entry, stop) = (dec!(13.06524), Some(dec!(12.65)));
-        assert_eq!(breakeven_stop(entry, stop, dec!(13.40), false), None, "under 1R");
-        assert_eq!(breakeven_stop(entry, stop, dec!(13.49), false), Some(dec!(13.07)));
-        assert_eq!(breakeven_stop(entry, Some(dec!(13.07)), dec!(14), false), None, "already moved");
+        assert_eq!(
+            breakeven_stop(entry, stop, dec!(13.40), false),
+            None,
+            "under 1R"
+        );
+        assert_eq!(
+            breakeven_stop(entry, stop, dec!(13.49), false),
+            Some(dec!(13.07))
+        );
+        assert_eq!(
+            breakeven_stop(entry, Some(dec!(13.07)), dec!(14), false),
+            None,
+            "already moved"
+        );
         assert_eq!(breakeven_stop(entry, None, dec!(14), false), None);
         // A short: entry 100, stop 102, 1R down is 98.
-        assert_eq!(breakeven_stop(dec!(100.004), Some(dec!(102)), dec!(98.5), true), None);
-        assert_eq!(breakeven_stop(dec!(100.004), Some(dec!(102)), dec!(98), true), Some(dec!(100.00)));
+        assert_eq!(
+            breakeven_stop(dec!(100.004), Some(dec!(102)), dec!(98.5), true),
+            None
+        );
+        assert_eq!(
+            breakeven_stop(dec!(100.004), Some(dec!(102)), dec!(98), true),
+            Some(dec!(100.00))
+        );
     }
 
     #[test]

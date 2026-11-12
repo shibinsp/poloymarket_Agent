@@ -380,7 +380,6 @@ pub fn generate_us_chart(
         });
     }
 
-
     // Build itemized detailed trades
     let detailed_trades = build_detailed_trades(&symbol_upper, &trade_markers, name);
     let summary = summarize_detailed_trades(&detailed_trades);

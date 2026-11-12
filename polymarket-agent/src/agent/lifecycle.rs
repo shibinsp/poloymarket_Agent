@@ -189,9 +189,10 @@ impl Agent {
             // Polymarket can value on a model of its own while every other
             // path keeps the main one. An override on the main endpoint
             // (another NVIDIA model) uses the main key, never the Gemini one.
-            let same_host = config.valuation.polymarket.as_ref().is_some_and(|o| {
-                o.base_url.is_none() || o.base_url == config.valuation.base_url
-            });
+            let same_host =
+                config.valuation.polymarket.as_ref().is_some_and(|o| {
+                    o.base_url.is_none() || o.base_url == config.valuation.base_url
+                });
             let polymarket_key = if same_host {
                 Some(api_key)
             } else {
@@ -971,7 +972,8 @@ impl Agent {
                 match scan_legacy(scanner).await {
                     Ok(candidates) => {
                         markets_scanned = candidates.len() as i64;
-                        if self.has_valuation_engine() && budget_available && !candidates.is_empty() {
+                        if self.has_valuation_engine() && budget_available && !candidates.is_empty()
+                        {
                             let bankroll = self.polymarket_bankroll().await;
                             let result = self.evaluate_and_trade(&candidates, bankroll, 1).await;
                             opportunities_found = result.opportunities as i64;
@@ -1013,9 +1015,16 @@ impl Agent {
                         if !candidates.is_empty() && self.config.agent.polymarket_underdog {
                             trades_placed += self.run_underdog(&candidates).await as i64;
                         }
-                        if self.has_valuation_engine() && budget_available && !candidates.is_empty() {
+                        if self.has_valuation_engine() && budget_available && !candidates.is_empty()
+                        {
                             let bankroll = self.polymarket_bankroll().await;
-                            let result = self.evaluate_and_trade(&candidates, bankroll, self.config.valuation.max_evaluations_per_scan).await;
+                            let result = self
+                                .evaluate_and_trade(
+                                    &candidates,
+                                    bankroll,
+                                    self.config.valuation.max_evaluations_per_scan,
+                                )
+                                .await;
                             opportunities_found = result.opportunities as i64;
                             trades_placed += result.trades as i64;
                             cycle_api_cost = result.api_cost;
@@ -2051,18 +2060,22 @@ impl Agent {
         // 15:45 exit. So no scans while the U.S. market is open or about to
         // open (found 3 Nov 2026); Polymarket keeps the other 17 hours.
         if self.orb.is_some() {
-            if let Some(alpaca) = self.venues.get(&crate::venue::types::VenueId::new("alpaca")) {
+            if let Some(alpaca) = self
+                .venues
+                .get(&crate::venue::types::VenueId::new("alpaca"))
+            {
                 let regular = |t| {
-                    alpaca.session_state(t).kind() == Some(crate::venue::session::SessionKind::Regular)
+                    alpaca.session_state(t).kind()
+                        == Some(crate::venue::session::SessionKind::Regular)
                 };
                 if regular(now) || regular(now + Duration::minutes(20)) {
                     return false;
                 }
             }
         }
-        let due = self
-            .last_polymarket_scan
-            .is_none_or(|t| now - t >= self.polymarket_interval() - Duration::seconds(5));
+        let due = self.last_polymarket_scan.map_or(true, |t| {
+            now - t >= self.polymarket_interval() - Duration::seconds(5)
+        });
         if due {
             self.last_polymarket_scan = Some(now);
         }

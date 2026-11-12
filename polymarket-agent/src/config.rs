@@ -66,7 +66,11 @@ pub struct TargetConfig {
 
 impl Default for TargetConfig {
     fn default() -> Self {
-        Self { daily_inr: default_target_inr(), usd_inr: default_usd_inr(), since: default_target_since() }
+        Self {
+            daily_inr: default_target_inr(),
+            usd_inr: default_usd_inr(),
+            since: default_target_since(),
+        }
     }
 }
 
@@ -395,12 +399,16 @@ pub struct IndiaStrategyConfig {
 impl IndiaStrategyConfig {
     /// Whether the opening-burst book runs.
     pub fn runs_burst(&self) -> bool {
-        self.also_run.iter().any(|s| s.eq_ignore_ascii_case("burst"))
+        self.also_run
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case("burst"))
     }
 
     /// Whether the gap-and-go book runs.
     pub fn runs_gapgo(&self) -> bool {
-        self.also_run.iter().any(|s| s.eq_ignore_ascii_case("gapgo"))
+        self.also_run
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case("gapgo"))
     }
 }
 
@@ -2002,9 +2010,11 @@ mod tests {
         let mut config: AppConfig = toml::from_str(&contents).expect("default config parses");
         config.agent.mode = AgentMode::Live;
         config.venues.clear();
-        let mut secrets = Secrets::default();
-        secrets.polymarket_private_key = Some(SecretString::new("configured".to_string().into()));
-        secrets.llm_api_key = Some(SecretString::new("configured".to_string().into()));
+        let secrets = Secrets {
+            polymarket_private_key: Some(SecretString::new("configured".to_string().into())),
+            llm_api_key: Some(SecretString::new("configured".to_string().into())),
+            ..Secrets::default()
+        };
 
         let issues = config.startup_issues(&secrets);
 

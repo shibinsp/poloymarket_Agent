@@ -793,12 +793,13 @@ impl Store {
         // $2 bets a day, bounded by its own $50 cash, and on 11 Nov 2026 its
         // 21 bets tripped this shared cap and halted the stock books for the
         // whole U.S. session.
-        let count_legacy: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM trades WHERE date(created_at) = ? AND venue_id <> 'polymarket'")
-                .bind(day.to_string())
-                .fetch_one(&self.pool)
-                .await
-                .context("Failed to count today's trades")?;
+        let count_legacy: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM trades WHERE date(created_at) = ? AND venue_id <> 'polymarket'",
+        )
+        .bind(day.to_string())
+        .fetch_one(&self.pool)
+        .await
+        .context("Failed to count today's trades")?;
         let count_us: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM us_paper_orders WHERE date(created_at) = ?")
                 .bind(day.to_string())
@@ -954,32 +955,48 @@ impl Store {
 
     /// Whether the pre-FOMC book already bought for this meeting.
     pub async fn prefomc_has(&self, symbol: &str, fomc_day: &str) -> Result<bool> {
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM us_prefomc_trades WHERE symbol = ? AND fomc_day = ?")
-            .bind(symbol)
-            .bind(fomc_day)
-            .fetch_one(&self.pool)
-            .await
-            .context("Failed to read pre-FOMC trades")?;
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM us_prefomc_trades WHERE symbol = ? AND fomc_day = ?",
+        )
+        .bind(symbol)
+        .bind(fomc_day)
+        .fetch_one(&self.pool)
+        .await
+        .context("Failed to read pre-FOMC trades")?;
         Ok(n > 0)
     }
 
     /// Open pre-FOMC positions: (id, qty, entry price).
     pub async fn prefomc_open(&self) -> Result<Vec<(i64, String, String)>> {
-        sqlx::query_as("SELECT id, qty, entry_price FROM us_prefomc_trades WHERE exit_at IS NULL ORDER BY id")
-            .fetch_all(&self.pool)
-            .await
-            .context("Failed to read open pre-FOMC trades")
+        sqlx::query_as(
+            "SELECT id, qty, entry_price FROM us_prefomc_trades WHERE exit_at IS NULL ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read open pre-FOMC trades")
     }
 
     pub async fn prefomc_realized(&self) -> Result<Decimal> {
-        let rows: Vec<(Option<String>,)> = sqlx::query_as("SELECT pnl FROM us_prefomc_trades WHERE pnl IS NOT NULL")
-            .fetch_all(&self.pool)
-            .await
-            .context("Failed to read pre-FOMC P&L")?;
-        Ok(rows.into_iter().filter_map(|r| r.0.and_then(|p| Decimal::from_str(&p).ok())).sum())
+        let rows: Vec<(Option<String>,)> =
+            sqlx::query_as("SELECT pnl FROM us_prefomc_trades WHERE pnl IS NOT NULL")
+                .fetch_all(&self.pool)
+                .await
+                .context("Failed to read pre-FOMC P&L")?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| r.0.and_then(|p| Decimal::from_str(&p).ok()))
+            .sum())
     }
 
-    pub async fn prefomc_open_trade(&self, symbol: &str, qty: Decimal, fomc_day: &str, day: &str, price: Decimal, at: DateTime<Utc>) -> Result<i64> {
+    pub async fn prefomc_open_trade(
+        &self,
+        symbol: &str,
+        qty: Decimal,
+        fomc_day: &str,
+        day: &str,
+        price: Decimal,
+        at: DateTime<Utc>,
+    ) -> Result<i64> {
         let r = sqlx::query(
             "INSERT INTO us_prefomc_trades (symbol, qty, fomc_day, entry_day, entry_price, entry_at) VALUES (?, ?, ?, ?, ?, ?)",
         )
@@ -995,7 +1012,14 @@ impl Store {
         Ok(r.last_insert_rowid())
     }
 
-    pub async fn prefomc_close_trade(&self, id: i64, day: &str, price: Decimal, pnl: Decimal, at: DateTime<Utc>) -> Result<()> {
+    pub async fn prefomc_close_trade(
+        &self,
+        id: i64,
+        day: &str,
+        price: Decimal,
+        pnl: Decimal,
+        at: DateTime<Utc>,
+    ) -> Result<()> {
         sqlx::query("UPDATE us_prefomc_trades SET exit_day = ?, exit_price = ?, pnl = ?, exit_at = ? WHERE id = ? AND exit_at IS NULL")
             .bind(day)
             .bind(price.to_string())
@@ -1031,12 +1055,14 @@ impl Store {
 
     /// Whether the Turnaround Tuesday book already acted on this Monday (a trade or a skip).
     pub async fn turnaround_entered_on(&self, symbol: &str, day: &str) -> Result<bool> {
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM us_turnaround_trades WHERE symbol = ? AND entry_day = ?")
-            .bind(symbol)
-            .bind(day)
-            .fetch_one(&self.pool)
-            .await
-            .context("Failed to read Turnaround Tuesday entries")?;
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM us_turnaround_trades WHERE symbol = ? AND entry_day = ?",
+        )
+        .bind(symbol)
+        .bind(day)
+        .fetch_one(&self.pool)
+        .await
+        .context("Failed to read Turnaround Tuesday entries")?;
         Ok(n > 0)
     }
 
@@ -1071,10 +1097,11 @@ impl Store {
 
     /// Sum of closed Turnaround Tuesday P&L.
     pub async fn turnaround_realized(&self) -> Result<Decimal> {
-        let rows: Vec<(Option<String>,)> = sqlx::query_as("SELECT pnl FROM us_turnaround_trades WHERE pnl IS NOT NULL")
-            .fetch_all(&self.pool)
-            .await
-            .context("Failed to read Turnaround Tuesday P&L")?;
+        let rows: Vec<(Option<String>,)> =
+            sqlx::query_as("SELECT pnl FROM us_turnaround_trades WHERE pnl IS NOT NULL")
+                .fetch_all(&self.pool)
+                .await
+                .context("Failed to read Turnaround Tuesday P&L")?;
         Ok(rows
             .into_iter()
             .filter_map(|r| r.0.and_then(|p| Decimal::from_str(&p).ok()))
@@ -1108,7 +1135,14 @@ impl Store {
         Ok(r.last_insert_rowid())
     }
 
-    pub async fn turnaround_close_trade(&self, id: i64, day: &str, price: Decimal, pnl: Decimal, at: DateTime<Utc>) -> Result<()> {
+    pub async fn turnaround_close_trade(
+        &self,
+        id: i64,
+        day: &str,
+        price: Decimal,
+        pnl: Decimal,
+        at: DateTime<Utc>,
+    ) -> Result<()> {
         sqlx::query(
             "UPDATE us_turnaround_trades SET exit_day = ?, exit_price = ?, pnl = ?, exit_at = ? WHERE id = ? AND exit_at IS NULL",
         )
@@ -1158,10 +1192,11 @@ impl Store {
 
     /// Sum of closed IBS P&L.
     pub async fn ibs_realized(&self) -> Result<Decimal> {
-        let rows: Vec<(Option<String>,)> = sqlx::query_as("SELECT pnl FROM us_ibs_trades WHERE pnl IS NOT NULL")
-            .fetch_all(&self.pool)
-            .await
-            .context("Failed to read IBS P&L")?;
+        let rows: Vec<(Option<String>,)> =
+            sqlx::query_as("SELECT pnl FROM us_ibs_trades WHERE pnl IS NOT NULL")
+                .fetch_all(&self.pool)
+                .await
+                .context("Failed to read IBS P&L")?;
         Ok(rows
             .into_iter()
             .filter_map(|r| r.0.and_then(|p| Decimal::from_str(&p).ok()))
@@ -1309,7 +1344,18 @@ impl Store {
     pub async fn us_ladder_spread_sources(
         &self,
         since_day: &str,
-    ) -> Result<Vec<(i64, String, String, String, String, Option<String>, Option<String>, String)>> {
+    ) -> Result<
+        Vec<(
+            i64,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+        )>,
+    > {
         sqlx::query_as(
             "SELECT id, day, underlying, short_strike, long_strike, entry_credit, exit_debit, status
              FROM us_spread_trades WHERE day >= ? ORDER BY id",
@@ -1481,13 +1527,15 @@ impl Store {
 
     /// Entry filled: the position is open.
     pub async fn option_opened(&self, id: i64, entry_price: &str, qty: i64) -> Result<()> {
-        sqlx::query("UPDATE us_option_trades SET status = 'OPEN', entry_price = ?, qty = ? WHERE id = ?")
-            .bind(entry_price)
-            .bind(qty)
-            .bind(id)
-            .execute(&self.pool)
-            .await
-            .context("Failed to open option trade")?;
+        sqlx::query(
+            "UPDATE us_option_trades SET status = 'OPEN', entry_price = ?, qty = ? WHERE id = ?",
+        )
+        .bind(entry_price)
+        .bind(qty)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .context("Failed to open option trade")?;
         Ok(())
     }
 
@@ -1549,11 +1597,13 @@ impl Store {
 
     /// Exit order died unfilled: back to OPEN so the next pass sells again.
     pub async fn option_reopen(&self, id: i64) -> Result<()> {
-        sqlx::query("UPDATE us_option_trades SET status = 'OPEN', exit_order_id = NULL WHERE id = ?")
-            .bind(id)
-            .execute(&self.pool)
-            .await
-            .context("Failed to reopen option trade")?;
+        sqlx::query(
+            "UPDATE us_option_trades SET status = 'OPEN', exit_order_id = NULL WHERE id = ?",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .context("Failed to reopen option trade")?;
         Ok(())
     }
 
@@ -1564,12 +1614,16 @@ impl Store {
                 .fetch_all(&self.pool)
                 .await
                 .context("Failed to read option totals")?;
-        let (mut n, mut today, mut all, mut losses) = (0i64, Decimal::ZERO, Decimal::ZERO, Decimal::ZERO);
+        let (mut n, mut today, mut all, mut losses) =
+            (0i64, Decimal::ZERO, Decimal::ZERO, Decimal::ZERO);
         for (d, status, pnl) in rows {
             if d == day && status != "CANCELLED" {
                 n += 1;
             }
-            let v = pnl.as_deref().and_then(|p| Decimal::from_str(p).ok()).unwrap_or_default();
+            let v = pnl
+                .as_deref()
+                .and_then(|p| Decimal::from_str(p).ok())
+                .unwrap_or_default();
             all += v;
             if v.is_sign_negative() {
                 losses += v;
@@ -1635,12 +1689,23 @@ impl Store {
     }
 
     pub async fn set_spread_order_id(&self, id: i64, order_id: &str) -> Result<()> {
-        self.spread_update("UPDATE us_spread_trades SET venue_order_id = ? WHERE id = ?", &[order_id], id)
-            .await
+        self.spread_update(
+            "UPDATE us_spread_trades SET venue_order_id = ? WHERE id = ?",
+            &[order_id],
+            id,
+        )
+        .await
     }
 
     /// The entry sent again at a new credit (the mid went unfilled).
-    pub async fn spread_resend(&self, id: i64, limit_credit: &str, client_order_id: &str, order_id: &str, at: DateTime<Utc>) -> Result<()> {
+    pub async fn spread_resend(
+        &self,
+        id: i64,
+        limit_credit: &str,
+        client_order_id: &str,
+        order_id: &str,
+        at: DateTime<Utc>,
+    ) -> Result<()> {
         self.spread_update(
             "UPDATE us_spread_trades SET limit_credit = ?, client_order_id = ?, venue_order_id = ?, entry_at = ? WHERE id = ?",
             &[limit_credit, client_order_id, order_id, &at.to_rfc3339()],
@@ -1670,7 +1735,13 @@ impl Store {
     }
 
     /// Buy-back order sent.
-    pub async fn spread_closing(&self, id: i64, client_order_id: &str, order_id: &str, reason: &str) -> Result<()> {
+    pub async fn spread_closing(
+        &self,
+        id: i64,
+        client_order_id: &str,
+        order_id: &str,
+        reason: &str,
+    ) -> Result<()> {
         self.spread_update(
             "UPDATE us_spread_trades SET status = 'CLOSING', exit_client_order_id = ?, exit_order_id = ?,
                  exit_reason = ?, exit_tries = exit_tries + 1 WHERE id = ?",
@@ -1691,7 +1762,14 @@ impl Store {
     }
 
     /// Bought back (or settled) for `debit` a share.
-    pub async fn spread_closed(&self, id: i64, debit: &str, pnl: &str, reason: &str, at: DateTime<Utc>) -> Result<()> {
+    pub async fn spread_closed(
+        &self,
+        id: i64,
+        debit: &str,
+        pnl: &str,
+        reason: &str,
+        at: DateTime<Utc>,
+    ) -> Result<()> {
         self.spread_update(
             "UPDATE us_spread_trades SET status = 'CLOSED', exit_debit = ?, pnl = ?, exit_reason = ?,
                  exit_at = ? WHERE id = ?",
@@ -1715,11 +1793,12 @@ impl Store {
 
     /// Underlyings that already have a spread row today (any status).
     pub async fn spread_underlyings_on(&self, day: &str) -> Result<Vec<String>> {
-        let rows: Vec<(String,)> = sqlx::query_as("SELECT underlying FROM us_spread_trades WHERE day = ?")
-            .bind(day)
-            .fetch_all(&self.pool)
-            .await
-            .context("Failed to read today's spreads")?;
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT underlying FROM us_spread_trades WHERE day = ?")
+                .bind(day)
+                .fetch_all(&self.pool)
+                .await
+                .context("Failed to read today's spreads")?;
         Ok(rows.into_iter().map(|(u,)| u).collect())
     }
 
@@ -1730,12 +1809,16 @@ impl Store {
                 .fetch_all(&self.pool)
                 .await
                 .context("Failed to read spread totals")?;
-        let (mut n, mut today, mut all, mut losses) = (0i64, Decimal::ZERO, Decimal::ZERO, Decimal::ZERO);
+        let (mut n, mut today, mut all, mut losses) =
+            (0i64, Decimal::ZERO, Decimal::ZERO, Decimal::ZERO);
         for (d, status, pnl) in rows {
             if d == day && status != "CANCELLED" {
                 n += 1;
             }
-            let v = pnl.as_deref().and_then(|p| Decimal::from_str(p).ok()).unwrap_or_default();
+            let v = pnl
+                .as_deref()
+                .and_then(|p| Decimal::from_str(p).ok())
+                .unwrap_or_default();
             all += v;
             if v.is_sign_negative() {
                 losses += v;
@@ -1805,31 +1888,62 @@ impl Store {
     /// The latest option trades as JSON, newest first.
     pub async fn recent_option_trades(&self, limit: i64) -> Result<Vec<serde_json::Value>> {
         #[allow(clippy::type_complexity)]
-        let rows: Vec<(String, String, String, bool, i64, String, Option<String>, Option<String>, Option<String>, Option<String>, String, Option<String>)> =
-            sqlx::query_as(
-                "SELECT day, underlying, contract, is_call, qty, status, entry_price, exit_price,
+        let rows: Vec<(
+            String,
+            String,
+            String,
+            bool,
+            i64,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT day, underlying, contract, is_call, qty, status, entry_price, exit_price,
                         exit_reason, pnl, entry_at, exit_at
                  FROM us_option_trades ORDER BY id DESC LIMIT ?",
-            )
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await
-            .context("Failed to read option trades")?;
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read option trades")?;
         Ok(rows
             .into_iter()
-            .map(|(day, underlying, contract, is_call, qty, status, entry, exit, reason, pnl, entry_at, exit_at)| {
-                serde_json::json!({
-                    "day": day, "underlying": underlying, "contract": contract,
-                    "kind": if is_call { "CALL" } else { "PUT" }, "qty": qty, "status": status,
-                    "entry_price": entry, "exit_price": exit, "exit_reason": reason, "pnl": pnl,
-                    "entry_at": entry_at, "exit_at": exit_at,
-                })
-            })
+            .map(
+                |(
+                    day,
+                    underlying,
+                    contract,
+                    is_call,
+                    qty,
+                    status,
+                    entry,
+                    exit,
+                    reason,
+                    pnl,
+                    entry_at,
+                    exit_at,
+                )| {
+                    serde_json::json!({
+                        "day": day, "underlying": underlying, "contract": contract,
+                        "kind": if is_call { "CALL" } else { "PUT" }, "qty": qty, "status": status,
+                        "entry_price": entry, "exit_price": exit, "exit_reason": reason, "pnl": pnl,
+                        "entry_at": entry_at, "exit_at": exit_at,
+                    })
+                },
+            )
             .collect())
     }
 
     /// The open crypto position of a book in one coin: (id, qty, cost).
-    pub async fn crypto_open(&self, book: &str, symbol: &str) -> Result<Option<(i64, Decimal, Decimal)>> {
+    pub async fn crypto_open(
+        &self,
+        book: &str,
+        symbol: &str,
+    ) -> Result<Option<(i64, Decimal, Decimal)>> {
         let row: Option<(i64, String, String)> = sqlx::query_as(
             "SELECT id, qty, cost FROM crypto_trades WHERE book = ? AND symbol = ? AND status = 'OPEN'
              ORDER BY id DESC LIMIT 1",
@@ -1840,7 +1954,11 @@ impl Store {
         .await
         .context("Failed to read open crypto trade")?;
         Ok(row.map(|(id, q, c)| {
-            (id, Decimal::from_str(&q).unwrap_or_default(), Decimal::from_str(&c).unwrap_or_default())
+            (
+                id,
+                Decimal::from_str(&q).unwrap_or_default(),
+                Decimal::from_str(&c).unwrap_or_default(),
+            )
         }))
     }
 
@@ -1910,7 +2028,10 @@ impl Store {
                 .context("Failed to read crypto P&L")?;
         let (mut losses, mut profits) = (Decimal::ZERO, Decimal::ZERO);
         for (p,) in rows {
-            let v = p.as_deref().and_then(|p| Decimal::from_str(p).ok()).unwrap_or_default();
+            let v = p
+                .as_deref()
+                .and_then(|p| Decimal::from_str(p).ok())
+                .unwrap_or_default();
             if v.is_sign_negative() {
                 losses += v;
             } else {
@@ -1927,7 +2048,10 @@ impl Store {
                 .fetch_all(&self.pool)
                 .await
                 .context("Failed to read crypto order ids")?;
-        Ok(rows.into_iter().flat_map(|(a, b)| a.into_iter().chain(b)).collect())
+        Ok(rows
+            .into_iter()
+            .flat_map(|(a, b)| a.into_iter().chain(b))
+            .collect())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1945,7 +2069,8 @@ impl Store {
         headlines: &str,
         action: &str,
     ) -> Result<()> {
-        let pct = |x: Option<Decimal>| x.map(|v| (v * Decimal::ONE_HUNDRED).round_dp(2).to_string());
+        let pct =
+            |x: Option<Decimal>| x.map(|v| (v * Decimal::ONE_HUNDRED).round_dp(2).to_string());
         sqlx::query(
             "INSERT INTO crypto_checks (at, day, symbol, kind, price, chg_24h, chg_7d, chg_60d, rule_says,
                                         news_risk, news_reason, market_view, headlines, action)
@@ -1972,7 +2097,11 @@ impl Store {
     }
 
     /// When the last check of this kind ran for a coin (RFC 3339), if ever.
-    pub async fn crypto_last_check(&self, symbol: &str, kind: &str) -> Result<Option<(String, String)>> {
+    pub async fn crypto_last_check(
+        &self,
+        symbol: &str,
+        kind: &str,
+    ) -> Result<Option<(String, String)>> {
         sqlx::query_as("SELECT day, at FROM crypto_checks WHERE symbol = ? AND kind = ? ORDER BY id DESC LIMIT 1")
             .bind(symbol)
             .bind(kind)
@@ -1982,29 +2111,57 @@ impl Store {
     }
 
     /// Crypto trades and checks as JSON, newest first.
-    pub async fn crypto_recent(&self, limit: i64) -> Result<(Vec<serde_json::Value>, Vec<serde_json::Value>)> {
+    pub async fn crypto_recent(
+        &self,
+        limit: i64,
+    ) -> Result<(Vec<serde_json::Value>, Vec<serde_json::Value>)> {
         #[allow(clippy::type_complexity)]
-        let trades: Vec<(String, String, String, String, String, String, String, String, Option<String>, Option<String>, Option<String>, Option<String>)> =
-            sqlx::query_as(
-                "SELECT book, symbol, status, qty, cost, entry_price, entry_at, entry_reason,
+        let trades: Vec<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT book, symbol, status, qty, cost, entry_price, entry_at, entry_reason,
                         exit_price, exit_at, exit_reason, pnl
                  FROM crypto_trades ORDER BY id DESC LIMIT ?",
-            )
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await
-            .context("Failed to read crypto trades")?;
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read crypto trades")?;
         #[allow(clippy::type_complexity)]
-        let checks: Vec<(String, String, String, String, Option<String>, Option<String>, Option<String>, String, String, Option<String>, Option<String>, Option<String>, String)> =
-            sqlx::query_as(
-                "SELECT at, symbol, kind, price, chg_24h, chg_7d, chg_60d, rule_says, news_risk,
+        let checks: Vec<(
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+        )> = sqlx::query_as(
+            "SELECT at, symbol, kind, price, chg_24h, chg_7d, chg_60d, rule_says, news_risk,
                         news_reason, market_view, headlines, action
                  FROM crypto_checks ORDER BY id DESC LIMIT ?",
-            )
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await
-            .context("Failed to read crypto checks")?;
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read crypto checks")?;
         Ok((
             trades
                 .into_iter()
@@ -2278,10 +2435,7 @@ impl Store {
     }
 
     /// Record one trading-desk decision card (the full card as JSON).
-    pub async fn insert_desk_decision(
-        &self,
-        card: &crate::us::desk::DecisionCard,
-    ) -> Result<i64> {
+    pub async fn insert_desk_decision(&self, card: &crate::us::desk::DecisionCard) -> Result<i64> {
         let action = serde_json::to_value(card.nova.action)?;
         let advisory = serde_json::to_value(card.nova.advisory_action)?;
         self.insert_desk_card(
@@ -2326,7 +2480,11 @@ impl Store {
     }
 
     /// One market's most recent decision cards, newest first, as stored JSON.
-    pub async fn recent_desk_decisions(&self, market: &str, limit: i64) -> Result<Vec<serde_json::Value>> {
+    pub async fn recent_desk_decisions(
+        &self,
+        market: &str,
+        limit: i64,
+    ) -> Result<Vec<serde_json::Value>> {
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT card FROM desk_decisions WHERE market = ? ORDER BY id DESC LIMIT ?",
         )
@@ -2373,7 +2531,11 @@ impl Store {
     /// Today's P&L of every equity trade on a venue: closed today (realized)
     /// plus still open (marked). The U.S. stock books' figure for the
     /// circuit breaker; options and crypto live in tables of their own.
-    pub async fn venue_equity_day_pnl(&self, venue: &str, day: chrono::NaiveDate) -> Result<Decimal> {
+    pub async fn venue_equity_day_pnl(
+        &self,
+        venue: &str,
+        day: chrono::NaiveDate,
+    ) -> Result<Decimal> {
         let rows: Vec<(Option<String>, Option<String>, String)> = sqlx::query_as(
             "SELECT realized_pnl, unrealized_pnl, status FROM trades
              WHERE venue_id = ? AND asset_class = 'equity'
@@ -2386,7 +2548,11 @@ impl Store {
         .context("Failed to read the venue's day P&L")?;
         let mut total = Decimal::ZERO;
         for (realized, unrealized, status) in rows {
-            let v = if status == "CLOSED" { realized } else { unrealized };
+            let v = if status == "CLOSED" {
+                realized
+            } else {
+                unrealized
+            };
             if let Some(v) = v.as_deref().and_then(|v| Decimal::from_str(v).ok()) {
                 total += v;
             }
@@ -3628,7 +3794,11 @@ mod tests {
         store.insert_desk_decision(&card("AAA")).await.unwrap();
         store.insert_desk_decision(&card("BBB")).await.unwrap();
         let cards = store.recent_desk_decisions("US", 10).await.unwrap();
-        assert!(store.recent_desk_decisions("IN", 10).await.unwrap().is_empty());
+        assert!(store
+            .recent_desk_decisions("IN", 10)
+            .await
+            .unwrap()
+            .is_empty());
         assert_eq!(cards.len(), 2);
         assert_eq!(cards[0]["symbol"], "BBB");
         assert_eq!(cards[0]["nova"]["action"], "TRADE");
@@ -3639,11 +3809,31 @@ mod tests {
     async fn the_intraday_book_opens_closes_and_totals() {
         let store = Store::new(":memory:").await.unwrap();
         store
-            .insert_intraday_trade("orb", "2026-11-02", "ITC", false, 9, "250", "255", "2500", Utc::now())
+            .insert_intraday_trade(
+                "orb",
+                "2026-11-02",
+                "ITC",
+                false,
+                9,
+                "250",
+                "255",
+                "2500",
+                Utc::now(),
+            )
             .await
             .unwrap();
         store
-            .insert_intraday_trade("burst", "2026-11-02", "TCS", true, 2, "3000", "2970", "10000", Utc::now())
+            .insert_intraday_trade(
+                "burst",
+                "2026-11-02",
+                "TCS",
+                true,
+                2,
+                "3000",
+                "2970",
+                "10000",
+                Utc::now(),
+            )
             .await
             .unwrap();
         let open = store.open_intraday_trades("orb").await.unwrap();
@@ -3676,10 +3866,23 @@ mod tests {
     async fn a_closed_trade_is_reviewed_once() {
         let store = Store::new(":memory:").await.unwrap();
         store
-            .insert_intraday_trade("india_orb", "2026-11-02", "TCS", true, 2, "100", "98", "10000", Utc::now())
+            .insert_intraday_trade(
+                "india_orb",
+                "2026-11-02",
+                "TCS",
+                true,
+                2,
+                "100",
+                "98",
+                "10000",
+                Utc::now(),
+            )
             .await
             .unwrap();
-        assert!(store.unreviewed_intraday_trades().await.unwrap().is_empty(), "still open");
+        assert!(
+            store.unreviewed_intraday_trades().await.unwrap().is_empty(),
+            "still open"
+        );
         let id = store.open_intraday_trades("india_orb").await.unwrap()[0].id;
         store
             .close_intraday_trade(id, "97.5", "STOP", "3", "-8", Utc::now())
@@ -3697,8 +3900,14 @@ mod tests {
             label: "FALSE_BREAKOUT".into(),
             lesson: "test".into(),
         };
-        store.insert_trade_review(&pending[0], &row, Utc::now()).await.unwrap();
-        store.insert_trade_review(&pending[0], &row, Utc::now()).await.unwrap();
+        store
+            .insert_trade_review(&pending[0], &row, Utc::now())
+            .await
+            .unwrap();
+        store
+            .insert_trade_review(&pending[0], &row, Utc::now())
+            .await
+            .unwrap();
         assert!(store.unreviewed_intraday_trades().await.unwrap().is_empty());
         let all = store.recent_trade_reviews(10).await.unwrap();
         assert_eq!(all.len(), 1);
@@ -4240,7 +4449,11 @@ mod tests {
             .await
             .unwrap();
         }
-        assert_eq!(store.consecutive_losses().await.unwrap(), 1, "only the stock loss counts");
+        assert_eq!(
+            store.consecutive_losses().await.unwrap(),
+            1,
+            "only the stock loss counts"
+        );
     }
 
     /// `max_trades_per_day` is only a limit if the count can see the rows.

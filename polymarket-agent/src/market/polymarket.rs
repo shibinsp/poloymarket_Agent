@@ -65,8 +65,10 @@ pub(crate) async fn gamma_markets_by_condition_id(
             let body = resp.text().await.unwrap_or_default();
             bail!("Gamma API returned {status}: {body}");
         }
-        let rows: Vec<serde_json::Value> =
-            resp.json().await.context("Failed to decode Gamma markets")?;
+        let rows: Vec<serde_json::Value> = resp
+            .json()
+            .await
+            .context("Failed to decode Gamma markets")?;
         let matching: Vec<_> = rows
             .into_iter()
             .filter(|m| {
@@ -467,7 +469,8 @@ impl PolymarketClient {
         self.rate_limit().await;
 
         let markets: Vec<GammaMarketResponse> =
-            gamma_markets_by_condition_id_as(&self.http, &self.gamma_base_url, condition_id).await?;
+            gamma_markets_by_condition_id_as(&self.http, &self.gamma_base_url, condition_id)
+                .await?;
 
         let market = markets.first().context("Market not found on Gamma")?;
         let prices_str = market.outcome_prices.as_deref().unwrap_or("[]");
@@ -1243,8 +1246,8 @@ fn snapshot_from_levels(
     mut bids: Vec<PriceLevel>,
     mut asks: Vec<PriceLevel>,
 ) -> OrderBookSnapshot {
-    bids.sort_by(|a, b| b.price.cmp(&a.price));
-    asks.sort_by(|a, b| a.price.cmp(&b.price));
+    bids.sort_by_key(|b| std::cmp::Reverse(b.price));
+    asks.sort_by_key(|a| a.price);
     let best_bid = bids.first().map(|b| b.price).unwrap_or(Decimal::ZERO);
     let best_ask = asks.first().map(|a| a.price).unwrap_or(Decimal::ONE);
     let midpoint = (best_bid + best_ask) / dec!(2);
@@ -1506,7 +1509,9 @@ mod tests {
 
     #[test]
     fn test_spread_calculation() {
-        let book = raw_book(r#"{"bids": [{"price": 0.60, "size": 100}], "asks": [{"price": 0.70, "size": 100}]}"#);
+        let book = raw_book(
+            r#"{"bids": [{"price": 0.60, "size": 100}], "asks": [{"price": 0.70, "size": 100}]}"#,
+        );
         assert_eq!(book.spread, dec!(0.10));
         assert_eq!(book.midpoint, dec!(0.65));
         assert_eq!(book.implied_probability, dec!(0.65));

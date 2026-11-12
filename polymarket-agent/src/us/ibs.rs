@@ -53,7 +53,11 @@ pub fn ibs(high: Decimal, low: Decimal, last: Decimal) -> Option<Decimal> {
 
 /// High, low and last close of today's completed bars, if the latest one
 /// ended at 15:45 or later (so an early close, or a feed gap, is no signal).
-pub fn day_so_far(bars: &[Bar], day: NaiveDate, now: DateTime<Utc>) -> Option<(Decimal, Decimal, Decimal)> {
+pub fn day_so_far(
+    bars: &[Bar],
+    day: NaiveDate,
+    now: DateTime<Utc>,
+) -> Option<(Decimal, Decimal, Decimal)> {
     let done: Vec<&Bar> = bars
         .iter()
         .filter(|b| b.ts.with_timezone(&New_York).date_naive() == day)
@@ -87,7 +91,12 @@ pub fn decide(held: bool, ibs: Decimal) -> Action {
     }
 }
 
-async fn run_day(store: &Store, data: &AlpacaBars, day: NaiveDate, now: DateTime<Utc>) -> Result<()> {
+async fn run_day(
+    store: &Store,
+    data: &AlpacaBars,
+    day: NaiveDate,
+    now: DateTime<Utc>,
+) -> Result<()> {
     let open = New_York
         .from_local_datetime(&day.and_hms_opt(9, 30, 0).context("9:30")?)
         .earliest()
@@ -101,10 +110,15 @@ async fn run_day(store: &Store, data: &AlpacaBars, day: NaiveDate, now: DateTime
     let today = day.to_string();
     for fund in FUNDS {
         let Some((high, low, last)) = bars.get(fund).and_then(|b| day_so_far(b, day, now)) else {
-            warn!(fund, "IBS: no complete bars to 15:45 today (early close or feed gap); holding as is");
+            warn!(
+                fund,
+                "IBS: no complete bars to 15:45 today (early close or feed gap); holding as is"
+            );
             continue;
         };
-        let Some(v) = ibs(high, low, last) else { continue };
+        let Some(v) = ibs(high, low, last) else {
+            continue;
+        };
         let open_trade = held.iter().find(|t| t.1 == fund);
         match decide(open_trade.is_some(), v) {
             Action::Buy => {
@@ -113,18 +127,27 @@ async fn run_day(store: &Store, data: &AlpacaBars, day: NaiveDate, now: DateTime
                 if qty <= Decimal::ZERO {
                     continue;
                 }
-                store.ibs_open_trade(fund, qty, &today, price, v, now).await?;
+                store
+                    .ibs_open_trade(fund, qty, &today, price, v, now)
+                    .await?;
                 info!(fund, ibs = %v.round_dp(3), %price, %qty, "IBS book: weak close, bought (paper, simulated)");
             }
             Action::Sell => {
                 let t = open_trade.expect("held");
-                let (qty, entry) = (Decimal::from_str_exact(&t.2)?, Decimal::from_str_exact(&t.3)?);
+                let (qty, entry) = (
+                    Decimal::from_str_exact(&t.2)?,
+                    Decimal::from_str_exact(&t.3)?,
+                );
                 let price = (last * (Decimal::ONE - SLIPPAGE)).round_dp(4);
                 let pnl = (price - entry) * qty;
-                store.ibs_close_trade(t.0, &today, price, v, pnl, now).await?;
+                store
+                    .ibs_close_trade(t.0, &today, price, v, pnl, now)
+                    .await?;
                 info!(fund, ibs = %v.round_dp(3), %entry, %price, pnl = %pnl.round_dp(2), "IBS book: sold at the close (paper, simulated)");
             }
-            Action::Hold => info!(fund, ibs = %v.round_dp(3), "IBS book: close still weak, holding another day"),
+            Action::Hold => {
+                info!(fund, ibs = %v.round_dp(3), "IBS book: close still weak, holding another day")
+            }
             Action::Nothing => info!(fund, ibs = %v.round_dp(3), "IBS book: no signal"),
         }
     }
@@ -166,7 +189,14 @@ mod tests {
             .with_ymd_and_hms(2026, 11, 9, h, m, 0)
             .unwrap()
             .with_timezone(&Utc);
-        Bar { ts, open: c, high: hi, low: lo, close: c, volume: dec!(1) }
+        Bar {
+            ts,
+            open: c,
+            high: hi,
+            low: lo,
+            close: c,
+            volume: dec!(1),
+        }
     }
 
     #[test]
@@ -186,15 +216,27 @@ mod tests {
     #[test]
     fn needs_bars_through_15_45() {
         let day = NaiveDate::from_ymd_opt(2026, 11, 9).unwrap();
-        let now = New_York.with_ymd_and_hms(2026, 11, 9, 15, 56, 0).unwrap().with_timezone(&Utc);
+        let now = New_York
+            .with_ymd_and_hms(2026, 11, 9, 15, 56, 0)
+            .unwrap()
+            .with_timezone(&Utc);
         let bars = vec![
             bar(9, 30, dec!(110), dec!(105), dec!(108)),
             bar(15, 45, dec!(104), dec!(100), dec!(101)),
             bar(15, 50, dec!(102), dec!(99), dec!(99.5)), // ends 15:55
         ];
-        assert_eq!(day_so_far(&bars, day, now), Some((dec!(110), dec!(99), dec!(99.5))));
-        let early = New_York.with_ymd_and_hms(2026, 11, 9, 15, 54, 0).unwrap().with_timezone(&Utc);
-        assert_eq!(day_so_far(&bars, day, early), Some((dec!(110), dec!(100), dec!(101))));
+        assert_eq!(
+            day_so_far(&bars, day, now),
+            Some((dec!(110), dec!(99), dec!(99.5)))
+        );
+        let early = New_York
+            .with_ymd_and_hms(2026, 11, 9, 15, 54, 0)
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            day_so_far(&bars, day, early),
+            Some((dec!(110), dec!(100), dec!(101)))
+        );
         assert_eq!(day_so_far(&bars[..1], day, now), None);
     }
 }
