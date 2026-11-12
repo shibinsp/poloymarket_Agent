@@ -1,13 +1,14 @@
 //! US pre-FOMC drift paper book, added 11 Nov 2026 at the user's yes.
 //!
 //! The rule: buy SPY at the close of the trading day before a Fed rate
-//! decision, sell it at the decision day's close (the statement comes out at
-//! 14:00 New York, so the hold covers the run-up and the reaction).
+//! decision, sell it on the decision day at 13:55 New York, just before the
+//! 14:00 statement. (Until 12 Nov 2026 it sold at the decision day's close.)
 //!
 //! Simulated, like the IBS and Turnaround Tuesday books: $1,000, fractional
 //! shares, losses come off the capital and profits are set aside, no Alpaca
-//! orders. Both trades are done at 15:55-15:59 New York at the last IEX price,
-//! with 2 bp slippage (5 minutes before the close, as the IBS book does).
+//! orders. The buy is done at 15:55-15:59 New York on the day before and the
+//! sell at 13:55-13:59 on the decision day, each at the last completed IEX
+//! 5-minute bar's close, with 2 bp slippage.
 //!
 //! Evidence (research/pipeline/ideas/fomc_and_india_turnaround.py, SPY daily
 //! 2002-2026, 200 meetings, 2 bp a side): 55% won, +0.26% a trade, profit
@@ -16,6 +17,12 @@
 //! same hold a week later loses (-0.10% a trade), so it is Fed-specific.
 //! Weak spot: since about 2020 (last 50 meetings) only +2.6% in all; the
 //! effect was published in 2015 and has faded. About 8 trades a year.
+//!
+//! Sell time (research/pipeline/ideas/prefomc_intraday.py, QQQ 5-min SIP
+//! 2016-2026, 86 meetings): selling at 13:55 won 65% (+0.31% a trade,
+//! holdout +7.0%, 8 of 11 years up) against 55% (+0.23%, holdout +1.0%, 6 of
+//! 11) for the close. The statement-to-close part alone averaged -0.07% with
+//! 1.2% swings: risk without return. The user chose 13:55 on 12 Nov 2026.
 
 use std::time::Duration;
 
@@ -28,15 +35,39 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::db::store::Store;
-use crate::us::ibs::day_so_far;
-use crate::us::orb::AlpacaBars;
+use crate::us::orb::{AlpacaBars, Bar};
 use crate::us::session::us_market_holidays;
 
 pub const SYMBOL: &str = "SPY";
 pub const CAPITAL_USD: Decimal = dec!(1000);
 const SLIPPAGE: Decimal = dec!(0.0002);
-const DECIDE_FROM: u32 = 15 * 60 + 55;
-const DECIDE_TO: u32 = 15 * 60 + 59;
+/// Buy window on the day before a decision: 15:55:00-15:58:59 New York.
+const BUY_WINDOW: (u32, u32) = (15 * 60 + 55, 15 * 60 + 59);
+/// Sell window on the decision day: 13:55:00-13:58:59, before the 14:00 statement.
+const SELL_WINDOW: (u32, u32) = (13 * 60 + 55, 13 * 60 + 59);
+
+/// Whether `minute` (New York minutes after midnight) is in the window for a buy or a sell.
+pub fn in_window(minute: u32, buy: bool) -> bool {
+    let (from, to) = if buy { BUY_WINDOW } else { SELL_WINDOW };
+    (from..to).contains(&minute)
+}
+
+/// The close of the last 5-minute bar of `day` that has ended by `now`, if
+/// that bar ended at `need_end` (New York minutes) or later; otherwise None
+/// (the feed is behind, so do not trade on a stale price).
+pub fn last_completed_close(
+    bars: &[Bar],
+    day: NaiveDate,
+    now: DateTime<Utc>,
+    need_end: u32,
+) -> Option<Decimal> {
+    let last = bars.iter().rev().find(|b| {
+        b.ts.with_timezone(&New_York).date_naive() == day
+            && b.ts + chrono::Duration::minutes(5) <= now
+    })?;
+    let end = (last.ts + chrono::Duration::minutes(5)).with_timezone(&New_York);
+    (end.hour() * 60 + end.minute() >= need_end).then_some(last.close)
+}
 
 /// Fed rate-decision days (second day of each FOMC meeting), from
 /// federalreserve.gov/monetarypolicy/fomccalendars.htm, checked 11 Nov 2026.
@@ -86,17 +117,27 @@ pub fn today_action(today: NaiveDate, holidays: &[NaiveDate]) -> Option<(NaiveDa
     None
 }
 
-async fn last_price(iex: &AlpacaBars, day: NaiveDate, now: DateTime<Utc>) -> Result<Decimal> {
+async fn last_price(
+    iex: &AlpacaBars,
+    day: NaiveDate,
+    now: DateTime<Utc>,
+    buy: bool,
+) -> Result<Decimal> {
     let open = New_York
         .from_local_datetime(&day.and_hms_opt(9, 30, 0).context("9:30")?)
         .earliest()
         .context("no 9:30 that day")?
         .with_timezone(&Utc);
     let bars = iex.bars(&[SYMBOL.to_string()], open).await?;
+    // The bar ending 5 minutes before the window must be in.
+    let need_end = if buy {
+        BUY_WINDOW.0 - 5
+    } else {
+        SELL_WINDOW.0 - 5
+    };
     bars.get(SYMBOL)
-        .and_then(|b| day_so_far(b, day, now))
-        .map(|(_, _, last)| last)
-        .context("no bars to 15:45 yet")
+        .and_then(|b| last_completed_close(b, day, now, need_end))
+        .context("the latest 5-minute bar is not in yet")
 }
 
 async fn act(
@@ -107,7 +148,7 @@ async fn act(
     buy: bool,
     now: DateTime<Utc>,
 ) -> Result<()> {
-    let last = last_price(iex, today, now).await?;
+    let last = last_price(iex, today, now, buy).await?;
     if buy {
         if store.prefomc_has(SYMBOL, &fomc.to_string()).await? {
             return Ok(());
@@ -138,14 +179,14 @@ async fn act(
             store
                 .prefomc_close_trade(id, &today.to_string(), price, pnl, now)
                 .await?;
-            info!(symbol = SYMBOL, %entry, %price, pnl = %pnl.round_dp(2), "Pre-FOMC book: sold at the Fed decision day's close (paper, simulated)");
+            info!(symbol = SYMBOL, %entry, %price, pnl = %pnl.round_dp(2), "Pre-FOMC book: sold at 13:55 on the Fed decision day, before the statement (paper, simulated)");
         }
     }
     Ok(())
 }
 
-/// Check every 20 seconds; act once in the 15:55 window on the day before a
-/// Fed decision (buy) and on the decision day (sell).
+/// Check every 20 seconds; buy once in the 15:55 window on the day before a
+/// Fed decision and sell once in the 13:55 window on the decision day.
 pub fn spawn_us_prefomc_worker(store: Store, iex: AlpacaBars) -> JoinHandle<()> {
     tokio::spawn(async move {
         let next = decision_days()
@@ -159,7 +200,7 @@ pub fn spawn_us_prefomc_worker(store: Store, iex: AlpacaBars) -> JoinHandle<()> 
             let ny = now.with_timezone(&New_York);
             let today = ny.date_naive();
             let minute = ny.hour() * 60 + ny.minute();
-            if done == Some(today) || !(DECIDE_FROM..DECIDE_TO).contains(&minute) {
+            if done == Some(today) {
                 continue;
             }
             let holidays = us_market_holidays();
@@ -167,6 +208,9 @@ pub fn spawn_us_prefomc_worker(store: Store, iex: AlpacaBars) -> JoinHandle<()> 
                 done = Some(today);
                 continue;
             };
+            if !in_window(minute, buy) {
+                continue;
+            }
             match act(&store, &iex, today, fomc, buy, now).await {
                 Ok(()) => done = Some(today),
                 Err(e) => warn!(error = %format!("{e:#}"), "Pre-FOMC book pass failed; retrying"),
@@ -206,6 +250,67 @@ mod tests {
         );
         // a Monday decision would buy on the Friday before
         assert_eq!(previous_trading_day(d("2026-11-16"), &[]), d("2026-11-13"));
+    }
+
+    #[test]
+    fn buys_at_15_55_and_sells_at_13_55() {
+        assert!(in_window(15 * 60 + 55, true));
+        assert!(!in_window(13 * 60 + 55, true));
+        assert!(in_window(13 * 60 + 55, false));
+        assert!(in_window(13 * 60 + 58, false));
+        assert!(!in_window(13 * 60 + 59, false));
+        assert!(
+            !in_window(14 * 60, false),
+            "never after the 14:00 statement"
+        );
+        assert!(
+            !in_window(15 * 60 + 55, false),
+            "no longer sells at the close"
+        );
+    }
+
+    #[test]
+    fn sells_on_the_bar_before_the_statement_and_not_on_a_stale_feed() {
+        let day = d("2026-12-09");
+        let bar = |h: u32, m: u32, c: Decimal| Bar {
+            ts: New_York
+                .with_ymd_and_hms(2026, 12, 9, h, m, 0)
+                .unwrap()
+                .with_timezone(&Utc),
+            open: c,
+            high: c,
+            low: c,
+            close: c,
+            volume: dec!(1),
+        };
+        let now = New_York
+            .with_ymd_and_hms(2026, 12, 9, 13, 56, 0)
+            .unwrap()
+            .with_timezone(&Utc);
+        let bars = vec![
+            bar(13, 40, dec!(600)),
+            bar(13, 45, dec!(601)),
+            bar(13, 50, dec!(602)),
+        ];
+        // the 13:50 bar ended at 13:55: its close is the sell price
+        assert_eq!(
+            last_completed_close(&bars, day, now, 13 * 60 + 50),
+            Some(dec!(602))
+        );
+        // a bar still forming is not used
+        let early = New_York
+            .with_ymd_and_hms(2026, 12, 9, 13, 54, 0)
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            last_completed_close(&bars, day, early, 13 * 60 + 45),
+            Some(dec!(601))
+        );
+        // if the latest bar ended before 13:50 the feed is behind: no price
+        assert_eq!(
+            last_completed_close(&bars[..1], day, now, 13 * 60 + 50),
+            None
+        );
     }
 
     #[test]

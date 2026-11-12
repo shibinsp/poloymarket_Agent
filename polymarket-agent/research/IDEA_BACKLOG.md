@@ -16,7 +16,9 @@ bars Feb 2024 onward (`research/data/spreads/`), FOMC dates 2001-2026
 |---|---|---|---|---|
 | 1 | DONE 11 Nov: **PASS** | Pre-FOMC drift: buy SPY at the close the day before a Fed decision, sell at the decision day's close | US | Documented in research (Lucca & Moench 2015) |
 | 2 | DONE 11 Nov: FAIL | India "Turnaround Monday": NIFTY below its 25-day average on Friday -> buy Monday open, sell Tuesday close | India | Turnaround Tuesday passed in the US; does it carry over? |
-| 2a | NEXT | Pre-FOMC drift, finer: hold only until the 14:00 announcement (5-min data, QQQ 2016+), and on ECB/RBI decision days | US / India | Research says the drift is before the announcement |
+| 2a | DONE 12 Nov: WATCH (14:00 exit better than close) | Pre-FOMC drift, finer: hold only until the 14:00 announcement (5-min data, QQQ 2016+) | US | Research says the drift is before the announcement |
+| 2b | NEXT | Central-bank drift elsewhere: RBI policy days on NIFTY (buy the close before, sell before the 10:00 statement) and ECB days on EFA | India / Intl | If the Fed effect is real, other central banks may show it too |
+| 2c | NEXT | Pre-FOMC on SPY and QQQ together with the 13:55 exit, as one basket (more trades for the 100-trade gate) | US | Doubles the sample for the promising exit |
 | 3 | NEXT | Turnaround Tuesday on more US funds (QQQ, IWM, sector ETFs) and as a 2-fund basket | US | Neighbours were all positive; more trades = more proof |
 | 4 | NEXT | Pre-holiday drift: buy SPY the close 2 days before a market holiday, sell the day before | US | Classic calendar effect |
 | 5 | NEXT | Sector momentum: each month hold the 3 best sector ETFs of the last 6 months (skip 1) | US | Cross-sectional sector momentum, not yet tested |
