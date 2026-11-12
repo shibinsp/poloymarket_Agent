@@ -752,6 +752,32 @@ impl Store {
 
         let high_water_mark = prior_peak.max(equity);
 
+        // The first mark of a new day is also the true close of the day
+        // before: nothing trades between the U.S. close and UTC midnight's
+        // next reading. If the agent was down at the close (the laptop
+        // restarted overnight on 11 Nov 2026), the previous day's
+        // closing_equity is a stale mid-session mark (it showed -$24.22
+        // while the day really made +$14.78). Carry this first mark back as
+        // that close.
+        let is_new_day: bool =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM daily_equity WHERE day = ?")
+                .bind(&day_str)
+                .fetch_one(&self.pool)
+                .await
+                .context("Failed to check for today's equity row")?
+                == 0;
+        if is_new_day {
+            sqlx::query(
+                "UPDATE daily_equity SET closing_equity = ?, updated_at = datetime('now')
+                 WHERE day = (SELECT MAX(day) FROM daily_equity WHERE day < ?)",
+            )
+            .bind(equity.to_string())
+            .bind(&day_str)
+            .execute(&self.pool)
+            .await
+            .context("Failed to close the previous day's equity")?;
+        }
+
         sqlx::query(
             "INSERT INTO daily_equity (day, starting_equity, high_water_mark, closing_equity, updated_at)
              VALUES (?, ?, ?, ?, datetime('now'))
@@ -4299,6 +4325,48 @@ mod tests {
             next_day.high_water_mark,
             dec!(140),
             "yesterday's peak is still the yardstick"
+        );
+    }
+
+    /// 11 Nov 2026: the last mark of the day was taken mid-session (an open
+    /// spread at -$24), the laptop then restarted, and the spread expired
+    /// for +$15. The first mark of the next day is the true close and must
+    /// replace the stale one, or the day shows a loss it never had.
+    #[tokio::test]
+    async fn the_next_days_first_mark_closes_a_day_left_stale() {
+        let store = Store::new(":memory:").await.unwrap();
+        let d = |n| chrono::NaiveDate::from_ymd_opt(2026, 11, n).unwrap();
+        store.record_equity(d(11), dec!(1935.04)).await.unwrap();
+        store.record_equity(d(11), dec!(1910.82)).await.unwrap(); // stale mid-session mark
+        store.record_equity(d(12), dec!(1949.82)).await.unwrap(); // agent back after the close
+        store.record_equity(d(12), dec!(1949.75)).await.unwrap();
+        let rows = store.get_daily_equity().await.unwrap();
+        let close = |day: &str| {
+            rows.iter()
+                .find(|r| r.day == day)
+                .and_then(|r| r.closing_equity.clone())
+                .unwrap()
+        };
+        assert_eq!(
+            close("2026-11-11"),
+            "1949.82",
+            "yesterday closes where today opened"
+        );
+        assert_eq!(
+            close("2026-11-12"),
+            "1949.75",
+            "today's close is today's latest mark"
+        );
+        // a later mark on the same day must not touch yesterday again
+        store.record_equity(d(12), dec!(1800)).await.unwrap();
+        let rows = store.get_daily_equity().await.unwrap();
+        assert_eq!(
+            rows.iter()
+                .find(|r| r.day == "2026-11-11")
+                .unwrap()
+                .closing_equity
+                .as_deref(),
+            Some("1949.82")
         );
     }
 
