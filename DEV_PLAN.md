@@ -55,7 +55,7 @@ The doc's design rules do not depend on the language, so we keep Rust and close 
 | Redis Streams | in-process bounded `tokio::mpsc` channels, with a raw-message recorder to disk for replay |
 | QuestDB / TimescaleDB | SQLite and Parquet files for now; revisit at more than 1 GB/month |
 | PostgreSQL audit | SQLite append-only tables (migration `010_india_audit.sql`) |
-| LangGraph analyst | Rust module with a fixed 5-step pipeline over `src/valuation/llm.rs` |
+| LangGraph analyst | **Python sidecar `analyst/`** (decided 12 Nov 2026): fixed 5-step pipeline; publishes a validated, expiring `context.json` that the Rust engine reads. Trading stays in Rust |
 | LightGBM filter | Python sidecar, called offline or batched. Added only after a strategy passes its gates |
 
 ---
@@ -194,6 +194,21 @@ Each phase gets one branch, one PR, a `/code-review`, and a squash-merge.
 - [ ] Start continuous paper trading on the internal broker.
 
 ### Phase 5: LLM analyst in shadow mode, plus monitoring (week 6)
+
+> **Status (12 Nov 2026): the analyst is built in `analyst/`, ahead of schedule and off the trading path. See `analyst/README.md`.**
+>
+> **Done:** the pipeline, the restrict-only schema, the validator, fallback, cache, audit DB, golden-eval, shadow-report, the filings RAG, volatility bands and the regime (India VIX, Nifty, FII/DII). All 28 guards are mutation-checked.
+>
+> **Still open:**
+> - the real 200-300 item golden set (it needs hand labelling);
+> - the Rust consumer of `context.json`, which waits for the Phase 2 risk gate;
+> - Telegram alerts and the dashboard panel.
+>
+> **Findings so far:**
+> - A next-day direction model has no out-of-sample edge on 6 large caps.
+> - The LLM does not yet beat the keyword baseline on the smoke set.
+> - BSE's API refuses automated requests (403).
+> - NVIDIA NIM has retired the engine's configured model.
 - [ ] Add `src/india/analyst/`, a linear 5-step pipeline that runs pre-market and every 15 minutes:
 
   | Step | Done by |

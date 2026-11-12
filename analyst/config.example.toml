@@ -1,0 +1,52 @@
+# Copy to config.local.toml (gitignored) and pass with --config.
+state_dir = "state"
+refresh_minutes = 15
+run_budget_s = 120
+
+[llm]
+# "none" uses the deterministic keyword classifier (no model, no key).
+# "openai_compatible" works with NVIDIA NIM, Mistral, vLLM or Ollama.
+# "anthropic" uses the Messages API.
+provider = "none"
+base_url = "https://integrate.api.nvidia.com/v1"
+model = "meta/llama-3.3-70b-instruct"
+api_key_env = "LLM_API_KEY"
+temperature = 0.0
+max_tokens_classify = 300
+timeout_s = 20
+retries = 1
+body_chars = 1500
+max_items_per_run = 30
+concurrency = 4
+# Reasoning models (e.g. nvidia/nemotron-3.5-lightning-30b-a3b) need thinking off:
+# extra_body = { chat_template_kwargs = { enable_thinking = false } }
+
+[sources]
+rss_feeds = [
+  "https://economictimes.indiatimes.com/markets/stocks/news/rssfeeds/2146842.cms",
+  "https://www.moneycontrol.com/rss/buzzingstocks.xml",
+]
+bse_announcements = false   # BSE corporate announcements API
+nse_fii_dii = false         # opt-in; check NSE website terms first
+market_data = true          # India VIX, Nifty, daily OHLCV via yfinance (pip install .[data])
+# events_calendar = "events.csv"   # symbol,date,event_type,description
+# universe_csv = "nifty100.csv"    # offline constituents list
+
+[compose]
+exclude_severity = 2
+watch_severity = 1
+max_watchlist = 12
+context_ttl_minutes = 20
+vix_cautious = 17.0
+vix_risk_off = 22.0
+vix_jump_risk_off_pct = 15.0
+nifty_drop_cautious_pct = -1.0
+nifty_drop_risk_off_pct = -2.0
+fii_sell_cautious_cr = -3000.0
+multiplier_neutral = 1.0
+multiplier_cautious = 0.75
+multiplier_risk_off = 0.5
+vol_ratio_cut1 = 1.5
+vol_ratio_cut2 = 2.0
+vol_cut1_multiplier = 0.75
+vol_cut2_multiplier = 0.5

@@ -1,0 +1,12 @@
+{"id": "g01", "title": "SEBI orders forensic audit of Infosys accounts after whistleblower complaint", "published_at": "2026-11-10T08:00:00+05:30", "symbols": ["INFY"], "label": {"event_type": "regulatory", "severity": 3}}
+{"id": "g02", "title": "Reliance Industries Q2 net profit rises 9% YoY to Rs 18,500 crore, beats estimates", "published_at": "2026-11-10T08:00:00+05:30", "symbols": ["RELIANCE"], "label": {"event_type": "results", "severity": 2}}
+{"id": "g03", "title": "Promoter of Bajaj Finance pledges additional 3% stake with lenders", "published_at": "2026-11-10T08:00:00+05:30", "symbols": ["BAJFINANCE"], "label": {"event_type": "pledge", "severity": 2}}
+{"id": "g04", "title": "ITC board approves 1:1 bonus issue; record date to be announced", "published_at": "2026-11-10T08:00:00+05:30", "symbols": ["ITC"], "label": {"event_type": "corporate_action", "severity": 1}}
+{"id": "g05", "title": "Block deal: 2 crore HDFC Bank shares change hands at 2% discount", "published_at": "2026-11-10T08:00:00+05:30", "symbols": ["HDFCBANK"], "label": {"event_type": "block_deal", "severity": 2}}
+{"id": "g06", "title": "TCS CEO steps down with immediate effect; board names interim chief", "published_at": "2026-11-10T08:00:00+05:30", "symbols": ["TCS"], "label": {"event_type": "management_change", "severity": 3}}
+{"id": "g07", "title": "State Bank of India to hold analyst meet next week", "published_at": "2026-11-10T08:00:00+05:30", "symbols": ["SBIN"], "label": {"event_type": "other", "severity": 0}}
+{"id": "g08", "title": "Larsen & Toubro cuts FY27 order inflow guidance to 8-10% from 10-12%", "published_at": "2026-11-10T08:00:00+05:30", "symbols": ["LT"], "label": {"event_type": "guidance", "severity": 2}}
+{"id": "g09", "title": "Reliance reportedly in talks to acquire a stake in a European green hydrogen firm, sources said", "published_at": "2026-11-10T08:00:00+05:30", "symbols": ["RELIANCE"], "label": {"event_type": "rumour", "severity": 1}}
+{"id": "g10", "title": "Infosys shares trade flat in a quiet session", "published_at": "2026-11-10T08:00:00+05:30", "symbols": ["INFY"], "label": {"event_type": "other", "severity": 0}}
+{"id": "g11", "title": "HDFC Bank board approves merger of subsidiary with itself", "published_at": "2026-11-10T08:00:00+05:30", "symbols": ["HDFCBANK"], "label": {"event_type": "merger", "severity": 2}}
+{"id": "g12", "title": "ITC Q2 profit falls 6%, misses street estimates on weak cigarette volumes", "published_at": "2026-11-10T08:00:00+05:30", "symbols": ["ITC"], "label": {"event_type": "results", "severity": 2}}
