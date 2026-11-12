@@ -7,14 +7,17 @@ export interface RouteDef {
 /** One list driving the nav, the router and document.title. */
 export const ROUTES: RouteDef[] = [
   { path: "/overview", label: "Overview", title: "Overview" },
+  { path: "/india", label: "India NSE", title: "India — Upstox Feed & Paper Strategy" },
+  { path: "/us", label: "US Equities", title: "US — Test · Equities & Alpaca Paper" },
+  { path: "/logs", label: "Live Logs", title: "Real-Time Agent Logs" },
   { path: "/trades", label: "Trades", title: "Trades" },
+  { path: "/orders", label: "Orders", title: "Orders and fills" },
   { path: "/risk", label: "Risk", title: "Risk and reconciliation" },
   { path: "/cycles", label: "Cycles", title: "Cycles" },
   { path: "/learn", label: "Learn From Mistakes", title: "Learn from mistakes · trade reviews" },
   { path: "/costs", label: "Costs", title: "API costs" },
-  { path: "/india", label: "India — Test", title: "India — intraday breakout, opening burst and gap and go (paper)" },
-  { path: "/us", label: "US — Test", title: "US — opening-range breakout (Alpaca paper)" },
-  { path: "/scanner", label: "Range Scanner", title: "Range scanner · likely high and low for the rest of today" },  { path: "/health", label: "Health", title: "Health" },
+  { path: "/scanner", label: "Range Scanner", title: "Range scanner · likely high and low for the rest of today" },
+  { path: "/health", label: "Health", title: "Health" },
   { path: "/settings", label: "Settings", title: "Settings" },
 ];
 

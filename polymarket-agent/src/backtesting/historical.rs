@@ -30,12 +30,17 @@ pub struct HistoricalSnapshot {
     pub end_date: DateTime<Utc>,
     /// The actual resolved outcome: 1.0 = YES, 0.0 = NO.
     pub resolved_outcome: Option<Decimal>,
+    /// Optional out-of-sample forecast made using information available at
+    /// `timestamp`. The resolved outcome is never a model input.
+    #[serde(default)]
+    pub model_probability: Option<Decimal>,
 }
 
 /// Load historical snapshots from a CSV file.
 ///
 /// Expected CSV columns: timestamp, market_id, question, category,
-/// yes_price, no_price, volume_24h, spread, end_date, resolved_outcome
+/// yes_price, no_price, volume_24h, spread, end_date, resolved_outcome,
+/// model_probability (optional; forecast as of timestamp)
 pub fn load_from_csv(path: &Path) -> Result<Vec<HistoricalSnapshot>> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read {}", path.display()))?;
@@ -83,6 +88,14 @@ fn parse_csv_line(line: &str) -> Result<HistoricalSnapshot> {
     } else {
         None
     };
+    let model_probability = if fields.len() > 10 && !fields[10].trim().is_empty() {
+        Some(
+            Decimal::from_str(fields[10].trim())
+                .with_context(|| format!("Invalid model_probability: {}", fields[10]))?,
+        )
+    } else {
+        None
+    };
 
     Ok(HistoricalSnapshot {
         timestamp,
@@ -95,6 +108,7 @@ fn parse_csv_line(line: &str) -> Result<HistoricalSnapshot> {
         spread: Decimal::from_str(fields[7].trim())?,
         end_date,
         resolved_outcome,
+        model_probability,
     })
 }
 
@@ -140,6 +154,7 @@ pub fn generate_synthetic(count: usize) -> Vec<HistoricalSnapshot> {
             spread,
             end_date,
             resolved_outcome: resolved,
+            model_probability: None,
         });
     }
 
@@ -241,6 +256,7 @@ mod tests {
             spread: dec!(0.03),
             end_date: Utc::now() + chrono::Duration::days(3),
             resolved_outcome: Some(Decimal::ONE),
+            model_probability: Some(dec!(0.7)),
         };
 
         let candidate = snapshot_to_candidate(&snap);
@@ -257,6 +273,14 @@ mod tests {
         assert_eq!(snap.market_id, "m1");
         assert_eq!(snap.yes_price, dec!(0.65));
         assert_eq!(snap.resolved_outcome, Some(Decimal::ONE));
+        assert!(snap.model_probability.is_none());
+    }
+
+    #[test]
+    fn test_parse_csv_line_with_out_of_sample_probability() {
+        let line = "2025-01-01T00:00:00Z,m1,Will BTC hit 100k?,crypto,0.65,0.35,50000,0.03,2025-01-08T00:00:00Z,1.0,0.8";
+        let snap = parse_csv_line(line).unwrap();
+        assert_eq!(snap.model_probability, Some(dec!(0.8)));
     }
 
     #[test]

@@ -1,7 +1,7 @@
-//! Edge calculation (fair value vs market price).
+//! Edge calculation (fair value vs executable market price).
 //!
-//! Determines whether a market is mispriced enough to trade,
-//! with thresholds adjusted by confidence level.
+//! Determines whether a market is mispriced enough to trade after estimated
+//! one-way taker fees, with thresholds adjusted by confidence level.
 
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -15,64 +15,72 @@ pub fn evaluate_edge(
     candidate: &MarketCandidate,
     valuation: &ValuationResult,
     config: &ValuationConfig,
+    taker_fee_pct: Decimal,
 ) -> Option<EdgeResult> {
-    // 1. If skeptical analyst returned a "pass" verdict, respect it and skip
+    // A "pass" verdict from the skeptical analyst means no trade.
     if let Some(ref verdict) = valuation.verdict {
         if verdict.eq_ignore_ascii_case("pass") {
             return None;
         }
     }
 
-    let market_prob = candidate.order_book.implied_probability;
-    let fair_prob = valuation.probability;
-
-    // Raw edge = |fair_value - market_implied_prob|
-    let raw_edge = (fair_prob - market_prob).abs();
-
-    // Determine threshold based on confidence
-    let threshold = edge_threshold(valuation, config);
-
     // Skip low-confidence valuations entirely
-    if valuation.confidence < dec!(0.4) || valuation.data_quality == DataQuality::Low {
+    if valuation.confidence < dec!(0.4)
+        || valuation.data_quality == DataQuality::Low
+        || !(Decimal::ZERO..=Decimal::ONE).contains(&valuation.probability)
+        || !(Decimal::ZERO..=Decimal::ONE).contains(&taker_fee_pct)
+    {
         return None;
     }
 
-    if raw_edge < threshold {
+    // Compare each side's model probability with the price actually needed to
+    // buy it: YES lifts the best ask; NO is the complement of the best YES
+    // bid. The midpoint is not executable and overstates edge on wide books.
+    let yes_price = candidate.order_book.asks.first()?.price;
+    let no_price = Decimal::ONE - candidate.order_book.bids.first()?.price;
+    if yes_price <= Decimal::ZERO
+        || yes_price >= Decimal::ONE
+        || no_price <= Decimal::ZERO
+        || no_price >= Decimal::ONE
+    {
         return None;
     }
 
-    // Determine which side to trade
-    let side = if fair_prob > market_prob {
-        Side::Yes // Market underprices YES → buy YES
+    let yes_probability = valuation.probability;
+    let no_probability = Decimal::ONE - yes_probability;
+    let yes_gross_edge = yes_probability - yes_price;
+    let no_gross_edge = no_probability - no_price;
+    let yes_net_edge = yes_gross_edge - yes_price * taker_fee_pct;
+    let no_net_edge = no_gross_edge - no_price * taker_fee_pct;
+    let (side, fair_probability, trade_price, raw_edge, net_edge) = if yes_net_edge >= no_net_edge {
+        (
+            Side::Yes,
+            yes_probability,
+            yes_price,
+            yes_gross_edge,
+            yes_net_edge,
+        )
     } else {
-        Side::No // Market overprices YES → buy NO
+        (
+            Side::No,
+            no_probability,
+            no_price,
+            no_gross_edge,
+            no_net_edge,
+        )
     };
 
-    // 2. Derive true executable price from book (ask for YES, 1 - bid for NO)
-    let executable_price = match side {
-        Side::Yes => candidate
-            .order_book
-            .asks
-            .first()
-            .map(|a| a.price)
-            .unwrap_or(candidate.order_book.midpoint),
-        Side::No => {
-            let best_bid = candidate
-                .order_book
-                .bids
-                .first()
-                .map(|b| b.price)
-                .unwrap_or(candidate.order_book.midpoint);
-            Decimal::ONE - best_bid
-        }
-    };
+    let threshold = edge_threshold(valuation, config);
+    if net_edge < threshold {
+        return None;
+    }
 
-    // 3. Conservative edge test:
-    // If uncertainty range is provided, conservative bound MUST still beat executable price
+    // Conservative edge test: when the model gives an uncertainty range, its
+    // pessimistic end must still beat the executable price.
     match side {
         Side::Yes => {
             if let Some(min_prob) = valuation.uncertainty_min {
-                if min_prob <= executable_price {
+                if min_prob <= trade_price {
                     return None;
                 }
             }
@@ -80,7 +88,7 @@ pub fn evaluate_edge(
         Side::No => {
             if let Some(max_prob_yes) = valuation.uncertainty_max {
                 let min_prob_no = Decimal::ONE - max_prob_yes;
-                if min_prob_no <= executable_price {
+                if min_prob_no <= trade_price {
                     return None;
                 }
             }
@@ -89,11 +97,12 @@ pub fn evaluate_edge(
 
     Some(EdgeResult {
         raw_edge,
+        net_edge,
         threshold,
         side,
-        fair_probability: fair_prob,
-        market_probability: market_prob,
-        trade_price: executable_price,
+        fair_probability,
+        market_probability: trade_price,
+        trade_price,
     })
 }
 
@@ -111,15 +120,17 @@ fn edge_threshold(valuation: &ValuationResult, config: &ValuationConfig) -> Deci
 /// Result of edge evaluation.
 #[derive(Debug, Clone)]
 pub struct EdgeResult {
-    /// Absolute difference between fair value and market price.
+    /// Expected value per share before fees, measured at the executable price.
     pub raw_edge: Decimal,
+    /// Expected value per share after estimated taker fees.
+    pub net_edge: Decimal,
     /// Threshold that was applied.
     pub threshold: Decimal,
     /// Which side to trade (Yes or No).
     pub side: Side,
-    /// Claude's fair probability estimate.
+    /// Fair probability of the selected outcome (YES or NO).
     pub fair_probability: Decimal,
-    /// Market's implied probability.
+    /// Executable price of the selected outcome.
     pub market_probability: Decimal,
     /// The price we'd trade at.
     pub trade_price: Decimal,
@@ -137,7 +148,7 @@ pub fn to_opportunity(
         order_book: candidate.order_book.clone(),
         fair_value: valuation.probability,
         confidence: valuation.confidence,
-        edge: edge.raw_edge,
+        edge: edge.net_edge,
         recommended_side: edge.side,
         kelly_size,
     }
@@ -220,24 +231,30 @@ mod tests {
     fn test_edge_buy_yes() {
         let config = test_config();
         let candidate = test_candidate(dec!(0.50));
-        // Claude says 65% probability, market says 50% → 15% edge → buy YES
+        // The YES ask is 0.52 (not the 0.50 midpoint); fees are deducted too.
         let valuation = test_valuation(dec!(0.65), dec!(0.85));
 
-        let result = evaluate_edge(&candidate, &valuation, &config).unwrap();
-        assert_eq!(result.raw_edge, dec!(0.15));
+        let result = evaluate_edge(&candidate, &valuation, &config, dec!(0.02)).unwrap();
+        assert_eq!(result.raw_edge, dec!(0.13));
+        assert_eq!(result.net_edge, dec!(0.1196));
         assert_eq!(result.side, Side::Yes);
+        assert_eq!(result.trade_price, dec!(0.52));
+        assert_eq!(result.fair_probability, dec!(0.65));
     }
 
     #[test]
     fn test_edge_buy_no() {
         let config = test_config();
         let candidate = test_candidate(dec!(0.70));
-        // Claude says 50% probability, market says 70% → 20% edge → buy NO
+        // NO costs 1 - the best YES bid (0.32), not 1 - the midpoint (0.30).
         let valuation = test_valuation(dec!(0.50), dec!(0.85));
 
-        let result = evaluate_edge(&candidate, &valuation, &config).unwrap();
-        assert_eq!(result.raw_edge, dec!(0.20));
+        let result = evaluate_edge(&candidate, &valuation, &config, dec!(0.02)).unwrap();
+        assert_eq!(result.raw_edge, dec!(0.18));
+        assert_eq!(result.net_edge, dec!(0.1736));
         assert_eq!(result.side, Side::No);
+        assert_eq!(result.trade_price, dec!(0.32));
+        assert_eq!(result.fair_probability, dec!(0.50));
     }
 
     #[test]
@@ -247,7 +264,7 @@ mod tests {
         // 3% edge at high confidence (threshold 6%) → no trade
         let valuation = test_valuation(dec!(0.53), dec!(0.85));
 
-        let result = evaluate_edge(&candidate, &valuation, &config);
+        let result = evaluate_edge(&candidate, &valuation, &config, dec!(0.02));
         assert!(result.is_none());
     }
 
@@ -258,7 +275,7 @@ mod tests {
         // Big edge but confidence too low → skip
         let valuation = test_valuation(dec!(0.80), dec!(0.30));
 
-        let result = evaluate_edge(&candidate, &valuation, &config);
+        let result = evaluate_edge(&candidate, &valuation, &config, dec!(0.02));
         assert!(result.is_none());
     }
 
@@ -286,7 +303,7 @@ mod tests {
         let mut valuation = test_valuation(dec!(0.80), dec!(0.85));
         valuation.data_quality = DataQuality::Low;
 
-        let result = evaluate_edge(&candidate, &valuation, &config);
+        let result = evaluate_edge(&candidate, &valuation, &config, dec!(0.02));
         assert!(result.is_none());
     }
 
@@ -297,7 +314,7 @@ mod tests {
         let mut valuation = test_valuation(dec!(0.75), dec!(0.85));
         valuation.verdict = Some("pass".to_string());
 
-        let result = evaluate_edge(&candidate, &valuation, &config);
+        let result = evaluate_edge(&candidate, &valuation, &config, Decimal::ZERO);
         assert!(
             result.is_none(),
             "A 'pass' verdict from skeptical analyst must reject trade"
@@ -313,7 +330,7 @@ mod tests {
         valuation.uncertainty_min = Some(dec!(0.51));
         valuation.uncertainty_max = Some(dec!(0.69));
 
-        let result = evaluate_edge(&candidate, &valuation, &config);
+        let result = evaluate_edge(&candidate, &valuation, &config, Decimal::ZERO);
         assert!(
             result.is_none(),
             "Conservative lower bound must beat executable price"
@@ -321,7 +338,7 @@ mod tests {
 
         // Now test where conservative lower bound does beat executable price:
         valuation.uncertainty_min = Some(dec!(0.58));
-        let result = evaluate_edge(&candidate, &valuation, &config);
+        let result = evaluate_edge(&candidate, &valuation, &config, Decimal::ZERO);
         assert!(
             result.is_some(),
             "Conservative lower bound above ask permits trade"
@@ -332,5 +349,26 @@ mod tests {
             dec!(0.52),
             "Trade price must be executable ask"
         );
+    }
+
+    #[test]
+    fn fee_and_executable_spread_can_remove_an_apparent_midpoint_edge() {
+        let config = test_config();
+        let candidate = test_candidate(dec!(0.50));
+        // At the midpoint this appears to clear 6%, but the executable ask
+        // and taker fee leave less than the 6% high-confidence threshold.
+        let valuation = test_valuation(dec!(0.56), dec!(0.90));
+
+        assert!(evaluate_edge(&candidate, &valuation, &config, dec!(0.02)).is_none());
+    }
+
+    #[test]
+    fn missing_book_side_is_not_treated_as_an_executable_quote() {
+        let config = test_config();
+        let mut candidate = test_candidate(dec!(0.50));
+        candidate.order_book.asks.clear();
+        let valuation = test_valuation(dec!(0.90), dec!(0.90));
+
+        assert!(evaluate_edge(&candidate, &valuation, &config, dec!(0.02)).is_none());
     }
 }

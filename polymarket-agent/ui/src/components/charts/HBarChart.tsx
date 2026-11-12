@@ -22,12 +22,16 @@ export function HBarChart({
   color?: string;
   ariaLabel: string;
 }) {
-  const max = rows.reduce((m, r) => Math.max(m, r.value), 0);
+  const valueOf = (value: number) =>
+    Number.isFinite(value) ? Math.max(0, value) : 0;
+  const max = rows.reduce((m, r) => Math.max(m, valueOf(r.value)), 0);
 
   return (
     <div role="img" aria-label={ariaLabel}>
       {rows.map((r) => {
-        const pct = max > 0 ? (r.value / max) * 100 : 0;
+        const valid = Number.isFinite(r.value);
+        const value = valid ? valueOf(r.value) : 0;
+        const pct = max > 0 ? Math.min(100, (value / max) * 100) : 0;
         return (
           <div key={r.label} style={{ marginBottom: 10 }}>
             <div
@@ -40,7 +44,7 @@ export function HBarChart({
               }}
             >
               <span>{r.label}</span>
-              <span className="mono">{formatValue(r.value)}</span>
+              <span className="mono">{valid ? formatValue(value) : "—"}</span>
             </div>
             <div
               style={{

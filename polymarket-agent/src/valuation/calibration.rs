@@ -1,8 +1,9 @@
-//! Confidence calibration system.
+//! Probability and confidence calibration.
 //!
-//! Tracks Claude's self-reported confidence against actual trade outcomes
-//! to compute a calibration discount. If Claude is systematically overconfident,
-//! the discount reduces future confidence values used in Kelly sizing.
+//! Tracks forecasts against resolved outcomes. Probability forecasts are
+//! blended with the market prior using a bounded, regularized Brier-loss fit;
+//! the separate confidence discount reduces Kelly sizing when self-reported
+//! confidence has been overoptimistic.
 
 use anyhow::{Context, Result};
 use rust_decimal::Decimal;
@@ -19,6 +20,13 @@ const MIN_CALIBRATION_SAMPLES: usize = 50;
 
 /// Floor for the calibration discount (never reduce confidence by more than 70%).
 const MIN_DISCOUNT: Decimal = dec!(0.30);
+/// Start by giving the model half the distance from the market prior. A model
+/// with no proven incremental value should not get to overwrite the market.
+pub const DEFAULT_MARKET_MODEL_WEIGHT: Decimal = dec!(0.50);
+const MIN_MARKET_CALIBRATION_SAMPLES: usize = 30;
+/// Regularizes the fitted blend toward the default until substantially more
+/// resolved observations exist.
+const MARKET_WEIGHT_PRIOR_SAMPLES: usize = 30;
 
 /// Record a prediction for calibration tracking.
 pub async fn record_prediction(
@@ -29,18 +37,157 @@ pub async fn record_prediction(
     market_price_at_entry: Decimal,
 ) -> Result<()> {
     sqlx::query(
-        "INSERT INTO confidence_calibration (market_id, claude_confidence, fair_value, market_price_at_entry, resolved)
-         VALUES (?, ?, ?, ?, 0)",
+        "INSERT INTO confidence_calibration
+         (market_id, claude_confidence, fair_value, market_price_at_entry, resolved,
+          market_yes_price, model_probability)
+         VALUES (?, ?, ?, ?, 0, ?, ?)",
     )
     .bind(market_id)
     .bind(claude_confidence.to_string())
     .bind(fair_value.to_string())
     .bind(market_price_at_entry.to_string())
+    .bind(market_price_at_entry.to_string())
+    .bind(fair_value.to_string())
     .execute(pool)
     .await
     .context("Failed to record calibration prediction")?;
 
     Ok(())
+}
+
+/// Record a prediction with both the raw model output and the executable
+/// YES-market prior. `fair_value` is the calibrated probability used for the
+/// decision and Brier score; `model_probability` is preserved to measure
+/// whether the model adds value beyond the market.
+pub async fn record_prediction_with_market_prior(
+    pool: &SqlitePool,
+    market_id: &str,
+    confidence: Decimal,
+    model_probability: Decimal,
+    fair_value: Decimal,
+    entry_price: Decimal,
+    market_yes_price: Decimal,
+) -> Result<()> {
+    let updated = sqlx::query(
+        "UPDATE confidence_calibration
+         SET claude_confidence = ?, fair_value = ?, market_price_at_entry = ?,
+             market_yes_price = ?, model_probability = ?
+         WHERE market_id = ? AND resolved = 0",
+    )
+    .bind(confidence.to_string())
+    .bind(fair_value.to_string())
+    .bind(entry_price.to_string())
+    .bind(market_yes_price.to_string())
+    .bind(model_probability.to_string())
+    .bind(market_id)
+    .execute(pool)
+    .await
+    .context("Failed to update market-relative calibration prediction")?;
+
+    if updated.rows_affected() == 0 {
+        sqlx::query(
+            "INSERT INTO confidence_calibration
+             (market_id, claude_confidence, fair_value, market_price_at_entry, resolved,
+              market_yes_price, model_probability)
+             VALUES (?, ?, ?, ?, 0, ?, ?)",
+        )
+        .bind(market_id)
+        .bind(confidence.to_string())
+        .bind(fair_value.to_string())
+        .bind(entry_price.to_string())
+        .bind(market_yes_price.to_string())
+        .bind(model_probability.to_string())
+        .execute(pool)
+        .await
+        .context("Failed to record market-relative calibration prediction")?;
+    }
+
+    Ok(())
+}
+
+/// Fit a bounded blend weight from resolved prediction-market forecasts.
+///
+/// The fitted parameter minimizes Brier loss for:
+/// `market_prior + weight * (model_probability - market_prior)`.
+/// It is constrained to [0, 1], so the model cannot extrapolate beyond its
+/// own forecast. The estimate is regularized toward a conservative 50/50
+/// blend; with fewer than 30 valid outcomes the default is used unchanged.
+pub async fn market_model_weight(pool: &SqlitePool) -> Result<(Decimal, usize)> {
+    let rows: Vec<(Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT model_probability, market_yes_price, actual_outcome
+         FROM (
+             SELECT model_probability, market_yes_price, actual_outcome,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY market_id ORDER BY resolved_at DESC, id DESC
+                    ) AS market_rank
+             FROM confidence_calibration
+             WHERE resolved = 1 AND actual_outcome IS NOT NULL
+               AND model_probability IS NOT NULL AND market_yes_price IS NOT NULL
+               AND market_id NOT LIKE ?
+         )
+         WHERE market_rank = 1",
+    )
+    .bind(format!("{DIRECTIONAL_PREFIX}%"))
+    .fetch_all(pool)
+    .await
+    .context("Failed to fetch market-relative calibration data")?;
+
+    let mut numerator = Decimal::ZERO;
+    let mut denominator = Decimal::ZERO;
+    let mut samples = 0usize;
+    for (model, market, outcome) in rows {
+        let parsed = model
+            .as_deref()
+            .and_then(|v| Decimal::from_str(v).ok())
+            .zip(market.as_deref().and_then(|v| Decimal::from_str(v).ok()))
+            .zip(outcome.as_deref().and_then(|v| Decimal::from_str(v).ok()));
+        let Some(((model, market), outcome)) = parsed else {
+            continue;
+        };
+        if !(Decimal::ZERO..=Decimal::ONE).contains(&model)
+            || !(Decimal::ZERO..=Decimal::ONE).contains(&market)
+            || !(Decimal::ZERO..=Decimal::ONE).contains(&outcome)
+        {
+            continue;
+        }
+
+        let model_delta = model - market;
+        numerator += model_delta * (outcome - market);
+        denominator += model_delta * model_delta;
+        samples += 1;
+    }
+
+    if samples < MIN_MARKET_CALIBRATION_SAMPLES {
+        return Ok((DEFAULT_MARKET_MODEL_WEIGHT, samples));
+    }
+
+    let fitted = if denominator.is_zero() {
+        Decimal::ZERO
+    } else {
+        (numerator / denominator).clamp(Decimal::ZERO, Decimal::ONE)
+    };
+    let sample_count = Decimal::from(samples as u64);
+    let prior_count = Decimal::from(MARKET_WEIGHT_PRIOR_SAMPLES as u64);
+    let weight = ((fitted * sample_count + DEFAULT_MARKET_MODEL_WEIGHT * prior_count)
+        / (sample_count + prior_count))
+        .clamp(Decimal::ZERO, Decimal::ONE);
+    Ok((weight, samples))
+}
+
+/// Blend a raw model probability toward the market prior using a bounded
+/// weight. Invalid inputs are rejected rather than silently clamped.
+pub fn blend_with_market_prior(
+    model_probability: Decimal,
+    market_prior: Decimal,
+    model_weight: Decimal,
+) -> Option<Decimal> {
+    if !(Decimal::ZERO..=Decimal::ONE).contains(&model_probability)
+        || !(Decimal::ZERO..=Decimal::ONE).contains(&market_prior)
+        || !(Decimal::ZERO..=Decimal::ONE).contains(&model_weight)
+    {
+        return None;
+    }
+    Some(market_prior + model_weight * (model_probability - market_prior))
 }
 
 /// Record the resolution of a prediction for calibration.
@@ -477,5 +624,127 @@ mod tests {
         // Still below MIN_CALIBRATION_SAMPLES
         let discount = compute_discount(store.pool(), 100).await.unwrap();
         assert_eq!(discount, DEFAULT_DISCOUNT);
+    }
+
+    #[test]
+    fn market_prior_blend_is_bounded_and_moves_toward_market() {
+        assert_eq!(
+            blend_with_market_prior(dec!(0.9), dec!(0.5), dec!(0.5)),
+            Some(dec!(0.70))
+        );
+        assert_eq!(
+            blend_with_market_prior(dec!(0.9), dec!(0.5), Decimal::ZERO),
+            Some(dec!(0.5))
+        );
+        assert_eq!(
+            blend_with_market_prior(dec!(1.1), dec!(0.5), dec!(0.5)),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn market_model_weight_uses_conservative_default_until_minimum_sample() {
+        let pool = pool().await;
+        for i in 0..29 {
+            let key = format!("sample-{i}");
+            record_prediction(&pool, &key, dec!(0.8), dec!(0.9), dec!(0.5))
+                .await
+                .unwrap();
+            record_resolution(&pool, &key, Decimal::ONE).await.unwrap();
+        }
+
+        assert_eq!(
+            market_model_weight(&pool).await.unwrap(),
+            (DEFAULT_MARKET_MODEL_WEIGHT, 29)
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_open_market_forecasts_replace_instead_of_double_counting() {
+        let pool = pool().await;
+        record_prediction_with_market_prior(
+            &pool,
+            "same-market",
+            dec!(0.7),
+            dec!(0.8),
+            dec!(0.65),
+            dec!(0.51),
+            dec!(0.52),
+        )
+        .await
+        .unwrap();
+        record_prediction_with_market_prior(
+            &pool,
+            "same-market",
+            dec!(0.75),
+            dec!(0.7),
+            dec!(0.61),
+            dec!(0.50),
+            dec!(0.53),
+        )
+        .await
+        .unwrap();
+
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT fair_value, model_probability, market_yes_price
+             FROM confidence_calibration WHERE market_id = ? AND resolved = 0",
+        )
+        .bind("same-market")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0],
+            ("0.61".to_string(), "0.7".to_string(), "0.53".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn market_model_weight_reduces_overconfident_forecasts() {
+        let pool = pool().await;
+        for i in 0..40 {
+            let key = format!("sample-{i}");
+            // The forecast swings strongly, but outcomes are independent of
+            // that swing; the market's 50/50 prior is the better predictor.
+            let model = if i % 2 == 0 { dec!(0.9) } else { dec!(0.1) };
+            record_prediction(&pool, &key, dec!(0.8), model, dec!(0.5))
+                .await
+                .unwrap();
+            let outcome = if i % 2 == 0 {
+                Decimal::ZERO
+            } else {
+                Decimal::ONE
+            };
+            record_resolution(&pool, &key, outcome).await.unwrap();
+        }
+
+        let (weight, samples) = market_model_weight(&pool).await.unwrap();
+        assert_eq!(samples, 40);
+        assert!(weight < DEFAULT_MARKET_MODEL_WEIGHT);
+        assert!(weight >= Decimal::ZERO);
+    }
+
+    #[tokio::test]
+    async fn market_model_weight_increases_only_when_model_beats_market_prior() {
+        let pool = pool().await;
+        for i in 0..40 {
+            let key = format!("sample-{i}");
+            let model = if i % 2 == 0 { dec!(0.9) } else { dec!(0.1) };
+            record_prediction(&pool, &key, dec!(0.8), model, dec!(0.5))
+                .await
+                .unwrap();
+            let outcome = if i % 2 == 0 {
+                Decimal::ONE
+            } else {
+                Decimal::ZERO
+            };
+            record_resolution(&pool, &key, outcome).await.unwrap();
+        }
+
+        let (weight, samples) = market_model_weight(&pool).await.unwrap();
+        assert_eq!(samples, 40);
+        assert!(weight > DEFAULT_MARKET_MODEL_WEIGHT);
+        assert!(weight <= Decimal::ONE);
     }
 }

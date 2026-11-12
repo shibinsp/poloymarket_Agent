@@ -14,6 +14,24 @@ export function linePath(points: [number, number][]): string {
     .join(" ");
 }
 
+/** Split a line at missing readings so gaps are never drawn as real data. */
+export function splitSegments(
+  points: ([number, number] | null)[],
+): [number, number][][] {
+  const segments: [number, number][][] = [];
+  let segment: [number, number][] = [];
+  for (const point of points) {
+    if (point === null) {
+      if (segment.length > 0) segments.push(segment);
+      segment = [];
+    } else {
+      segment.push(point);
+    }
+  }
+  if (segment.length > 0) segments.push(segment);
+  return segments;
+}
+
 /** The same line closed down to a baseline, for an area fill. */
 export function areaPath(points: [number, number][], baselineY: number): string {
   if (points.length === 0) return "";

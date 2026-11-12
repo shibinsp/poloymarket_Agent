@@ -24,7 +24,9 @@ export function DonutChart({
 }) {
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
 
-  const total = segments.reduce((sum, s) => sum + Math.max(0, s.value), 0);
+  const valueOf = (value: number) =>
+    Number.isFinite(value) ? Math.max(0, value) : 0;
+  const total = segments.reduce((sum, s) => sum + valueOf(s.value), 0);
   const radius = (size - strokeWidth) / 2;
   const center = size / 2;
   const circumference = 2 * Math.PI * radius;
@@ -32,7 +34,8 @@ export function DonutChart({
   let cumulativeAngle = 0;
 
   const renderedSegments = segments.map((seg, idx) => {
-    const fraction = total > 0 ? Math.max(0, seg.value) / total : 0;
+    const value = valueOf(seg.value);
+    const fraction = total > 0 ? value / total : 0;
     const strokeDasharray = `${fraction * circumference} ${circumference}`;
     const strokeDashoffset = -cumulativeAngle * circumference;
     cumulativeAngle += fraction;
@@ -66,7 +69,7 @@ export function DonutChart({
 
   return (
     <div
-      role="img"
+      role="group"
       aria-label={ariaLabel}
       style={{
         display: "flex",
@@ -83,6 +86,7 @@ export function DonutChart({
           width={size}
           height={size}
           style={{ transform: "rotate(-90deg)", overflow: "visible" }}
+          aria-hidden="true"
         >
           {total === 0 ? (
             <circle
@@ -117,7 +121,9 @@ export function DonutChart({
           </span>
           <span style={{ fontSize: "16px", fontWeight: "700", color: "var(--text-primary)", fontVariantNumeric: "tabular-nums" }}>
             {activeSegment
-              ? `${total > 0 ? ((activeSegment.value / total) * 100).toFixed(1) : 0}%`
+              ? Number.isFinite(activeSegment.value)
+                ? `${total > 0 ? ((valueOf(activeSegment.value) / total) * 100).toFixed(1) : 0}%`
+                : "—"
               : (centerValue ?? total.toFixed(0))}
           </span>
           {activeSegment?.sublabel && (
@@ -131,14 +137,24 @@ export function DonutChart({
       {/* Legend / Breakdown */}
       <div style={{ display: "flex", flexDirection: "column", gap: "8px", minWidth: "160px" }}>
         {segments.map((seg, idx) => {
-          const pct = total > 0 ? ((seg.value / total) * 100).toFixed(1) : "0.0";
+          const pct = Number.isFinite(seg.value)
+            ? total > 0
+              ? ((valueOf(seg.value) / total) * 100).toFixed(1)
+              : "0.0"
+            : "—";
           const isHovered = hoveredIndex === idx;
 
           return (
-            <div
+            <button
+              type="button"
+              className="donut__legend-item"
+              aria-label={`${seg.label}: ${pct === "—" ? "unavailable" : `${pct}%`}`}
+              aria-pressed={isHovered}
               key={seg.label}
               onMouseEnter={() => setHoveredIndex(idx)}
               onMouseLeave={() => setHoveredIndex(null)}
+              onFocus={() => setHoveredIndex(idx)}
+              onBlur={() => setHoveredIndex(null)}
               style={{
                 display: "flex",
                 alignItems: "center",
@@ -149,6 +165,11 @@ export function DonutChart({
                 background: isHovered ? "var(--surface-2)" : "transparent",
                 cursor: "pointer",
                 transition: "background 0.12s ease",
+                border: 0,
+                color: "inherit",
+                font: "inherit",
+                textAlign: "left",
+                width: "100%",
               }}
             >
               <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
@@ -167,7 +188,7 @@ export function DonutChart({
               </div>
               <div style={{ textAlign: "right" }}>
                 <strong style={{ fontSize: "13px", color: "var(--text-primary)", fontVariantNumeric: "tabular-nums" }}>
-                  {pct}%
+                  {pct}{pct === "—" ? "" : "%"}
                 </strong>
                 {seg.sublabel && (
                   <span style={{ display: "block", fontSize: "11px", color: "var(--text-muted)" }}>
@@ -175,7 +196,7 @@ export function DonutChart({
                   </span>
                 )}
               </div>
-            </div>
+            </button>
           );
         })}
       </div>

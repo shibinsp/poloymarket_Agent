@@ -111,6 +111,7 @@ dashboard_bind = "127.0.0.1"
 clob_base_url = "https://clob.polymarket.com"
 gamma_base_url = "https://gamma-api.polymarket.com"
 chain_id = 137
+taker_fee_pct = 0.02              # Conservative estimate; verify against each market's current fee schedule
 
 [rate_limit]
 requests_per_second = 10

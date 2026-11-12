@@ -221,6 +221,11 @@ cargo run --release -- --mode live
 | `max_slippage_pct` | `0.02` | Max 2% slippage from midpoint |
 | `max_retries` | `3` | Retry attempts on transient failures |
 
+**Polymarket execution:**
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `taker_fee_pct` | `0.02` | Conservative estimated one-way fee as a fraction of purchase notional. Verify against each market's current fee schedule. |
+
 **Rate Limiting:**
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -244,15 +249,19 @@ mode = "backtest"
 
 CSV format:
 ```csv
-timestamp,market_id,question,category,yes_price,no_price,volume_24h,spread,end_date,resolved_outcome
-2025-01-01T00:00:00Z,m1,Will BTC hit 100k?,crypto,0.65,0.35,50000,0.03,2025-01-08T00:00:00Z,1.0
+timestamp,market_id,question,category,yes_price,no_price,volume_24h,spread,end_date,resolved_outcome,model_probability
+2025-01-01T00:00:00Z,m1,Will BTC hit 100k?,crypto,0.65,0.35,50000,0.03,2025-01-08T00:00:00Z,1.0,0.72
 ```
 
-The backtester outputs a full results summary including win rate, Sharpe ratio, max drawdown, profit factor, edge accuracy, and net P&L after API costs.
+`model_probability` is optional and must be an out-of-sample YES forecast made using only data available at `timestamp`. The resolved outcome is used only as the settlement label; it is never used to generate a forecast. If no forecast is supplied, the backtest uses the market price as its prior and should produce no trades. The simulated entry uses the executable ask/bid, estimated taker fee, and the same net-edge threshold and side-specific Kelly calculation as the live prediction-market path. When forecasts are supplied, results report model and market-prior Brier scores over the same resolved sample (`lower is better`); these scores evaluate probability quality independently of whether a trade passed the edge filters. The backtest cannot verify that supplied forecasts were genuinely generated out of sample, and it does not model historical queue position or guarantee limit-order fills.
+
+Live probability estimates are blended with the market-implied YES probability. The initial model weight is 0.5; after at least 30 resolved prediction-market forecasts, the weight is fitted to reduce historical Brier loss versus the market prior and regularized back toward 0.5. The weight is bounded to [0, 1], so the model cannot extrapolate beyond its own forecast. Calibration is based on executed markets and remains provisional; paper results and walk-forward evaluation are required before increasing risk.
+
+The backtester outputs a results summary including win rate, Sharpe ratio, max drawdown, profit factor, edge accuracy, estimated fees, and net P&L after API costs.
 
 ### Paper Trading (default)
 
-Simulates all trades locally. Orders fill at limit price. No real money is used and no Polymarket API keys are needed. Claude API is called for valuations.
+Simulates all trades locally, including unfilled orders, partial fills, and adverse price movement. No real money is used and no Polymarket wallet key is needed. The configured LLM API key is used for valuations.
 
 ```toml
 [agent]
@@ -261,7 +270,7 @@ mode = "paper"
 
 ### Live Trading
 
-Places real orders on Polymarket via the CLOB API. Requires a funded Polygon wallet.
+Polymarket live mode is intentionally blocked during startup in this build. Order status lookup, open-order listing, position reporting, and cash reconciliation are not yet implemented and verified as one safe lifecycle. Do not remove this gate or fund a wallet to work around it. Use paper mode while these capabilities are completed and tested.
 
 ```toml
 [agent]
@@ -507,7 +516,7 @@ cargo clippy -- -D warnings
 5. **Model risk.** Claude can be confidently wrong. The confidence score is self-assessed, not externally calibrated.
 6. **Black swan risk.** A single unexpected event can wipe correlated positions.
 7. **Jurisdiction.** Polymarket's international CLOB prohibits US persons from trading under its Terms of Service. If you are in the US, do not fund or run live mode against it.
-8. **Live mode is not yet production-safe.** As of 2026-09-17 the live path records orders as filled without confirmation, hardcodes a 7-day order expiry, has no kill switch, drawdown breaker, or daily-loss limit, and submits NO-side entries with an inverted order side. Do not run `--mode live` until the go-live gate in the roadmap is complete.
+8. **Polymarket live mode is intentionally blocked at startup.** Order status, open-order listing, position reporting, and cash reconciliation must be implemented and verified together before this gate is removed. Do not bypass it or use real funds.
 
 ## License
 

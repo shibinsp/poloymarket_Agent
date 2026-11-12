@@ -31,18 +31,21 @@ interface IntradayStatusData {
 
 export function MarketSessionRibbon() {
   const [data, setData] = useState<IntradayStatusData | null>(null);
+  const [unavailable, setUnavailable] = useState(false);
 
   useEffect(() => {
     let active = true;
     async function load() {
       try {
         const res = await fetch("/api/intraday/status");
-        if (res.ok && active) {
-          const json = await res.json();
+        if (!res.ok) throw new Error(`Market status request failed (${res.status})`);
+        const json: IntradayStatusData = await res.json();
+        if (active) {
           setData(json);
+          setUnavailable(false);
         }
       } catch {
-        // silent fallback
+        if (active) setUnavailable(true);
       }
     }
     load();
@@ -58,11 +61,17 @@ export function MarketSessionRibbon() {
     };
   }, []);
 
-  if (!data) return null;
+  if (!data) {
+    return unavailable ? (
+      <div className="connbar connbar--warning" role="status">
+        Market session details are temporarily unavailable.
+      </div>
+    ) : null;
+  }
 
   const indiaOpen = data.india?.session_state === "OPEN";
   const usOpen = data.us?.session_state === "OPEN";
-  const fx = data.fx_rate?.rate ?? "86.50";
+  const fx = Number(data.fx_rate?.rate);
 
   return (
     <div
@@ -80,6 +89,11 @@ export function MarketSessionRibbon() {
         marginBottom: "12px",
       }}
     >
+      {unavailable && (
+        <Badge tone="warning" title="Showing the last successful session response">
+          Session status may be stale
+        </Badge>
+      )}
       <div style={{ display: "flex", alignItems: "center", gap: "16px", flexWrap: "wrap" }}>
         {/* NSE Market Pill */}
         <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
@@ -113,16 +127,17 @@ export function MarketSessionRibbon() {
         {/* Polymarket 24/7 Pill */}
         <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
           <span style={{ fontWeight: 600, color: "var(--text-primary)" }}>Polymarket:</span>
-          <Badge tone="good">🟢 24/7 LIVE</Badge>
+          <Badge tone="neutral">24/7 market</Badge>
         </div>
       </div>
 
       {/* FX Reference Benchmark */}
-      <div style={{ display: "flex", alignItems: "center", gap: "8px", color: "var(--text-secondary)" }}>
-        <span>USD/INR:</span>
-        <strong style={{ color: "var(--text-primary)" }}>₹{fx}</strong>
-        <span style={{ fontSize: "11px", color: "var(--text-muted)" }}>• 15:15 IST Square-off Active</span>
-      </div>
+      {Number.isFinite(fx) && fx > 0 && (
+        <div style={{ display: "flex", alignItems: "center", gap: "8px", color: "var(--text-secondary)" }}>
+          <span>USD/INR:</span>
+          <strong style={{ color: "var(--text-primary)" }}>₹{fx.toFixed(2)}</strong>
+        </div>
+      )}
     </div>
   );
 }

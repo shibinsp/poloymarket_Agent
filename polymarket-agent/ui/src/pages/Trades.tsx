@@ -200,7 +200,7 @@ export function Trades() {
     for (const o of indiaOrders) {
       if (seenIds.has(o.id) || (o.client_order_id && seenIds.has(o.client_order_id)) || (o.venue_order_id && seenIds.has(o.venue_order_id))) continue;
       const rawP = num(o.average_fill_price || o.price) ?? 0;
-      const p = rawP > 0 ? rawP : (o.symbol === "RELIANCE" ? 1205.50 : 2500.00);
+      const p = rawP;
       const match = indiaPnlMap.get(o.id);
       list.push({
         id: `ind-${o.id}`,
