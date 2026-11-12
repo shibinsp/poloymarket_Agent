@@ -129,6 +129,20 @@ fn size_continuous(
     risk: &RiskConfig,
     cfg: &ContinuousSizingConfig,
 ) -> SizeResult {
+    let is_us_equity = inputs.instrument.asset_class == AssetClass::Equity
+        && inputs.instrument.quote_ccy.eq_ignore_ascii_case("USD")
+        && inputs.instrument.venue().as_str() == "alpaca";
+
+    let cash_buffer_pct = if is_us_equity {
+        risk.us_cash_buffer_pct.unwrap_or(Decimal::ZERO)
+    } else {
+        Decimal::ZERO
+    };
+    if cash_buffer_pct < Decimal::ZERO || cash_buffer_pct >= Decimal::ONE {
+        return SizeResult::none("invalid U.S. equity cash-buffer setting");
+    }
+    let sizing_bankroll = inputs.bankroll * (Decimal::ONE - cash_buffer_pct);
+
     let state_multiplier = state_multiplier(inputs.state);
     if state_multiplier.is_zero() {
         return SizeResult::none("agent state forbids new positions");
@@ -136,7 +150,7 @@ fn size_continuous(
     if inputs.price <= Decimal::ZERO {
         return SizeResult::none("non-positive price");
     }
-    if inputs.bankroll <= Decimal::ZERO {
+    if sizing_bankroll <= Decimal::ZERO {
         return SizeResult::none("no bankroll");
     }
 
@@ -153,8 +167,16 @@ fn size_continuous(
 
     // Risk budget shrinks with low confidence and with agent state, the same
     // way Kelly scaling does for prediction markets.
-    let risk_pct = cfg.risk_per_trade_pct * inputs.confidence * state_multiplier;
-    let risk_usd = inputs.bankroll * risk_pct;
+    let configured_risk_pct = if is_us_equity {
+        risk.us_risk_per_trade_pct.unwrap_or(cfg.risk_per_trade_pct)
+    } else {
+        cfg.risk_per_trade_pct
+    };
+    if configured_risk_pct <= Decimal::ZERO || configured_risk_pct > Decimal::ONE {
+        return SizeResult::none("invalid risk-per-trade setting");
+    }
+    let risk_pct = configured_risk_pct * inputs.confidence * state_multiplier;
+    let risk_usd = sizing_bankroll * risk_pct;
 
     // Losing `stop_pct` of the notional must cost exactly the risk budget.
     let mut position_usd = risk_usd / stop_pct;
@@ -165,7 +187,15 @@ fn size_continuous(
     // — sets the size, and realised risk per trade is correspondingly
     // smaller. That is deliberate for micro capital, but it means raising
     // risk_per_trade_pct alone changes nothing until the cap is raised too.
-    let max_position = inputs.bankroll * risk.max_position_pct;
+    let max_position_pct = if is_us_equity {
+        risk.us_max_position_pct.unwrap_or(risk.max_position_pct)
+    } else {
+        risk.max_position_pct
+    };
+    if max_position_pct <= Decimal::ZERO || max_position_pct > Decimal::ONE {
+        return SizeResult::none("invalid maximum position setting");
+    }
+    let max_position = sizing_bankroll * max_position_pct;
     if position_usd > max_position {
         position_usd = max_position;
     }
@@ -209,7 +239,7 @@ fn size_continuous(
     // fraction of the budget — at the shipped defaults roughly a third of it —
     // and a caller aggregating this field into a portfolio risk number would
     // otherwise over-count every position.
-    let realised_risk_pct = position_usd * stop_pct / inputs.bankroll;
+    let realised_risk_pct = position_usd * stop_pct / sizing_bankroll;
 
     SizeResult {
         position_usd,
@@ -470,6 +500,26 @@ mod tests {
         );
         // Uncapped the target is $2000 (20% of bankroll); the 6% cap wins.
         assert_eq!(result.position_usd, dec!(600.00));
+    }
+
+    #[test]
+    fn us_equity_sizing_applies_its_risk_position_and_cash_buffer_limits() {
+        let inst = equity(None);
+        let bars = candles();
+        let mut risk = uncapped_risk_config();
+        risk.us_max_position_pct = Some(dec!(0.20));
+        risk.us_cash_buffer_pct = Some(dec!(0.10));
+        risk.us_risk_per_trade_pct = Some(dec!(0.01));
+
+        let result = size_position(
+            &inputs(&inst, &bars, dec!(10_000), AgentState::Alive),
+            &risk,
+            &continuous_config(),
+        );
+
+        assert_eq!(result.position_usd, dec!(1800));
+        assert_eq!(result.stop_pct, Some(dec!(0.03)));
+        assert_eq!(result.risk_pct, Some(dec!(0.006)));
     }
 
     /// Finding 9: the reported risk has to describe the position being

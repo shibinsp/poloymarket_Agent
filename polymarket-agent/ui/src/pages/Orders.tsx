@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { usePolled } from "../components/live/StrategyLedgers";
 import { useDataset } from "../data/useDataset";
 import { DatasetCard } from "../components/ui/DatasetCard";
 import { Card } from "../components/ui/Card";
@@ -25,6 +26,16 @@ export function Orders() {
   const india = useDataset<IndiaSandboxStatusResponse>("indiaSandbox");
   const us = useDataset<UsPaperStatusResponse>("usPaper");
   const now = useNow();
+  // The breakout strategy's closed trades, so an exit order can show what its trade made.
+  const orbTrades = usePolled<{ trades: { id: number; realized_pnl: string | null; status: string | null }[] }>("/api/us/orb/trades");
+  const tradePnl = useMemo(() => {
+    const m = new Map<number, number>();
+    for (const t of orbTrades?.trades ?? []) {
+      const v = num(t.realized_pnl);
+      if (t.status === "CLOSED" && v !== null) m.set(t.id, v);
+    }
+    return m;
+  }, [orbTrades]);
 
   const [marketFilter, setMarketFilter] = useState<"ALL" | "INDIA" | "US" | "POLYMARKET">("ALL");
   const [state, setState] = useState<string>("ALL");
@@ -328,6 +339,15 @@ export function Orders() {
                   const ccy = o.venue_id.includes("upstox") ? "₹" : "$";
                   const pnlInfo = pnlMap.get(o.client_order_id);
                   const isSell = o.side.toUpperCase() === "SELL";
+                  if (o.intent === "EXIT") {
+                    const tradeResult = o.trade_id !== null ? tradePnl.get(o.trade_id) : undefined;
+                    if (tradeResult === undefined || o.state !== "FILLED") return <span className="muted">—</span>;
+                    return (
+                      <span style={{ fontWeight: 800, color: tradeResult > 0 ? "var(--status-good, #10b981)" : tradeResult < 0 ? "var(--status-critical, #ef4444)" : "inherit" }}>
+                        {tradeResult >= 0 ? `+${ccy}${tradeResult.toFixed(2)}` : `-${ccy}${Math.abs(tradeResult).toFixed(2)}`} on the trade
+                      </span>
+                    );
+                  }
                   if (isSell) {
                     if (pnlInfo && pnlInfo.pnl !== null) {
                       const isPos = pnlInfo.pnl > 0;
@@ -354,7 +374,7 @@ export function Orders() {
                   }
                   return (
                     <span style={{ fontSize: "12px", color: "var(--text-secondary)" }}>
-                      — (Open Long @ {ccy}{num(o.avg_fill_price || o.limit_price)?.toFixed(2)})
+                      — (Opened long @ {ccy}{num(o.avg_fill_price || o.limit_price)?.toFixed(2)})
                     </span>
                   );
                 },

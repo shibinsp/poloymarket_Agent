@@ -1,0 +1,795 @@
+{
+ "at": "2026-11-11 21:34 IST",
+ "markets": {
+  "us": {
+   "stocks": 90,
+   "days": [
+    "2001-11-12",
+    "2026-11-11"
+   ],
+   "funnel": [
+    [
+     "g1",
+     74,
+     74
+    ],
+    [
+     "g2",
+     19,
+     19
+    ],
+    [
+     "g3",
+     12,
+     9
+    ],
+    [
+     "g4",
+     24,
+     9
+    ],
+    [
+     "g5",
+     28,
+     9
+    ],
+    [
+     "g6",
+     54,
+     9
+    ],
+    [
+     "g7",
+     0,
+     0
+    ],
+    [
+     "g8",
+     32,
+     0
+    ],
+    [
+     "g9",
+     4,
+     0
+    ]
+   ],
+   "info": {
+    "n": 74,
+    "neff": 9,
+    "bar": 1.0326998019340674,
+    "bar_eff": 0.648223756635268,
+    "T": 5528
+   },
+   "imp": [
+    [
+     "mom12_1",
+     0.002212775819940826
+    ],
+    [
+     "mom6_1",
+     0.0014739361147957904
+    ],
+    [
+     "ret5",
+     -0.0009288752465009092
+    ],
+    [
+     "ibs",
+     -0.0009034501271711986
+    ],
+    [
+     "vol63",
+     0.0006583787308317982
+    ],
+    [
+     "ret2",
+     -0.0006456141068939638
+    ],
+    [
+     "hurst",
+     0.0005718837062098941
+    ],
+    [
+     "ret1",
+     -0.0005510032455778577
+    ],
+    [
+     "beta",
+     0.0005433312090027436
+    ],
+    [
+     "rsi2",
+     -0.0005381658647832001
+    ]
+   ],
+   "passed": [],
+   "passed_soft": [],
+   "best": [
+    {
+     "name": "us momentum 126-21 q0.2 H21",
+     "desc": "Known: buy the 20% best 126-day performers (skipping the last 21 days), sell the worst, rebalance every 21 days",
+     "kind": "baseline",
+     "trades": 4949,
+     "ann": 12.847639860126062,
+     "tot": 281.8323537570511,
+     "halves": [
+      61.85843750411163,
+      219.9739162529395
+     ],
+     "ypos": 0.6956521739130435,
+     "c2": 264.0431835563367,
+     "sharpe": 0.502467449905654,
+     "dsr": 0.006647364728563237,
+     "dsr_eff": 0.24807204428662039,
+     "hold": -47.302462131837395,
+     "hold_sharpe": -0.6641542884177146,
+     "dd": -81.04427484981471,
+     "mc": 0.0,
+     "gates": {
+      "g1": true,
+      "g2": true,
+      "g3": true,
+      "g4": true,
+      "g5": true,
+      "g6": true,
+      "g7": false,
+      "g8": false,
+      "g9": false
+     }
+    },
+    {
+     "name": "us reversal L1 q0.2 H21",
+     "desc": "Known: buy the 20% worst 1-day losers, sell the 20% best, rebalance every 21 day(s)",
+     "kind": "baseline",
+     "trades": 9611,
+     "ann": 4.347095914423242,
+     "tot": 95.3601040275067,
+     "halves": [
+      66.91345415696058,
+      28.446649870546096
+     ],
+     "ypos": 0.5652173913043478,
+     "c2": 55.352135288729144,
+     "sharpe": 0.19045251133818009,
+     "dsr": 4.044151335791833e-05,
+     "dsr_eff": 0.01608076487171808,
+     "hold": 107.31691045108103,
+     "hold_sharpe": 1.7689100018024022,
+     "dd": -56.93528400599605,
+     "mc": 0.0,
+     "gates": {
+      "g1": true,
+      "g2": true,
+      "g3": false,
+      "g4": true,
+      "g5": false,
+      "g6": true,
+      "g7": false,
+      "g8": true,
+      "g9": false
+     }
+    },
+    {
+     "name": "us pairs K5 in1.5 out0.0",
+     "desc": "Ours: Kalman pairs, 5 most correlated pairs re-picked quarterly, enter at z=1.5, exit at z=0.0, max 20 days",
+     "kind": "ours",
+     "trades": 5145,
+     "ann": -0.45371703883927245,
+     "tot": -9.95296742342658,
+     "halves": [
+      -2.388856727445842,
+      -7.564110695980738
+     ],
+     "ypos": 0.30434782608695654,
+     "c2": -27.06652945698021,
+     "sharpe": -0.25925693319671045,
+     "dsr": 3.293857373800865e-10,
+     "dsr_eff": 7.194151799946721e-06,
+     "hold": -2.3702291248025755,
+     "hold_sharpe": -0.6816844756012553,
+     "dd": -12.909974801499875,
+     "mc": 0.0,
+     "gates": {
+      "g1": true,
+      "g2": false,
+      "g3": false,
+      "g4": false,
+      "g5": false,
+      "g6": false,
+      "g7": false,
+      "g8": false,
+      "g9": false
+     }
+    },
+    {
+     "name": "us quantrank H1 a0.01 q0.1",
+     "desc": "Ours: QuantRank (25 measures, ridge learned on past years only), long top 10% / short bottom 10%, rebalance every 1 day(s)",
+     "kind": "ours",
+     "trades": 103163,
+     "ann": -6.446078918847317,
+     "tot": -141.40446136265066,
+     "halves": [
+      25.44757165011269,
+      -166.85203301276337
+     ],
+     "ypos": 0.391304347826087,
+     "c2": -888.3425566007459,
+     "sharpe": -0.24775642350567134,
+     "dsr": 9.49274842633441e-10,
+     "dsr_eff": 1.3182314073251646e-05,
+     "hold": -2.293000444265425,
+     "hold_sharpe": -0.03262390046566534,
+     "dd": -231.2153274769403,
+     "mc": 0.0,
+     "gates": {
+      "g1": true,
+      "g2": false,
+      "g3": false,
+      "g4": false,
+      "g5": false,
+      "g6": false,
+      "g7": false,
+      "g8": false,
+      "g9": false
+     }
+    },
+    {
+     "name": "us quantrank H21 a1.0 q0.1",
+     "desc": "Ours: QuantRank (25 measures, ridge learned on past years only), long top 10% / short bottom 10%, rebalance every 21 day(s)",
+     "kind": "ours",
+     "trades": 3477,
+     "ann": 7.752568894017915,
+     "tot": 170.06428907194854,
+     "halves": [
+      -42.277334274617374,
+      212.341623346566
+     ],
+     "ypos": 0.5217391304347826,
+     "c2": 144.6908763735359,
+     "sharpe": 0.2445120070827086,
+     "dsr": 0.00011180087114607645,
+     "dsr_eff": 0.029351793208198064,
+     "hold": 61.57207113955889,
+     "hold_sharpe": 0.5429732088396325,
+     "dd": -151.7020015817867,
+     "mc": 0.0,
+     "gates": {
+      "g1": true,
+      "g2": false,
+      "g3": false,
+      "g4": true,
+      "g5": true,
+      "g6": true,
+      "g7": false,
+      "g8": true,
+      "g9": false
+     }
+    },
+    {
+     "name": "us quantrank H5 a0.01 q0.1",
+     "desc": "Ours: QuantRank (25 measures, ridge learned on past years only), long top 10% / short bottom 10%, rebalance every 5 day(s)",
+     "kind": "ours",
+     "trades": 19075,
+     "ann": 7.347789709294037,
+     "tot": 161.18484727372,
+     "halves": [
+      69.1827288592672,
+      92.00211841445281
+     ],
+     "ypos": 0.4782608695652174,
+     "c2": 23.41024409911686,
+     "sharpe": 0.25742072113586667,
+     "dsr": 0.00014446507118303598,
+     "dsr_eff": 0.03382690314662684,
+     "hold": 43.65907222626177,
+     "hold_sharpe": 0.4812860833689402,
+     "dd": -89.17525192677671,
+     "mc": 0.0,
+     "gates": {
+      "g1": true,
+      "g2": true,
+      "g3": false,
+      "g4": true,
+      "g5": true,
+      "g6": true,
+      "g7": false,
+      "g8": true,
+      "g9": false
+     }
+    },
+    {
+     "name": "us quantrank-long H1 a0.01 q0.1",
+     "desc": "Ours, long only: QuantRank top 10%, rebalance every 1 day(s) (measured as the extra over holding all stocks)",
+     "kind": "ours",
+     "trades": 63863,
+     "ann": -2.17093955727768,
+     "tot": -47.62283282790086,
+     "halves": [
+      50.35790682606374,
+      -97.98073965396459
+     ],
+     "ypos": 0.30434782608695654,
+     "c2": -428.5994890790041,
+     "sharpe": -0.15382307055073566,
+     "dsr": 1.4226190540976798e-08,
+     "dsr_eff": 8.768831889266388e-05,
+     "hold": -7.522888130233217,
+     "hold_sharpe": -0.1890228821311955,
+     "dd": -117.91425929975699,
+     "mc": 0.0,
+     "gates": {
+      "g1": true,
+      "g2": false,
+      "g3": false,
+      "g4": false,
+      "g5": false,
+      "g6": false,
+      "g7": false,
+      "g8": false,
+      "g9": false
+     }
+    },
+    {
+     "name": "us quantrank-long H21 a1.0 q0.1",
+     "desc": "Ours, long only: QuantRank top 10%, rebalance every 21 day(s) (measured as the extra over holding all stocks)",
+     "kind": "ours",
+     "trades": 4744,
+     "ann": 6.713443430154895,
+     "tot": 147.26950508688992,
+     "halves": [
+      -8.69513005099591,
+      155.96463513788584
+     ],
+     "ypos": 0.43478260869565216,
+     "c2": 135.12516462517402,
+     "sharpe": 0.29840745397521334,
+     "dsr": 0.00028824499137551087,
+     "dsr_eff": 0.05050506545870801,
+     "hold": 48.66658477095408,
+     "hold_sharpe": 0.6319689925835928,
+     "dd": -109.1346052578881,
+     "mc": 0.0,
+     "gates": {
+      "g1": true,
+      "g2": false,
+      "g3": false,
+      "g4": true,
+      "g5": true,
+      "g6": true,
+      "g7": false,
+      "g8": true,
+      "g9": false
+     }
+    },
+    {
+     "name": "us quantrank-long H5 a0.01 q0.1",
+     "desc": "Ours, long only: QuantRank top 10%, rebalance every 5 day(s) (measured as the extra over holding all stocks)",
+     "kind": "ours",
+     "trades": 13201,
+     "ann": 8.985701566689402,
+     "tot": 197.11491373277386,
+     "halves": [
+      40.95610329457987,
+      156.158810438194
+     ],
+     "ypos": 0.6086956521739131,
+     "c2": 131.60602523336203,
+     "sharpe": 0.49533079420763027,
+     "dsr": 0.005902660788327002,
+     "dsr_eff": 0.23687237929342286,
+     "hold": 51.33153262748606,
+     "hold_sharpe": 0.8533755325846787,
+     "dd": -53.05084292481703,
+     "mc": 0.9968,
+     "gates": {
+      "g1": true,
+      "g2": true,
+      "g3": true,
+      "g4": true,
+      "g5": true,
+      "g6": true,
+      "g7": false,
+      "g8": true,
+      "g9": true
+     }
+    }
+   ]
+  },
+  "in": {
+   "stocks": 51,
+   "days": [
+    "2007-09-17",
+    "2026-11-09"
+   ],
+   "funnel": [
+    [
+     "g1",
+     74,
+     74
+    ],
+    [
+     "g2",
+     6,
+     6
+    ],
+    [
+     "g3",
+     3,
+     2
+    ],
+    [
+     "g4",
+     7,
+     2
+    ],
+    [
+     "g5",
+     0,
+     0
+    ],
+    [
+     "g6",
+     4,
+     0
+    ],
+    [
+     "g7",
+     0,
+     0
+    ],
+    [
+     "g8",
+     14,
+     0
+    ],
+    [
+     "g9",
+     0,
+     0
+    ]
+   ],
+   "info": {
+    "n": 74,
+    "neff": 10,
+    "bar": 2.283689165189063,
+    "bar_eff": 1.4841976647059871,
+    "T": 3944
+   },
+   "imp": [
+    [
+     "ret2",
+     -0.002248961506670458
+    ],
+    [
+     "ret5",
+     -0.0021504836633856007
+    ],
+    [
+     "rsi2",
+     -0.0018532383614401492
+    ],
+    [
+     "resid_z",
+     -0.0018076725083852835
+    ],
+    [
+     "resid5",
+     -0.0018016223308981256
+    ],
+    [
+     "ibs",
+     -0.0016257782637933433
+    ],
+    [
+     "ret10",
+     -0.0015661131387034006
+    ],
+    [
+     "mom12_1",
+     0.0015024479340412045
+    ],
+    [
+     "ret1",
+     -0.0014722624883564486
+    ],
+    [
+     "intraday",
+     -0.0014640899874708672
+    ]
+   ],
+   "passed": [],
+   "passed_soft": [],
+   "best": [
+    {
+     "name": "in momentum 252-21 q0.1 H21",
+     "desc": "Known: buy the 10% best 252-day performers (skipping the last 21 days), sell the worst, rebalance every 21 days",
+     "kind": "baseline",
+     "trades": 1066,
+     "ann": 8.185897021856107,
+     "tot": 128.1157851357162,
+     "halves": [
+      65.94703842641911,
+      62.16874670929708
+     ],
+     "ypos": 0.5882352941176471,
+     "c2": 101.64378513571621,
+     "sharpe": 0.2998340321173895,
+     "dsr": 7.172661116874907e-16,
+     "dsr_eff": 9.417749766722607e-07,
+     "hold": 24.160216562392673,
+     "hold_sharpe": 0.5892588127350902,
+     "dd": -98.77915405921387,
+     "mc": 0.0,
+     "gates": {
+      "g1": true,
+      "g2": true,
+      "g3": false,
+      "g4": true,
+      "g5": false,
+      "g6": false,
+      "g7": false,
+      "g8": true,
+      "g9": false
+     }
+    },
+    {
+     "name": "in reversal L2 q0.1 H5",
+     "desc": "Known: buy the 10% worst 2-day losers, sell the 10% best, rebalance every 5 day(s)",
+     "kind": "baseline",
+     "trades": 12710,
+     "ann": 2.0363180328769537,
+     "tot": 31.869993339947243,
+     "halves": [
+      134.39406764978875,
+      -102.52407430984152
+     ],
+     "ypos": 0.5882352941176471,
+     "c2": -305.9420066600527,
+     "sharpe": 0.08030319690511108,
+     "dsr": 1.4861178844856971e-18,
+     "dsr_eff": 1.4185542516721862e-08,
+     "hold": -45.02696330995456,
+     "hold_sharpe": -0.9857675811509806,
+     "dd": -120.43728922033674,
+     "mc": 0.0,
+     "gates": {
+      "g1": true,
+      "g2": false,
+      "g3": false,
+      "g4": false,
+      "g5": false,
+      "g6": false,
+      "g7": false,
+      "g8": false,
+      "g9": false
+     }
+    },
+    {
+     "name": "in pairs K5 in2.0 out0.0",
+     "desc": "Ours: Kalman pairs, 5 most correlated pairs re-picked quarterly, enter at z=2.0, exit at z=0.0, max 20 days",
+     "kind": "ours",
+     "trades": 1713,
+     "ann": -0.7129330618186767,
+     "tot": -11.157968237352623,
+     "halves": [
+      2.7951824942194112,
+      -13.953150731572034
+     ],
+     "ypos": 0.29411764705882354,
+     "c2": -25.21942200471899,
+     "sharpe": -0.38122815703655777,
+     "dsr": 4.118674888196497e-26,
+     "dsr_eff": 9.685027519556265e-14,
+     "hold": 0.857445733312608,
+     "hold_sharpe": 0.4274753364482159,
+     "dd": -18.02985809705822,
+     "mc": 0.0,
+     "gates": {
+      "g1": true,
+      "g2": false,
+      "g3": false,
+      "g4": false,
+      "g5": false,
+      "g6": false,
+      "g7": false,
+      "g8": true,
+      "g9": false
+     }
+    },
+    {
+     "name": "in quantrank H1 a1.0 q0.2",
+     "desc": "Ours: QuantRank (25 measures, ridge learned on past years only), long top 20% / short bottom 20%, rebalance every 1 day(s)",
+     "kind": "ours",
+     "trades": 46431,
+     "ann": -16.7307746129693,
+     "tot": -261.8499010855195,
+     "halves": [
+      -1.215810297850703,
+      -260.6340907876688
+     ],
+     "ypos": 0.23529411764705882,
+     "c2": -850.8792344188528,
+     "sharpe": -1.0224067771755627,
+     "dsr": 1.836272741121661e-38,
+     "dsr_eff": 6.071707374466785e-23,
+     "hold": -84.01241220785703,
+     "hold_sharpe": -2.8396575024486865,
+     "dd": -293.2390364017491,
+     "mc": 0.0,
+     "gates": {
+      "g1": true,
+      "g2": false,
+      "g3": false,
+      "g4": false,
+      "g5": false,
+      "g6": false,
+      "g7": false,
+      "g8": false,
+      "g9": false
+     }
+    },
+    {
+     "name": "in quantrank H21 a0.01 q0.1",
+     "desc": "Ours: QuantRank (25 measures, ridge learned on past years only), long top 10% / short bottom 10%, rebalance every 21 day(s)",
+     "kind": "ours",
+     "trades": 2193,
+     "ann": 4.139570018679692,
+     "tot": 64.78755616536789,
+     "halves": [
+      57.036003084039265,
+      7.751553081328614
+     ],
+     "ypos": 0.5294117647058824,
+     "c2": 11.087556165367879,
+     "sharpe": 0.21125837606824607,
+     "dsr": 1.5557197250662206e-16,
+     "dsr_eff": 2.6165766390136304e-07,
+     "hold": -11.323156603166904,
+     "hold_sharpe": -0.3322444071859007,
+     "dd": -67.76642911393911,
+     "mc": 0.0,
+     "gates": {
+      "g1": true,
+      "g2": true,
+      "g3": false,
+      "g4": true,
+      "g5": false,
+      "g6": true,
+      "g7": false,
+      "g8": false,
+      "g9": false
+     }
+    },
+    {
+     "name": "in quantrank H5 a0.01 q0.1",
+     "desc": "Ours: QuantRank (25 measures, ridge learned on past years only), long top 10% / short bottom 10%, rebalance every 5 day(s)",
+     "kind": "ours",
+     "trades": 10228,
+     "ann": -1.7109148293433918,
+     "tot": -26.777174948136256,
+     "halves": [
+      45.55243604384061,
+      -72.32961099197685
+     ],
+     "ypos": 0.35294117647058826,
+     "c2": -279.6531749481362,
+     "sharpe": -0.08149153145753756,
+     "dsr": 3.522161758794842e-21,
+     "dsr_eff": 2.739327829316803e-10,
+     "hold": -8.575369958001792,
+     "hold_sharpe": -0.24546926116599735,
+     "dd": -98.87805973595022,
+     "mc": 0.0,
+     "gates": {
+      "g1": true,
+      "g2": false,
+      "g3": false,
+      "g4": false,
+      "g5": false,
+      "g6": false,
+      "g7": false,
+      "g8": false,
+      "g9": false
+     }
+    },
+    {
+     "name": "in quantrank-long H1 a1.0 q0.1",
+     "desc": "Ours, long only: QuantRank top 10%, rebalance every 1 day(s) (measured as the extra over holding all stocks)",
+     "kind": "ours",
+     "trades": 16828,
+     "ann": -14.183999227298855,
+     "tot": -221.99084504947098,
+     "halves": [
+      -11.283827987757817,
+      -210.70701706171317
+     ],
+     "ypos": 0.11764705882352941,
+     "c2": -596.7022685944577,
+     "sharpe": -1.0867171240643967,
+     "dsr": 2.2908683880552492e-41,
+     "dsr_eff": 6.762354961508099e-25,
+     "hold": -30.08640796337855,
+     "hold_sharpe": -1.17276232674108,
+     "dd": -255.29012036486557,
+     "mc": 0.0,
+     "gates": {
+      "g1": true,
+      "g2": false,
+      "g3": false,
+      "g4": false,
+      "g5": false,
+      "g6": false,
+      "g7": false,
+      "g8": false,
+      "g9": false
+     }
+    },
+    {
+     "name": "in quantrank-long H21 a0.01 q0.2",
+     "desc": "Ours, long only: QuantRank top 20%, rebalance every 21 day(s) (measured as the extra over holding all stocks)",
+     "kind": "ours",
+     "trades": 1998,
+     "ann": 1.7541206014608974,
+     "tot": 27.453379572070553,
+     "halves": [
+      42.617907600598585,
+      -15.164528028528036
+     ],
+     "ypos": 0.35294117647058826,
+     "c2": 6.220254491140853,
+     "sharpe": 0.2010457581719739,
+     "dsr": 1.0125369523659683e-16,
+     "dsr_eff": 2.0436770226683036e-07,
+     "hold": 3.935522620143045,
+     "hold_sharpe": 0.23874663612167096,
+     "dd": -45.66430516896543,
+     "mc": 0.0,
+     "gates": {
+      "g1": true,
+      "g2": false,
+      "g3": false,
+      "g4": true,
+      "g5": false,
+      "g6": false,
+      "g7": false,
+      "g8": true,
+      "g9": false
+     }
+    },
+    {
+     "name": "in quantrank-long H5 a0.01 q0.2",
+     "desc": "Ours, long only: QuantRank top 20%, rebalance every 5 day(s) (measured as the extra over holding all stocks)",
+     "kind": "ours",
+     "trades": 8892,
+     "ann": -1.3057394954276151,
+     "tot": -20.435859404629024,
+     "halves": [
+      32.38689319598859,
+      -52.822752600617626
+     ],
+     "ypos": 0.35294117647058826,
+     "c2": -128.9026109056735,
+     "sharpe": -0.14125478101697853,
+     "dsr": 3.1962525898423487e-22,
+     "dsr_eff": 5.579194419170871e-11,
+     "hold": -8.911712697275872,
+     "hold_sharpe": -0.5673578730383433,
+     "dd": -63.42073095552192,
+     "mc": 0.0,
+     "gates": {
+      "g1": true,
+      "g2": false,
+      "g3": false,
+      "g4": false,
+      "g5": false,
+      "g6": false,
+      "g7": false,
+      "g8": false,
+      "g9": false
+     }
+    }
+   ]
+  }
+ }
+}

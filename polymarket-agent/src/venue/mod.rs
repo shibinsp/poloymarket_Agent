@@ -74,6 +74,12 @@ pub trait Venue: Send + Sync {
     /// Cancel everything outstanding — used by the kill switch.
     async fn cancel_all(&self) -> Result<()>;
 
+    /// Cancel everything outstanding except protective stops. Venues that do
+    /// not place any have nothing to leave behind.
+    async fn cancel_all_except_protective(&self) -> Result<()> {
+        self.cancel_all().await
+    }
+
     async fn open_orders(&self) -> Result<Vec<OrderAck>>;
 
     /// Positions as the venue sees them — the source of truth for
@@ -187,7 +193,7 @@ impl VenueRegistry {
     /// of what this is for.
     pub async fn cancel_all_resting(&self, why: &str) {
         for venue in self.all() {
-            match venue.cancel_all().await {
+            match venue.cancel_all_except_protective().await {
                 Ok(()) => tracing::info!(venue = %venue.id(), why, "Cancelled resting orders"),
                 Err(e) => tracing::warn!(
                     venue = %venue.id(),

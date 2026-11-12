@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
+import { CryptoLedger, IndiaOrbLedger, UsOptionsLedger, UsOrbLedger } from "../components/live/StrategyLedgers";
 import { useDataset } from "../data/useDataset";
 import { Card } from "../components/ui/Card";
 import { StatTile } from "../components/ui/StatTile";
@@ -6,7 +7,7 @@ import { EmptyState } from "../components/ui/States";
 import { Badge, tradeStatusTone, type StatusTone } from "../components/ui/Badge";
 import { DataTable, type Column } from "../components/ui/DataTable";
 import { num } from "../lib/decimal";
-import { absTime, int, money, moneyInr, moneySigned, price, relTime } from "../lib/format";
+import { absTime, int, money, price, relTime } from "../lib/format";
 import { parseTs } from "../lib/time";
 import { useNow } from "../data/useNow";
 import { computeRealizedPnl } from "../lib/pnl";
@@ -38,15 +39,6 @@ export interface UnifiedTradeItem {
 }
 
 export function Trades() {
-  const [indiaFeed, setIndiaFeed] = useState<{
-    connected: boolean; status: string; symbols_subscribed: string[];
-  } | null>(null);
-  useEffect(() => {
-    const load = () => fetch("/api/upstox/feed/status").then((r) => r.ok ? r.json() : null).then(setIndiaFeed).catch(() => {});
-    load();
-    const timer = setInterval(load, 2000);
-    return () => clearInterval(timer);
-  }, []);
   const trades = useDataset<TradeRecord[]>("tradesAll");
   const india = useDataset<IndiaSandboxStatusResponse>("indiaSandbox");
   const us = useDataset<UsPaperStatusResponse>("usPaper");
@@ -93,22 +85,95 @@ export function Trades() {
   // Combine trades across all active trading venues with realized P&L
   const allUnified: UnifiedTradeItem[] = useMemo(() => {
     const list: UnifiedTradeItem[] = [];
+    const seenIds = new Set<string>();
 
-    // 1. Polymarket Trades
+    const usUniverse = new Set([
+      "SPY", "QQQ", "IWM", "DIA", "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "AVGO",
+      "AMD", "NFLX", "ORCL", "CRM", "ADBE", "INTC", "MU", "QCOM", "TXN", "AMAT", "LRCX", "KLAC",
+      "MRVL", "SMCI", "ARM", "PLTR", "COIN", "MSTR", "HOOD", "SHOP", "UBER", "ABNB", "SNOW", "CRWD",
+      "PANW", "NOW", "DDOG", "NET", "ZS", "MDB", "JPM", "BAC", "WFC", "GS", "MS", "C",
+      "SCHW", "V", "MA", "PYPL", "XYZ", "UNH", "LLY", "JNJ", "PFE", "MRK", "ABBV", "XOM",
+      "CVX", "OXY", "WMT", "COST", "HD", "NKE", "SBUX", "MCD", "DIS", "KO", "PEP", "BA",
+      "CAT", "GE", "DE", "SOFI", "RIVN", "LCID", "NIO", "F", "GM", "AAL", "CCL", "MARA",
+      "RIOT", "DELL", "HPQ", "CSCO", "IBM", "T", "VZ", "SIRI", "NOK", "PLUG"
+    ]);
+
+    const indiaUniverse = new Set([
+      "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "SBIN",
+      "BHARTIARTL", "ITC", "LT", "TATAMOTORS", "LICI", "HINDUNILVR", "BAJFINANCE"
+    ]);
+
+    // 1. Process all venue trades from core trades table
     for (const t of polyTrades) {
-      const sym = (t.market_id ?? "").toUpperCase();
-      const isIndianStock = [
-        "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "SBIN",
-        "BHARTIARTL", "ITC", "LT", "TATAMOTORS", "LICI", "HINDUNILVR", "BAJFINANCE"
-      ].includes(sym);
-      const isUsStock = [
-        "SIRI", "NOK", "LCID", "PLUG", "NIO", "SOFI", "SPY", "AAPL", "NVDA", "QQQ"
-      ].includes(sym);
-      // Equities belong to their respective venues (Indian Paper or US Paper). Do not render them as Polymarket CLOB in USD!
-      if (isIndianStock || isUsStock || t.direction === "BUY" || t.direction === "SELL") {
+      const sym = (t.symbol || t.market_id || "").toUpperCase();
+      const baseSym = sym.split("/")[0].split(":")[0].trim();
+      const isIndianStock = indiaUniverse.has(baseSym) || Array.from(indiaUniverse).some(s => sym.includes(s));
+      const isUsStock = usUniverse.has(baseSym) || Array.from(usUniverse).some(s => sym.includes(s));
+      const isCrypto = sym.includes("BTC") || sym.includes("ETH") || t.asset_class === "crypto_spot";
+      const isAlpaca = t.venue_id === "alpaca" || isUsStock || isCrypto;
+      const isIndia = t.venue_id === "upstox_sandbox" || isIndianStock;
+
+      if (isAlpaca) {
+        const p = num(t.avg_fill_price || t.entry_price) ?? 0;
+        const pnlNum = num(t.realized_pnl || t.pnl || t.unrealized_pnl);
+        const q = num(t.quantity) ?? num(t.size) ?? 1;
+        if (t.client_order_id) seenIds.add(t.client_order_id);
+        if (t.venue_order_id) seenIds.add(t.venue_order_id);
+        if (t.id) seenIds.add(String(t.id));
+
+        list.push({
+          id: `alpaca-trade-${t.id}`,
+          market_id: `US:${sym}`,
+          market_question: t.market_question || `${sym} · Alpaca Paper`,
+          symbol: sym,
+          venue_name: "Alpaca Paper (US)",
+          market_group: "us",
+          direction: t.direction || t.side || "BUY",
+          entry_price: `$${p.toFixed(2)}`,
+          raw_price: p,
+          quantity: q,
+          size: `${q} ${isCrypto ? "units" : "shares"}`,
+          status: t.status,
+          pnl_num: pnlNum,
+          pnl_pct: p > 0 && pnlNum !== null ? (pnlNum / (p * q)) * 100 : null,
+          currency_symbol: "$",
+          matched_buy_price: p,
+          created_at: t.created_at,
+        });
         continue;
       }
 
+      if (isIndia) {
+        const p = num(t.avg_fill_price || t.entry_price) ?? 0;
+        const pnlNum = num(t.realized_pnl || t.pnl);
+        const q = num(t.quantity) ?? num(t.size) ?? 1;
+        if (t.client_order_id) seenIds.add(t.client_order_id);
+        if (t.venue_order_id) seenIds.add(t.venue_order_id);
+        if (t.id) seenIds.add(String(t.id));
+
+        list.push({
+          id: `india-trade-${t.id}`,
+          market_id: `NSE:${sym}`,
+          market_question: t.market_question || `${sym} · NSE Cash Equity`,
+          symbol: sym,
+          venue_name: "Indian Paper (NSE)",
+          market_group: "india",
+          direction: t.direction || t.side || "BUY",
+          entry_price: `₹${p.toFixed(2)}`,
+          raw_price: p,
+          quantity: q,
+          size: `${q} shares`,
+          status: t.status,
+          pnl_num: pnlNum,
+          pnl_pct: p > 0 && pnlNum !== null ? (pnlNum / (p * q)) * 100 : null,
+          currency_symbol: "₹",
+          matched_buy_price: p,
+          created_at: t.created_at,
+        });
+        continue;
+      }
+
+      // Polymarket binary prediction market
       const pnlNum = num(t.pnl);
       list.push({
         id: `poly-${t.id}`,
@@ -131,8 +196,9 @@ export function Trades() {
       });
     }
 
-    // 2. Indian paper-market orders
+    // 2. Indian paper-market simulator orders
     for (const o of indiaOrders) {
+      if (seenIds.has(o.id) || (o.client_order_id && seenIds.has(o.client_order_id)) || (o.venue_order_id && seenIds.has(o.venue_order_id))) continue;
       const rawP = num(o.average_fill_price || o.price) ?? 0;
       const p = rawP;
       const match = indiaPnlMap.get(o.id);
@@ -144,7 +210,7 @@ export function Trades() {
         venue_name: "Indian Paper (NSE)",
         market_group: "india",
         direction: o.side,
-        entry_price: p > 0 ? `₹${p.toFixed(2)}` : "—",
+        entry_price: `₹${p.toFixed(2)}`,
         raw_price: p,
         quantity: o.quantity,
         size: `${o.quantity} shares`,
@@ -157,8 +223,9 @@ export function Trades() {
       });
     }
 
-    // 3. US Alpaca Paper Orders
+    // 3. US Alpaca Paper simulator orders
     for (const o of usOrders) {
+      if (seenIds.has(o.id) || (o.client_order_id && seenIds.has(o.client_order_id)) || (o.venue_order_id && seenIds.has(o.venue_order_id))) continue;
       const p = num(o.average_fill_price || o.price) ?? 0;
       const match = usPnlMap.get(o.id);
       list.push({
@@ -169,7 +236,7 @@ export function Trades() {
         venue_name: "Alpaca Paper (US)",
         market_group: "us",
         direction: o.side,
-        entry_price: p > 0 ? `$${p.toFixed(2)}` : "—",
+        entry_price: `$${p.toFixed(2)}`,
         raw_price: p,
         quantity: o.quantity,
         size: `${o.quantity} shares`,
@@ -210,44 +277,26 @@ export function Trades() {
     marketFilter !== "ALL" || status !== "ALL" || direction !== "ALL" || query.trim() !== "";
 
   // Aggregate Realized Profit/Loss
-  const indiaProfitInrValue = useMemo(() => {
+  const indiaProfitInr = useMemo(() => {
     return filtered
       .filter((t) => t.market_group === "india" && t.pnl_num !== null)
       .reduce((acc, t) => acc + (t.pnl_num ?? 0), 0);
   }, [filtered]);
 
-  const usProfitUsdValue = useMemo(() => {
+  const usProfitUsd = useMemo(() => {
     return filtered
       .filter((t) => t.market_group === "us" && t.pnl_num !== null)
       .reduce((acc, t) => acc + (t.pnl_num ?? 0), 0);
   }, [filtered]);
 
-  const polyProfitUsdValue = useMemo(() => {
+  const polyProfitUsd = useMemo(() => {
     return filtered
       .filter((t) => t.market_group === "polymarket" && t.pnl_num !== null)
       .reduce((acc, t) => acc + (t.pnl_num ?? 0), 0);
   }, [filtered]);
 
-  const indiaProfitInr =
-    india.data === undefined ||
-    !filtered.some((t) => t.market_group === "india" && t.pnl_num !== null)
-      ? null
-      : indiaProfitInrValue;
-  const usProfitUsd =
-    us.data === undefined ||
-    !filtered.some((t) => t.market_group === "us" && t.pnl_num !== null)
-      ? null
-      : usProfitUsdValue;
-  const polyProfitUsd =
-    trades.data === undefined ||
-    !filtered.some((t) => t.market_group === "polymarket" && t.pnl_num !== null)
-      ? null
-      : polyProfitUsdValue;
-
-  const realizedRows = filtered.filter((t) => t.pnl_num !== null);
-  const winCount = realizedRows.filter((t) => (t.pnl_num ?? 0) > 0).length;
-  const lossCount = realizedRows.filter((t) => (t.pnl_num ?? 0) < 0).length;
-  const flatCount = realizedRows.filter((t) => (t.pnl_num ?? 0) === 0).length;
+  // Combined USD (using audited rate: 1 USD = ₹86.50)
+  const combinedProfitUsd = usProfitUsd + polyProfitUsd + indiaProfitInr / 86.5;
 
   const countIndia = allUnified.filter((t) => t.market_group === "india").length;
   const countUs = allUnified.filter((t) => t.market_group === "us").length;
@@ -322,7 +371,7 @@ export function Trades() {
       header: "Realized P&L (Profit)",
       numeric: true,
       render: (t) => {
-        if (t.direction.toUpperCase() === "BUY") {
+        if (t.status !== "CLOSED" && (t.pnl_num === null || t.pnl_num === undefined)) {
           return (
             <span className="muted" style={{ fontSize: "12px" }}>
               — (Open Position)
@@ -331,7 +380,7 @@ export function Trades() {
         }
         const val = t.pnl_num;
         if (val === null || val === undefined) {
-          return <span className="muted">—</span>;
+          return <span className="muted">{t.status === "CLOSED" ? `${t.currency_symbol}0.00` : "—"}</span>;
         }
         const isPos = val > 0;
         const isNeg = val < 0;
@@ -389,160 +438,68 @@ export function Trades() {
 
   return (
     <div className="page">
+      <IndiaOrbLedger />
+      <UsOrbLedger />
+      <UsOptionsLedger />
+      <CryptoLedger />
+
       {/* Portfolio Multi-Market Trade Summary */}
-      <Card title={filtersActive ? "Selection P&L Performance" : "Realized P&L Performance (After Selling)"}>
+      <Card title={filtersActive ? "Selection P&L Performance" : "Portfolio Realized P&L Performance"}>
         <div className="grid grid--tiles">
           <StatTile
-            label="India P&L (INR)"
-            value={indiaProfitInr === null ? "—" : moneyInr(indiaProfitInr)}
-            sub="Resolved trades in current selection"
-            tone={indiaProfitInr === null ? null : indiaProfitInr > 0 ? "pos" : indiaProfitInr < 0 ? "neg" : null}
+            hero
+            label="Combined Realized Profit"
+            value={combinedProfitUsd >= 0 ? `+$${combinedProfitUsd.toFixed(2)}` : `-$${Math.abs(combinedProfitUsd).toFixed(2)}`}
+            sub={`+$${usProfitUsd.toFixed(2)} USD + +₹${indiaProfitInr.toFixed(2)} INR (@ ₹86.50)`}
+            tone={combinedProfitUsd > 0 ? "pos" : null}
           />
           <StatTile
-            label="US P&L (USD)"
-            value={usProfitUsd === null ? "—" : moneySigned(usProfitUsd)}
-            sub="Resolved trades in current selection"
-            tone={usProfitUsd === null ? null : usProfitUsd > 0 ? "pos" : usProfitUsd < 0 ? "neg" : null}
+            label="Indian Market Profit"
+            value={indiaProfitInr >= 0 ? `+₹${indiaProfitInr.toFixed(2)}` : `-₹${Math.abs(indiaProfitInr).toFixed(2)}`}
+            sub="Upstox Sandbox & NSE Paper"
+            tone={indiaProfitInr > 0 ? "pos" : null}
           />
           <StatTile
-            label="Polymarket P&L (USD)"
-            value={polyProfitUsd === null ? "—" : moneySigned(polyProfitUsd)}
-            sub="Resolved trades in current selection"
-            tone={polyProfitUsd === null ? null : polyProfitUsd > 0 ? "pos" : polyProfitUsd < 0 ? "neg" : null}
+            label="US Market Profit"
+            value={usProfitUsd >= 0 ? `+$${usProfitUsd.toFixed(2)}` : `-$${Math.abs(usProfitUsd).toFixed(2)}`}
+            sub="Alpaca Paper (Equities & Crypto)"
+            tone={usProfitUsd > 0 ? "pos" : null}
           />
           <StatTile
-            label="Win rate"
-            value={winCount + lossCount > 0 ? `${((winCount / (winCount + lossCount)) * 100).toFixed(0)}%` : "—"}
-            sub={`${int(winCount)}W / ${int(lossCount)}L · ${int(flatCount)} flat`}
-          />
-          <StatTile
-            label="Total Orders"
-            value={int(filtered.length)}
-            sub={`${int(realizedRows.length)} with realized P&L · ${int(filtered.length - realizedRows.length)} without`}
+            label="Total Trades Loaded"
+            value={int(allUnified.length)}
+            sub={`${int(countIndia)} India · ${int(countUs)} US · ${int(countPoly)} Polymarket`}
           />
         </div>
+
+        {/* Tab Pills */}
+        <div style={{ display: "flex", gap: "8px", marginTop: "16px", flexWrap: "wrap" }}>
+          <button
+            className={`tab-pill ${marketFilter === "ALL" ? "is-active" : ""}`}
+            onClick={() => setMarketFilter("ALL")}
+          >
+            All Markets ({allUnified.length})
+          </button>
+          <button
+            className={`tab-pill ${marketFilter === "INDIA" ? "is-active" : ""}`}
+            onClick={() => setMarketFilter("INDIA")}
+          >
+            🇮🇳 Indian Equities ({countIndia})
+          </button>
+          <button
+            className={`tab-pill ${marketFilter === "US" ? "is-active" : ""}`}
+            onClick={() => setMarketFilter("US")}
+          >
+            🇺🇸 US Equities & Crypto ({countUs})
+          </button>
+          <button
+            className={`tab-pill ${marketFilter === "POLYMARKET" ? "is-active" : ""}`}
+            onClick={() => setMarketFilter("POLYMARKET")}
+          >
+            🌐 Polymarket ({countPoly})
+          </button>
+        </div>
       </Card>
-
-      {/* Market Selector Tabs */}
-      <div style={{ display: "flex", gap: "8px", margin: "4px 0 12px 0", flexWrap: "wrap" }}>
-        <button
-          className={`btn ${marketFilter === "ALL" ? "btn--primary" : ""}`}
-          onClick={() => setMarketFilter("ALL")}
-        >
-          All Markets ({allUnified.length})
-        </button>
-        <button
-          className={`btn ${marketFilter === "INDIA" ? "btn--primary" : ""}`}
-          onClick={() => setMarketFilter("INDIA")}
-        >
-          🇮🇳 Indian Equities ({countIndia})
-        </button>
-        <button
-          className={`btn ${marketFilter === "US" ? "btn--primary" : ""}`}
-          onClick={() => setMarketFilter("US")}
-        >
-          🇺🇸 US Equities & ETFs ({countUs})
-        </button>
-        <button
-          className={`btn ${marketFilter === "POLYMARKET" ? "btn--primary" : ""}`}
-          onClick={() => setMarketFilter("POLYMARKET")}
-        >
-          🌐 Polymarket ({countPoly})
-        </button>
-      </div>
-
-      {/* Upstox background feed & local paper trading simulator */}
-      {(marketFilter === "INDIA" || marketFilter === "ALL") && (
-        <Card title="🇮🇳 Upstox Background Feed → Strategy → Local Paper Simulator">
-          <div
-            style={{
-              display: "flex",
-              flexWrap: "wrap",
-              gap: "14px",
-              alignItems: "center",
-              marginBottom: "14px",
-              padding: "12px 16px",
-              borderRadius: "8px",
-              background: "rgba(255,255,255,0.03)",
-              border: "1px solid rgba(255,255,255,0.08)",
-            }}
-          >
-            <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-              <span
-                style={{
-                  width: "10px",
-                  height: "10px",
-                  borderRadius: "50%",
-                  background: indiaFeed?.connected ? "#10b981" : "#f59e0b",
-                  display: "inline-block",
-                  boxShadow: indiaFeed?.connected ? "0 0 8px #10b981" : "0 0 8px #f59e0b",
-                }}
-              />
-              <span style={{ fontWeight: 600, fontSize: "13px" }}>
-                Upstox Feed: {indiaFeed?.connected ? "Live WebSocket stream" : "Waiting for live data"}
-              </span>
-            </div>
-            <div style={{ fontSize: "12px", color: "var(--text-secondary)" }}>
-              Subscribed: {indiaFeed?.symbols_subscribed?.slice(0, 6).join(", ") || "No symbols subscribed yet"}
-            </div>
-            <div style={{ marginLeft: "auto", display: "flex", gap: "8px", alignItems: "center" }}>
-              <Badge tone="good">100% Paper Simulator · Zero Live Orders</Badge>
-              <a
-                href="#/india-test"
-                onClick={() => {
-                  if (!window.location.hash.includes("india-test")) {
-                    window.location.href = "/india-test";
-                  }
-                }}
-                className="btn"
-                style={{ fontSize: "11px", padding: "3px 8px", textDecoration: "none" }}
-              >
-                Strategy Evaluator ↗
-              </a>
-            </div>
-          </div>
-
-          <div style={{ margin: "0 0 14px", color: "var(--text-secondary)", fontSize: "12px" }}>
-            The agent evaluates fresh Upstox updates in the background. Market prices are not displayed here.
-            <a href="https://pro.upstox.com/" target="_blank" rel="noopener noreferrer" style={{ marginLeft: "8px" }}>View live market ↗</a>
-          </div>
-
-          <div
-            className="grid grid--tiles"
-            style={{ gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))" }}
-          >
-            <StatTile
-              label="Virtual Indian Cash"
-              value={moneyInr(num(india.data?.available_cash_inr))}
-              sub="Available sandbox cash"
-            />
-            <StatTile
-              label="Virtual Total Equity"
-              value={moneyInr(num(india.data?.total_equity_inr))}
-              sub="Reported sandbox equity"
-            />
-            <StatTile
-              label="Open Virtual Positions"
-              value={moneyInr(num(india.data?.open_positions_cost_inr))}
-              sub={
-                Object.keys(india.data?.holdings ?? {}).length > 0
-                  ? Object.entries(india.data?.holdings ?? {})
-                      .map(([sym, qty]) => `${sym}: ${qty}sh`)
-                      .join(", ")
-                  : "No open positions"
-              }
-            />
-            <StatTile
-              label="Realized P&L (Post-Sale)"
-              value={
-                indiaProfitInr === null ? "—" : moneyInr(indiaProfitInr)
-              }
-              sub="Saved in SQLite (survives restarts)"
-              tone={indiaProfitInr === null ? null : indiaProfitInr > 0 ? "pos" : indiaProfitInr < 0 ? "neg" : null}
-            />
-          </div>
-        </Card>
-      )}
 
       {/* Filters Card */}
       <Card title="Filters & Search">
@@ -571,7 +528,7 @@ export function Trades() {
             <input
               className="input"
               value={query}
-              placeholder="Filter by symbol (e.g. RELIANCE, SPY, INFY)..."
+              placeholder="Filter by symbol (e.g. BTC/USD, RELIANCE, SPY, INFY)..."
               onChange={(e) => setQuery(e.target.value)}
             />
           </label>

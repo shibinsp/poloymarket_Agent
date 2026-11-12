@@ -2,17 +2,30 @@
 mode = "paper"                    # paper | live | backtest
 cycle_interval_seconds = 60       # 1 minute (reduced from 600s to eliminate latency)
 death_balance_threshold = 0.0
-low_fuel_threshold = 10.0
+low_fuel_threshold = 2.0
 api_reserve = 2.0
 initial_paper_balance = 100.0
 daily_api_budget = 0.50           # max API spend per UTC day ($); see [risk] below
 max_sleep_seconds = 3600          # longest sleep while every venue is closed
+# Polymarket, paper, alongside the venues (from 3 Nov 2026): its own $50 wallet,
+# rebuilt from the ledger every cycle, and
+# a scan every 10 cycles (10 minutes), around the clock.
+polymarket_capital_usd = 50.0
+polymarket_scan_every_cycles = 10
+# Underdog-a-week-out paper book: $2 bets on 20-30c tokens 156-180 h before
+# the end, held to settlement (src/agent/poly_underdog.rs, built 9 Nov 2026).
+polymarket_underdog = true
+# Paused 11 Nov 2026 (user: "Pause it, re-test fully"): underdogs won 6 of 35
+# live, mostly small tennis matches the backtest never covered (its sample was
+# only markets over ~$98k traded). Open bets still settle. Back on only if a
+# rule passes the full re-test on all closed markets, small ones included.
+polymarket_new_bets = false
 
 [scanning]
 max_markets = 1000
-min_volume_24h = 5000.0
+min_volume_24h = 1500.0
 max_resolution_days = 14
-max_spread_pct = 0.05
+max_spread_pct = 0.03              # a wider book costs more than any edge we can price
 categories = ["weather", "sports", "crypto", "politics"]
 
 [valuation]
@@ -27,24 +40,66 @@ categories = ["weather", "sports", "crypto", "politics"]
 # if your endpoint bills you, otherwise the daily budget cap and the
 # edge-justifies-cost gate will both treat calls as free.
 provider = "openai_compatible"
+# NVIDIA for everything except Polymarket (see [valuation.polymarket] below).
+# llama-3.2-11b-vision was withdrawn (404); deepseek-v4.1-flash is the chat
+# model the key still serves, slow on the free tier (~78 s, and on 3 Nov 2026
+# not answering at all), hence the timeout.
 base_url = "https://integrate.api.nvidia.com/v1"
-model = "meta/llama-3.2-11b-vision-instruct"
+model = "deepseek-ai/deepseek-v4.1-flash"
+request_timeout_seconds = 120
+max_evaluations_per_scan = 5
 max_tokens = 4096
 # input_price_per_million = 3.00
 # output_price_per_million = 15.00
-min_edge_threshold = 0.005
-high_confidence_edge = 0.005
-low_confidence_edge = 0.010
+# Edge must clear spread, fees and model error. 1-2% hurdles were below the
+# cost of crossing a typical Polymarket book, so they selected losing trades.
+min_edge_threshold = 0.05
+high_confidence_edge = 0.04
+low_confidence_edge = 0.08
 cache_ttl_seconds = 300
 
+# Polymarket only: Google Gemini through its OpenAI-compatible endpoint, with
+# the free AI Studio key in POLYMARKET_LLM_API_KEY. gemini-3.5-flash answered
+# in ~6 s on 3 Nov 2026 while NVIDIA gave no reply in 200 s.
+#
+# 3 Nov 2026 evening: Gemini's free tier answered 429 to parallel valuations,
+# so Polymarket moved back to NVIDIA (deepseek still silent). mistral-large-4
+# timed out on 4 of 5 parallel calls; nemotron-3.5-lightning answered all 5 in
+# 11-60 s with valid JSON. It uses LLM_API_KEY. Gemini, if wanted again:
+#   base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+#   model = "gemini-3.5-flash"
+#
+# 9 Nov 2026: moved to Groq's free tier (user's key in POLYMARKET_LLM_API_KEY).
+# gpt-oss-120b answered 5 parallel real valuation prompts in ~2 s with valid
+# JSON (~600 in / ~600 out tokens), against 11-180 s on NVIDIA nemotron.
+# Free limits: 1,000 requests/day, 8,000 tokens/minute; a 429 just skips that
+# valuation. NVIDIA, if wanted again (uses LLM_API_KEY only if the host matches
+# the main base_url):
+#   base_url = "https://integrate.api.nvidia.com/v1"
+#   model = "nvidia/nemotron-3.5-lightning-30b-a3b"
+#   request_timeout_seconds = 180
+#   max_tokens = 16384
+[valuation.polymarket]
+base_url = "https://api.groq.com/openai/v1"
+model = "openai/gpt-oss-120b"
+request_timeout_seconds = 60
+max_tokens = 2048
+
 [risk]
-kelly_fraction = 0.5
-max_position_pct = 1.0               # Allow up to 100% allocation for micro $5.00 seed capital
-max_total_exposure_pct = 1.0         # Full exposure cap for micro-capital trading
+kelly_fraction = 0.20                 # fractional Kelly: model probabilities are not well calibrated
+max_position_pct = 0.10              # no single position above 10% of bankroll
+max_total_exposure_pct = 0.50        # at most half the bankroll at risk at once
 max_positions_per_category = 3
 min_position_usd = 1.0
-india_capital_allocation_inr = 1000.0     # INR: ₹1,000 isolated paper/sandbox allocation
-us_capital_allocation_usd = 5.0          # USD: strictly $5.00 initial capital for US equities
+india_capital_allocation_inr = 25000.0     # INR: ₹1,000 isolated paper/sandbox allocation
+us_capital_allocation_usd = 1000.0       # USD: $1,000, the original allocation, restored 4 Nov 2026 at the user's request ($500 on 3-4 Nov)
+us_max_position_pct = 0.20               # At most $200 of the $1,000 US allocation in one stock
+us_max_exposure_pct = 0.90               # At most $900 total US stock exposure (3 trades x $200 fit)
+us_cash_buffer_pct = 0.10                 # Keep 10% of available US stock cash uncommitted
+us_risk_per_trade_pct = 0.01              # Target at most 1% of available capital at the ATR stop
+us_max_daily_loss_usd = 20.0              # Tightest cash loss limit; pauses all entries for the day
+us_max_trades_per_day = 3
+us_max_quote_age_seconds = 120
 
 
 # --- Circuit breakers -------------------------------------------------------
@@ -67,14 +122,15 @@ us_capital_allocation_usd = 5.0          # USD: strictly $5.00 initial capital f
 # Lost more than this fraction of the day's opening equity -> stop entries for
 # the rest of the UTC day. Lifts by itself at midnight.
 max_daily_loss_pct = 0.05
-# The same limit in cash. Set to 2000.0 (~2%) for the $100k paper account; LIVE: 5.0
-max_daily_loss_usd = 2000.0
+# The same limit in cash. Sized to the capital actually traded ($100 bankroll +
+# $1,000 US allocation), not the $100k Alpaca paper balance; LIVE: 5.0
+max_daily_loss_usd = 50.0
 # Below the all-time equity high by more than this -> stop until a human
 # resumes. Does not lift at midnight: sleeping on a drawdown changes nothing.
 max_drawdown_pct = 0.15
 # Positions opened per UTC day, and losing closes in a row. Both rest-of-day.
-max_trades_per_day = 500
-max_consecutive_losses = 4
+max_trades_per_day = 20
+max_consecutive_losses = 10
 # Absolute ceilings, applied only in live mode. A percentage of a paper
 # balance is a number nobody agreed to, and the first live run must not
 # inherit it: 6% of a $100,000 paper account is a $6,000 position.
@@ -119,10 +175,23 @@ path = "polymarket-agent.db"
 [[venues]]
 id = "alpaca"
 kind = "alpaca"
-enabled = false
+enabled = true
 base_url = "https://paper-api.alpaca.markets"
 data_url = "https://data.alpaca.markets"
-symbols = ["SIRI", "NOK", "LCID", "PLUG", "NIO", "SOFI", "BTC/USD", "ETH/USD", "SPY", "AAPL", "NVDA", "QQQ"]
+# Liquid large caps and index ETFs only: low-priced names (SIRI, NOK, LCID,
+# PLUG, NIO, SOFI) whipsaw a daily crossover and carry wider spreads.
+# The swing strategy trades only [us_strategy].symbols; the rest are the
+# opening-range breakout universe ([us_orb]).
+symbols = [
+    "SPY", "QQQ", "IWM", "DIA", "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "AVGO",
+    "AMD", "NFLX", "ORCL", "CRM", "ADBE", "INTC", "MU", "QCOM", "TXN", "AMAT", "LRCX", "KLAC",
+    "MRVL", "SMCI", "ARM", "PLTR", "COIN", "MSTR", "HOOD", "SHOP", "UBER", "ABNB", "SNOW", "CRWD",
+    "PANW", "NOW", "DDOG", "NET", "ZS", "MDB", "JPM", "BAC", "WFC", "GS", "MS", "C",
+    "SCHW", "V", "MA", "PYPL", "XYZ", "UNH", "LLY", "JNJ", "PFE", "MRK", "ABBV", "XOM",
+    "CVX", "OXY", "WMT", "COST", "HD", "NKE", "SBUX", "MCD", "DIS", "KO", "PEP", "BA",
+    "CAT", "GE", "DE", "SOFI", "RIVN", "LCID", "NIO", "F", "GM", "AAL", "CCL", "MARA",
+    "RIOT", "DELL", "HPQ", "CSCO", "IBM", "T", "VZ",
+]
 fee_pct = 0.0025
 #
 # Coinbase Advanced Trade — spot crypto, 24/7.
@@ -179,12 +248,24 @@ fee_pct = 0.0025
 [[venues]]
 id = "upstox_sandbox"
 kind = "upstox_sandbox"
-enabled = true
-symbols = ["ITC", "TATAMOTORS", "HDFCBANK", "SBIN", "RELIANCE", "INFY", "ICICIBANK", "TCS"]
+# Off: the NSE paper book is run by the [india_strategy] worker alone. Enabled,
+# the generic venue cycle also traded it (bought BHARTIARTL on 2026-10-30 while
+# the momentum strategy was in cash). The worker uses the Upstox feed directly.
+enabled = false
+symbols = ["ITC", "TATAMOTORS", "HDFCBANK", "SBIN", "RELIANCE", "INFY", "ICICIBANK", "TCS", "BHARTIARTL", "LT", "HINDUNILVR"]
 fee_pct = 0.001
 
+# Polymarket prediction markets, paper (simulated fills against the live book).
+# It runs as its own loop next to the venues: its own scanner, model valuation,
+# Kelly sizing and $50 wallet ([agent] polymarket_capital_usd). Its trades are
+# the YES / NO rows of the ledger; the US and India limits never include it.
+[[venues]]
+id = "polymarket"
+kind = "polymarket"
+enabled = true
+
 [sizing_continuous]
-risk_per_trade_pct = 0.95           # Allow micro $5 capital allocation to size 1 full share of sub-$5 stock
+risk_per_trade_pct = 0.02           # lose at most 2% of bankroll if the stop is hit
 atr_period = 14
 atr_multiplier = 1.5            # stop distance = ATR x this, then clamped
 min_stop_pct = 0.01             # 1.0% min stop
@@ -193,8 +274,183 @@ min_p_up = 0.51                 # minimum probability-of-up before a view is tra
 max_orders_per_cycle = 2        # cap on new positions opened per cycle
 
 [exits_continuous]
-take_profit_pct = 0.02          # 2.0% realistic take-profit target
+take_profit_pct = 0.015          # 2.0% realistic take-profit target
 max_hold_hours = 24             # 24 hours max hold
+
+[us_options]
+# Options on the ORB / burst stock entries (src/us/options.rs): a call on a
+# long breakout, a put on a short, nearest expiry 2-9 days out, the affordable
+# strike nearest the money, sold when the stock trade closes (by 15:50).
+# Its own $500 paper book: losses come off it, profits are set aside.
+# Backtest May-Oct 2026: +$2,086 on 156 trades, but outlier-driven (median
+# trade -$15; without the best three, -$45) and negative at triple costs.
+# Paused 9 Nov 2026 at the user's yes: near-the-money options lost in every
+# test; all the profit came from rare far-out wins (no reliable edge). Live:
+# -$79 SMCI, NVDA call about half lost. Replaced by the IBS book (src/us/ibs.rs).
+# Exit-only while the NVDA call is open (restart at 00:2x IST 10 Nov during
+# market hours): the worker runs so it sells the call by 15:50, and
+# max_daily_loss_usd = 0 below blocks every new entry. Set enabled = false
+# at the next restart once no option trade is open. Done 10 Nov 02:4x IST
+# (NVDA call closed -$52 at 15:47 NY 9 Nov; no option trade open).
+enabled = false
+capital_usd = 500.0
+max_spread_pct = 0.10
+min_days_to_expiry = 2
+max_days_to_expiry = 9
+# Its own daily loss limit (4 Nov 2026): no new option entry once today's
+# closed option trades have lost this much. The U.S. stock books' $20 limit
+# ([risk] us_max_daily_loss_usd) no longer counts the options book: an SMCI
+# call down ~$40 tripped it on 4 Nov with the stocks near flat.
+max_daily_loss_usd = 0.0  # was 100.0; 0 = no new entries (paused 9 Nov)
+# Calls only (4 Nov 2026, the user's choice): on May-Oct 2026, with the live
+# ORB rules and the 10:00 cutoff, calls made +$2,288 on 53 trades (both halves
+# up, every exit/strike variant positive, +$218 without the best 3, 3% chance
+# of luck); puts lost $262 on 58. Short stock breakdowns still trade.
+calls_only = true
+
+[target]
+# The user's daily goal (4 Nov 2026): Rs 500 a day across every book, tracked
+# on the Overview page. Display only: no strategy reads it, so it never makes
+# the agent bet bigger. The Alpaca account's change (US stocks, options,
+# crypto) and Polymarket are converted at usd_inr; update the rate by hand.
+daily_inr = 500.0
+usd_inr = 86.5                 # the Overview page's reference rate
+since = "2026-11-03"
+
+[crypto]
+# BTC + ETH (src/crypto_book.rs): hold a coin while its daily close is above
+# the close 60 days earlier, otherwise cash; decided once a day at 00:10 UTC.
+# The "crypto" book trades it on Alpaca paper with a news guard (severe news
+# can veto a buy or move to cash, never add risk); "crypto_rule" follows the
+# rule alone on paper, to measure the guard. $20 each, $10 a coin; losses come
+# off the capital, profits are set aside. Backtest Jan 2021 - Oct 2026: passed
+# on both coins; BTC $20 -> $51 (hold $53, worst fall -61% vs -77%), ETH
+# $20 -> $100 (hold $62, -56% vs -79%).
+enabled = true
+capital_usd = 20.0
+symbols = ["BTC/USD", "ETH/USD"]
+lookback_days = 60
+news_guard = true
+
+[us_strategy]
+# Selectable US equity strategy: "sma_crossover" | "momentum_pullback"
+strategy = "sma_crossover"
+fast_sma_period = 20
+slow_sma_period = 50
+moving_average_type = "SMA"   # Explicitly Simple Moving Average (SMA), not EMA
+symbols = [
+    "SPY", "QQQ", "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA",
+]
+# Golden-cross confirmations (0 disables each). A cross is only an entry when
+# ADX(14) >= min_adx and regime_symbol closes above its regime_sma_period-day
+# SMA. Over 5 years (examples/us_sma_compare.rs) these cut drawdown at the same
+# profit factor; a signal-day volume filter (min_volume_ratio = 1.2) removed
+# three quarters of trades and turned the profit factor to 0.99, so it is off.
+min_volume_ratio = 0.0
+min_adx = 20.0
+regime_symbol = "SPY"
+regime_sma_period = 200
+# Stop management: after +breakeven_at_r R the stop moves to entry, then trails
+# trail_atr_multiplier x ATR(14) below the highest high since entry.
+breakeven_at_r = 1.0
+trail_atr_multiplier = 3.0
+
+[us_orb]
+# "Stocks in play" opening-range breakout, intraday, long and short, paper only.
+# The 9:30 five-minute bar is the range; a stock qualifies when that bar's volume
+# is >= rvol_min x its 14-session average. Enter on the first 5-minute close
+# beyond the range, stop at the other side, flat 15 minutes before the close.
+# Backtest (91 symbols, Nov 2024 - Oct 2026, equal $ sizing, 5 bp slippage):
+# +6.3% in the first year and +21.3% in the second, which was held out.
+# Live uses Alpaca's free IEX feed (the backtest used SIP), so ranges differ a little.
+enabled = true
+rvol_min = 2.5
+position_pct = 0.20          # equal dollars per trade: $200 of the $1,000 U.S. allocation, $600 for all 3
+max_trades_per_day = 3       # shared with the U.S. daily entry limit
+daily_loss_pct = 0.02        # no new ORB entries after a 2% day loss
+# Only the capital trades, never its profits; a net loss since this day shrinks
+# it (min(capital + P&L, capital)), as on the India books. The book was $1,000
+# ($200 a trade) until 3 Nov 2026, $500 ($150) on 3-4 Nov, and $1,000 again
+# from 4 Nov at the user's request.
+capital_since = "2026-11-03"
+allow_short = true           # whole shares only: shorts above ~$200 a share will not size
+max_entry_slippage_pct = 0.002
+# No new ORB entries from 10:00 ET (minutes after the 9:30 open). On the 210
+# May-Oct 2026 backtest trades, entries from 10:00 lost in both halves (-$13.60
+# over 57) while earlier ones made +$88.36. Set by the user on 4 Nov 2026; 390
+# turns it off. The options book mirrors ORB entries, so it follows this too.
+last_entry_minute = 30
+# No new ORB/burst entries on these New York dates: FOMC decisions, CPI and
+# jobs reports. May-Oct 2026, the 26 ORB trades on such days lost $33.32 while
+# the other 184 made +$108.08 (+$75 live -> +$108 skipping them, both halves
+# better, 5/6 months). Few trades, so judge it live. Set by the user 5 Nov 2026.
+# Sources: BLS CPI/Employment Situation schedules, Fed FOMC calendar. Dec 4 is
+# the usual first-Friday jobs date, not yet confirmed; add 2027 CPI/jobs dates
+# when BLS publishes them.
+skip_days = [
+  "2026-11-06", "2026-11-10",                 # jobs (Oct), CPI (Oct)
+  "2026-12-04", "2026-12-09", "2026-12-10",   # jobs (Nov), FOMC, CPI (Nov)
+  "2027-01-27", "2027-03-17", "2027-04-28", "2027-06-09", "2027-07-28",  # FOMC
+]
+# The trading desk (src/us/desk.rs): ATLAS scans, VEGA reads the chart, ORION
+# the news, LUNA the sentiment, TITAN the risk, NOVA decides and records a card
+# (GET /api/us/desk). A trading halt in the last 24h always skips the trade.
+# "advisory": ORION's earnings/merger/offering veto and LUNA's half size are
+# recorded but do not change orders; "enforce": they do. Backtested over 2,490
+# trades they were inconsistent (the veto cut the held-out year from +21% to
+# +4%), so advisory is the setting to keep.
+desk_mode = "advisory"
+# The opening burst (us::orb::BURST_STRATEGY), from 3 Nov 2026: one trade at
+# 9:35 on the loudest 9:30 move (>= 1% on >= 3x volume, with SPY). Same $150
+# size; it shares the 3-trades-a-day limit, so with a burst the ORB gets 2.
+burst = true
+symbols = [
+    "SPY", "QQQ", "IWM", "DIA", "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "AVGO",
+    "AMD", "NFLX", "ORCL", "CRM", "ADBE", "INTC", "MU", "QCOM", "TXN", "AMAT", "LRCX", "KLAC",
+    "MRVL", "SMCI", "ARM", "PLTR", "COIN", "MSTR", "HOOD", "SHOP", "UBER", "ABNB", "SNOW", "CRWD",
+    "PANW", "NOW", "DDOG", "NET", "ZS", "MDB", "JPM", "BAC", "WFC", "GS", "MS", "C",
+    "SCHW", "V", "MA", "PYPL", "XYZ", "UNH", "LLY", "JNJ", "PFE", "MRK", "ABBV", "XOM",
+    "CVX", "OXY", "WMT", "COST", "HD", "NKE", "SBUX", "MCD", "DIS", "KO", "PEP", "BA",
+    "CAT", "GE", "DE", "SOFI", "RIVN", "LCID", "NIO", "F", "GM", "AAL", "CCL", "MARA",
+    "RIOT", "DELL", "HPQ", "CSCO", "IBM", "T", "VZ",
+]
+
+[india_strategy]
+# "orb": intraday opening-range breakout on the NIFTY 50, long and short, paper
+#   only, no leverage: see src/india/orb.rs. Roughly break-even in replay on
+#   Rs 2,500 (-9.4% then +7.6%), so this is an experiment, not a proven edge.
+# "momentum": monthly rotation into the 4 strongest watchlist stocks by
+#   9-month return, only while NIFTY 50 closes above its 200-day SMA (else cash).
+#   Beat NIFTY on 2023-2026 data the selection never saw.
+# "pullback": the original 5-minute VWAP pullback. It lost 15-32% over
+#   May-Oct 2026 in replay, before and after costs; kept only for comparison.
+strategy = "orb"
+intraday_capital_inr = 10000.0      # trades size from this only; profits are not reinvested
+# Intraday books that run alongside the one above, each on its own capital and
+# ledger. "burst": the opening burst (src/india/burst.rs), one trade at 9:20.
+# "gapgo": gap and go (src/india/gapgo.rs), one trade at 9:20; a test added on
+# 3 Nov 2026 at the user's request, flat in backtest (+Rs 12 over 55 trades).
+also_run = ["burst", "gapgo"]
+burst_capital_inr = 10000.0
+gapgo_capital_inr = 10000.0
+# From 4 to 5 Nov 2026 the ORB traded nothing: it failed the walk-forward and
+# robustness scores (score.py, May-Oct 2026), even with TimesFM. Its signals
+# are followed on the india_orb_track ledger; the burst leads India.
+# 5 Nov 2026, the user: trade the ORB again, longs only, when TimesFM agrees.
+# May-Oct 2026: +Rs 618 on 21 trades, both halves up, every setting positive,
+# +Rs 491 at 2x costs; but no trades in Aug-Sep (2 of 6 months up) and the
+# walk-forward was -Rs 269, so it is a paper test, like gap-and-go. Shorts
+# and vetoed longs stay on the tracking ledgers. orb_track_only = true stops
+# all ORB trading again.
+orb_track_only = false
+orb_longs_only = true
+# TimesFM's veto on the burst (6 Nov 2026 review, burst_tfm.py, May-Oct 2026).
+# The model forecasts back toward recent prices on 93% of bursts, so it vetoes
+# about 2 in 3. The 13 trades it agreed with made +Rs 968; the 29 it vetoed made
+# +Rs 53 (break-even). With the veto: +968, halves +716 / +251. Without it:
+# +1,020, halves +355 / +665. Neither is better in both halves, so the veto
+# stays on. false = trade every burst and only record TimesFM's view.
+burst_timesfm_veto = true
 
 [telemetry]
 # OpenTelemetry span export. Off unless an endpoint is set here or via
@@ -229,3 +485,21 @@ service_name = "polymarket-agent"
 # the ordinary logs regardless of this setting.
 export_content = true
 export_timeout_seconds = 10
+
+[us_spreads]
+# Same-day (0DTE) bear call spreads on SPY and QQQ (src/us/spreads.rs): at
+# 11:00 New York sell the first call strike at least 0.6% above the price and
+# buy the one $2 higher, for the natural credit; buy back at 15:50. No stop:
+# the bought call caps the loss at $2 less the credit (~$170 a spread).
+# Backtest May-Oct 2026: +$1,207 on 148 spreads, both halves up, 5 of 6
+# months, max drawdown -$305, 0.8% chance of luck; it trades FOMC/CPI/jobs
+# days (better with them in). Weak spot: strong rally afternoons. Paper only,
+# set by the user on 6 Nov 2026.
+enabled = true
+underlyings = ["SPY", "QQQ"]
+otm_pct = 0.006
+width = 2.0
+entry_minute = 660     # 11:00 New York
+exit_minute = 950      # 15:50 New York
+min_credit = 0.05
+qty = 1

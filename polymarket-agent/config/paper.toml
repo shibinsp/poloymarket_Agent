@@ -88,7 +88,7 @@ max_daily_loss_pct = 0.05
 max_daily_loss_usd = 2000.0       # ~2% of a $100k paper account. LIVE: 5.0
 max_drawdown_pct = 0.15
 max_trades_per_day = 10
-max_consecutive_losses = 4
+max_consecutive_losses = 10
 # Inert in paper; they bind only in live mode. Left at the live values so the
 # transition changes one word — mode — and not the risk numbers.
 max_live_notional_per_position_usd = 10.0

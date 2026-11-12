@@ -14,8 +14,9 @@ export const ROUTES: RouteDef[] = [
   { path: "/orders", label: "Orders", title: "Orders and fills" },
   { path: "/risk", label: "Risk", title: "Risk and reconciliation" },
   { path: "/cycles", label: "Cycles", title: "Cycles" },
-  { path: "/learn", label: "Learn From Mistakes", title: "Learn from Mistakes · Trade Post-Mortem" },
+  { path: "/learn", label: "Learn From Mistakes", title: "Learn from mistakes · trade reviews" },
   { path: "/costs", label: "Costs", title: "API costs" },
+  { path: "/scanner", label: "Range Scanner", title: "Range scanner · likely high and low for the rest of today" },
   { path: "/health", label: "Health", title: "Health" },
   { path: "/settings", label: "Settings", title: "Settings" },
 ];

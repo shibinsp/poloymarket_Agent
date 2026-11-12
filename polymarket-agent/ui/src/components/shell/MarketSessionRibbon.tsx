@@ -7,6 +7,8 @@ interface IntradayStatusData {
     session_state: "OPEN" | "CLOSED";
     currency_symbol: string;
     capital_allocation_inr: string | number;
+    /** The intraday breakout's own capital; the allocation above is the older sandbox book. */
+    intraday_capital_inr?: string | number | null;
     local_time: string;
     entry_permitted: boolean;
     exit_due: boolean;
@@ -99,9 +101,9 @@ export function MarketSessionRibbon() {
           <Badge tone={indiaOpen ? "good" : "neutral"}>
             {indiaOpen ? "🟢 09:15–15:30 IST OPEN" : "⚪ CLOSED"}
           </Badge>
-          {data.india?.capital_allocation_inr && (
+          {(data.india?.intraday_capital_inr ?? data.india?.capital_allocation_inr) && (
             <span style={{ color: "var(--text-secondary)", fontSize: "11px" }}>
-              (Cap: ₹{Number(data.india.capital_allocation_inr).toLocaleString("en-IN")})
+              (India books: ₹{Number(data.india?.intraday_capital_inr ?? data.india?.capital_allocation_inr).toLocaleString("en-IN", { maximumFractionDigits: 2 })} after losses)
             </span>
           )}
           {data.india?.exit_due && (

@@ -1,6 +1,6 @@
 #![allow(clippy::double_must_use)]
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::Parser;
 
@@ -9,7 +9,9 @@ use polymarket_agent::config::{self, AgentMode, AppConfig, ExposeSecret};
 use polymarket_agent::db::store::Store;
 use polymarket_agent::monitoring;
 use polymarket_agent::monitoring::alerts::{AlertLevel, AnomalyKind};
-use polymarket_agent::monitoring::dashboard::{spawn_dashboard, DashboardState};
+use polymarket_agent::monitoring::dashboard::{
+    spawn_dashboard, spawn_us_backtest_server, DashboardState,
+};
 use polymarket_agent::monitoring::logger;
 use rust_decimal_macros::dec;
 
@@ -30,6 +32,10 @@ struct CliArgs {
     /// Run a quick validation check (single cycle, no trades)
     #[arg(long)]
     dry_run: bool,
+
+    /// Run only the loopback US historical backtest API; no trading loop or order routes.
+    #[arg(long)]
+    us_backtest_server: bool,
 }
 
 #[derive(Debug, Clone, clap::ValueEnum)]
@@ -59,6 +65,12 @@ async fn main() -> Result<()> {
     // Override mode from CLI if provided
     if let Some(mode) = args.mode.clone() {
         config.agent.mode = mode.into();
+    }
+
+    if args.us_backtest_server {
+        config.agent.mode = AgentMode::Backtest;
+        config.telemetry.enabled = Some(false);
+        config.telemetry.otlp_endpoint = None;
     }
 
     // Held for the lifetime of the process; `shutdown` flushes pending spans.
@@ -92,6 +104,9 @@ async fn main() -> Result<()> {
 /// Run whichever mode was selected. Separated from `main` only so that every
 /// return path passes back through the flush above.
 async fn dispatch(args: CliArgs, config: AppConfig, secrets: config::Secrets) -> Result<()> {
+    if args.us_backtest_server {
+        return run_us_backtest_server(&config, &secrets).await;
+    }
     if args.dry_run {
         return run_dry_run(&config, &secrets).await;
     }
@@ -106,6 +121,54 @@ async fn dispatch(args: CliArgs, config: AppConfig, secrets: config::Secrets) ->
         AgentMode::Backtest => run_backtest(&config),
         AgentMode::Paper | AgentMode::Live => run_agent(config, secrets).await,
     }
+}
+
+/// Serve only the US backtest routes without constructing or running an agent.
+async fn run_us_backtest_server(config: &AppConfig, secrets: &config::Secrets) -> Result<()> {
+    let store = Store::new(&config.database.path).await?;
+    let alpaca_feed = std::sync::Arc::new(
+        polymarket_agent::us::market_feed::AlpacaLiveMarketFeed::new(
+            secrets
+                .alpaca_key_id
+                .as_ref()
+                .map(|key| key.expose_secret().to_string()),
+            secrets
+                .alpaca_secret_key
+                .as_ref()
+                .map(|secret| secret.expose_secret().to_string()),
+            None,
+        ),
+    );
+    let kill_switch = std::sync::Arc::new(polymarket_agent::agent::kill_switch::KillSwitch::new(
+        config.database.halt_file(),
+    ));
+    let dashboard_state = DashboardState::new(
+        store,
+        monitoring::health::HealthState::new(),
+        config.agent.initial_paper_balance,
+        None,
+        kill_switch,
+        config.risk.clone(),
+        AgentMode::Backtest,
+        false,
+        config.valuation.model.clone(),
+    )
+    .with_alpaca_feed(alpaca_feed);
+    let _server = spawn_us_backtest_server(
+        dashboard_state,
+        "127.0.0.1",
+        config.monitoring.dashboard_port,
+    )
+    .await?;
+
+    tracing::info!(
+        port = config.monitoring.dashboard_port,
+        "US backtest-only service started; no agent, trading, or order-management routes are active"
+    );
+    tokio::signal::ctrl_c()
+        .await
+        .context("Could not wait for shutdown signal")?;
+    Ok(())
 }
 
 /// Quick dry-run validation: tests connectivity and pipeline without placing trades.
@@ -199,6 +262,7 @@ async fn run_dry_run(config: &AppConfig, secrets: &config::Secrets) -> Result<()
         for issue in &startup_issues {
             println!("      - {issue}");
         }
+        println!("      The agent is not allowed to run in a paper/live session without a valuation key.");
         println!("      Resolve all startup blockers before running this mode.");
         return Err(anyhow::anyhow!("{}", startup_issues.join("; ")));
     }
@@ -425,6 +489,16 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
         chrono::Utc::now(),
     ));
 
+    // Upstox requires the OAuth redirect URI to match the callback served by
+    // this dashboard instance. Keep it aligned with the configured dashboard
+    // port, while allowing deployments to supply the exact URI registered in
+    // their Upstox developer app.
+    let upstox_redirect_uri = std::env::var("UPSTOX_REDIRECT_URI").unwrap_or_else(|_| {
+        format!(
+            "http://127.0.0.1:{}/api/upstox/callback",
+            config.monitoring.dashboard_port
+        )
+    });
     let upstox_feed = std::sync::Arc::new(
         polymarket_agent::india::market_feed::UpstoxLiveMarketFeed::new(
             secrets
@@ -439,22 +513,67 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
                 .upstox_sandbox_token
                 .as_ref()
                 .map(|k| k.expose_secret().to_string()),
-            None,
+            Some(upstox_redirect_uri),
         ),
     );
     upstox_feed.clone().spawn_feed_worker();
-    // Indian strategy decisions run continuously from fresh Upstox ticks, but
-    // only after the operator resumes the agent and only as local paper fills.
-    let _india_strategy_worker =
+    // Indian strategy decisions run only while the agent is not halted and
+    // only as local paper fills.
+    let india_capital = config
+        .risk
+        .india_capital_allocation_inr
+        .unwrap_or(dec!(1000.0));
+    let _india_strategy_worker = if config.india_strategy.strategy.eq_ignore_ascii_case("orb") {
+        tracing::info!("NSE paper strategy: intraday opening-range breakout");
+        polymarket_agent::india::orb::spawn_india_orb_worker(
+            upstox_feed.clone(),
+            store.clone_for_parallel(),
+            kill_switch.clone(),
+            config.india_strategy.intraday_capital_inr,
+            config.india_strategy.orb_track_only,
+            config.india_strategy.orb_longs_only,
+        )
+    } else if config
+        .india_strategy
+        .strategy
+        .eq_ignore_ascii_case("pullback")
+    {
+        tracing::info!("NSE paper strategy: 5-minute pullback (intraday)");
         polymarket_agent::india::strategy_worker::spawn_upstox_strategy_worker(
             upstox_feed.clone(),
             store.clone_for_parallel(),
             kill_switch.clone(),
-            config
-                .risk
-                .india_capital_allocation_inr
-                .unwrap_or(dec!(1000.0)),
-        );
+            india_capital,
+        )
+    } else {
+        tracing::info!("NSE paper strategy: monthly momentum rotation");
+        polymarket_agent::india::momentum::spawn_momentum_worker(
+            upstox_feed.clone(),
+            store.clone_for_parallel(),
+            kill_switch.clone(),
+            india_capital,
+            config.database.data_dir().join("india_momentum_state.json"),
+        )
+    };
+    let _india_burst_worker = config.india_strategy.runs_burst().then(|| {
+        tracing::info!("NSE paper strategy, alongside: opening burst");
+        polymarket_agent::india::burst::spawn_india_burst_worker(
+            upstox_feed.clone(),
+            store.clone_for_parallel(),
+            kill_switch.clone(),
+            config.india_strategy.burst_capital_inr,
+            config.india_strategy.burst_timesfm_veto,
+        )
+    });
+    let _india_gapgo_worker = config.india_strategy.runs_gapgo().then(|| {
+        tracing::info!("NSE paper strategy, alongside: gap and go");
+        polymarket_agent::india::gapgo::spawn_india_gapgo_worker(
+            upstox_feed.clone(),
+            store.clone_for_parallel(),
+            kill_switch.clone(),
+            config.india_strategy.gapgo_capital_inr,
+        )
+    });
 
     let alpaca_feed = std::sync::Arc::new(
         polymarket_agent::us::market_feed::AlpacaLiveMarketFeed::new(
@@ -471,6 +590,276 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
     );
     alpaca_feed.clone().start_streaming();
 
+    // Options on the ORB / burst entries, on a $500 paper book of their own.
+    let _us_options_worker = if config.us_options.enabled
+        && config.agent.mode == polymarket_agent::config::AgentMode::Paper
+    {
+        let trading = config
+            .venues
+            .iter()
+            .find(|v| v.kind == "alpaca" && v.enabled)
+            .and_then(|v| v.base_url.clone())
+            .unwrap_or_else(|| "https://paper-api.alpaca.markets".to_string());
+        match (
+            secrets.alpaca_key_id.as_ref(),
+            secrets.alpaca_secret_key.as_ref(),
+        ) {
+            (Some(k), Some(s)) => match polymarket_agent::us::options::AlpacaOptions::paper(
+                k.expose_secret().to_string(),
+                s.expose_secret().to_string(),
+                trading,
+            ) {
+                Ok(api) => Some(polymarket_agent::us::options::spawn_us_options_worker(
+                    api,
+                    store.clone_for_parallel(),
+                    kill_switch.clone(),
+                    config.us_options.clone(),
+                )),
+                Err(e) => {
+                    tracing::warn!(error = %e, "U.S. options book not started");
+                    None
+                }
+            },
+            _ => {
+                tracing::warn!("U.S. options book needs Alpaca keys; not started");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // US capital ladder: every closed US trade re-sized at $10-$2,000 (paper
+    // bookkeeping only, no orders).
+    let _us_ladder_worker = (config.agent.mode == polymarket_agent::config::AgentMode::Paper)
+        .then(|| polymarket_agent::us::ladder::spawn_us_ladder_worker(store.clone_for_parallel()));
+
+    // "Buy a weak close" on QQQ/SPY/IWM at 15:55, held to the next close
+    // (simulated paper book; live IEX prices, no orders).
+    let _us_ibs_worker = if config.agent.mode == polymarket_agent::config::AgentMode::Paper {
+        secrets
+            .alpaca_key_id
+            .as_ref()
+            .zip(secrets.alpaca_secret_key.as_ref())
+            .map(|(k, s)| {
+                polymarket_agent::us::ibs::spawn_us_ibs_worker(
+                    store.clone_for_parallel(),
+                    polymarket_agent::us::orb::AlpacaBars::new(
+                        k.expose_secret().to_string(),
+                        s.expose_secret().to_string(),
+                        "iex".to_string(),
+                    ),
+                )
+            })
+    } else {
+        None
+    };
+
+    // Turnaround Tuesday on DIA: Friday below its 25-day average -> buy Monday's
+    // open, sell Tuesday's close (simulated paper book; no orders).
+    let _us_turnaround_worker = if config.agent.mode == polymarket_agent::config::AgentMode::Paper {
+        secrets
+            .alpaca_key_id
+            .as_ref()
+            .zip(secrets.alpaca_secret_key.as_ref())
+            .map(|(k, s)| {
+                let make = |feed: &str| {
+                    polymarket_agent::us::orb::AlpacaBars::new(
+                        k.expose_secret().to_string(),
+                        s.expose_secret().to_string(),
+                        feed.to_string(),
+                    )
+                };
+                polymarket_agent::us::turnaround::spawn_us_turnaround_worker(
+                    store.clone_for_parallel(),
+                    make("sip"),
+                    make("iex"),
+                )
+            })
+    } else {
+        None
+    };
+
+    // Pre-FOMC drift on SPY: buy the close before a Fed decision, sell the
+    // decision day's close (simulated paper book; no orders).
+    let _us_prefomc_worker = if config.agent.mode == polymarket_agent::config::AgentMode::Paper {
+        secrets
+            .alpaca_key_id
+            .as_ref()
+            .zip(secrets.alpaca_secret_key.as_ref())
+            .map(|(k, s)| {
+                polymarket_agent::us::prefomc::spawn_us_prefomc_worker(
+                    store.clone_for_parallel(),
+                    polymarket_agent::us::orb::AlpacaBars::new(
+                        k.expose_secret().to_string(),
+                        s.expose_secret().to_string(),
+                        "iex".to_string(),
+                    ),
+                )
+            })
+    } else {
+        None
+    };
+
+    // Same-day bear call spreads on SPY and QQQ, sold at 11:00, bought back at 15:50.
+    let _us_spreads_worker = if config.us_spreads.enabled
+        && config.agent.mode == polymarket_agent::config::AgentMode::Paper
+    {
+        let trading = config
+            .venues
+            .iter()
+            .find(|v| v.kind == "alpaca" && v.enabled)
+            .and_then(|v| v.base_url.clone())
+            .unwrap_or_else(|| "https://paper-api.alpaca.markets".to_string());
+        match (
+            secrets.alpaca_key_id.as_ref(),
+            secrets.alpaca_secret_key.as_ref(),
+        ) {
+            (Some(k), Some(s)) => match polymarket_agent::us::options::AlpacaOptions::paper(
+                k.expose_secret().to_string(),
+                s.expose_secret().to_string(),
+                trading,
+            ) {
+                Ok(api) => Some(polymarket_agent::us::spreads::spawn_us_spreads_worker(
+                    api,
+                    store.clone_for_parallel(),
+                    kill_switch.clone(),
+                    config.us_spreads.clone(),
+                )),
+                Err(e) => {
+                    tracing::warn!(error = %e, "U.S. spread book not started");
+                    None
+                }
+            },
+            _ => {
+                tracing::warn!("U.S. spread book needs Alpaca keys; not started");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // BTC + ETH on the 60-day rule with a news guard, $20 books of their own.
+    let _crypto_worker =
+        if config.crypto.enabled && config.agent.mode == polymarket_agent::config::AgentMode::Paper
+        {
+            let trading = config
+                .venues
+                .iter()
+                .find(|v| v.kind == "alpaca" && v.enabled)
+                .and_then(|v| v.base_url.clone())
+                .unwrap_or_else(|| "https://paper-api.alpaca.markets".to_string());
+            // The news read runs on the Polymarket model (same NVIDIA host, so the
+            // main key), which answers in seconds; the main model otherwise.
+            let same_host =
+                config.valuation.polymarket.as_ref().is_some_and(|o| {
+                    o.base_url.is_none() || o.base_url == config.valuation.base_url
+                });
+            let llm_config = if same_host {
+                config.valuation.for_polymarket()
+            } else {
+                config.valuation.clone()
+            };
+            let llm = secrets.llm_api_key.as_ref().and_then(|key| {
+                polymarket_agent::valuation::llm::LlmClient::new(
+                    key.expose_secret().to_string(),
+                    &llm_config,
+                    store.clone_for_parallel(),
+                )
+                .map_err(|e| tracing::warn!(error = %e, "Crypto news guard has no model"))
+                .ok()
+                .map(std::sync::Arc::new)
+            });
+            match (
+                secrets.alpaca_key_id.as_ref(),
+                secrets.alpaca_secret_key.as_ref(),
+            ) {
+                (Some(k), Some(s)) => match polymarket_agent::crypto_book::CryptoApi::paper(
+                    k.expose_secret().to_string(),
+                    s.expose_secret().to_string(),
+                    trading,
+                ) {
+                    Ok(api) => Some(polymarket_agent::crypto_book::spawn_crypto_worker(
+                        api,
+                        llm,
+                        store.clone_for_parallel(),
+                        kill_switch.clone(),
+                        config.crypto.clone(),
+                    )),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Crypto book not started");
+                        None
+                    }
+                },
+                _ => {
+                    tracing::warn!("Crypto book needs Alpaca keys; not started");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+    // Post-mortems of closed trades. Reviews read bars after the close, so the
+    // free plan's SIP history (15 minutes late) is the better source.
+    let _review_worker = polymarket_agent::review::spawn_review_worker(
+        store.clone_for_parallel(),
+        upstox_feed.access_token.clone(),
+        secrets
+            .alpaca_key_id
+            .as_ref()
+            .zip(secrets.alpaca_secret_key.as_ref())
+            .map(|(k, s)| {
+                polymarket_agent::us::orb::AlpacaBars::new(
+                    k.expose_secret().to_string(),
+                    s.expose_secret().to_string(),
+                    "sip".to_string(),
+                )
+            }),
+    );
+
+    // How high and how low each stock is likely to trade for the rest of today
+    // (display only). The usual range comes from SIP daily bars; today's U.S.
+    // bars from IEX, live on the free plan (SIP would be 15 minutes late).
+    let (range_scans, _range_scanner) = polymarket_agent::range_scanner::spawn_range_scanner(
+        upstox_feed.access_token.clone(),
+        secrets
+            .alpaca_key_id
+            .as_ref()
+            .zip(secrets.alpaca_secret_key.as_ref())
+            .map(|(k, s)| {
+                let bars = |feed: &str| {
+                    polymarket_agent::us::orb::AlpacaBars::new(
+                        k.expose_secret().to_string(),
+                        s.expose_secret().to_string(),
+                        feed.to_string(),
+                    )
+                };
+                polymarket_agent::range_scanner::UsBars {
+                    daily: bars("sip"),
+                    live: bars("iex"),
+                    live_note: "Live IEX prices (IEX trades only, so highs and lows can be a little narrower)"
+                        .to_string(),
+                }
+            }),
+        config.us_orb.symbols.clone(),
+    );
+
+    // Every U.S. headline as Alpaca publishes it (/api/us/news). No strategy acts on it yet.
+    let live_news = secrets
+        .alpaca_key_id
+        .as_ref()
+        .zip(secrets.alpaca_secret_key.as_ref())
+        .map(|(k, s)| {
+            polymarket_agent::us::news_stream::spawn_news_stream(
+                k.expose_secret().to_string(),
+                s.expose_secret().to_string(),
+                config.us_orb.symbols.clone(),
+            )
+            .0
+        });
+
     let dashboard_state = DashboardState::new(
         dashboard_store,
         health_state.clone(),
@@ -486,7 +875,54 @@ async fn run_agent(config: AppConfig, secrets: config::Secrets) -> Result<()> {
         config.valuation.model.clone(),
     )
     .with_upstox_feed(upstox_feed)
-    .with_alpaca_feed(alpaca_feed);
+    .with_alpaca_feed(alpaca_feed)
+    .with_range_scans(range_scans)
+    .with_target(config.target.clone())
+    .with_india_intraday_capital(config.india_strategy.intraday_capital_inr);
+    let dashboard_state = match live_news {
+        Some(news) => dashboard_state.with_live_news(news),
+        None => dashboard_state,
+    };
+    let dashboard_state = if config.india_strategy.runs_burst() {
+        dashboard_state.with_india_burst_capital(config.india_strategy.burst_capital_inr)
+    } else {
+        dashboard_state
+    };
+    let dashboard_state = if config.india_strategy.runs_gapgo() {
+        dashboard_state.with_india_gapgo_capital(config.india_strategy.gapgo_capital_inr)
+    } else {
+        dashboard_state
+    };
+    let dashboard_state = if config.uses_polymarket() {
+        dashboard_state.with_polymarket_capital(
+            config
+                .agent
+                .polymarket_capital_usd
+                .unwrap_or(config.agent.initial_paper_balance),
+        )
+    } else {
+        dashboard_state
+    };
+    let dashboard_state = match config
+        .us_orb
+        .capital_usd
+        .or(config.risk.us_capital_allocation_usd)
+    {
+        Some(capital) if config.us_orb.enabled => {
+            dashboard_state.with_us_book(capital, config.us_orb.capital_since)
+        }
+        _ => dashboard_state,
+    };
+    let dashboard_state = if config.us_options.enabled {
+        dashboard_state.with_us_options_capital(config.us_options.capital_usd)
+    } else {
+        dashboard_state
+    };
+    let dashboard_state = if config.crypto.enabled {
+        dashboard_state.with_crypto_capital(config.crypto.capital_usd)
+    } else {
+        dashboard_state
+    };
     let dashboard_handle = spawn_dashboard(
         dashboard_state,
         &config.monitoring.dashboard_bind,

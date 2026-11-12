@@ -254,6 +254,21 @@ impl Quote {
         }
     }
 
+    /// The price to judge a position or a signal by: the side that would be
+    /// crossed, unless the book is too wide for that side to mean anything,
+    /// when the last trade (or, without one, the midpoint) is the better
+    /// estimate. A hollow book's midpoint can be far off too: ABNB's was $5
+    /// under the market on 2 Nov 2026. Not a price to send as an exit limit,
+    /// which has to stay marketable.
+    pub fn fair_price(&self, side: Side) -> Decimal {
+        match self.spread_pct() {
+            Some(spread) if spread > WIDE_SPREAD => {
+                self.last.filter(|p| *p > Decimal::ZERO).unwrap_or(self.mid)
+            }
+            _ => self.taker_price(side),
+        }
+    }
+
     /// Depth levels that a taker order of this side consumes.
     pub fn levels_for_side(&self, side: Side) -> &[PriceLevel] {
         match (&self.book, side) {
@@ -307,18 +322,35 @@ pub enum TimeInForce {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OrderKind {
-    Limit { price: Decimal },
+    Limit {
+        price: Decimal,
+    },
     Market,
+    /// A stop-market order: rests at the venue and sells or buys at market
+    /// once the price trades through `price`. Alpaca only; other venues refuse.
+    Stop {
+        price: Decimal,
+    },
 }
 
 impl OrderKind {
     pub fn limit_price(&self) -> Option<Decimal> {
         match self {
             OrderKind::Limit { price } => Some(*price),
-            OrderKind::Market => None,
+            OrderKind::Market | OrderKind::Stop { .. } => None,
         }
     }
 }
+
+/// `client_order_id` prefix of a protective stop. Halting cancels what the
+/// agent has resting, but must leave these: a halted or stopped agent is
+/// exactly when an open position most needs a stop nobody has to watch.
+pub const PROTECTIVE_STOP_PREFIX: &str = "stop-";
+
+/// Spread, as a fraction of mid, past which one side of the book says little
+/// about the price. On 30 Oct 2026 IEX showed MSTR at 127.00 / 135.95 while it
+/// traded around 130.40.
+pub const WIDE_SPREAD: Decimal = rust_decimal_macros::dec!(0.01);
 
 /// An order to send to a venue.
 #[derive(Debug, Clone, PartialEq)]
@@ -581,6 +613,46 @@ mod tests {
         // Unknown is deliberately neither: it must be resolved by querying.
         assert!(!OrderState::Unknown.is_open());
         assert!(!OrderState::Unknown.is_terminal());
+    }
+
+    /// MSTR on IEX, 30 Oct 2026: traded near 130.40 with this book up, and was
+    /// valued at the 127 bid.
+    #[test]
+    fn a_wide_book_is_judged_at_the_mid_and_a_normal_one_at_the_touch() {
+        let quote = |bid: Decimal, ask: Decimal| Quote {
+            instrument: InstrumentId::new(VenueId::new("stub"), "MSTR"),
+            bid,
+            ask,
+            mid: (bid + ask) / Decimal::from(2),
+            last: None,
+            ts: Utc::now(),
+            book: None,
+        };
+        let wide = quote(Decimal::from(127), Decimal::new(13595, 2));
+        assert_eq!(wide.fair_price(Side::Sell), wide.mid);
+        assert_eq!(wide.fair_price(Side::Buy), wide.mid);
+
+        let normal = quote(Decimal::new(8370, 2), Decimal::new(8375, 2));
+        assert_eq!(normal.fair_price(Side::Sell), normal.bid);
+        assert_eq!(normal.fair_price(Side::Buy), normal.ask);
+    }
+
+    /// ABNB on 2 Nov 2026: IEX bid 156.75 / ask 168.57, last trade 168.11.
+    #[test]
+    fn a_hollow_book_is_judged_at_the_last_trade() {
+        let mut q = Quote {
+            instrument: InstrumentId::new(VenueId::new("stub"), "ABNB"),
+            bid: Decimal::new(15675, 2),
+            ask: Decimal::new(16857, 2),
+            mid: Decimal::new(16266, 2),
+            last: Some(Decimal::new(16811, 2)),
+            ts: Utc::now(),
+            book: None,
+        };
+        assert_eq!(q.fair_price(Side::Sell), Decimal::new(16811, 2));
+        assert_eq!(q.fair_price(Side::Buy), Decimal::new(16811, 2));
+        q.last = None;
+        assert_eq!(q.fair_price(Side::Sell), q.mid);
     }
 
     #[test]

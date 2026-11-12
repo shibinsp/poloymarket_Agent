@@ -32,8 +32,8 @@ use crate::valuation::fair_value::DataQuality;
 use crate::valuation::llm::LlmClient;
 use crate::venue::session::SessionKind;
 use crate::venue::types::{
-    AssetClass, Candle, CandleInterval, Instrument, OrderKind, OrderRequest, OrderState, Quote,
-    ScanFilter, Side, TimeInForce,
+    AssetClass, Candle, CandleInterval, Instrument, InstrumentId, OrderKind, OrderRequest,
+    OrderState, Quote, ScanFilter, Side, TimeInForce,
 };
 use crate::venue::{Venue, VenueRegistry};
 use rust_decimal_macros::dec;
@@ -141,11 +141,9 @@ impl VenueCycle<'_> {
 
         // Never place a second order for a symbol whose previous order hasn't
         // been resolved: that is how duplicate positions appear.
-        let busy: HashSet<String> = self
-            .store
-            .get_unresolved_orders()
-            .await?
-            .into_iter()
+        let unresolved_orders = self.store.get_unresolved_orders().await?;
+        let busy: HashSet<String> = unresolved_orders
+            .iter()
             .map(|o| format!("{}:{}", o.venue_id, o.symbol))
             .collect();
 
@@ -168,14 +166,61 @@ impl VenueCycle<'_> {
         // via PortfolioManager since the beginning.
         let mut balances: HashMap<String, Option<Decimal>> = HashMap::new();
         let all_open_trades = self.store.get_open_venue_trades().await?;
+        let open_symbols: HashSet<String> = all_open_trades
+            .iter()
+            .map(|t| format!("{}:{}", t.venue_id, t.symbol))
+            .collect();
         let mut venue_notional: HashMap<String, Decimal> = HashMap::new();
         let mut venue_positions: HashMap<String, usize> = HashMap::new();
+        let mut unknown_reserved_exposure: HashSet<String> = HashSet::new();
         for trade in &all_open_trades {
             let cost = trade.quantity * trade.avg_fill_price.unwrap_or(trade.entry_price);
             *venue_notional
                 .entry(trade.venue_id.clone())
                 .or_insert(Decimal::ZERO) += cost;
             *venue_positions.entry(trade.venue_id.clone()).or_insert(0) += 1;
+        }
+
+        // Reserve the unfilled part of every unresolved entry order. A pending
+        // order is a potential position even before its fill is reported.
+        // Unknown order size blocks further entries for that venue.
+        for order in &unresolved_orders {
+            if !order.side.eq_ignore_ascii_case("BUY")
+                || !order.intent.eq_ignore_ascii_case("ENTRY")
+            {
+                continue;
+            }
+
+            let qty = order.qty.parse::<Decimal>();
+            let filled = order.filled_qty.parse::<Decimal>();
+            let price = order
+                .limit_price
+                .as_deref()
+                .and_then(|value| value.parse::<Decimal>().ok());
+            let (Ok(qty), Ok(filled), Some(price)) = (qty, filled, price) else {
+                unknown_reserved_exposure.insert(order.venue_id.clone());
+                continue;
+            };
+            if qty <= Decimal::ZERO
+                || filled < Decimal::ZERO
+                || filled > qty
+                || price <= Decimal::ZERO
+            {
+                unknown_reserved_exposure.insert(order.venue_id.clone());
+                continue;
+            }
+            let remaining_qty = (qty - filled).max(Decimal::ZERO);
+            if remaining_qty.is_zero() {
+                continue;
+            }
+
+            *venue_notional
+                .entry(order.venue_id.clone())
+                .or_insert(Decimal::ZERO) += remaining_qty * price;
+            let key = format!("{}:{}", order.venue_id, order.symbol);
+            if !open_symbols.contains(&key) {
+                *venue_positions.entry(order.venue_id.clone()).or_insert(0) += 1;
+            }
         }
 
         // Account for any active Indian paper sandbox positions
@@ -215,10 +260,38 @@ impl VenueCycle<'_> {
                 outcome.skipped_unresolved += 1;
                 continue;
             }
+            if open_symbols.contains(&instrument.id.key()) {
+                info!(
+                    instrument = %instrument.id,
+                    "Position already open for this instrument — skipping duplicate entry"
+                );
+                continue;
+            }
+
+            // The alpaca venue also lists the ORB universe; the swing
+            // strategy scans only its own symbols.
+            let sma_symbols = &self.config.us_strategy.symbols;
+            if is_us_equity(&instrument)
+                && !sma_symbols.is_empty()
+                && !sma_symbols
+                    .iter()
+                    .any(|s| s.eq_ignore_ascii_case(instrument.symbol()))
+            {
+                continue;
+            }
 
             let Some(venue) = self.registry.get(instrument.venue()) else {
                 continue;
             };
+            let venue_key = venue.id().to_string();
+            if unknown_reserved_exposure.contains(&venue_key) {
+                warn!(
+                    venue = %venue.id(),
+                    instrument = %instrument.id,
+                    "Unresolved entry has no safe notional estimate; blocking new entries for this venue"
+                );
+                continue;
+            }
 
             // Intraday equity session cutoff check: block new entries 30 mins before market close
             if matches!(instrument.asset_class, AssetClass::Equity)
@@ -268,20 +341,75 @@ impl VenueCycle<'_> {
                 continue;
             }
 
-            let venue_key = venue.id().to_string();
             let cur_notional = venue_notional
                 .get(&venue_key)
                 .copied()
                 .unwrap_or(Decimal::ZERO);
             let cur_positions = venue_positions.get(&venue_key).copied().unwrap_or(0);
 
-            if let Some(reason) =
+            let us_equity = is_us_equity(&instrument);
+            if us_equity {
+                if let Some(limit) = self.config.risk.us_max_trades_per_day {
+                    let trades_today = match self
+                        .store
+                        .count_venue_equity_entries_opened_on("alpaca", now.date_naive())
+                        .await
+                    {
+                        Ok(count) => count,
+                        Err(error) => {
+                            warn!(%error, "Could not read today's U.S. equity trade count; blocking stock entries");
+                            continue;
+                        }
+                    };
+                    if trades_today >= limit {
+                        info!(
+                            instrument = %instrument.id,
+                            trades_today,
+                            limit,
+                            "U.S. equity daily entry limit reached"
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            let exposure_base = if us_equity {
+                let tracked_capital = bankroll + cur_notional;
+                self.config
+                    .risk
+                    .us_capital_allocation_usd
+                    .unwrap_or(tracked_capital)
+                    .min(tracked_capital)
+            } else {
+                bankroll
+            };
+            let max_exposure_pct = if us_equity {
+                self.config
+                    .risk
+                    .us_max_exposure_pct
+                    .unwrap_or(self.config.risk.max_total_exposure_pct)
+            } else {
+                self.config.risk.max_total_exposure_pct
+            };
+
+            let block_reason = if us_equity {
+                portfolio_block_with_limits(
+                    cur_notional,
+                    cur_positions,
+                    exposure_base,
+                    max_exposure_pct,
+                    self.config.risk.max_positions_per_category as usize,
+                )
+            } else {
                 portfolio_block(cur_notional, cur_positions, bankroll, &self.config.risk)
-            {
+            };
+            if let Some(reason) = block_reason {
                 info!(
                     venue = %venue.id(),
                     open_notional = %cur_notional,
                     open_positions = cur_positions,
+                    exposure_base = %exposure_base,
+                    max_exposure_pct = %max_exposure_pct,
                     reason,
                     "No further entries for venue this cycle"
                 );
@@ -336,6 +464,46 @@ impl VenueCycle<'_> {
         Ok(outcome)
     }
 
+    /// Why the broad market forbids a new SMA long right now, or `None`.
+    /// Any failure to load or validate the proxy's bars blocks the entry.
+    async fn sma_regime_rejection(
+        &self,
+        venue: &dyn Venue,
+        instrument: &Instrument,
+        now: DateTime<Utc>,
+    ) -> Option<String> {
+        let strategy = &self.config.us_strategy;
+        let period = strategy.regime_sma_period;
+        if period == 0 {
+            return None;
+        }
+        let proxy = InstrumentId::new(instrument.venue().clone(), strategy.regime_symbol.clone());
+        let bars = match venue.candles(&proxy, CandleInterval::D1, period + 30).await {
+            Ok(bars) => bars,
+            Err(e) => {
+                return Some(format!(
+                    "could not load {} bars: {e:#}",
+                    strategy.regime_symbol
+                ))
+            }
+        };
+        let completed: Vec<Candle> = bars
+            .into_iter()
+            .filter(|c| c.ts + Duration::hours(24) <= now)
+            .collect();
+        if let Err(e) = crate::us::sma_crossover::validate_daily_candles(
+            &strategy.regime_symbol,
+            &completed,
+            now,
+            period,
+            crate::us::sma_crossover::MAX_PERMISSIBLE_STALE_DAYS,
+        ) {
+            return Some(e.to_string());
+        }
+        let closes: Vec<Decimal> = completed.iter().map(|c| c.close).collect();
+        crate::us::sma_crossover::regime_rejection(&closes, period)
+    }
+
     async fn evaluate_instrument(
         &self,
         venue: &dyn Venue,
@@ -350,14 +518,117 @@ impl VenueCycle<'_> {
     ) -> Result<EvaluationResult> {
         let quote = venue.quote(&instrument.id).await?;
 
-        // Enough bars for the ATR window plus its seed bar.
-        let wanted = self.config.sizing_continuous.atr_period + 1;
-        let candles = venue
-            .candles(&instrument.id, CandleInterval::H1, wanted.max(50))
-            .await
-            .unwrap_or_default();
+        let is_us_equity = is_us_equity(instrument);
+        if quote.bid <= Decimal::ZERO
+            || quote.ask <= Decimal::ZERO
+            || quote.mid <= Decimal::ZERO
+            || quote.ask < quote.bid
+        {
+            warn!(instrument = %instrument.id, "Invalid or crossed quote; blocking entry");
+            return Ok(EvaluationResult {
+                cost: Decimal::ZERO,
+                notional: Decimal::ZERO,
+                placed: false,
+            });
+        }
+        if is_us_equity {
+            let max_age = self.config.risk.us_max_quote_age_seconds.unwrap_or(120);
+            if max_age == 0 || max_age > 86_400 {
+                warn!(
+                    instrument = %instrument.id,
+                    max_age_seconds = max_age,
+                    "Invalid U.S. quote-age limit; blocking stock entry"
+                );
+                return Ok(EvaluationResult {
+                    cost: Decimal::ZERO,
+                    notional: Decimal::ZERO,
+                    placed: false,
+                });
+            }
+            // The clock now, not the cycle's start: `ctx.now` is minutes old by
+            // the end of a scan over the whole universe, which made every fresh
+            // quote look like it came from the future.
+            let quote_age = Utc::now().signed_duration_since(quote.ts);
+            if quote_age < Duration::seconds(-5) || quote_age > Duration::seconds(max_age as i64) {
+                info!(
+                    instrument = %instrument.id,
+                    quote_at = %quote.ts,
+                    quote_age_seconds = quote_age.num_seconds(),
+                    max_age_seconds = max_age,
+                    "Quote is stale or timestamped in the future; blocking stock entry"
+                );
+                return Ok(EvaluationResult {
+                    cost: Decimal::ZERO,
+                    notional: Decimal::ZERO,
+                    placed: false,
+                });
+            }
+        }
+        let use_us_paper_strategy = is_us_equity && self.config.agent.mode == AgentMode::Paper;
+        let is_sma_crossover = self
+            .config
+            .us_strategy
+            .strategy
+            .eq_ignore_ascii_case("sma_crossover");
 
-        let (view, cost) = if let Some(llm) = llm {
+        let candles = if use_us_paper_strategy && is_sma_crossover {
+            // Daily candles for 20-day / 50-day SMA crossover (need >= 51 completed daily bars)
+            venue
+                .candles(&instrument.id, CandleInterval::D1, 65)
+                .await
+                .unwrap_or_default()
+        } else {
+            // Enough bars for the ATR window plus its seed bar.
+            let wanted = self.config.sizing_continuous.atr_period + 1;
+            venue
+                .candles(&instrument.id, CandleInterval::H1, wanted.max(50))
+                .await
+                .unwrap_or_default()
+        };
+
+        // US equities use an explicit, auditable technical rule set in paper
+        // mode. The former generic LLM view repeatedly selected thin, low-
+        // priced names and its short paper record is not enough to establish
+        // an edge. Keep this candidate paper-only while it gathers evidence.
+        let (view, cost) = if use_us_paper_strategy {
+            if is_sma_crossover {
+                let completed_daily: Vec<Candle> = candles
+                    .iter()
+                    .filter(|candle| candle.ts + Duration::hours(24) <= ctx.now)
+                    .cloned()
+                    .collect();
+
+                let sma_cfg = crate::us::sma_crossover::SmaCrossoverConfig {
+                    fast_sma_period: self.config.us_strategy.fast_sma_period,
+                    slow_sma_period: self.config.us_strategy.slow_sma_period,
+                    moving_average_type: self.config.us_strategy.moving_average_type.clone(),
+                    min_history_bars: crate::us::sma_crossover::MINIMUM_REQUIRED_DAILY_BARS,
+                    max_stale_days: crate::us::sma_crossover::MAX_PERMISSIBLE_STALE_DAYS,
+                    entry_filters: self.config.us_strategy.sma_entry_filters(),
+                };
+
+                (
+                    crate::us::sma_crossover::generate_sma_crossover_view(
+                        instrument,
+                        &quote,
+                        &completed_daily,
+                        ctx.now,
+                        &sma_cfg,
+                    ),
+                    Decimal::ZERO,
+                )
+            } else {
+                let completed_candles: Vec<Candle> = candles
+                    .iter()
+                    .filter(|candle| candle.ts + Duration::hours(1) <= ctx.now)
+                    .cloned()
+                    .collect();
+                (
+                    generate_us_momentum_view(instrument, &quote, &completed_candles),
+                    Decimal::ZERO,
+                )
+            }
+        } else if let Some(llm) = llm {
             let system = build_system_prompt();
             let user = build_user_prompt(instrument, &quote, &candles, &[]);
             match llm.complete(&system, &user, Some(ctx.cycle)).await {
@@ -395,23 +666,70 @@ impl VenueCycle<'_> {
         // The venue's own fee. Charging every venue the highest fee among
         // them made a cheap venue's edge look unprofitable and stopped it
         // trading at all.
-        let fee_pct = self.config.venue_fee_pct(venue.id().as_str());
-        let cost_to_trade =
-            directional::round_trip_cost(&quote, fee_pct, self.config.execution.max_slippage_pct);
+        let configured_fee_pct = self.config.venue_fee_pct(venue.id().as_str());
+        let fee_pct = effective_venue_fee_pct(use_us_paper_strategy, configured_fee_pct);
+        let estimated_slippage_pct = if use_us_paper_strategy {
+            // Use a modest 10-basis-point round-trip estimate for the liquid
+            // names this paper candidate permits. Replace this estimate with
+            // measured fill slippage once the paper sample is meaningful.
+            dec!(0.001)
+        } else {
+            self.config.execution.max_slippage_pct
+        };
+        let cost_to_trade = directional::round_trip_cost(&quote, fee_pct, estimated_slippage_pct);
 
-        if !directional::should_trade(
-            &view,
-            cost_to_trade,
-            self.config.min_p_up(),
-            self.config.valuation.min_edge_threshold,
-        ) {
+        let edge_threshold = if use_us_paper_strategy {
+            // A 1.5% net hurdle is intentionally above estimated spread,
+            // venue fees and slippage, while remaining reachable for an
+            // hourly equity move. This is a paper-only candidate threshold.
+            dec!(0.015)
+        } else {
+            self.config.valuation.min_edge_threshold
+        };
+        let is_sma_golden_cross = use_us_paper_strategy
+            && is_sma_crossover
+            && view.direction == Direction::Long
+            && view
+                .key_factors
+                .iter()
+                .any(|factor| factor == "action:LONG_ENTRY_GOLDEN_CROSS");
+        // The regime check needs the market proxy's bars, so it runs only on
+        // the rare bar that already carries a confirmed golden cross.
+        let regime_block = if is_sma_golden_cross {
+            self.sma_regime_rejection(venue, instrument, ctx.now).await
+        } else {
+            None
+        };
+        if let Some(reason) = &regime_block {
+            info!(
+                instrument = %instrument.id,
+                reason = %reason,
+                "Golden cross blocked by the market-regime filter"
+            );
+        }
+        let trade_allowed = if use_us_paper_strategy && is_sma_crossover {
+            // A crossover is the strategy's entry rule; it supplies no return
+            // forecast to satisfy the generic model edge gate. Require the
+            // explicit golden-cross event and reject unusually wide quotes.
+            is_sma_golden_cross
+                && regime_block.is_none()
+                && view.data_quality != DataQuality::Low
+                && quote
+                    .spread_pct()
+                    .map(|spread| spread <= self.config.execution.max_slippage_pct)
+                    .unwrap_or(false)
+                && estimated_slippage_pct <= self.config.execution.max_slippage_pct
+        } else {
+            directional::should_trade(&view, cost_to_trade, self.config.min_p_up(), edge_threshold)
+        };
+        if !trade_allowed {
             info!(
                 instrument = %instrument.id,
                 direction = ?view.direction,
                 p_up = %view.p_up,
                 expected_return = %view.expected_return_pct,
                 round_trip_cost = %cost_to_trade,
-                "No tradeable edge"
+                "Entry signal or execution-cost checks did not pass"
             );
             return Ok(EvaluationResult {
                 cost,
@@ -421,7 +739,7 @@ impl VenueCycle<'_> {
         }
 
         let price = quote.taker_price(Side::Buy);
-        let sizing = size_position(
+        let mut sizing = size_position(
             &SizeInputs {
                 instrument,
                 probability: view.p_up,
@@ -441,6 +759,97 @@ impl VenueCycle<'_> {
             &self.config.risk,
             &self.config.sizing_continuous,
         );
+
+        if is_us_equity
+            && sizing.should_trade()
+            && sizing
+                .stop_pct
+                .map(|stop| stop <= Decimal::ZERO)
+                .unwrap_or(true)
+        {
+            warn!(instrument = %instrument.id, "No valid protective stop distance; blocking stock entry");
+            return Ok(EvaluationResult {
+                cost,
+                notional: Decimal::ZERO,
+                placed: false,
+            });
+        }
+
+        if sizing.should_trade() {
+            let us_equity = is_us_equity;
+            let capital_base = if us_equity {
+                let tracked_capital = bankroll + open_notional;
+                self.config
+                    .risk
+                    .us_capital_allocation_usd
+                    .unwrap_or(tracked_capital)
+                    .min(tracked_capital)
+            } else {
+                bankroll
+            };
+            let max_position_pct = if us_equity {
+                self.config
+                    .risk
+                    .us_max_position_pct
+                    .unwrap_or(self.config.risk.max_position_pct)
+            } else {
+                self.config.risk.max_position_pct
+            };
+            let max_exposure_pct = if us_equity {
+                self.config
+                    .risk
+                    .us_max_exposure_pct
+                    .unwrap_or(self.config.risk.max_total_exposure_pct)
+            } else {
+                self.config.risk.max_total_exposure_pct
+            };
+            let cash_buffer_pct = if us_equity {
+                self.config.risk.us_cash_buffer_pct.unwrap_or(Decimal::ZERO)
+            } else {
+                Decimal::ZERO
+            };
+            if capital_base <= Decimal::ZERO
+                || max_position_pct <= Decimal::ZERO
+                || max_position_pct > Decimal::ONE
+                || max_exposure_pct <= Decimal::ZERO
+                || max_exposure_pct > Decimal::ONE
+                || cash_buffer_pct < Decimal::ZERO
+                || cash_buffer_pct >= Decimal::ONE
+            {
+                warn!(instrument = %instrument.id, "Invalid pre-trade risk limits; blocking entry");
+                return Ok(EvaluationResult {
+                    cost,
+                    notional: Decimal::ZERO,
+                    placed: false,
+                });
+            }
+
+            // Clamp the order to the remaining portfolio exposure, the per-
+            // position limit, and free cash after preserving the cash buffer.
+            let exposure_room =
+                (capital_base * max_exposure_pct - open_notional).max(Decimal::ZERO);
+            let cash_room = bankroll * (Decimal::ONE - cash_buffer_pct);
+            let max_order_notional = (capital_base * max_position_pct)
+                .min(exposure_room)
+                .min(cash_room);
+            sizing.position_usd = sizing.position_usd.min(max_order_notional);
+            if let Some(stop_pct) = sizing.stop_pct {
+                sizing.risk_pct = Some(sizing.position_usd * stop_pct / capital_base);
+            }
+            if sizing.position_usd < self.config.risk.min_position_usd {
+                info!(
+                    instrument = %instrument.id,
+                    allowed_notional = %sizing.position_usd,
+                    min_position = %self.config.risk.min_position_usd,
+                    "Pre-trade caps leave less than the minimum order size"
+                );
+                return Ok(EvaluationResult {
+                    cost,
+                    notional: Decimal::ZERO,
+                    placed: false,
+                });
+            }
+        }
 
         if !sizing.should_trade() {
             info!(
@@ -475,6 +884,19 @@ impl VenueCycle<'_> {
                 notional: Decimal::ZERO,
                 placed: false,
             });
+        }
+        // Quantity rounding must never push a fractional-share order above
+        // the dollar limits that were checked above.
+        if qty * limit_price > sizing.position_usd {
+            qty = instrument.round_qty(sizing.position_usd / limit_price);
+            if qty <= Decimal::ZERO || qty * limit_price > sizing.position_usd {
+                info!(instrument = %instrument.id, "Rounded quantity would exceed pre-trade notional limits");
+                return Ok(EvaluationResult {
+                    cost,
+                    notional: Decimal::ZERO,
+                    placed: false,
+                });
+            }
         }
 
         // Strict Capital Allocation Guard: Indian Paper & US Market isolations
@@ -746,6 +1168,8 @@ impl VenueCycle<'_> {
                 horizon_hours: Some(view.horizon_hours),
                 client_order_id: Some(client_order_id.clone()),
                 venue_order_id: ack.map(|a| a.venue_order_id.clone()),
+                strategy: (use_us_paper_strategy && is_sma_crossover)
+                    .then(|| "sma_crossover".to_string()),
             })
             .await?;
 
@@ -832,6 +1256,251 @@ impl VenueCycle<'_> {
             notional: qty * limit_price,
             placed: true,
         })
+    }
+}
+
+/// Upgraded US Adaptive Momentum & Pullback Rebound Strategy for cash equities:
+/// 1. Excludes sub-dollar microcaps (< $1.00) and excessive spreads while permitting
+///    active, liquid growth equities (e.g. SOFI, NOK, PLUG, LCID, NIO).
+/// 2. Accepts TWO high-expectancy setups:
+///    - Confirmed Resistance Breakout: Bullish trend (Fast SMA > Slow SMA), price
+///      breaking above prior 10-bar resistance with confirming volume (>= 1.0x avg)
+///      and healthy RSI (45-72).
+///    - Pullback Rebound (Mean Reversion in Trend): Strong established uptrend
+///      (Fast SMA >= Slow SMA, Close > Slow SMA), price pulling back near Fast SMA
+///      (within 2%), green reversal candle (close >= open), RSI in sweet spot (40-68),
+///      and steady volume.
+/// 3. Invalidation stop is placed at support (-1.5%), with a +2.2% to +2.5% profit target.
+fn generate_us_momentum_view(
+    instrument: &Instrument,
+    quote: &Quote,
+    candles: &[Candle],
+) -> DirectionalView {
+    let flat = |reason: String, factor: &str| DirectionalView {
+        direction: Direction::Flat,
+        p_up: dec!(0.50),
+        expected_return_pct: Decimal::ZERO,
+        horizon_hours: 24,
+        confidence: dec!(0.50),
+        invalidation_price: None,
+        target_price: None,
+        reasoning_summary: reason,
+        key_factors: vec![factor.to_string()],
+        data_quality: DataQuality::Medium,
+    };
+
+    // 1. Exclude sub-dollar microcaps (< $1.00) to protect against extreme illiquidity
+    if quote.mid < dec!(1.0) {
+        return flat(
+            format!(
+                "Skipping {}: US paper strategy excludes microcaps below $1.00",
+                instrument.symbol()
+            ),
+            "price_floor",
+        );
+    }
+
+    // 2. Spread filter: allow up to 0.50% for lower-priced stocks ($1-$10) due to 1-cent ticks,
+    // and 0.25% for larger liquid equities.
+    let max_spread = if quote.mid < dec!(10.0) {
+        dec!(0.0050)
+    } else {
+        dec!(0.0025)
+    };
+    if quote
+        .spread_pct()
+        .map(|spread| spread > max_spread)
+        .unwrap_or(true)
+    {
+        return flat(
+            format!(
+                "Skipping {}: quote spread is missing or exceeds limit ({:.2}%)",
+                instrument.symbol(),
+                max_spread * dec!(100.0)
+            ),
+            "spread_filter",
+        );
+    }
+
+    // 3. Minimum history: at least 20 completed hourly bars
+    if candles.len() < 20 {
+        return flat(
+            format!(
+                "Skipping {}: need 20 completed hourly bars, got {}",
+                instrument.symbol(),
+                candles.len()
+            ),
+            "insufficient_history",
+        );
+    }
+
+    let n = candles.len();
+    let fast_sma = candles[n - 10..]
+        .iter()
+        .map(|candle| candle.close)
+        .sum::<Decimal>()
+        / dec!(10.0);
+    let slow_window = 30.min(n);
+    let slow_sma = candles[n - slow_window..]
+        .iter()
+        .map(|candle| candle.close)
+        .sum::<Decimal>()
+        / Decimal::from(slow_window);
+    let prior_resistance = candles[n - 11..n - 1]
+        .iter()
+        .map(|candle| candle.high)
+        .max()
+        .unwrap_or(Decimal::ZERO);
+    let vol_window = 20.min(n - 1);
+    let average_volume = candles[n - 1 - vol_window..n - 1]
+        .iter()
+        .map(|candle| candle.volume)
+        .sum::<Decimal>()
+        / Decimal::from(vol_window);
+    let latest = &candles[n - 1];
+
+    let mut gains = Decimal::ZERO;
+    let mut losses = Decimal::ZERO;
+    for index in (n - 14)..n {
+        let change = candles[index].close - candles[index - 1].close;
+        if change > Decimal::ZERO {
+            gains += change;
+        } else {
+            losses += change.abs();
+        }
+    }
+    let rsi = if losses.is_zero() && gains.is_zero() {
+        dec!(50.0)
+    } else if losses.is_zero() {
+        dec!(100.0)
+    } else if gains.is_zero() {
+        dec!(0.0)
+    } else {
+        let relative_strength = gains / losses;
+        dec!(100.0) - (dec!(100.0) / (Decimal::ONE + relative_strength))
+    };
+
+    // Overbought filter: reject if RSI > 72 (exhaustion risk)
+    if rsi > dec!(72.0) {
+        return flat(
+            format!(
+                "Skipping {}: overbought conditions (RSI {:.1} > 72)",
+                instrument.symbol(),
+                rsi
+            ),
+            "momentum_filters_not_met",
+        );
+    }
+
+    // Macro trend: overall uptrend required
+    let uptrend = fast_sma > slow_sma;
+    if !uptrend {
+        return flat(
+            format!(
+                "Skipping {}: SMA10 <= SMA{} downtrend/choppy regime",
+                instrument.symbol(),
+                slow_window
+            ),
+            "momentum_filters_not_met",
+        );
+    }
+
+    // SETUP 1: Confirmed Resistance Breakout
+    let breakout_confirmed = latest.close > prior_resistance;
+    let breakout_volume_confirmed =
+        average_volume > Decimal::ZERO && latest.volume >= average_volume * dec!(1.0);
+    let breakout_rsi_confirmed = rsi >= dec!(45.0) && rsi <= dec!(72.0);
+    let is_breakout = breakout_confirmed
+        && breakout_volume_confirmed
+        && breakout_rsi_confirmed
+        && latest.close > fast_sma;
+
+    // SETUP 2: Pullback Rebound in Trend
+    let pullback_near_sma = latest.close >= fast_sma * dec!(0.985);
+    let green_bounce = latest.close >= latest.open;
+    let pullback_rsi_confirmed = rsi >= dec!(40.0) && rsi <= dec!(68.0);
+    let pullback_volume_confirmed =
+        average_volume.is_zero() || latest.volume >= average_volume * dec!(0.70);
+    let is_pullback_rebound =
+        pullback_near_sma && green_bounce && pullback_rsi_confirmed && pullback_volume_confirmed;
+
+    if !is_breakout && !is_pullback_rebound {
+        let reason = format!(
+            "Skipping {}: neither breakout (close > {:.2}, vol >= {:.0}) nor pullback rebound (close >= open near SMA {:.2}) confirmed (RSI {:.1})",
+            instrument.symbol(),
+            prior_resistance,
+            average_volume,
+            fast_sma,
+            rsi
+        );
+        return flat(reason, "momentum_filters_not_met");
+    }
+
+    let entry = quote.mid;
+    let (expected_return, conf, p_up, target, factors, summary) = if is_breakout {
+        (
+            dec!(0.025),
+            dec!(0.65),
+            dec!(0.58),
+            entry * dec!(1.025),
+            vec![
+                "hourly_trend".to_string(),
+                "resistance_breakout".to_string(),
+                "relative_volume".to_string(),
+                "rsi_range".to_string(),
+            ],
+            format!(
+                "US hourly breakout candidate for {}: price above SMA10 > SMA{}, broke prior resistance on confirming volume, RSI {:.1}",
+                instrument.symbol(),
+                slow_window,
+                rsi
+            ),
+        )
+    } else {
+        (
+            dec!(0.025),
+            dec!(0.68),
+            dec!(0.60),
+            entry * dec!(1.022),
+            vec![
+                "hourly_trend".to_string(),
+                "pullback_support".to_string(),
+                "reversal_candle".to_string(),
+                "rsi_range".to_string(),
+            ],
+            format!(
+                "US hourly pullback rebound candidate for {}: uptrend SMA10 > SMA{}, bounced at support with green candle, RSI {:.1}",
+                instrument.symbol(),
+                slow_window,
+                rsi
+            ),
+        )
+    };
+
+    DirectionalView {
+        direction: Direction::Long,
+        p_up,
+        expected_return_pct: expected_return,
+        horizon_hours: 24,
+        confidence: conf,
+        invalidation_price: Some(entry * dec!(0.985)),
+        target_price: Some(target),
+        reasoning_summary: summary,
+        key_factors: factors,
+        data_quality: DataQuality::Medium,
+    }
+}
+
+/// The generic venue fee is configured for prediction-market taker fees.
+/// Standard Alpaca self-directed equity API orders are commission-free, so
+/// do not apply that unrelated per-side fee to the US paper strategy. Spread
+/// and slippage are still charged by `round_trip_cost`; regulatory sell fees
+/// remain a small modeling limitation.
+fn effective_venue_fee_pct(use_us_paper_strategy: bool, configured_fee_pct: Decimal) -> Decimal {
+    if use_us_paper_strategy {
+        Decimal::ZERO
+    } else {
+        configured_fee_pct
     }
 }
 
@@ -1025,13 +1694,39 @@ fn portfolio_block(
     bankroll: Decimal,
     risk: &crate::config::RiskConfig,
 ) -> Option<&'static str> {
-    if open_notional >= bankroll * risk.max_total_exposure_pct || open_notional >= bankroll {
+    portfolio_block_with_limits(
+        open_notional,
+        open_positions,
+        bankroll,
+        risk.max_total_exposure_pct,
+        risk.max_positions_per_category as usize,
+    )
+}
+
+fn portfolio_block_with_limits(
+    open_notional: Decimal,
+    open_positions: usize,
+    exposure_base: Decimal,
+    max_exposure_pct: Decimal,
+    max_positions: usize,
+) -> Option<&'static str> {
+    if exposure_base <= Decimal::ZERO
+        || max_exposure_pct <= Decimal::ZERO
+        || open_notional >= exposure_base * max_exposure_pct
+        || open_notional >= exposure_base
+    {
         return Some("total exposure is at its cap");
     }
-    if open_positions >= risk.max_positions_per_category as usize {
+    if open_positions >= max_positions {
         return Some("at the open-position limit");
     }
     None
+}
+
+fn is_us_equity(instrument: &Instrument) -> bool {
+    instrument.asset_class == AssetClass::Equity
+        && instrument.quote_ccy.eq_ignore_ascii_case("USD")
+        && instrument.venue().as_str() == "alpaca"
 }
 
 /// Whether an order must carry the extended-hours flag.
@@ -1255,6 +1950,304 @@ mod tests {
     fn app_config() -> AppConfig {
         let toml = std::fs::read_to_string("config/default.toml").unwrap();
         toml::from_str(&toml).unwrap()
+    }
+
+    fn us_equity(symbol: &str) -> Instrument {
+        Instrument {
+            id: InstrumentId::new(VenueId::new("alpaca"), symbol),
+            asset_class: AssetClass::Equity,
+            display_name: symbol.to_string(),
+            quote_ccy: "USD".to_string(),
+            tick_size: Some(dec!(0.01)),
+            lot_size: None,
+            min_notional: None,
+            min_qty: None,
+            fractional: true,
+            meta: InstrumentMeta::Equity {
+                exchange: "NASDAQ".to_string(),
+            },
+        }
+    }
+
+    fn us_quote(mid: Decimal, spread: Decimal) -> Quote {
+        Quote {
+            instrument: InstrumentId::new(VenueId::new("alpaca"), "SPY"),
+            bid: mid - spread / dec!(2.0),
+            ask: mid + spread / dec!(2.0),
+            mid,
+            last: Some(mid),
+            ts: Utc::now(),
+            book: None,
+        }
+    }
+
+    fn us_breakout_candles() -> Vec<Candle> {
+        let now = Utc::now();
+        let mut candles: Vec<Candle> = (0..40)
+            .map(|i| {
+                let drift = Decimal::from(i) * dec!(0.12);
+                let oscillation = if i % 2 == 0 { dec!(0.4) } else { dec!(-0.4) };
+                let close = dec!(100.0) + drift + oscillation;
+                Candle {
+                    ts: now - Duration::hours((40 - i) as i64),
+                    open: close - dec!(0.2),
+                    high: close + dec!(0.15),
+                    low: close - dec!(0.15),
+                    close,
+                    volume: dec!(1000),
+                }
+            })
+            .collect();
+        let prior_high = candles[29..39]
+            .iter()
+            .map(|candle| candle.high)
+            .max()
+            .unwrap();
+        let close = prior_high + dec!(0.2);
+        let latest = candles.last_mut().unwrap();
+        latest.open = close - dec!(0.5);
+        latest.high = close + dec!(0.05);
+        latest.low = latest.open - dec!(0.05);
+        latest.close = close;
+        latest.volume = dec!(1200);
+        candles
+    }
+
+    #[test]
+    fn us_paper_strategy_accepts_confirmed_liquid_breakout() {
+        let candles = us_breakout_candles();
+        let instrument = us_equity("SPY");
+        let quote = us_quote(candles.last().unwrap().close, dec!(0.12));
+
+        let view = generate_us_momentum_view(&instrument, &quote, &candles);
+
+        assert_eq!(view.direction, Direction::Long);
+        assert_eq!(view.expected_return_pct, dec!(0.025));
+        assert!(view.invalidation_price.unwrap() < quote.mid);
+        assert!(view.target_price.unwrap() > quote.mid);
+
+        // US Alpaca paper cost model: zero commission, spread + 10-bps slippage.
+        // The configured 25-bps fee (prediction-market taker fee) must NOT be
+        // charged here — Alpaca equity orders are commission-free.
+        let paper_fee = effective_venue_fee_pct(/*use_us_paper_strategy=*/ true, dec!(0.0025));
+        assert_eq!(
+            paper_fee,
+            Decimal::ZERO,
+            "commission must be zero on the US paper path"
+        );
+        let round_trip_cost = directional::round_trip_cost(&quote, paper_fee, dec!(0.001));
+
+        // The net edge still clears the 1.5% hurdle after paying spread and slippage.
+        assert!(
+            directional::should_trade(&view, round_trip_cost, dec!(0.55), dec!(0.015)),
+            "a valid breakout must clear the edge threshold after spread + slippage \
+             (cost {round_trip_cost}, view {view:?})"
+        );
+    }
+
+    /// Alpaca self-directed equity API accounts charge zero commission.
+    /// The generic `fee_pct` in `VenueConfig` exists for prediction-market
+    /// taker fees (25 bps per side); applying it to commission-free equity
+    /// orders overstates costs and incorrectly rejects qualifying paper trades.
+    ///
+    /// This tests both branches of `effective_venue_fee_pct`:
+    ///   • US Alpaca paper path  → zero commission (fee is waived)
+    ///   • All other cases       → the configured fee is passed through unchanged
+    #[test]
+    fn alpaca_paper_commission_is_zero_other_venues_keep_their_configured_fee() {
+        // US Alpaca paper: commission is waived regardless of what fee_pct is
+        // configured.  Even a non-default value must be zeroed out.
+        assert_eq!(
+            effective_venue_fee_pct(true, dec!(0.0025)),
+            Decimal::ZERO,
+            "US Alpaca paper path must carry zero commission"
+        );
+        assert_eq!(
+            effective_venue_fee_pct(true, dec!(0.01)),
+            Decimal::ZERO,
+            "any configured fee must be zeroed on the US paper path"
+        );
+
+        // Any other venue or mode: the configured fee is returned unchanged.
+        assert_eq!(
+            effective_venue_fee_pct(false, dec!(0.0025)),
+            dec!(0.0025),
+            "non-paper or non-Alpaca path must keep the configured fee"
+        );
+        assert_eq!(
+            effective_venue_fee_pct(false, Decimal::ZERO),
+            Decimal::ZERO,
+            "a zero fee on another venue stays zero"
+        );
+    }
+
+    /// Even though commission is zero on the Alpaca paper path, spread and the
+    /// 10-basis-point round-trip slippage estimate are still included in the
+    /// cost calculation.  A live or non-Alpaca venue adds its configured fee
+    /// on top of those same components.
+    #[test]
+    fn alpaca_paper_cost_includes_spread_and_slippage_but_not_commission() {
+        use crate::valuation::directional;
+
+        let mid = dec!(100.0);
+        let spread = dec!(0.20); // bid 99.90 / ask 100.10 — 0.20% spread
+        let quote = us_quote(mid, spread);
+
+        // US paper path: fee = 0, slippage = 10 bps
+        let paper_fee = effective_venue_fee_pct(true, dec!(0.0025));
+        let paper_slippage = dec!(0.001); // 10 bps
+        let paper_cost = directional::round_trip_cost(&quote, paper_fee, paper_slippage);
+
+        // Generic / live path: fee = 25 bps per side, same slippage
+        let generic_fee = effective_venue_fee_pct(false, dec!(0.0025));
+        let generic_cost = directional::round_trip_cost(&quote, generic_fee, paper_slippage);
+
+        // Paper cost is positive — spread and slippage are not zeroed.
+        assert!(
+            paper_cost > Decimal::ZERO,
+            "spread and slippage must contribute to the paper cost (got {paper_cost})"
+        );
+
+        // Generic cost is higher than paper because it includes the 25-bps
+        // commission; the difference equals two sides of commission.
+        assert!(
+            generic_cost > paper_cost,
+            "live/other-venue cost must exceed paper cost by at least the commission \
+             (paper {paper_cost}, generic {generic_cost})"
+        );
+    }
+
+    #[test]
+    fn us_paper_strategy_rejects_penny_stocks_and_wide_spreads() {
+        let candles = us_breakout_candles();
+        let penny_stock = us_equity("PLUG");
+        let cheap_quote = us_quote(dec!(0.50), dec!(0.01));
+        let cheap_view = generate_us_momentum_view(&penny_stock, &cheap_quote, &candles);
+        assert_eq!(cheap_view.direction, Direction::Flat);
+        assert_eq!(cheap_view.key_factors, vec!["price_floor"]);
+
+        let liquid_stock = us_equity("SPY");
+        let mid = candles.last().unwrap().close;
+        let wide_quote = us_quote(mid, mid * dec!(0.01));
+        let wide_view = generate_us_momentum_view(&liquid_stock, &wide_quote, &candles);
+        assert_eq!(wide_view.direction, Direction::Flat);
+        assert_eq!(wide_view.key_factors, vec!["spread_filter"]);
+    }
+
+    #[test]
+    fn us_paper_strategy_accepts_liquid_growth_stocks_above_one_dollar() {
+        let candles = us_breakout_candles();
+        let growth_stock = us_equity("SOFI");
+        let quote = us_quote(dec!(9.20), dec!(0.02));
+        let view = generate_us_momentum_view(&growth_stock, &quote, &candles);
+        assert_eq!(view.direction, Direction::Long);
+        assert_eq!(view.expected_return_pct, dec!(0.025));
+    }
+
+    #[test]
+    fn us_paper_strategy_accepts_pullback_rebound_in_uptrend() {
+        let mut candles = us_breakout_candles();
+        let n = candles.len();
+        let fast_sma = candles[n - 10..].iter().map(|c| c.close).sum::<Decimal>() / dec!(10.0);
+        // Set last candle to bounce right at fast_sma with a green bar (close > open)
+        let latest = candles.last_mut().unwrap();
+        latest.open = fast_sma * dec!(0.992);
+        latest.close = fast_sma * dec!(0.998);
+        latest.high = latest.close + dec!(0.05);
+        latest.low = latest.open - dec!(0.05);
+        latest.volume = dec!(1000);
+
+        let instrument = us_equity("AAPL");
+        let quote = us_quote(latest.close, dec!(0.04));
+        let view = generate_us_momentum_view(&instrument, &quote, &candles);
+
+        assert_eq!(view.direction, Direction::Long);
+        assert_eq!(view.expected_return_pct, dec!(0.025));
+        assert!(view.key_factors.contains(&"pullback_support".to_string()));
+    }
+
+    #[test]
+    fn us_paper_strategy_rejects_incomplete_history() {
+        let candles: Vec<Candle> = us_breakout_candles().into_iter().take(19).collect();
+        let instrument = us_equity("SPY");
+        let quote = us_quote(candles.last().unwrap().close, dec!(0.12));
+
+        let view = generate_us_momentum_view(&instrument, &quote, &candles);
+        assert_eq!(view.direction, Direction::Flat);
+        assert_eq!(view.key_factors, vec!["insufficient_history"]);
+    }
+
+    #[test]
+    fn us_paper_strategy_rejects_failed_momentum_filters() {
+        let instrument = us_equity("SPY");
+
+        // 1. Weak volume (below 1.0x avg) with non-bounce candle
+        let mut weak_volume_candles = us_breakout_candles();
+        let last = weak_volume_candles.last_mut().unwrap();
+        last.volume = dec!(500);
+        last.open = last.close + dec!(0.20); // red candle
+        let quote = us_quote(weak_volume_candles.last().unwrap().close, dec!(0.12));
+        let view = generate_us_momentum_view(&instrument, &quote, &weak_volume_candles);
+        assert_eq!(view.direction, Direction::Flat);
+        assert_eq!(view.key_factors, vec!["momentum_filters_not_met"]);
+
+        // 2. No resistance breakout (close <= prior 10-bar high) and red candle
+        let mut no_breakout_candles = us_breakout_candles();
+        let prior_high = no_breakout_candles[29..39]
+            .iter()
+            .map(|c| c.high)
+            .max()
+            .unwrap();
+        let last = no_breakout_candles.last_mut().unwrap();
+        last.close = prior_high - dec!(0.10);
+        last.open = prior_high;
+        let quote = us_quote(no_breakout_candles.last().unwrap().close, dec!(0.12));
+        let view = generate_us_momentum_view(&instrument, &quote, &no_breakout_candles);
+        assert_eq!(view.direction, Direction::Flat);
+        assert_eq!(view.key_factors, vec!["momentum_filters_not_met"]);
+
+        // 3. Price below SMA10
+        let mut below_sma_candles = us_breakout_candles();
+        let last = below_sma_candles.last_mut().unwrap();
+        last.close = dec!(90.0);
+        last.open = dec!(91.0);
+        let quote = us_quote(below_sma_candles.last().unwrap().close, dec!(0.12));
+        let view = generate_us_momentum_view(&instrument, &quote, &below_sma_candles);
+        assert_eq!(view.direction, Direction::Flat);
+        assert_eq!(view.key_factors, vec!["momentum_filters_not_met"]);
+
+        // 4. SMA10 <= SMA30 (bearish trend)
+        let now = Utc::now();
+        let bear_candles: Vec<Candle> = (0..40)
+            .map(|i| {
+                let close = dec!(150.0) - Decimal::from(i) * dec!(0.5);
+                Candle {
+                    ts: now - Duration::hours((40 - i) as i64),
+                    open: close + dec!(0.2),
+                    high: close + dec!(0.5),
+                    low: close - dec!(0.5),
+                    close,
+                    volume: dec!(1200),
+                }
+            })
+            .collect();
+        let quote = us_quote(bear_candles.last().unwrap().close, dec!(0.12));
+        let view = generate_us_momentum_view(&instrument, &quote, &bear_candles);
+        assert_eq!(view.direction, Direction::Flat);
+        assert_eq!(view.key_factors, vec!["momentum_filters_not_met"]);
+
+        // 5. RSI > 72 (overbought filter)
+        let mut overbought_candles = us_breakout_candles();
+        let len = overbought_candles.len();
+        for j in 0..14 {
+            let idx = len - 14 + j;
+            overbought_candles[idx].close += Decimal::from(j + 1) * dec!(3.5);
+            overbought_candles[idx].high += Decimal::from(j + 1) * dec!(4.0);
+        }
+        let quote = us_quote(overbought_candles.last().unwrap().close, dec!(0.12));
+        let view = generate_us_momentum_view(&instrument, &quote, &overbought_candles);
+        assert_eq!(view.direction, Direction::Flat);
+        assert_eq!(view.key_factors, vec!["momentum_filters_not_met"]);
     }
 
     #[tokio::test]

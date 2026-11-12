@@ -13,7 +13,10 @@ import { absTime, durationMs, int, money, moneySigned, relTime } from "../lib/fo
 import { parseTs } from "../lib/time";
 import { decimate } from "../lib/scale";
 import { useNow } from "../data/useNow";
-import type { CycleRecord, Metrics } from "../api/types";
+import type {
+  CycleRecord,
+  Metrics,
+} from "../api/types";
 
 /** The three scan stages, as separate small multiples. */
 const FUNNEL: {
@@ -54,6 +57,7 @@ export function Cycles() {
               <StatTile
                 label="Bankroll"
                 value={money(num(c.bankroll))}
+                sub="As the agent recorded it this cycle"
               />
               <StatTile label="Duration" value={durationMs(c.duration_ms)} />
               <StatTile
@@ -69,7 +73,7 @@ export function Cycles() {
       <DatasetCard title="Bankroll and unrealized P&L" label="Cycle history" dataset={cycles} datasetKey="cyclesAll">
         {(rows) => {
           const asc = cyclesAscending(rows);
-          const shown = decimate(asc, (c) => num(c.bankroll), 240);
+          const shown = decimate(asc, (c) => num(c.bankroll) ?? 0, 240);
           if (shown.length === 0) return <EmptyState title="No cycles recorded yet" />;
           const cats = shown.map((c) => String(c.cycle_number));
           return (
@@ -92,7 +96,7 @@ export function Cycles() {
                     {
                       name: "Bankroll",
                       color: "var(--series-1)",
-                      values: shown.map((c) => num(c.bankroll)),
+                      values: shown.map((c) => num(c.bankroll) ?? 0),
                     },
                   ]}
                 />

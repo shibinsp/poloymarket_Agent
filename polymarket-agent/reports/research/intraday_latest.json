@@ -1,0 +1,912 @@
+{
+ "at": "2026-11-11 21:18 IST",
+ "markets": {
+  "us": {
+   "variants": 2824,
+   "days": [
+    "2026-05-01",
+    "2026-11-10"
+   ],
+   "research_days": 89,
+   "months": [
+    "2026-05",
+    "2026-06",
+    "2026-07",
+    "2026-08",
+    "2026-09"
+   ],
+   "funnel": [
+    [
+     "g1",
+     2395,
+     2395
+    ],
+    [
+     "g2",
+     266,
+     177
+    ],
+    [
+     "g3",
+     687,
+     131
+    ],
+    [
+     "g4",
+     382,
+     105
+    ],
+    [
+     "g5",
+     6,
+     0
+    ],
+    [
+     "g6",
+     993,
+     0
+    ],
+    [
+     "g7",
+     0,
+     0
+    ],
+    [
+     "g8",
+     647,
+     0
+    ]
+   ],
+   "neff": 14,
+   "luck_bar_all": 8.505177743084912,
+   "luck_bar_eff": 4.229671234460816,
+   "passed": [],
+   "passed_eff": [],
+   "near": [],
+   "families": {
+    "us ampm fade": [
+     12,
+     0,
+     0,
+     0
+    ],
+    "us ampm fade +mkt": [
+     12,
+     0,
+     0,
+     0
+    ],
+    "us ampm follow": [
+     12,
+     0,
+     0,
+     0
+    ],
+    "us ampm follow +mkt": [
+     12,
+     0,
+     0,
+     0
+    ],
+    "us burst30 fade": [
+     12,
+     0,
+     0,
+     0
+    ],
+    "us burst30 fade +mkt": [
+     12,
+     0,
+     0,
+     0
+    ],
+    "us burst30 follow": [
+     12,
+     0,
+     0,
+     0
+    ],
+    "us burst30 follow +mkt": [
+     12,
+     0,
+     0,
+     0
+    ],
+    "us firstmove fade": [
+     144,
+     0,
+     0,
+     0
+    ],
+    "us firstmove fade +mkt": [
+     144,
+     0,
+     0,
+     0
+    ],
+    "us firstmove follow": [
+     144,
+     0,
+     0,
+     0
+    ],
+    "us firstmove follow +mkt": [
+     144,
+     0,
+     0,
+     0
+    ],
+    "us gap fade": [
+     48,
+     0,
+     0,
+     0
+    ],
+    "us gap fade +mkt": [
+     48,
+     0,
+     0,
+     0
+    ],
+    "us gap follow": [
+     48,
+     0,
+     0,
+     0
+    ],
+    "us gap follow +mkt": [
+     48,
+     0,
+     0,
+     0
+    ],
+    "us latemove fade": [
+     18,
+     0,
+     0,
+     0
+    ],
+    "us latemove fade +mkt": [
+     18,
+     0,
+     0,
+     0
+    ],
+    "us latemove follow": [
+     18,
+     0,
+     0,
+     0
+    ],
+    "us latemove follow +mkt": [
+     18,
+     0,
+     0,
+     0
+    ],
+    "us orb both stop-far": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "us orb both stop-far +mkt": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "us orb both stop-mid": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "us orb both stop-mid +mkt": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "us orb both stop-none": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "us orb both stop-none +mkt": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "us orb long stop-far": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "us orb long stop-far +mkt": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "us orb long stop-mid": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "us orb long stop-mid +mkt": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "us orb long stop-none": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "us orb long stop-none +mkt": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "us orb short stop-far": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "us orb short stop-far +mkt": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "us orb short stop-mid": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "us orb short stop-mid +mkt": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "us orb short stop-none": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "us orb short stop-none +mkt": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "us prevday high fade stop-half-range": [
+     3,
+     0,
+     0,
+     0
+    ],
+    "us prevday high fade stop-half-range +mkt": [
+     3,
+     0,
+     0,
+     0
+    ],
+    "us prevday high fade stop-none": [
+     3,
+     0,
+     0,
+     0
+    ],
+    "us prevday high fade stop-none +mkt": [
+     3,
+     0,
+     0,
+     0
+    ],
+    "us prevday high follow stop-half-range": [
+     3,
+     0,
+     0,
+     0
+    ],
+    "us prevday high follow stop-half-range +mkt": [
+     3,
+     0,
+     0,
+     0
+    ],
+    "us prevday high follow stop-none": [
+     3,
+     0,
+     0,
+     0
+    ],
+    "us prevday high follow stop-none +mkt": [
+     3,
+     0,
+     0,
+     0
+    ],
+    "us prevday low fade stop-half-range": [
+     3,
+     0,
+     0,
+     0
+    ],
+    "us prevday low fade stop-half-range +mkt": [
+     3,
+     0,
+     0,
+     0
+    ],
+    "us prevday low fade stop-none": [
+     3,
+     0,
+     0,
+     0
+    ],
+    "us prevday low fade stop-none +mkt": [
+     3,
+     0,
+     0,
+     0
+    ],
+    "us prevday low follow stop-half-range": [
+     3,
+     0,
+     0,
+     0
+    ],
+    "us prevday low follow stop-half-range +mkt": [
+     3,
+     0,
+     0,
+     0
+    ],
+    "us prevday low follow stop-none": [
+     3,
+     0,
+     0,
+     0
+    ],
+    "us prevday low follow stop-none +mkt": [
+     3,
+     0,
+     0,
+     0
+    ],
+    "us timeofday long": [
+     91,
+     0,
+     0,
+     0
+    ],
+    "us timeofday long +mkt": [
+     91,
+     0,
+     0,
+     0
+    ],
+    "us timeofday short": [
+     91,
+     0,
+     0,
+     0
+    ],
+    "us timeofday short +mkt": [
+     91,
+     0,
+     0,
+     0
+    ],
+    "us vwap fade": [
+     18,
+     0,
+     0,
+     0
+    ],
+    "us vwap fade +mkt": [
+     18,
+     0,
+     0,
+     0
+    ],
+    "us vwap follow": [
+     18,
+     0,
+     0,
+     0
+    ],
+    "us vwap follow +mkt": [
+     18,
+     0,
+     0,
+     0
+    ]
+   },
+   "live": {
+    "name": "us orb r5 both last30 rv2.5 stop-far x74",
+    "desc": "Opening-range breakout: first 5 min is the range; both on a 5-min close beyond it within 30 min, opening volume at least 2.5x normal; stop far; exit 15 min before the close",
+    "trades": 242,
+    "per_day_pct": 0.4066671157894815,
+    "total_pct": 36.19337330526386,
+    "halves": [
+     26.913379725980786,
+     9.279993579283087
+    ],
+    "months_up": 0.8,
+    "cost2_pct": 29.89337330526386,
+    "sharpe": 3.4658038631258496,
+    "dsr_all": 0.0002481158485766933,
+    "dsr_eff": 0.29877760275235,
+    "holdout_pct": -3.2687129190597464,
+    "mc": 0.0,
+    "win": 0.5714285714285714,
+    "gates": {
+     "g1": true,
+     "g2": true,
+     "g3": true,
+     "g4": true,
+     "g5": false,
+     "g6": true,
+     "g7": false,
+     "g8": false,
+     "g9": false
+    }
+   },
+   "best_sharpe": 4.418182330570152
+  },
+  "in": {
+   "variants": 2772,
+   "days": [
+    "2026-05-04",
+    "2026-11-09"
+   ],
+   "research_days": 86,
+   "months": [
+    "2026-05",
+    "2026-06",
+    "2026-07",
+    "2026-08",
+    "2026-09"
+   ],
+   "funnel": [
+    [
+     "g1",
+     1772,
+     1772
+    ],
+    [
+     "g2",
+     89,
+     3
+    ],
+    [
+     "g3",
+     257,
+     3
+    ],
+    [
+     "g4",
+     55,
+     0
+    ],
+    [
+     "g5",
+     3,
+     0
+    ],
+    [
+     "g6",
+     564,
+     0
+    ],
+    [
+     "g7",
+     0,
+     0
+    ],
+    [
+     "g8",
+     466,
+     0
+    ]
+   ],
+   "neff": 15,
+   "luck_bar_all": 19.213987140189296,
+   "luck_bar_eff": 9.9641813189496,
+   "passed": [],
+   "passed_eff": [],
+   "near": [],
+   "families": {
+    "in ampm fade": [
+     12,
+     0,
+     0,
+     0
+    ],
+    "in ampm fade +mkt": [
+     12,
+     0,
+     0,
+     0
+    ],
+    "in ampm follow": [
+     12,
+     0,
+     0,
+     0
+    ],
+    "in ampm follow +mkt": [
+     12,
+     0,
+     0,
+     0
+    ],
+    "in burst30 fade": [
+     12,
+     0,
+     0,
+     0
+    ],
+    "in burst30 fade +mkt": [
+     12,
+     0,
+     0,
+     0
+    ],
+    "in burst30 follow": [
+     12,
+     0,
+     0,
+     0
+    ],
+    "in burst30 follow +mkt": [
+     12,
+     0,
+     0,
+     0
+    ],
+    "in firstmove fade": [
+     144,
+     0,
+     0,
+     0
+    ],
+    "in firstmove fade +mkt": [
+     144,
+     0,
+     0,
+     0
+    ],
+    "in firstmove follow": [
+     144,
+     0,
+     0,
+     0
+    ],
+    "in firstmove follow +mkt": [
+     144,
+     0,
+     0,
+     0
+    ],
+    "in gap fade": [
+     48,
+     0,
+     0,
+     0
+    ],
+    "in gap fade +mkt": [
+     48,
+     0,
+     0,
+     0
+    ],
+    "in gap follow": [
+     48,
+     0,
+     0,
+     0
+    ],
+    "in gap follow +mkt": [
+     48,
+     0,
+     0,
+     0
+    ],
+    "in latemove fade": [
+     18,
+     0,
+     0,
+     0
+    ],
+    "in latemove fade +mkt": [
+     18,
+     0,
+     0,
+     0
+    ],
+    "in latemove follow": [
+     18,
+     0,
+     0,
+     0
+    ],
+    "in latemove follow +mkt": [
+     18,
+     0,
+     0,
+     0
+    ],
+    "in orb both stop-far": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "in orb both stop-far +mkt": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "in orb both stop-mid": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "in orb both stop-mid +mkt": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "in orb both stop-none": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "in orb both stop-none +mkt": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "in orb long stop-far": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "in orb long stop-far +mkt": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "in orb long stop-mid": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "in orb long stop-mid +mkt": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "in orb long stop-none": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "in orb long stop-none +mkt": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "in orb short stop-far": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "in orb short stop-far +mkt": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "in orb short stop-mid": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "in orb short stop-mid +mkt": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "in orb short stop-none": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "in orb short stop-none +mkt": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "in prevday high fade stop-half-range": [
+     3,
+     0,
+     0,
+     0
+    ],
+    "in prevday high fade stop-half-range +mkt": [
+     3,
+     0,
+     0,
+     0
+    ],
+    "in prevday high fade stop-none": [
+     3,
+     0,
+     0,
+     0
+    ],
+    "in prevday high fade stop-none +mkt": [
+     3,
+     0,
+     0,
+     0
+    ],
+    "in prevday high follow stop-half-range": [
+     3,
+     0,
+     0,
+     0
+    ],
+    "in prevday high follow stop-half-range +mkt": [
+     3,
+     0,
+     0,
+     0
+    ],
+    "in prevday high follow stop-none": [
+     3,
+     0,
+     0,
+     0
+    ],
+    "in prevday high follow stop-none +mkt": [
+     3,
+     0,
+     0,
+     0
+    ],
+    "in prevday low fade stop-half-range": [
+     3,
+     0,
+     0,
+     0
+    ],
+    "in prevday low fade stop-half-range +mkt": [
+     3,
+     0,
+     0,
+     0
+    ],
+    "in prevday low fade stop-none": [
+     3,
+     0,
+     0,
+     0
+    ],
+    "in prevday low fade stop-none +mkt": [
+     3,
+     0,
+     0,
+     0
+    ],
+    "in prevday low follow stop-half-range": [
+     3,
+     0,
+     0,
+     0
+    ],
+    "in prevday low follow stop-half-range +mkt": [
+     3,
+     0,
+     0,
+     0
+    ],
+    "in prevday low follow stop-none": [
+     3,
+     0,
+     0,
+     0
+    ],
+    "in prevday low follow stop-none +mkt": [
+     3,
+     0,
+     0,
+     0
+    ],
+    "in timeofday long": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "in timeofday long +mkt": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "in timeofday short": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "in timeofday short +mkt": [
+     78,
+     0,
+     0,
+     0
+    ],
+    "in vwap fade": [
+     18,
+     0,
+     0,
+     0
+    ],
+    "in vwap fade +mkt": [
+     18,
+     0,
+     0,
+     0
+    ],
+    "in vwap follow": [
+     18,
+     0,
+     0,
+     0
+    ],
+    "in vwap follow +mkt": [
+     18,
+     0,
+     0,
+     0
+    ]
+   },
+   "live": null,
+   "best_sharpe": 2.0405041541043207
+  }
+ }
+}

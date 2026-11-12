@@ -186,6 +186,20 @@ pub struct EquityQuote {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct LatestTradesResponse {
+    #[serde(default)]
+    pub trades: std::collections::HashMap<String, EquityTrade>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EquityTrade {
+    #[serde(rename = "t")]
+    pub ts: DateTime<Utc>,
+    #[serde(rename = "p", deserialize_with = "de_decimal")]
+    pub price: Decimal,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct CryptoOrderbooksResponse {
     #[serde(default)]
     pub orderbooks: std::collections::HashMap<String, CryptoOrderbook>,
@@ -248,6 +262,8 @@ pub struct NewOrder {
     pub time_in_force: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit_price: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_price: Option<String>,
     pub extended_hours: bool,
     /// The whole point of the idempotency story: a retry after a timeout
     /// carries the same id and Alpaca rejects the duplicate instead of

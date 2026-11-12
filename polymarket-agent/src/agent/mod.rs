@@ -1,6 +1,7 @@
 pub mod budget;
 pub mod kill_switch;
 pub mod lifecycle;
+pub mod poly_underdog;
 pub mod reconcile;
 pub mod scheduler;
 pub mod self_funding;

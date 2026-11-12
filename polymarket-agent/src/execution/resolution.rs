@@ -163,36 +163,27 @@ pub(crate) async fn fetch_market_resolution(
     gamma_base_url: &str,
     condition_id: &str,
 ) -> Result<Option<MarketResolution>> {
-    let url = format!("{}/markets", gamma_base_url);
-
-    let response = http
-        .get(&url)
-        .query(&[("condition_id", condition_id)])
-        .send()
+    let markets: Vec<GammaResolutionResponse> =
+        crate::market::polymarket::gamma_markets_by_condition_id_as(
+            http,
+            gamma_base_url,
+            condition_id,
+        )
         .await
-        .context("HTTP request to Gamma API failed")?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("Gamma API returned {status}: {body}");
-    }
-
-    let markets: Vec<GammaResolutionResponse> = response
-        .json()
-        .await
-        .context("Failed to deserialize Gamma resolution response")?;
+        .context("Failed to fetch Gamma resolution")?;
 
     let market = match markets.first() {
         Some(m) => m,
         None => return Ok(None),
     };
 
-    // Market must be both closed and resolved
-    let closed = market.closed.unwrap_or(false);
-    let resolved = market.resolved.unwrap_or(false);
-
-    if !closed || !resolved {
+    // Gamma no longer sends `resolved`, so a closed market counts as settled
+    // once its final prices are a clean 1 / 0 (see `settled_yes_won`). A
+    // closed market still awaiting its result shows ["0", "0"] or mid prices.
+    if !market.closed.unwrap_or(false) {
+        return Ok(None);
+    }
+    if market.resolved == Some(false) {
         return Ok(None);
     }
 
@@ -219,21 +210,28 @@ pub(crate) async fn fetch_market_resolution(
         }
     };
 
-    // First outcome is YES, second is NO
-    let yes_price = match prices.first().and_then(|s| Decimal::from_str(s).ok()) {
-        Some(p) => p,
-        None => {
-            warn!(
-                condition_id = %condition_id,
-                "No valid YES price in outcome_prices — skipping resolution"
-            );
-            return Ok(None);
-        }
-    };
+    Ok(settled_yes_won(&prices).map(|yes_won| MarketResolution { yes_won }))
+}
 
-    let yes_won = yes_price > dec!(0.5);
-
-    Ok(Some(MarketResolution { yes_won }))
+/// Whether the first outcome (YES) won, from a closed market's final prices.
+/// `None` unless the prices are a clean settlement: one side at least 0.99
+/// and the other at most 0.01. First outcome is YES, second is NO.
+fn settled_yes_won(prices: &[String]) -> Option<bool> {
+    let p: Vec<Decimal> = prices
+        .iter()
+        .filter_map(|s| Decimal::from_str(s).ok())
+        .collect();
+    if p.len() != 2 {
+        return None;
+    }
+    let (yes, no) = (p[0], p[1]);
+    if yes >= dec!(0.99) && no <= dec!(0.01) {
+        Some(true)
+    } else if no >= dec!(0.99) && yes <= dec!(0.01) {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 /// Settle a single trade based on market resolution.
@@ -336,6 +334,7 @@ mod tests {
                 horizon_hours: None,
                 client_order_id: Some("c-1".to_string()),
                 venue_order_id: None,
+                strategy: None,
             })
             .await
             .expect("insert");
@@ -363,6 +362,58 @@ mod tests {
     }
     use crate::db::store::TradeRecord;
 
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn only_clean_final_prices_count_as_settled() {
+        assert_eq!(settled_yes_won(&s(&["1", "0"])), Some(true));
+        assert_eq!(settled_yes_won(&s(&["0", "1"])), Some(false));
+        assert_eq!(settled_yes_won(&s(&["0.995", "0.005"])), Some(true));
+        // Closed but still waiting for its result.
+        assert_eq!(settled_yes_won(&s(&["0", "0"])), None);
+        assert_eq!(settled_yes_won(&s(&["0.9825", "0.0175"])), None);
+        assert_eq!(settled_yes_won(&s(&["0.5", "0.5"])), None);
+        assert_eq!(settled_yes_won(&s(&["1"])), None);
+    }
+
+    /// Gamma no longer sends `resolved`; a closed market with clean final
+    /// prices settles, an open one does not, and only our market's row counts.
+    #[tokio::test]
+    async fn a_closed_market_settles_without_a_resolved_field() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::query_param("condition_ids", "0xohio"))
+            .and(wiremock::matchers::query_param("closed", "true"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {"conditionId": "0xohio", "closed": true, "outcomePrices": "[\"1\", \"0\"]"}
+                ])),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {"conditionId": "0xother", "closed": true, "outcomePrices": "[\"0\", \"1\"]"}
+                ])),
+            )
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let r = fetch_market_resolution(&http, &server.uri(), "0xohio")
+            .await
+            .unwrap()
+            .expect("settled");
+        assert!(r.yes_won);
+        assert!(fetch_market_resolution(&http, &server.uri(), "0xopen")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
     fn open_yes_trade(id: i64, entry: &str, size: &str) -> TradeRecord {
         TradeRecord {
             id: Some(id),
@@ -382,6 +433,7 @@ mod tests {
             pnl: None,
             created_at: None,
             resolved_at: None,
+            ..Default::default()
         }
     }
 

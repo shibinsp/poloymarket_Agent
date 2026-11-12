@@ -756,6 +756,7 @@ impl Venue for CoinbaseVenue {
         // Decimal end to end.
         let base_size = request.qty.normalize().to_string();
         let configuration = match (request.kind, request.side) {
+            (OrderKind::Stop { .. }, _) => bail!("Coinbase stop orders are not supported here"),
             (OrderKind::Limit { price }, _) => {
                 let limit_price = price.normalize().to_string();
                 match request.tif {

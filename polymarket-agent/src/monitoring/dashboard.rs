@@ -62,6 +62,27 @@ pub struct DashboardState {
     pub upstox_feed: Arc<crate::india::market_feed::UpstoxLiveMarketFeed>,
     pub alpaca_feed: Arc<crate::us::market_feed::AlpacaLiveMarketFeed>,
     pub dynamic_caps: Arc<tokio::sync::RwLock<DynamicCapitalCaps>>,
+    /// Capital the NSE intraday breakout trades with, on its own ledger. The
+    /// sandbox allocation above is a different, older book.
+    india_intraday_capital_inr: Option<Decimal>,
+    /// Capital of the NSE opening-burst book, when that book runs.
+    india_burst_capital_inr: Option<Decimal>,
+    /// Capital of the NSE gap-and-go book, when that book runs.
+    india_gapgo_capital_inr: Option<Decimal>,
+    /// Paper capital of the Polymarket loop, when it runs.
+    polymarket_capital_usd: Option<Decimal>,
+    /// The U.S. intraday book's capital and the day it started on it.
+    us_book: Option<(Decimal, Option<chrono::NaiveDate>)>,
+    /// Capital of the U.S. options book, when it runs.
+    us_options_capital_usd: Option<Decimal>,
+    /// Each crypto book's capital, when the crypto worker runs.
+    crypto_capital_usd: Option<Decimal>,
+    /// The range scanner's latest scan per market, when it runs.
+    range_scans: Option<crate::range_scanner::RangeScans>,
+    /// Live U.S. headlines from Alpaca's news stream, when it runs.
+    live_news: Option<crate::us::news_stream::LiveNews>,
+    /// The daily profit target the Overview tracks.
+    target: crate::config::TargetConfig,
 }
 
 impl DashboardState {
@@ -82,7 +103,7 @@ impl DashboardState {
             .unwrap_or(rust_decimal_macros::dec!(1000.0));
         let init_us = risk
             .us_capital_allocation_usd
-            .unwrap_or(rust_decimal_macros::dec!(5.0));
+            .unwrap_or(rust_decimal_macros::dec!(1000.0));
 
         Self {
             store: Arc::new(store),
@@ -106,6 +127,16 @@ impl DashboardState {
                 us_enabled: true,
                 polymarket_enabled: true,
             })),
+            india_intraday_capital_inr: None,
+            india_burst_capital_inr: None,
+            india_gapgo_capital_inr: None,
+            polymarket_capital_usd: None,
+            us_book: None,
+            us_options_capital_usd: None,
+            crypto_capital_usd: None,
+            range_scans: None,
+            live_news: None,
+            target: crate::config::TargetConfig::default(),
             // Trim before storing: the page sends a trimmed token, so keeping
             // stray whitespace here would 401 every request with an
             // apparently-correct token.
@@ -130,6 +161,68 @@ impl DashboardState {
     ) -> Self {
         self.alpaca_feed = feed;
         self
+    }
+
+    pub fn with_india_intraday_capital(mut self, capital_inr: Decimal) -> Self {
+        self.india_intraday_capital_inr = Some(capital_inr);
+        self
+    }
+
+    pub fn with_india_burst_capital(mut self, capital_inr: Decimal) -> Self {
+        self.india_burst_capital_inr = Some(capital_inr);
+        self
+    }
+
+    pub fn with_india_gapgo_capital(mut self, capital_inr: Decimal) -> Self {
+        self.india_gapgo_capital_inr = Some(capital_inr);
+        self
+    }
+
+    pub fn with_us_book(mut self, capital_usd: Decimal, since: Option<chrono::NaiveDate>) -> Self {
+        self.us_book = Some((capital_usd, since));
+        self
+    }
+
+    pub fn with_us_options_capital(mut self, capital_usd: Decimal) -> Self {
+        self.us_options_capital_usd = Some(capital_usd);
+        self
+    }
+
+    pub fn with_crypto_capital(mut self, capital_usd: Decimal) -> Self {
+        self.crypto_capital_usd = Some(capital_usd);
+        self
+    }
+
+    pub fn with_range_scans(mut self, scans: crate::range_scanner::RangeScans) -> Self {
+        self.range_scans = Some(scans);
+        self
+    }
+
+    pub fn with_live_news(mut self, news: crate::us::news_stream::LiveNews) -> Self {
+        self.live_news = Some(news);
+        self
+    }
+
+    pub fn with_target(mut self, target: crate::config::TargetConfig) -> Self {
+        self.target = target;
+        self
+    }
+
+    pub fn with_polymarket_capital(mut self, capital_usd: Decimal) -> Self {
+        self.polymarket_capital_usd = Some(capital_usd);
+        self
+    }
+
+    /// The NSE intraday books that run, as (strategy, capital).
+    fn india_books(&self) -> Vec<(&'static str, Decimal)> {
+        [
+            (crate::india::orb::STRATEGY, self.india_intraday_capital_inr),
+            (crate::india::burst::STRATEGY, self.india_burst_capital_inr),
+            (crate::india::gapgo::STRATEGY, self.india_gapgo_capital_inr),
+        ]
+        .into_iter()
+        .filter_map(|(s, c)| c.map(|c| (s, c)))
+        .collect()
     }
 }
 
@@ -186,6 +279,49 @@ pub fn spawn_dashboard(
     }))
 }
 
+/// Start an isolated, loopback-only server for historical U.S. backtests.
+///
+/// This intentionally exposes no trading, paper-order, halt/resume, or agent
+/// control routes. It can therefore fetch and persist backtests without
+/// starting the trading loop or reconciling/cancelling resting orders.
+pub async fn spawn_us_backtest_server(
+    state: DashboardState,
+    bind: &str,
+    port: u16,
+) -> Result<JoinHandle<()>> {
+    let ip = if bind.eq_ignore_ascii_case("localhost") {
+        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    } else {
+        bind.parse::<IpAddr>()?
+    };
+    if !ip.is_loopback() {
+        bail!("The isolated US backtest server must bind to loopback");
+    }
+
+    let app = Router::new()
+        .route(
+            "/",
+            get(|| async { axum::response::Html(include_str!("../../static/index.html")) }),
+        )
+        .route(
+            "/api/health",
+            get(|| async { Json(serde_json::json!({"status": "ok", "mode": "us_backtest_only"})) }),
+        )
+        .route("/api/us/backtest/history", get(us_backtest_history_handler))
+        .route("/api/us/backtest/run", post(us_backtest_run_handler))
+        .with_state(state);
+
+    let address = std::net::SocketAddr::new(ip, port);
+    let listener = tokio::net::TcpListener::bind(address).await?;
+    info!(%address, "Isolated US backtest server listening; trading routes are disabled");
+
+    Ok(tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, app).await {
+            warn!(%error, "Isolated US backtest server stopped");
+        }
+    }))
+}
+
 /// A non-loopback bind with no token would expose every trade to the network:
 /// refuse it in live mode, fall back to loopback otherwise.
 fn resolve_bind(bind: &str, has_token: bool, mode: AgentMode) -> Result<String> {
@@ -228,6 +364,22 @@ fn build_router(state: DashboardState) -> Router {
         .route("/api/risk", get(risk_handler))
         .route("/api/halt", get(halt_status_handler))
         .route("/api/india/watchlist", get(india_watchlist_handler))
+        .route("/api/us/desk", get(us_desk_handler))
+        .route("/api/us/orb/trades", get(us_orb_trades_handler))
+        .route("/api/us/options", get(us_options_handler))
+        .route("/api/us/spreads", get(us_spreads_handler))
+        .route("/api/us/ladder", get(us_ladder_handler))
+        .route("/api/us/ibs", get(us_ibs_handler))
+        .route("/api/us/turnaround", get(us_turnaround_handler))
+        .route("/api/us/prefomc", get(us_prefomc_handler))
+        .route("/api/crypto", get(crypto_handler))
+        .route("/api/range-scanner", get(range_scanner_handler))
+        .route("/api/target", get(target_handler))
+        .route("/api/us/news", get(us_news_handler))
+        .route("/api/india/desk", get(india_desk_handler))
+        .route("/api/india/intraday", get(india_intraday_handler))
+        .route("/api/reviews", get(reviews_handler))
+        .route("/api/polymarket/trades", get(polymarket_trades_handler))
         .route(
             "/api/india/backtest/history",
             get(india_backtest_history_handler),
@@ -617,21 +769,6 @@ async fn resume_handler(State(state): State<DashboardState>) -> impl IntoRespons
             .into_response();
     }
 
-    if let Some(ref h) = cleared {
-        if matches!(
-            h.source,
-            crate::agent::kill_switch::HaltSource::Reconciliation
-        ) {
-            let now_str = chrono::Utc::now().to_rfc3339();
-            let _ = sqlx::query(
-                "UPDATE trades SET status = 'CLOSED', close_reason = 'reconciliation_cleared', closed_at = ? WHERE status IN ('OPEN', 'PARTIAL')"
-            )
-            .bind(&now_str)
-            .execute(state.store.pool())
-            .await;
-        }
-    }
-
     info!(?cleared, "Resumed over the API");
     Json(serde_json::json!({
         "halted": false,
@@ -744,6 +881,578 @@ pub struct IndiaBacktestRunRequest {
     pub train_ratio: Option<Decimal>,
     pub val_ratio: Option<Decimal>,
     pub test_ratio: Option<Decimal>,
+}
+
+/// The U.S. intraday strategies' trades (breakout and opening burst), from the
+/// main ledger, newest first; each row carries its strategy.
+async fn us_orb_trades_handler(State(state): State<DashboardState>) -> impl IntoResponse {
+    let mut trades = Vec::new();
+    for strategy in [crate::us::orb::ORB_STRATEGY, crate::us::orb::BURST_STRATEGY] {
+        match state
+            .store
+            .recent_strategy_trades("alpaca", strategy, 100)
+            .await
+        {
+            Ok(t) => trades.extend(t),
+            Err(e) => return rows_unavailable(e),
+        }
+    }
+    trades.sort_by_key(|t| std::cmp::Reverse(t["id"].as_i64().unwrap_or_default()));
+    trades.truncate(100);
+    // The U.S. book: its capital, what it has made or lost since it started on
+    // that capital, and what it trades with now (never more than the capital).
+    let book = match state.us_book {
+        Some((capital, since)) => {
+            let strategies = [crate::us::orb::ORB_STRATEGY, crate::us::orb::BURST_STRATEGY];
+            let today = chrono::Utc::now().date_naive();
+            match (
+                state
+                    .store
+                    .strategies_realized_since(&strategies, since)
+                    .await,
+                state
+                    .store
+                    .strategies_realized_since(&strategies, Some(today))
+                    .await,
+            ) {
+                (Ok(realized), Ok(today_pnl)) => serde_json::json!({
+                    "capital_usd": capital,
+                    "since": since,
+                    "pnl_total_usd": realized,
+                    "pnl_today_usd": today_pnl,
+                    "value_usd": capital + realized,
+                    "trading_capital_usd": crate::india::orb::trading_cash(capital, realized),
+                }),
+                (Err(e), _) | (_, Err(e)) => return rows_unavailable(e),
+            }
+        }
+        None => serde_json::json!(null),
+    };
+    Json(serde_json::json!({ "trades": trades, "book": book })).into_response()
+}
+
+/// The U.S. options book: capital minus losing trades (profits set aside),
+/// its P&L, and its trades, newest first.
+async fn us_options_handler(State(state): State<DashboardState>) -> impl IntoResponse {
+    let Some(capital) = state.us_options_capital_usd else {
+        return Json(serde_json::json!({ "book": null, "trades": [] })).into_response();
+    };
+    let day = chrono::Utc::now()
+        .with_timezone(&chrono_tz::America::New_York)
+        .date_naive()
+        .to_string();
+    match (
+        state.store.option_totals(&day).await,
+        state.store.recent_option_trades(100).await,
+    ) {
+        (Ok((n, today, total, losses)), Ok(trades)) => Json(serde_json::json!({
+            "book": {
+                "capital_usd": capital,
+                "trades_today": n,
+                "pnl_today_usd": today,
+                "pnl_total_usd": total,
+                "losses_usd": losses,
+                "profits_usd": total - losses,
+                "trading_capital_usd": crate::india::orb::trading_cash(capital, losses),
+            },
+            "trades": trades,
+        }))
+        .into_response(),
+        (Err(e), _) | (_, Err(e)) => rows_unavailable(e),
+    }
+}
+
+/// The credit-spread book: today's and all-time P&L and the latest spreads.
+async fn us_spreads_handler(State(state): State<DashboardState>) -> impl IntoResponse {
+    let day = chrono::Utc::now()
+        .with_timezone(&chrono_tz::America::New_York)
+        .date_naive()
+        .to_string();
+    match (
+        state.store.spread_totals(&day).await,
+        state.store.recent_spread_trades(100).await,
+    ) {
+        (Ok((n, today, total, losses)), Ok(trades)) => Json(serde_json::json!({
+            "book": {
+                "spreads_today": n,
+                "pnl_today_usd": today,
+                "pnl_total_usd": total,
+                "losses_usd": losses,
+                "profits_usd": total - losses,
+            },
+            "trades": trades,
+        }))
+        .into_response(),
+        (Err(e), _) | (_, Err(e)) => rows_unavailable(e),
+    }
+}
+
+/// The daily profit target across every book, per UTC day from the target's
+/// start: the Alpaca account's change (US stocks, options, crypto), the real
+/// India books in rupees and Polymarket, all in rupees at the configured rate.
+/// Today's row is live (the account's latest mark).
+async fn target_handler(State(state): State<DashboardState>) -> impl IntoResponse {
+    let t = &state.target;
+    let equity = match state.store.get_daily_equity().await {
+        Ok(rows) => rows,
+        Err(e) => return rows_unavailable(e),
+    };
+    let india = state
+        .store
+        .india_real_pnl_by_day(&t.since)
+        .await
+        .unwrap_or_default();
+    let poly = state
+        .store
+        .polymarket_pnl_by_day(&t.since)
+        .await
+        .unwrap_or_default();
+    let dec = |s: &str| s.parse::<Decimal>().unwrap_or_default();
+    let mut days: std::collections::BTreeMap<String, (Decimal, Decimal, Decimal)> =
+        Default::default();
+    for r in equity.iter().filter(|r| r.day.as_str() >= t.since.as_str()) {
+        if let Some(close) = r.closing_equity.as_deref() {
+            days.entry(r.day.clone()).or_default().0 = dec(close) - dec(&r.starting_equity);
+        }
+    }
+    for (d, v) in &india {
+        days.entry(d.clone()).or_default().1 = *v;
+    }
+    for (d, v) in &poly {
+        days.entry(d.clone()).or_default().2 = *v;
+    }
+    let today = chrono::Utc::now().date_naive().to_string();
+    let rows: Vec<serde_json::Value> = days
+        .iter()
+        .map(|(d, (us, inr, pm))| {
+            let total = (*us + *pm) * t.usd_inr + *inr;
+            serde_json::json!({
+                "day": d,
+                "us_account_usd": us.round_dp(2),
+                "india_inr": inr.round_dp(2),
+                "polymarket_usd": pm.round_dp(2),
+                "total_inr": total.round_dp(0),
+                "hit": total >= t.daily_inr,
+                "live": *d == today,
+            })
+        })
+        .collect();
+    let n = Decimal::from(rows.len().max(1) as i64);
+    let sum: Decimal = days
+        .values()
+        .map(|(us, inr, pm)| (*us + *pm) * t.usd_inr + *inr)
+        .sum();
+    Json(serde_json::json!({
+        "target_inr": t.daily_inr,
+        "usd_inr": t.usd_inr,
+        "since": t.since,
+        "days": rows,
+        "total_inr": sum.round_dp(0),
+        "average_inr": (sum / n).round_dp(0),
+        "days_hit": days.values().filter(|(us, inr, pm)| (*us + *pm) * t.usd_inr + *inr >= t.daily_inr).count(),
+    }))
+    .into_response()
+}
+
+/// The range scanner's latest scan per market: each stock's likely high and
+/// low for the rest of today and the chance of a new high or low.
+#[derive(serde::Deserialize)]
+struct NewsQuery {
+    symbol: Option<String>,
+    limit: Option<usize>,
+}
+
+/// Live U.S. headlines, newest first; `symbol` keeps only that stock's.
+async fn us_news_handler(
+    State(state): State<DashboardState>,
+    axum::extract::Query(q): axum::extract::Query<NewsQuery>,
+) -> impl IntoResponse {
+    let Some(news) = &state.live_news else {
+        return Json(serde_json::json!({ "status": "OFF", "items": [] }));
+    };
+    let b = news.read().await;
+    let symbol = q
+        .symbol
+        .map(|s| s.trim().to_ascii_uppercase())
+        .filter(|s| !s.is_empty());
+    let items: Vec<&crate::us::news_stream::NewsItem> = b
+        .items
+        .iter()
+        .filter(|i| {
+            symbol
+                .as_ref()
+                .map_or(true, |s| i.symbols.iter().any(|x| x == s))
+        })
+        .take(q.limit.unwrap_or(200).min(500))
+        .collect();
+    Json(serde_json::json!({
+        "status": b.status,
+        "connected_since": b.connected_since,
+        "last_message_at": b.last_message_at,
+        "streamed": b.streamed,
+        "items": items,
+    }))
+}
+
+async fn range_scanner_handler(State(state): State<DashboardState>) -> impl IntoResponse {
+    let scans = match &state.range_scans {
+        Some(s) => s.read().await.clone(),
+        None => Default::default(),
+    };
+    Json(serde_json::json!({
+        "india": scans.get("india"),
+        "us": scans.get("us"),
+    }))
+}
+
+/// The crypto books (BTC + ETH, 60-day rule; one with the news guard, one
+/// on the rule alone): each book's capital after losses, open coins marked
+/// at their last check's price, trades and the market checks, newest first.
+async fn crypto_handler(State(state): State<DashboardState>) -> impl IntoResponse {
+    let Some(capital) = state.crypto_capital_usd else {
+        return Json(serde_json::json!({ "books": [], "trades": [], "checks": [] }))
+            .into_response();
+    };
+    let (trades, checks) = match state.store.crypto_recent(100).await {
+        Ok(x) => x,
+        Err(e) => return rows_unavailable(e),
+    };
+    let dec = |v: &serde_json::Value| {
+        v.as_str()
+            .and_then(|s| s.parse::<Decimal>().ok())
+            .unwrap_or_default()
+    };
+    // The latest price per coin, from its newest check.
+    let mut last_price: std::collections::HashMap<String, Decimal> =
+        std::collections::HashMap::new();
+    for c in &checks {
+        if let Some(sym) = c["symbol"].as_str() {
+            last_price
+                .entry(sym.to_string())
+                .or_insert_with(|| dec(&c["price"]));
+        }
+    }
+    let mut books = Vec::new();
+    let book_names = [crate::crypto_book::BOOK, crate::crypto_book::SHADOW]
+        .into_iter()
+        .chain(crate::crypto_book::RIVALS.iter().map(|(b, _)| *b));
+    for book in book_names {
+        let (losses, profits) = match state.store.crypto_realized(book).await {
+            Ok(x) => x,
+            Err(e) => return rows_unavailable(e),
+        };
+        let mut open_value = Decimal::ZERO;
+        let mut open_cost = Decimal::ZERO;
+        for t in trades
+            .iter()
+            .filter(|t| t["book"] == book && t["status"] == "OPEN")
+        {
+            let px = t["symbol"]
+                .as_str()
+                .and_then(|s| last_price.get(s))
+                .copied()
+                .unwrap_or_default();
+            open_value += dec(&t["qty"]) * px;
+            open_cost += dec(&t["cost"]);
+        }
+        books.push(serde_json::json!({
+            "book": book,
+            "capital_usd": capital,
+            "losses_usd": losses,
+            "profits_usd": profits,
+            "trading_capital_usd": crate::india::orb::trading_cash(capital, losses),
+            "open_cost_usd": open_cost.round_dp(2),
+            "open_value_usd": open_value.round_dp(2),
+            "unrealized_usd": (open_value - open_cost).round_dp(2),
+            "value_usd": (capital + losses + profits + open_value - open_cost).round_dp(2),
+        }));
+    }
+    Json(serde_json::json!({ "books": books, "trades": trades, "checks": checks })).into_response()
+}
+
+/// The trading desk's latest decision cards: one per signal, each with
+/// ATLAS, VEGA, ORION, LUNA, TITAN and NOVA's reports.
+async fn us_desk_handler(State(state): State<DashboardState>) -> impl IntoResponse {
+    match state.store.recent_desk_decisions("US", 50).await {
+        Ok(cards) => Json(serde_json::json!({ "cards": cards })).into_response(),
+        Err(e) => rows_unavailable(e),
+    }
+}
+
+/// The NSE intraday paper books: each book's totals, their sum, and every
+/// trade, newest first.
+/// The US "buy a weak close" (IBS) paper book: money, what is held, trades.
+async fn us_ibs_handler(State(state): State<DashboardState>) -> impl IntoResponse {
+    use crate::us::ibs::{CAPITAL_USD, FUNDS, THRESHOLD};
+    match (
+        state.store.ibs_realized().await,
+        state.store.ibs_trades(100).await,
+    ) {
+        (Ok(realized), Ok(trades)) => {
+            let losses: Decimal = trades
+                .iter()
+                .filter_map(|t| t["pnl"].as_str().and_then(|p| p.parse::<Decimal>().ok()))
+                .filter(|p| *p < Decimal::ZERO)
+                .sum();
+            Json(serde_json::json!({
+                "capital_usd": CAPITAL_USD, "funds": FUNDS, "threshold": THRESHOLD,
+                "pnl_total_usd": realized.round_dp(2), "losses_usd": losses.round_dp(2),
+                "trading_capital_usd": (CAPITAL_USD + realized).min(CAPITAL_USD).round_dp(2),
+                "open": trades.iter().filter(|t| t["status"] == "OPEN").count(),
+                "trades": trades,
+            }))
+            .into_response()
+        }
+        (Err(e), _) | (_, Err(e)) => rows_unavailable(e),
+    }
+}
+
+/// The US pre-FOMC drift paper book (SPY): money, what is held, trades, next meeting.
+async fn us_prefomc_handler(State(state): State<DashboardState>) -> impl IntoResponse {
+    use crate::us::prefomc::{decision_days, CAPITAL_USD, SYMBOL};
+    match (
+        state.store.prefomc_realized().await,
+        state.store.prefomc_trades(100).await,
+    ) {
+        (Ok(realized), Ok(trades)) => {
+            let today = chrono::Utc::now()
+                .with_timezone(&chrono_tz::America::New_York)
+                .date_naive();
+            let next = decision_days()
+                .into_iter()
+                .find(|d| *d >= today)
+                .map(|d| d.to_string());
+            Json(serde_json::json!({
+                "capital_usd": CAPITAL_USD, "symbol": SYMBOL, "next_decision": next,
+                "pnl_total_usd": realized.round_dp(2),
+                "trading_capital_usd": (CAPITAL_USD + realized).min(CAPITAL_USD).round_dp(2),
+                "open": trades.iter().filter(|t| t["status"] == "OPEN").count(),
+                "trades": trades,
+            }))
+            .into_response()
+        }
+        (Err(e), _) | (_, Err(e)) => rows_unavailable(e),
+    }
+}
+
+/// The US Turnaround Tuesday paper book (DIA): money, what is held, trades.
+async fn us_turnaround_handler(State(state): State<DashboardState>) -> impl IntoResponse {
+    use crate::us::turnaround::{CAPITAL_USD, SMA_DAYS, SYMBOL};
+    match (
+        state.store.turnaround_realized().await,
+        state.store.turnaround_trades(100).await,
+    ) {
+        (Ok(realized), Ok(trades)) => {
+            let losses: Decimal = trades
+                .iter()
+                .filter_map(|t| t["pnl"].as_str().and_then(|p| p.parse::<Decimal>().ok()))
+                .filter(|p| *p < Decimal::ZERO)
+                .sum();
+            Json(serde_json::json!({
+                "capital_usd": CAPITAL_USD, "symbol": SYMBOL, "sma_days": SMA_DAYS,
+                "pnl_total_usd": realized.round_dp(2), "losses_usd": losses.round_dp(2),
+                "trading_capital_usd": (CAPITAL_USD + realized).min(CAPITAL_USD).round_dp(2),
+                "open": trades.iter().filter(|t| t["status"] == "OPEN").count(),
+                "trades": trades,
+            }))
+            .into_response()
+        }
+        (Err(e), _) | (_, Err(e)) => rows_unavailable(e),
+    }
+}
+
+/// The US capital ladder: each book's result at every starting amount, from
+/// the start of the ladder week, by New York day. Paper bookkeeping only.
+async fn us_ladder_handler(State(state): State<DashboardState>) -> impl IntoResponse {
+    use crate::us::ladder::{cash, AMOUNTS, BOOKS, START_DAY};
+    use std::str::FromStr;
+    let today = chrono::Utc::now()
+        .with_timezone(&chrono_tz::America::New_York)
+        .date_naive()
+        .to_string();
+    let mut out = Vec::new();
+    for book in BOOKS {
+        for amount in AMOUNTS {
+            let rows = match state.store.us_ladder_rows(book, amount).await {
+                Ok(r) => r,
+                Err(e) => return rows_unavailable(e),
+            };
+            let pnl = |r: &(String, String, String)| Decimal::from_str(&r.2).unwrap_or_default();
+            let total: Decimal = rows.iter().map(pnl).sum();
+            let today_pnl: Decimal = rows.iter().filter(|r| r.0 == today).map(pnl).sum();
+            let taken = rows
+                .iter()
+                .filter(|r| Decimal::from_str(&r.1).unwrap_or_default() > Decimal::ZERO)
+                .count();
+            out.push(serde_json::json!({
+                "book": book, "capital_usd": amount,
+                "trades_taken": taken, "trades_too_small": rows.len() - taken,
+                "pnl_today_usd": today_pnl.round_dp(2), "pnl_total_usd": total.round_dp(2),
+                "trading_capital_usd": cash(Decimal::from(amount), total).round_dp(2),
+            }));
+        }
+    }
+    Json(serde_json::json!({ "since": START_DAY, "ny_day": today, "ladder": out })).into_response()
+}
+
+async fn india_intraday_handler(State(state): State<DashboardState>) -> impl IntoResponse {
+    let day = chrono::Utc::now()
+        .with_timezone(&chrono_tz::Asia::Kolkata)
+        .date_naive()
+        .to_string();
+    let trades = match state.store.recent_intraday_trades(100).await {
+        Ok(t) => t,
+        Err(e) => return rows_unavailable(e),
+    };
+    let books = state.india_books();
+    let mut out = Vec::new();
+    let (mut capital, mut count, mut today_pnl, mut total_pnl, mut losses) = (
+        Decimal::ZERO,
+        0i64,
+        Decimal::ZERO,
+        Decimal::ZERO,
+        Decimal::ZERO,
+    );
+    for (strategy, cap) in &books {
+        let totals = state.store.intraday_totals(strategy, &day).await;
+        let lost = state.store.intraday_losses(strategy).await;
+        match (totals, lost) {
+            (Ok((n, today, total)), Ok(lost)) => {
+                capital += *cap;
+                count += n;
+                today_pnl += today;
+                total_pnl += total;
+                losses += lost;
+                // Losses come off the capital; profits are set aside.
+                out.push(serde_json::json!({
+                    "strategy": strategy, "capital_inr": cap, "trades_today": n,
+                    "pnl_today_inr": today, "pnl_total_inr": total,
+                    "losses_inr": lost, "profits_inr": total - lost,
+                    "trading_capital_inr": crate::india::orb::trading_cash(*cap, lost),
+                }));
+            }
+            (Err(e), _) | (_, Err(e)) => return rows_unavailable(e),
+        }
+    }
+    // The trades TimesFM made the books skip, followed as if taken: kept out
+    // of the totals above, which are real books only.
+    let mut shadow = Vec::new();
+    for (book, ledger) in [
+        (
+            crate::india::orb::STRATEGY,
+            crate::india::timesfm::ORB_SHADOW,
+        ),
+        (
+            crate::india::burst::STRATEGY,
+            crate::india::timesfm::BURST_SHADOW,
+        ),
+        (crate::india::orb::STRATEGY, crate::india::orb::TRACK),
+    ] {
+        match state.store.intraday_totals(ledger, &day).await {
+            Ok((n, today, total)) => shadow.push(serde_json::json!({
+                "book": book, "strategy": ledger, "trades_today": n,
+                "pnl_today_inr": today, "pnl_total_inr": total,
+            })),
+            Err(e) => return rows_unavailable(e),
+        }
+    }
+    // Paper copies of each real book at every starting amount.
+    let mut ladder = Vec::new();
+    for book in [
+        crate::india::orb::STRATEGY,
+        crate::india::burst::STRATEGY,
+        crate::india::gapgo::STRATEGY,
+    ] {
+        for amount in crate::india::ladder::AMOUNTS {
+            let ledger = crate::india::ladder::ledger(book, amount);
+            let cap = Decimal::from(amount);
+            match (
+                state.store.intraday_totals(&ledger, &day).await,
+                state.store.intraday_losses(&ledger).await,
+            ) {
+                (Ok((n, today, total)), Ok(lost)) => ladder.push(serde_json::json!({
+                    "book": book, "capital_inr": cap, "trades_today": n,
+                    "pnl_today_inr": today, "pnl_total_inr": total,
+                    "trading_capital_inr": crate::india::orb::trading_cash(cap, lost),
+                })),
+                (Err(e), _) | (_, Err(e)) => return rows_unavailable(e),
+            }
+        }
+    }
+    Json(serde_json::json!({
+        "ladder": ladder,
+        "capital_inr": (!books.is_empty()).then_some(capital),
+        "trades_today": count,
+        "pnl_today_inr": today_pnl,
+        "pnl_total_inr": total_pnl,
+        "losses_inr": losses,
+        "profits_inr": total_pnl - losses,
+        "trading_capital_inr": (!books.is_empty()).then_some(capital + losses),
+        "books": out,
+        "timesfm_skipped": shadow,
+        "trades": trades,
+    }))
+    .into_response()
+}
+
+/// The Polymarket paper book: its capital, what is open, what has settled,
+/// and every trade, newest first.
+async fn polymarket_trades_handler(State(state): State<DashboardState>) -> impl IntoResponse {
+    match (
+        state.store.polymarket_book().await,
+        state.store.recent_polymarket_trades(100).await,
+    ) {
+        (Ok((open_cost, realized)), Ok(trades)) => Json(serde_json::json!({
+            "capital_usd": state.polymarket_capital_usd,
+            "open_cost_usd": open_cost,
+            "realized_pnl_usd": realized,
+            "cash_usd": state.polymarket_capital_usd.map(|c| c + realized - open_cost),
+            "trades": trades,
+        }))
+        .into_response(),
+        (Err(e), _) | (_, Err(e)) => rows_unavailable(e),
+    }
+}
+
+/// Post-mortems of closed trades, newest first, and per strategy how many
+/// trades and how much P&L each label accounts for (P&L in the market's own
+/// currency, so India and US are never added together).
+async fn reviews_handler(State(state): State<DashboardState>) -> impl IntoResponse {
+    let reviews = match state.store.recent_trade_reviews(500).await {
+        Ok(r) => r,
+        Err(e) => return rows_unavailable(e),
+    };
+    let mut groups: std::collections::BTreeMap<(String, String, String), (i64, Decimal)> =
+        Default::default();
+    for r in &reviews {
+        let key = (
+            r["market"].as_str().unwrap_or_default().to_string(),
+            r["strategy"].as_str().unwrap_or_default().to_string(),
+            r["label"].as_str().unwrap_or_default().to_string(),
+        );
+        let pnl = r["pnl"]
+            .as_str()
+            .and_then(|p| p.parse::<Decimal>().ok())
+            .unwrap_or_default();
+        let g = groups.entry(key).or_default();
+        g.0 += 1;
+        g.1 += pnl;
+    }
+    let summary: Vec<_> = groups
+        .into_iter()
+        .map(|((market, strategy, label), (count, pnl))| {
+            serde_json::json!({ "market": market, "strategy": strategy, "label": label, "count": count, "pnl": pnl })
+        })
+        .collect();
+    Json(serde_json::json!({ "summary": summary, "reviews": reviews })).into_response()
+}
+
+/// The India desk's decision cards (monthly momentum, intraday breakout).
+async fn india_desk_handler(State(state): State<DashboardState>) -> impl IntoResponse {
+    match state.store.recent_desk_decisions("IN", 24).await {
+        Ok(cards) => Json(serde_json::json!({ "cards": cards })).into_response(),
+        Err(e) => rows_unavailable(e),
+    }
 }
 
 async fn india_watchlist_handler() -> impl IntoResponse {
@@ -1718,10 +2427,13 @@ pub struct UsBacktestRunRequest {
     pub name: Option<String>,
     pub csv_path: Option<String>,
     pub csv_content: Option<String>,
+    pub symbols: Option<Vec<String>>,
+    pub history_years: Option<u32>,
     pub initial_capital: Option<Decimal>,
     pub risk_pct_per_trade: Option<Decimal>,
     pub stop_loss_pct: Option<Decimal>,
     pub take_profit_pct: Option<Decimal>,
+    pub strategy: Option<String>,
 }
 
 async fn us_backtest_run_handler(
@@ -1730,37 +2442,140 @@ async fn us_backtest_run_handler(
 ) -> impl IntoResponse {
     use crate::us::backtest::{parse_and_validate_us_csv, run_us_backtest, UsBacktestConfig};
 
-    let content_res = if let Some(content) = req.csv_content {
-        Ok(content)
-    } else {
-        let path = req.csv_path.as_deref().unwrap_or("data/us_sample_data.csv");
-        std::fs::read_to_string(path)
+    const DEFAULT_SYMBOLS: &[&str] = &[
+        "SPY", "QQQ", "DIA", "IWM", "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "AMD",
+    ];
+    let is_sma = req
+        .strategy
+        .as_deref()
+        .map(|strategy| strategy.eq_ignore_ascii_case("sma_crossover"))
+        .unwrap_or(true);
+    let history_years = req.history_years.unwrap_or(10);
+    let (candles, data_source, symbols, used_history_years) = if let Some(csv_content) =
+        req.csv_content
+    {
+        match parse_and_validate_us_csv(&csv_content) {
+            Ok(candles) => (candles, "csv_upload".to_string(), Vec::new(), None),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": format!("Invalid US OHLCV CSV: {e:#}") })),
+                )
+                    .into_response();
+            }
+        }
+    } else if let Some(path) = req.csv_path.as_deref() {
+        match std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("Failed to read CSV at {path}: {e}"))
-    };
-
-    let csv_content = match content_res {
-        Ok(c) => c,
-        Err(e) => {
+            .and_then(|content| parse_and_validate_us_csv(&content))
+        {
+            Ok(candles) => (candles, "csv_file".to_string(), Vec::new(), None),
+            Err(e) => {
+                return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": format!("Could not load US OHLCV CSV: {e:#}") })),
+                    )
+                        .into_response();
+            }
+        }
+    } else if is_sma {
+        if !(1..=10).contains(&history_years) {
+            return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "Historical lookback must be between 1 and 10 years" })),
+                )
+                    .into_response();
+        }
+        let requested = req.symbols.unwrap_or_else(|| {
+            DEFAULT_SYMBOLS
+                .iter()
+                .map(|symbol| (*symbol).to_string())
+                .collect()
+        });
+        let mut symbols = Vec::new();
+        for symbol in requested {
+            let symbol = symbol.trim().to_ascii_uppercase();
+            if symbol.is_empty()
+                || symbol.len() > 15
+                || !symbol
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+            {
+                return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": format!("Invalid US stock symbol: {symbol}") })),
+                    )
+                        .into_response();
+            }
+            if !symbols.contains(&symbol) {
+                symbols.push(symbol);
+            }
+        }
+        if symbols.is_empty() || symbols.len() > 20 {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": e.to_string() })),
+                Json(serde_json::json!({ "error": "Select between 1 and 20 distinct symbols" })),
             )
                 .into_response();
         }
-    };
-
-    let candles = match parse_and_validate_us_csv(&csv_content) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": format!("Invalid US OHLCV CSV: {e:#}") })),
-            )
-                .into_response();
+        let feed = state.alpaca_feed.clone();
+        let fetched = futures_util::future::try_join_all(symbols.iter().map(|symbol| {
+            let feed = feed.clone();
+            let symbol = symbol.clone();
+            async move {
+                feed.fetch_daily_history_candles(&symbol, history_years)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{symbol}: {e:#}"))
+            }
+        }))
+        .await;
+        match fetched {
+            Ok(per_symbol) => (
+                per_symbol.into_iter().flatten().collect(),
+                format!(
+                    "alpaca_{}_1day_split_adjusted",
+                    state
+                        .alpaca_feed
+                        .feed_type
+                        .read()
+                        .await
+                        .to_ascii_lowercase()
+                ),
+                symbols,
+                Some(history_years),
+            ),
+            Err(e) => {
+                return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({
+                            "error": format!("Could not load complete Alpaca daily history: {e:#}. No bundled sample data was substituted."),
+                        })),
+                    )
+                        .into_response();
+            }
+        }
+    } else {
+        let path = "data/us_sample_data.csv";
+        match std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("Failed to read CSV at {path}: {e}"))
+            .and_then(|content| parse_and_validate_us_csv(&content))
+        {
+            Ok(candles) => (candles, "bundled_demo_csv".to_string(), Vec::new(), None),
+            Err(e) => {
+                return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": format!("Could not load US OHLCV CSV: {e:#}") })),
+                    )
+                        .into_response();
+            }
         }
     };
 
     let mut config = UsBacktestConfig::default();
+    if is_sma {
+        config.fast_sma_period = crate::us::sma_crossover::DEFAULT_FAST_SMA_PERIOD;
+        config.slow_sma_period = crate::us::sma_crossover::DEFAULT_SLOW_SMA_PERIOD;
+    }
     if let Some(c) = req.initial_capital {
         config.initial_capital_usd = c;
     }
@@ -1774,27 +2589,109 @@ async fn us_backtest_run_handler(
         config.take_profit_pct = t;
     }
 
+    let mut candle_symbols: Vec<String> = candles.iter().map(|c| c.symbol.clone()).collect();
+    candle_symbols.sort();
+    candle_symbols.dedup();
+    let symbols = if symbols.is_empty() {
+        candle_symbols
+    } else {
+        symbols
+    };
+    let start_date = candles.iter().map(|c| c.timestamp).min();
+    let end_date = candles.iter().map(|c| c.timestamp).max();
+    let benchmark_symbol = symbols
+        .iter()
+        .find(|symbol| symbol.as_str() == "SPY")
+        .cloned()
+        .or_else(|| symbols.first().cloned());
+    let data_metadata = serde_json::json!({
+        "source": data_source.clone(),
+        "symbols": symbols.clone(),
+        "bar_count": candles.len(),
+        "start_date": start_date,
+        "end_date": end_date,
+        "history_years": used_history_years,
+        "adjustment": if data_source.starts_with("alpaca_") { Some("split") } else { None },
+        "benchmark_symbol": benchmark_symbol,
+    });
     let run_name = req.name.unwrap_or_else(|| {
         format!(
-            "US Backtest {}",
+            "US {} Backtest {}",
+            if is_sma { "SMA 20/50" } else { "" },
             chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")
         )
     });
 
-    let result = match run_us_backtest(&candles, &config) {
-        Ok(r) => r,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": format!("Backtest execution failed: {e:#}") })),
-            )
-                .into_response();
+    // The SMA strategy's regime filter reads SPY. When SPY was not selected,
+    // load it separately so it gates entries without being traded itself.
+    let regime_candles = if is_sma
+        && config.sma_entry_filters.regime_sma_period > 0
+        && !candles.iter().any(|c| c.symbol == "SPY")
+    {
+        match used_history_years {
+            Some(years) => match state
+                .alpaca_feed
+                .fetch_daily_history_candles("SPY", years)
+                .await
+            {
+                Ok(bars) => Some(bars),
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({
+                            "error": format!("Could not load SPY history for the market-regime filter: {e:#}"),
+                        })),
+                    )
+                        .into_response();
+                }
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    let result = if is_sma {
+        match crate::us::sma_crossover::run_us_sma_crossover_backtest_with_regime(
+            &candles,
+            regime_candles.as_deref(),
+            &config,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": format!("SMA Crossover backtest failed: {e:#}") })),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        match run_us_backtest(&candles, &config) {
+            Ok(r) => r,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(
+                        serde_json::json!({ "error": format!("Backtest execution failed: {e:#}") }),
+                    ),
+                )
+                    .into_response();
+            }
         }
     };
 
     let id = format!("us-bt-{}", uuid::Uuid::new_v4().simple());
-    let config_json = serde_json::to_string(&config).unwrap_or_default();
-    let results_json = serde_json::to_string(&result).unwrap_or_default();
+    let mut config_value = serde_json::to_value(&config).unwrap_or_default();
+    if let Some(config_object) = config_value.as_object_mut() {
+        config_object.insert("data".to_string(), data_metadata.clone());
+    }
+    let mut result_value = serde_json::to_value(&result).unwrap_or_default();
+    if let Some(result_object) = result_value.as_object_mut() {
+        result_object.insert("data".to_string(), data_metadata);
+    }
+    let config_json = serde_json::to_string(&config_value).unwrap_or_default();
+    let results_json = serde_json::to_string(&result_value).unwrap_or_default();
 
     if let Err(e) = state
         .store
@@ -1804,7 +2701,7 @@ async fn us_backtest_run_handler(
         warn!(error = %e, "Failed to persist US backtest run");
     }
 
-    Json(serde_json::to_value(&result).unwrap_or_default()).into_response()
+    Json(result_value).into_response()
 }
 
 /// Calculates cumulative realized profit, capital tied up in open positions,
@@ -2287,6 +3184,19 @@ async fn intraday_status_handler(State(state): State<DashboardState>) -> impl In
         .to_string();
 
     let fx = crate::market::fx::get_current_fx_rate();
+    let books = state.india_books();
+    // What the books may trade: capital minus losing trades; profits are set
+    // aside. An unreadable ledger counts as no losses here, display only.
+    let mut intraday_trading = Decimal::ZERO;
+    for (strategy, cap) in &books {
+        let lost = state
+            .store
+            .intraday_losses(strategy)
+            .await
+            .unwrap_or_default();
+        intraday_trading += crate::india::orb::trading_cash(*cap, lost);
+    }
+    let intraday_capital_inr = (!books.is_empty()).then_some(intraday_trading);
     let (cap_inr, cap_usd) = {
         let caps = state.dynamic_caps.read().await;
         (
@@ -2315,6 +3225,7 @@ async fn intraday_status_handler(State(state): State<DashboardState>) -> impl In
             "test_mode": "Historical Backtest & Upstox Sandbox (Live Blocked)",
             "live_orders_blocked": true,
             "capital_allocation_inr": cap_inr,
+            "intraday_capital_inr": intraday_capital_inr,
             "max_exposure_pct": state.risk.india_max_exposure_pct,
             "max_daily_loss_inr": state.risk.india_max_daily_loss_inr,
         },
@@ -2336,6 +3247,12 @@ async fn intraday_status_handler(State(state): State<DashboardState>) -> impl In
             "capital_allocation_usd": cap_usd,
             "max_exposure_pct": state.risk.us_max_exposure_pct,
             "max_daily_loss_usd": state.risk.us_max_daily_loss_usd,
+            "daily_loss_scope": "combined_account_equity",
+            "max_position_pct": state.risk.us_max_position_pct,
+            "cash_buffer_pct": state.risk.us_cash_buffer_pct,
+            "risk_per_trade_pct": state.risk.us_risk_per_trade_pct,
+            "max_trades_per_day": state.risk.us_max_trades_per_day,
+            "max_quote_age_seconds": state.risk.us_max_quote_age_seconds,
         }
     }))
 }
@@ -2460,7 +3377,9 @@ async fn venue_toggle_handler(
     .into_response()
 }
 
-async fn logs_handler(axum::extract::Query(query): axum::extract::Query<LogsQuery>) -> impl IntoResponse {
+async fn logs_handler(
+    axum::extract::Query(query): axum::extract::Query<LogsQuery>,
+) -> impl IntoResponse {
     const LOG_PATH: &str = "/tmp/moneyai.log";
     const MAX_LINES: usize = 1_000;
     const READ_BYTES: u64 = 512 * 1024;
@@ -2483,7 +3402,7 @@ async fn logs_handler(axum::extract::Query(query): axum::extract::Query<LogsQuer
             return vec!["[error reading log file]".to_string()];
         }
         let content = if offset > 0 {
-            buf.splitn(2, '\n').nth(1).unwrap_or("")
+            buf.split_once('\n').map_or("", |(_, rest)| rest)
         } else {
             &buf
         };
@@ -2531,7 +3450,7 @@ async fn settings_caps_get_handler(State(state): State<DashboardState>) -> impl 
         "us_enabled": caps.us_enabled,
         "polymarket_enabled": caps.polymarket_enabled,
         "default_india_capital_inr": 1000.0,
-        "default_us_capital_usd": 5.0,
+        "default_us_capital_usd": 1000.0,
         "currency_inr": "₹",
         "currency_usd": "$"
     }))

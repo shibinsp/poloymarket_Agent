@@ -5,6 +5,16 @@
 pub mod backtest;
 pub mod chart;
 pub mod costs;
+pub mod desk;
+pub mod ibs;
 pub mod instruments;
+pub mod ladder;
 pub mod market_feed;
+pub mod news_stream;
+pub mod options;
+pub mod orb;
+pub mod prefomc;
 pub mod session;
+pub mod sma_crossover;
+pub mod spreads;
+pub mod turnaround;

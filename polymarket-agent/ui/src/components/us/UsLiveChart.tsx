@@ -1009,7 +1009,7 @@ export function UsLiveChart({ onOrderPlaced }: { onOrderPlaced?: () => void }) {
                 </p>
               </div>
 
-              <Badge tone="good">Pullback Strategy Paper Simulator</Badge>
+              <Badge tone="neutral">Older pullback simulator — not the live breakout strategy</Badge>
             </div>
 
             {/* Summary Stat Cards */}

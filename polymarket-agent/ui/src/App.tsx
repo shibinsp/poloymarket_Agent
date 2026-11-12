@@ -10,6 +10,7 @@ import { LearnFromMistakes } from "./pages/LearnFromMistakes";
 import { Costs } from "./pages/Costs";
 import { IndiaTest } from "./pages/IndiaTest";
 import { UsTest } from "./pages/UsTest";
+import { RangeScanner } from "./pages/RangeScanner";
 import { Logs } from "./pages/Logs";
 import { Health } from "./pages/Health";
 import { Settings } from "./pages/Settings";
@@ -88,6 +89,8 @@ export function App() {
           <UsTest />
         ) : path === "/logs" ? (
           <Logs />
+        ) : path === "/scanner" ? (
+          <RangeScanner />
         ) : path === "/health" ? (
           <Health />
         ) : path === "/settings" ? (

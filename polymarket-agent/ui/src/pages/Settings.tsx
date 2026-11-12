@@ -61,57 +61,6 @@ export function Settings() {
     }
   }
 
-  // Strategy Configuration state
-  const [strategyParams, setStrategyParams] = useState({
-    pullbackDipPct: "0.80",
-    fastEma: "20",
-    slowEma: "50",
-    rewardRiskRatio: "1.50",
-    stopLossBufferPct: "0.30",
-    maxHoldHours: "24",
-  });
-  const [strategySaved, setStrategySaved] = useState(false);
-
-  useEffect(() => {
-    try {
-      const saved = localStorage.getItem("polymarket_pullback_config");
-      if (saved) {
-        setStrategyParams(JSON.parse(saved));
-      }
-    } catch {
-      // ignore
-    }
-  }, []);
-
-  function handleSaveStrategy() {
-    try {
-      localStorage.setItem("polymarket_pullback_config", JSON.stringify(strategyParams));
-      setStrategySaved(true);
-      setTimeout(() => setStrategySaved(false), 3000);
-    } catch {
-      // ignore
-    }
-  }
-
-  function handleResetStrategy() {
-    const defaults = {
-      pullbackDipPct: "0.80",
-      fastEma: "20",
-      slowEma: "50",
-      rewardRiskRatio: "1.50",
-      stopLossBufferPct: "0.30",
-      maxHoldHours: "24",
-    };
-    setStrategyParams(defaults);
-    try {
-      localStorage.setItem("polymarket_pullback_config", JSON.stringify(defaults));
-      setStrategySaved(true);
-      setTimeout(() => setStrategySaved(false), 3000);
-    } catch {
-      // ignore
-    }
-  }
-
   // Capital Allocation Caps state (exclusive to Settings)
   const [caps, setCaps] = useState<CapsConfig | null>(null);
   const [indiaCapDraft, setIndiaCapDraft] = useState("");
@@ -291,94 +240,6 @@ export function Settings() {
         </div>
       </Card>
 
-      {/* 2. Pullback & Confirmed Rebound Strategy Configuration */}
-      <Card title="Pullback Strategy Configuration">
-        <p className="muted" style={{ marginTop: 0 }}>
-          Tune 5m candle pullback parameters, trend filters, and execution rules. Strategy initiates paper buys only upon confirmed rebound above VWAP and exits at the planned target ratio.
-        </p>
-        <div className="filters" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: "14px", alignItems: "flex-end" }}>
-          <label className="field">
-            <span>Pullback Dip Depth (%)</span>
-            <input
-              className="input"
-              type="number"
-              step="0.1"
-              min="0.1"
-              value={strategyParams.pullbackDipPct}
-              onChange={(e) => setStrategyParams({ ...strategyParams, pullbackDipPct: e.target.value })}
-            />
-          </label>
-          <label className="field">
-            <span>Fast EMA Period</span>
-            <input
-              className="input"
-              type="number"
-              min="5"
-              max="50"
-              value={strategyParams.fastEma}
-              onChange={(e) => setStrategyParams({ ...strategyParams, fastEma: e.target.value })}
-            />
-          </label>
-          <label className="field">
-            <span>Slow EMA Period</span>
-            <input
-              className="input"
-              type="number"
-              min="20"
-              max="200"
-              value={strategyParams.slowEma}
-              onChange={(e) => setStrategyParams({ ...strategyParams, slowEma: e.target.value })}
-            />
-          </label>
-          <label className="field">
-            <span>Reward-to-Risk Target Ratio</span>
-            <input
-              className="input"
-              type="number"
-              step="0.1"
-              min="1.0"
-              value={strategyParams.rewardRiskRatio}
-              onChange={(e) => setStrategyParams({ ...strategyParams, rewardRiskRatio: e.target.value })}
-            />
-          </label>
-          <label className="field">
-            <span>Stop Buffer Below Low (%)</span>
-            <input
-              className="input"
-              type="number"
-              step="0.05"
-              min="0.1"
-              value={strategyParams.stopLossBufferPct}
-              onChange={(e) => setStrategyParams({ ...strategyParams, stopLossBufferPct: e.target.value })}
-            />
-          </label>
-          <label className="field">
-            <span>Max Position Hold (Hours)</span>
-            <input
-              className="input"
-              type="number"
-              min="1"
-              max="72"
-              value={strategyParams.maxHoldHours}
-              onChange={(e) => setStrategyParams({ ...strategyParams, maxHoldHours: e.target.value })}
-            />
-          </label>
-        </div>
-        <div style={{ display: "flex", gap: "10px", marginTop: "16px", alignItems: "center" }}>
-          <button className="btn btn--primary" onClick={handleSaveStrategy}>
-            Save Strategy Config
-          </button>
-          <button className="btn" onClick={handleResetStrategy}>
-            Reset Strategy Defaults
-          </button>
-          {strategySaved && (
-            <span style={{ color: "var(--status-good, #22c55e)", fontSize: "12px", fontWeight: 600 }}>
-              ✓ Strategy configuration saved successfully.
-            </span>
-          )}
-        </div>
-      </Card>
-
       {/* 3. Market Feeds & Data Providers */}
       <Card title="Market Feeds & Session Gating Config">
         <p className="muted" style={{ marginTop: 0 }}>
@@ -400,10 +261,10 @@ export function Settings() {
           <div style={{ background: "rgba(255,255,255,0.03)", padding: "12px 16px", borderRadius: "8px", border: "1px solid var(--border-color)" }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
               <strong>🇺🇸 US Market Feed</strong>
-              <Badge tone="neutral">Alpaca IEX Feed</Badge>
+              <Badge tone="neutral">Alpaca IEX + SIP</Badge>
             </div>
             <p className="muted" style={{ fontSize: "12px", margin: "0 0 6px" }}>
-              Stream: Alpaca WebSocket V2. Disclaimer: IEX Top of Book (Not consolidated SIP).
+              Live prices: Alpaca WebSocket V2, IEX top of book. The ORB picks its stocks at 9:50 from the full SIP volume (all exchanges), not IEX alone.
             </p>
             <div style={{ fontSize: "11px", color: "var(--text-secondary)" }}>
               Session: Regular Trading Hours 09:30–16:00 ET. Daylight saving transitions tracked via <code>America/New_York</code>.
@@ -532,12 +393,15 @@ export function Settings() {
 
       <Card title="Capital Allocation Caps">
         <p className="muted" style={{ marginTop: 0 }}>
-          Configure maximum capital allocation caps for paper trading venues. Changes dynamically update sandbox buying power, exposure checks, and the venue tags in the top navigation ribbon.
+          Caps for the general paper venue path (sandbox buying power and exposure checks). They do not size the strategy books.
+        </p>
+        <p className="muted" style={{ marginTop: 0, fontSize: 12 }}>
+          The India ORB, burst and gap books trade their own ₹10,000 each (₹30,000 in all, set in <code>config/default.toml</code>); the top bar shows what is left of that after losses.
         </p>
         <div className="filters" style={{ alignItems: "flex-end", gap: "16px" }}>
           <label className="field" style={{ minWidth: 220, flex: 1 }}>
             <span>
-              NSE India Cap (INR){" "}
+              NSE India venue cap (INR){" "}
               {caps && (
                 <Badge tone="neutral">
                   Current: ₹{Number(caps.india_capital_allocation_inr).toLocaleString("en-IN")}
@@ -571,7 +435,7 @@ export function Settings() {
 
           <label className="field" style={{ minWidth: 220, flex: 1 }}>
             <span>
-              US Equities Cap (USD){" "}
+              US venue cap (USD){" "}
               {caps && (
                 <Badge tone="neutral">
                   Current: ${Number(caps.us_capital_allocation_usd).toFixed(2)}

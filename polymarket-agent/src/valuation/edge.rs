@@ -17,6 +17,13 @@ pub fn evaluate_edge(
     config: &ValuationConfig,
     taker_fee_pct: Decimal,
 ) -> Option<EdgeResult> {
+    // A "pass" verdict from the skeptical analyst means no trade.
+    if let Some(ref verdict) = valuation.verdict {
+        if verdict.eq_ignore_ascii_case("pass") {
+            return None;
+        }
+    }
+
     // Skip low-confidence valuations entirely
     if valuation.confidence < dec!(0.4)
         || valuation.data_quality == DataQuality::Low
@@ -66,6 +73,26 @@ pub fn evaluate_edge(
     let threshold = edge_threshold(valuation, config);
     if net_edge < threshold {
         return None;
+    }
+
+    // Conservative edge test: when the model gives an uncertainty range, its
+    // pessimistic end must still beat the executable price.
+    match side {
+        Side::Yes => {
+            if let Some(min_prob) = valuation.uncertainty_min {
+                if min_prob <= trade_price {
+                    return None;
+                }
+            }
+        }
+        Side::No => {
+            if let Some(max_prob_yes) = valuation.uncertainty_max {
+                let min_prob_no = Decimal::ONE - max_prob_yes;
+                if min_prob_no <= trade_price {
+                    return None;
+                }
+            }
+        }
     }
 
     Some(EdgeResult {
@@ -145,6 +172,9 @@ mod tests {
             high_confidence_edge: dec!(0.06),
             low_confidence_edge: dec!(0.10),
             cache_ttl_seconds: 300,
+            request_timeout_seconds: 15,
+            max_evaluations_per_scan: 10,
+            polymarket: None,
         }
     }
 
@@ -190,6 +220,10 @@ mod tests {
             key_factors: vec!["test".to_string()],
             data_quality: DataQuality::High,
             time_sensitivity: crate::valuation::fair_value::TimeSensitivity::Days,
+            uncertainty_min: None,
+            uncertainty_max: None,
+            counter_arguments: Vec::new(),
+            verdict: None,
         }
     }
 
@@ -271,6 +305,50 @@ mod tests {
 
         let result = evaluate_edge(&candidate, &valuation, &config, dec!(0.02));
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_skeptical_pass_verdict_rejects_trade() {
+        let config = test_config();
+        let candidate = test_candidate(dec!(0.50));
+        let mut valuation = test_valuation(dec!(0.75), dec!(0.85));
+        valuation.verdict = Some("pass".to_string());
+
+        let result = evaluate_edge(&candidate, &valuation, &config, Decimal::ZERO);
+        assert!(
+            result.is_none(),
+            "A 'pass' verdict from skeptical analyst must reject trade"
+        );
+    }
+
+    #[test]
+    fn test_conservative_edge_below_executable_price_rejects_trade() {
+        let config = test_config();
+        let candidate = test_candidate(dec!(0.50)); // asks first price is 0.52
+                                                    // Fair value is 0.60, but uncertainty min is 0.51 (which is <= executable ask 0.52)
+        let mut valuation = test_valuation(dec!(0.60), dec!(0.85));
+        valuation.uncertainty_min = Some(dec!(0.51));
+        valuation.uncertainty_max = Some(dec!(0.69));
+
+        let result = evaluate_edge(&candidate, &valuation, &config, Decimal::ZERO);
+        assert!(
+            result.is_none(),
+            "Conservative lower bound must beat executable price"
+        );
+
+        // Now test where conservative lower bound does beat executable price:
+        valuation.uncertainty_min = Some(dec!(0.58));
+        let result = evaluate_edge(&candidate, &valuation, &config, Decimal::ZERO);
+        assert!(
+            result.is_some(),
+            "Conservative lower bound above ask permits trade"
+        );
+        let edge = result.unwrap();
+        assert_eq!(
+            edge.trade_price,
+            dec!(0.52),
+            "Trade price must be executable ask"
+        );
     }
 
     #[test]

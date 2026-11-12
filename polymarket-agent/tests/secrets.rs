@@ -85,6 +85,9 @@ async fn the_llm_client_redacts_its_api_key() {
         high_confidence_edge: rust_decimal_macros::dec!(0.06),
         low_confidence_edge: rust_decimal_macros::dec!(0.10),
         cache_ttl_seconds: 300,
+        request_timeout_seconds: 15,
+        max_evaluations_per_scan: 10,
+        polymarket: None,
     };
     let client =
         polymarket_agent::valuation::llm::LlmClient::new(ANTHROPIC_KEY.to_string(), &config, store)

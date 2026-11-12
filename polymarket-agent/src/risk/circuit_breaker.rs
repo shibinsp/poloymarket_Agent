@@ -47,6 +47,10 @@ pub enum BreakerTrip {
     /// from the percentage because at micro capital a percentage is a
     /// rounding error and the cash number is the one that was actually agreed.
     DailyLossUsd { lost: Decimal, limit: Decimal },
+    /// The U.S. stock books (ORB, burst, any equity strategy) lost more than
+    /// `us_max_daily_loss_usd` today, closed and open trades together. The
+    /// options and crypto books on the same account have limits of their own.
+    UsBookLoss { lost: Decimal, limit: Decimal },
     /// Equity is more than `max_drawdown_pct` below its all-time high.
     Drawdown {
         drawdown_pct: Decimal,
@@ -78,6 +82,7 @@ impl BreakerTrip {
             Self::Drawdown { .. } => HaltScope::UntilResume,
             Self::DailyLossPct { .. }
             | Self::DailyLossUsd { .. }
+            | Self::UsBookLoss { .. }
             | Self::TradeCount { .. }
             | Self::ConsecutiveLosses { .. } => HaltScope::RestOfDay,
         }
@@ -89,6 +94,7 @@ impl BreakerTrip {
         match self {
             Self::DailyLossPct { .. } => "daily_loss_pct",
             Self::DailyLossUsd { .. } => "daily_loss_usd",
+            Self::UsBookLoss { .. } => "us_book_daily_loss",
             Self::Drawdown { .. } => "drawdown",
             Self::TradeCount { .. } => "trade_count",
             Self::ConsecutiveLosses { .. } => "consecutive_losses",
@@ -110,6 +116,13 @@ impl std::fmt::Display for BreakerTrip {
             ),
             Self::DailyLossUsd { lost, limit } => {
                 write!(f, "down ${lost} on the day, limit ${limit}")
+            }
+            Self::UsBookLoss { lost, limit } => {
+                write!(
+                    f,
+                    "U.S. stock books down ${} today, limit ${limit}",
+                    lost.round_dp(2)
+                )
             }
             Self::Drawdown {
                 drawdown_pct,
@@ -139,11 +152,20 @@ impl std::fmt::Display for BreakerTrip {
 /// Every limit is a strict `>` on losses and a `>=` on counts, so a limit of
 /// zero means "no loss at all is tolerated" and "no trades at all", rather
 /// than silently meaning "disabled". To switch a check off, set it high.
+///
+/// `us_book_day_pnl` is today's P&L of the U.S. stock books alone. The U.S.
+/// cash limit is measured on it, so the options book ($500 of its own, where
+/// one contract can swing $40 in minutes) no longer halts the stock books: on
+/// 4 Nov 2026 an SMCI call down ~$40 tripped the $20 limit with the stocks
+/// near flat. `None` (unreadable) falls back to the whole account, the
+/// cautious way. The account-wide cash, percentage and drawdown limits still
+/// see every book.
 pub fn evaluate(
     equity: Decimal,
     marks: &DayMarks,
     trades_today: u32,
     consecutive_losses: u32,
+    us_book_day_pnl: Option<Decimal>,
     cfg: &RiskConfig,
 ) -> Option<BreakerTrip> {
     // Drawdown is checked first on purpose. It is the only trip that outlives
@@ -166,6 +188,25 @@ pub fn evaluate(
             lost,
             limit: cfg.max_daily_loss_usd,
         });
+    }
+
+    // The U.S. stock books' own dollar ceiling; it pauses all new entries.
+    if let Some(us_limit) = cfg.us_max_daily_loss_usd {
+        match us_book_day_pnl {
+            Some(pnl) if -pnl > us_limit => {
+                return Some(BreakerTrip::UsBookLoss {
+                    lost: -pnl,
+                    limit: us_limit,
+                });
+            }
+            None if lost > us_limit => {
+                return Some(BreakerTrip::DailyLossUsd {
+                    lost,
+                    limit: us_limit,
+                });
+            }
+            _ => {}
+        }
     }
 
     // A starting equity of zero has no percentage to measure against; the
@@ -257,7 +298,7 @@ mod tests {
     #[test]
     fn a_quiet_day_trips_nothing() {
         assert_eq!(
-            evaluate(dec!(100), &day(dec!(100), dec!(100)), 0, 0, &cfg()),
+            evaluate(dec!(100), &day(dec!(100), dec!(100)), 0, 0, None, &cfg()),
             None
         );
     }
@@ -267,7 +308,7 @@ mod tests {
         // Guards the sign of `starting_equity - equity`. Flipped, this is the
         // breaker that halts the agent precisely when it is working.
         assert_eq!(
-            evaluate(dec!(150), &day(dec!(100), dec!(150)), 0, 0, &cfg()),
+            evaluate(dec!(150), &day(dec!(100), dec!(150)), 0, 0, None, &cfg()),
             None
         );
     }
@@ -277,12 +318,12 @@ mod tests {
         let c = cfg();
         // Exactly 5% down: at the limit, not past it.
         assert_eq!(
-            evaluate(dec!(95), &day(dec!(100), dec!(100)), 0, 0, &c),
+            evaluate(dec!(95), &day(dec!(100), dec!(100)), 0, 0, None, &c),
             None,
             "a loss equal to the limit is within it"
         );
         // 5.01% down.
-        let trip = evaluate(dec!(94.99), &day(dec!(100), dec!(100)), 0, 0, &c)
+        let trip = evaluate(dec!(94.99), &day(dec!(100), dec!(100)), 0, 0, None, &c)
             .expect("5.01% down must trip the daily loss breaker");
         assert!(
             matches!(trip, BreakerTrip::DailyLossPct { .. }),
@@ -297,7 +338,7 @@ mod tests {
         // $250 but the operator agreed to risk $5.
         let mut c = cfg();
         c.max_daily_loss_usd = dec!(5);
-        let trip = evaluate(dec!(4994), &day(dec!(5000), dec!(5000)), 0, 0, &c)
+        let trip = evaluate(dec!(4994), &day(dec!(5000), dec!(5000)), 0, 0, None, &c)
             .expect("a $6 loss must trip a $5 cash limit even though it is 0.12%");
         match trip {
             BreakerTrip::DailyLossUsd { lost, limit } => {
@@ -309,12 +350,63 @@ mod tests {
     }
 
     #[test]
+    fn the_us_limit_counts_the_stock_books_not_the_options_book() {
+        // 4 Nov 2026: the account down $49 (an SMCI call ~-$40), stocks -$4.
+        let mut c = cfg();
+        c.max_daily_loss_usd = dec!(50);
+        c.us_max_daily_loss_usd = Some(dec!(20));
+        let marks = day(dec!(2006.14), dec!(2014.71));
+        assert_eq!(
+            evaluate(dec!(1956.94), &marks, 3, 0, Some(dec!(-4.43)), &c),
+            None
+        );
+        match evaluate(dec!(1980), &marks, 3, 0, Some(dec!(-21)), &c).expect("stocks down $21") {
+            BreakerTrip::UsBookLoss { lost, limit } => {
+                assert_eq!((lost, limit), (dec!(21), dec!(20)));
+            }
+            other => panic!("expected the U.S. book trip, got {other:?}"),
+        }
+        // The account-wide cash limit still sees every book.
+        match evaluate(dec!(1950), &marks, 3, 0, Some(dec!(-4)), &c).expect("account down $56") {
+            BreakerTrip::DailyLossUsd { limit, .. } => assert_eq!(limit, dec!(50)),
+            other => panic!("expected the account trip, got {other:?}"),
+        }
+        // Unreadable book P&L: the account loss is used, the cautious way.
+        assert!(matches!(
+            evaluate(dec!(1980), &marks, 3, 0, None, &c),
+            Some(BreakerTrip::DailyLossUsd { .. })
+        ));
+    }
+
+    #[test]
+    fn the_configured_us_cash_limit_uses_the_tighter_daily_ceiling() {
+        let mut c = cfg();
+        c.max_daily_loss_usd = dec!(1000);
+        c.us_max_daily_loss_usd = Some(dec!(20));
+
+        assert_eq!(
+            evaluate(dec!(980), &day(dec!(1000), dec!(1000)), 0, 0, None, &c),
+            None,
+            "a loss exactly at the U.S. cash limit remains within the limit"
+        );
+        match evaluate(dec!(979), &day(dec!(1000), dec!(1000)), 0, 0, None, &c)
+            .expect("a $21 loss must exceed the configured $20 cap")
+        {
+            BreakerTrip::DailyLossUsd { lost, limit } => {
+                assert_eq!(lost, dec!(21));
+                assert_eq!(limit, dec!(20));
+            }
+            other => panic!("expected the tighter cash limit, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn drawdown_is_measured_from_the_all_time_high_not_todays_open() {
         let c = cfg();
         // Today opened at 80 and is flat, so the day shows no loss at all.
         // But the account peaked at 100, which is a 20% drawdown.
         let marks = day(dec!(80), dec!(100));
-        let trip = evaluate(dec!(80), &marks, 0, 0, &c)
+        let trip = evaluate(dec!(80), &marks, 0, 0, None, &c)
             .expect("20% below the all-time high must trip even on a flat day");
         match trip {
             BreakerTrip::Drawdown {
@@ -337,7 +429,7 @@ mod tests {
     fn drawdown_outranks_the_daily_loss_when_both_hold() {
         // Both conditions are true. The operator needs to be told about the
         // one that will still be true tomorrow.
-        let trip = evaluate(dec!(50), &day(dec!(100), dec!(100)), 0, 0, &cfg())
+        let trip = evaluate(dec!(50), &day(dec!(100), dec!(100)), 0, 0, None, &cfg())
             .expect("half the account gone must trip something");
         assert!(
             matches!(trip, BreakerTrip::Drawdown { .. }),
@@ -349,7 +441,7 @@ mod tests {
     fn a_zero_high_water_mark_does_not_divide_by_zero() {
         // A brand-new account with nothing recorded yet.
         assert_eq!(
-            evaluate(dec!(0), &day(dec!(0), dec!(0)), 0, 0, &cfg()),
+            evaluate(dec!(0), &day(dec!(0), dec!(0)), 0, 0, None, &cfg()),
             None
         );
     }
@@ -358,11 +450,11 @@ mod tests {
     fn the_trade_counter_trips_on_reaching_the_limit_not_after_exceeding_it() {
         let c = cfg();
         assert_eq!(
-            evaluate(dec!(100), &day(dec!(100), dec!(100)), 9, 0, &c),
+            evaluate(dec!(100), &day(dec!(100), dec!(100)), 9, 0, None, &c),
             None,
             "the tenth trade of a ten-trade day is still allowed"
         );
-        let trip = evaluate(dec!(100), &day(dec!(100), dec!(100)), 10, 0, &c)
+        let trip = evaluate(dec!(100), &day(dec!(100), dec!(100)), 10, 0, None, &c)
             .expect("the eleventh must be refused");
         assert_eq!(
             trip,
@@ -377,11 +469,11 @@ mod tests {
     fn a_losing_streak_trips_on_reaching_the_limit() {
         let c = cfg();
         assert_eq!(
-            evaluate(dec!(100), &day(dec!(100), dec!(100)), 0, 3, &c),
+            evaluate(dec!(100), &day(dec!(100), dec!(100)), 0, 3, None, &c),
             None
         );
         assert!(matches!(
-            evaluate(dec!(100), &day(dec!(100), dec!(100)), 0, 4, &c),
+            evaluate(dec!(100), &day(dec!(100), dec!(100)), 0, 4, None, &c),
             Some(BreakerTrip::ConsecutiveLosses { count: 4, limit: 4 })
         ));
     }

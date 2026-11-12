@@ -37,6 +37,7 @@ pub async fn record_trade(
                 pnl: None,
                 created_at: None,
                 resolved_at: None,
+                ..Default::default()
             };
 
             let trade_id = store.insert_trade(&trade).await?;
@@ -240,6 +241,7 @@ mod tests {
             pnl: None,
             created_at: None,
             resolved_at: None,
+            ..Default::default()
         };
         let trade2 = TradeRecord {
             id: None,
@@ -259,6 +261,7 @@ mod tests {
             pnl: None,
             created_at: None,
             resolved_at: None,
+            ..Default::default()
         };
 
         store.insert_trade(&trade1).await.unwrap();
@@ -286,6 +289,7 @@ mod tests {
             pnl: None,
             created_at: None,
             resolved_at: None,
+            ..Default::default()
         };
         store.insert_trade(&trade3).await.unwrap();
         let exposure2 = unrealized_exposure(&store).await.unwrap();

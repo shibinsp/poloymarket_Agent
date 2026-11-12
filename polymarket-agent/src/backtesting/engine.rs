@@ -138,6 +138,10 @@ pub fn run_backtest(snapshots: &[HistoricalSnapshot], config: &BacktestConfig) -
                 key_factors: vec![],
                 data_quality: crate::valuation::fair_value::DataQuality::High,
                 time_sensitivity: crate::valuation::fair_value::TimeSensitivity::Days,
+                uncertainty_min: None,
+                uncertainty_max: None,
+                counter_arguments: Vec::new(),
+                verdict: None,
             };
             let Some(edge_result) = edge::evaluate_edge(
                 &candidate,
@@ -292,6 +296,9 @@ mod tests {
                 high_confidence_edge: dec!(0.03),
                 low_confidence_edge: dec!(0.08),
                 cache_ttl_seconds: 300,
+                request_timeout_seconds: 15,
+                max_evaluations_per_scan: 10,
+                polymarket: None,
             },
             taker_fee_pct: dec!(0.02),
             simulated_api_cost_per_eval: dec!(0.01),

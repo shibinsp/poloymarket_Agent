@@ -894,6 +894,7 @@ impl Venue for BinanceUsVenue {
         }
 
         match request.kind {
+            OrderKind::Stop { .. } => bail!("Binance.US stop orders are not supported here"),
             OrderKind::Limit { price } => {
                 // Binance has no good-till-date on spot, and no day orders on
                 // a market that never closes. Rewriting either into GTC would

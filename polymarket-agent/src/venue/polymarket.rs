@@ -319,7 +319,9 @@ impl Venue for PolymarketVenue {
         let token_id = Self::token_id_of(&request.instrument)?;
         let price = match request.kind {
             OrderKind::Limit { price } => price,
-            OrderKind::Market => bail!("Polymarket orders are limit-only"),
+            OrderKind::Market | OrderKind::Stop { .. } => {
+                bail!("Polymarket orders are limit-only")
+            }
         };
 
         let outcome = self

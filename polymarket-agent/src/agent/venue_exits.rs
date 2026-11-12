@@ -18,29 +18,41 @@ use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
 use crate::db::store::{OrderRecord, Store, VenueOpenTrade};
+use crate::venue::session::SessionKind;
 use crate::venue::types::{
     Instrument, InstrumentId, OrderKind, OrderRequest, OrderState, Side, TimeInForce, VenueId,
+    PROTECTIVE_STOP_PREFIX,
 };
 use crate::venue::{Venue, VenueRegistry};
+
+/// How often, and how far apart, to re-read a stop just cancelled before
+/// leaving the exit to the next cycle: about three seconds in all.
+const CANCEL_CONFIRM_TRIES: usize = 6;
+const CANCEL_CONFIRM_WAIT_MS: u64 = 500;
 
 /// Why a position is being closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitReason {
     StopLoss,
+    /// A stop that has been raised above the initial stop (breakeven or trail).
+    TrailingStop,
     TakeProfit,
     MaxHold,
     SessionClose,
     EmergencyStop,
+    SmaDeathCross,
 }
 
 impl ExitReason {
     pub fn as_str(&self) -> &'static str {
         match self {
             ExitReason::StopLoss => "STOP_LOSS",
+            ExitReason::TrailingStop => "TRAILING_STOP",
             ExitReason::TakeProfit => "TAKE_PROFIT",
             ExitReason::MaxHold => "MAX_HOLD",
             ExitReason::SessionClose => "SESSION_CLOSE",
             ExitReason::EmergencyStop => "EMERGENCY_STOP",
+            ExitReason::SmaDeathCross => "SMA_DEATH_CROSS",
         }
     }
 }
@@ -48,16 +60,42 @@ impl ExitReason {
 /// Rules applied to an open position, resolved from the trade and config.
 #[derive(Debug, Clone, Copy)]
 pub struct ExitRules {
+    /// A short: the stop sits above the price and the target below it.
+    pub is_short: bool,
     pub stop_price: Option<Decimal>,
+    /// The stop has been ratcheted above its entry level.
+    pub stop_trailed: bool,
     pub target_price: Option<Decimal>,
     pub max_hold_until: Option<DateTime<Utc>>,
     pub session_close_due: bool,
     pub emergency_stop: bool,
+    pub sma_exit_due: bool,
+}
+
+/// How to record an exit order the venue call failed on: the state, and what
+/// to write over the order's stored exit reason.
+///
+/// Only a refusal overwrites the reason, because a refused order never fills.
+/// A timeout or dropped connection may still have reached the venue: on 3 Nov
+/// 2026 ORCL's 15:45 sale came back as an error, filled anyway, and the trade
+/// was closed with the error text as its reason instead of SESSION_CLOSE.
+pub fn failed_exit_record(error: &str) -> (&'static str, Option<&str>) {
+    let refused = error.contains("HTTP 4")
+        || error.contains("rejected")
+        || error.contains("below the venue's minimum")
+        || error.contains("rounds to zero")
+        || error.contains("insufficient qty")
+        || error.contains("not tradable");
+    if refused {
+        ("REJECTED", Some(error))
+    } else {
+        ("UNKNOWN", None)
+    }
 }
 
 /// Decide whether an open long should be closed at the current mark.
 ///
-/// Emergency stop and session close take precedence over price boundaries.
+/// Emergency stop, SMA death cross and session close take precedence over price boundaries.
 /// Stop is checked before target: if a bar straddles both, assuming the good
 /// outcome would flatter every backtest and every logged P&L.
 pub fn evaluate_exit(
@@ -68,16 +106,33 @@ pub fn evaluate_exit(
     if rules.emergency_stop {
         return Some(ExitReason::EmergencyStop);
     }
+    if rules.sma_exit_due {
+        return Some(ExitReason::SmaDeathCross);
+    }
     if rules.session_close_due {
         return Some(ExitReason::SessionClose);
     }
     if let Some(stop) = rules.stop_price {
-        if mark_price <= stop {
-            return Some(ExitReason::StopLoss);
+        let hit = if rules.is_short {
+            mark_price >= stop
+        } else {
+            mark_price <= stop
+        };
+        if hit {
+            return Some(if rules.stop_trailed {
+                ExitReason::TrailingStop
+            } else {
+                ExitReason::StopLoss
+            });
         }
     }
     if let Some(target) = rules.target_price {
-        if mark_price >= target {
+        let reached = if rules.is_short {
+            mark_price <= target
+        } else {
+            mark_price >= target
+        };
+        if reached {
             return Some(ExitReason::TakeProfit);
         }
     }
@@ -90,8 +145,48 @@ pub fn evaluate_exit(
 }
 
 /// Unrealised P&L of a long position at the current mark.
+/// The break-even stop for a position that has gained at least the risk it
+/// started with (1R), or `None` while it has not, or once the stop is already
+/// at or past the entry. Rounded to a cent on the side that never gives back
+/// more than the entry.
+pub fn breakeven_stop(
+    entry: Decimal,
+    stop: Option<Decimal>,
+    mark: Decimal,
+    is_short: bool,
+) -> Option<Decimal> {
+    let stop = stop?;
+    if !is_short && stop < entry && mark - entry >= entry - stop {
+        Some(entry.round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToPositiveInfinity))
+    } else if is_short && stop > entry && entry - mark >= stop - entry {
+        Some(entry.round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToNegativeInfinity))
+    } else {
+        None
+    }
+}
+
 pub fn unrealized_pnl(entry: Decimal, mark: Decimal, qty: Decimal) -> Decimal {
     (mark - entry) * qty
+}
+
+/// P&L of a long or a short; `qty` is always positive.
+pub fn position_pnl(entry: Decimal, mark: Decimal, qty: Decimal, is_short: bool) -> Decimal {
+    let pnl = unrealized_pnl(entry, mark, qty);
+    if is_short {
+        -pnl
+    } else {
+        pnl
+    }
+}
+
+/// The side that closes a position, which is also the side of the book it
+/// is valued on: the bid for a long, the ask for a short.
+fn closing_side(is_short: bool) -> Side {
+    if is_short {
+        Side::Buy
+    } else {
+        Side::Sell
+    }
 }
 
 /// Mark open continuous positions to market and close any that have hit an
@@ -105,6 +200,8 @@ pub struct VenueExits<'a> {
     pub order_ttl_seconds: i64,
     /// Account-wide emergency stop flag.
     pub emergency_stop: bool,
+    /// Optional US strategy config for SMA crossover exits.
+    pub us_strategy: Option<&'a crate::config::UsStrategyConfig>,
 }
 
 impl VenueExits<'_> {
@@ -120,14 +217,27 @@ impl VenueExits<'_> {
         // `VenueCycle::run`; the exit side needs it just as much, and the
         // consequence here is worse — an entry duplicate is an unwanted
         // position, a duplicate exit inverts the one you have.
-        let exiting: HashSet<i64> = self
-            .store
-            .get_unresolved_orders()
-            .await?
-            .into_iter()
-            .filter(|o| o.intent == "EXIT")
+        let unresolved = self.store.get_unresolved_orders().await?;
+        // A resting stop is not an exit under way: the exit it guards against
+        // may still be due.
+        let exiting: HashSet<i64> = unresolved
+            .iter()
+            .filter(|o| o.intent == "EXIT" && !o.is_protective_stop())
             .filter_map(|o| o.trade_id)
             .collect();
+        // An entry still working can add to the position, so its stop waits
+        // until the size is final.
+        let entering: HashSet<i64> = unresolved
+            .iter()
+            .filter(|o| o.intent == "ENTRY")
+            .filter_map(|o| o.trade_id)
+            .collect();
+        let mut stops: HashMap<i64, Vec<OrderRecord>> = HashMap::new();
+        for order in unresolved.into_iter().filter(|o| o.is_protective_stop()) {
+            if let Some(trade_id) = order.trade_id {
+                stops.entry(trade_id).or_default().push(order);
+            }
+        }
 
         let mut instruments: HashMap<String, Vec<Instrument>> = HashMap::new();
 
@@ -144,9 +254,30 @@ impl VenueExits<'_> {
                 }
                 continue;
             }
-            match self.process(&trade, now, cycle, &mut instruments).await {
+            let trade_stops = stops.get(&trade.id).map(Vec::as_slice).unwrap_or(&[]);
+            match self
+                .process(&trade, trade_stops, now, cycle, &mut instruments)
+                .await
+            {
                 Ok(true) => closed += 1,
-                Ok(false) => {}
+                Ok(false) => {
+                    if crate::us::orb::is_intraday_strategy(trade.strategy.as_deref())
+                        && trade_stops.is_empty()
+                        && !entering.contains(&trade.id)
+                    {
+                        if let Err(e) = self
+                            .place_resting_stop(&trade, now, cycle, &mut instruments)
+                            .await
+                        {
+                            warn!(
+                                trade_id = trade.id,
+                                symbol = %trade.symbol,
+                                error = %format!("{e:#}"),
+                                "Could not place a resting stop — the agent's own check still covers it"
+                            );
+                        }
+                    }
+                }
                 Err(e) => warn!(
                     trade_id = trade.id,
                     symbol = %trade.symbol,
@@ -169,9 +300,9 @@ impl VenueExits<'_> {
         };
         let instrument_id = InstrumentId::new(venue_id, trade.symbol.clone());
         let quote = venue.quote(&instrument_id).await?;
-        let mark = quote.taker_price(Side::Sell);
+        let mark = quote.fair_price(closing_side(trade.is_short));
         let entry = trade.avg_fill_price.unwrap_or(trade.entry_price);
-        let pnl = unrealized_pnl(entry, mark, trade.quantity);
+        let pnl = position_pnl(entry, mark, trade.quantity, trade.is_short);
         self.store
             .mark_trade(trade.id, &mark.to_string(), &pnl.to_string(), now)
             .await
@@ -181,6 +312,8 @@ impl VenueExits<'_> {
     async fn process(
         &self,
         trade: &VenueOpenTrade,
+        // The position's protective stops still unresolved at the venue.
+        stops: &[OrderRecord],
         now: DateTime<Utc>,
         cycle: i64,
         instruments: &mut HashMap<String, Vec<Instrument>>,
@@ -199,28 +332,175 @@ impl VenueExits<'_> {
 
         let instrument_id = InstrumentId::new(venue_id, trade.symbol.clone());
         let quote = venue.quote(&instrument_id).await?;
-        // Value a long at what it could be sold for, not the midpoint.
-        let mark = quote.taker_price(Side::Sell);
+        // Value a position at what closing it would get, not the midpoint,
+        // unless the book is too wide for that side to mean anything.
+        let side = closing_side(trade.is_short);
+        let mark = quote.fair_price(side);
+        if let (Some(spread), Some(last)) = (quote.spread_pct(), quote.last) {
+            if spread > crate::venue::types::WIDE_SPREAD {
+                info!(
+                    symbol = %trade.symbol,
+                    bid = %quote.bid,
+                    ask = %quote.ask,
+                    last = %last,
+                    "Wide quote: marked at the last trade, not the midpoint"
+                );
+            }
+        }
 
         let entry: Decimal = trade.avg_fill_price.unwrap_or(trade.entry_price);
         let qty = trade.quantity;
-        let pnl = unrealized_pnl(entry, mark, qty);
+        let pnl = position_pnl(entry, mark, qty, trade.is_short);
 
         self.store
             .mark_trade(trade.id, &mark.to_string(), &pnl.to_string(), now)
             .await?;
 
         let is_equity = trade.asset_class.eq_ignore_ascii_case("equity");
-        let session_close_due = is_equity && venue.session().is_intraday_exit_due(now, 15);
+        let is_us_alpaca_equity = is_equity && trade.venue_id.eq_ignore_ascii_case("alpaca");
+        // An opening-range breakout is intraday whatever the swing strategy
+        // is: it takes the session-close exit, never the SMA rules.
+        let is_orb_position = crate::us::orb::is_intraday_strategy(trade.strategy.as_deref());
+        let is_sma_position = is_us_alpaca_equity
+            && !is_orb_position
+            && self
+                .us_strategy
+                .map(|s| s.strategy.eq_ignore_ascii_case("sma_crossover"))
+                .unwrap_or(false);
+        // Daily crossover positions are meant to survive overnight. Intraday
+        // session-close exits would invalidate the 20/50-day holding rule.
+        let session_close_due =
+            is_equity && !is_sma_position && venue.session().is_intraday_exit_due(now, 15);
+
+        // Break-even after +1R for U.S. intraday trades, at the user's request
+        // on 3 Nov 2026 after RIVN went +1.52R and closed at a loss. Tested on
+        // 210 trades: +$74.76 against +$74.45, so protection, not an edge.
+        if is_orb_position && is_us_alpaca_equity && !session_close_due {
+            if let Some(be) = breakeven_stop(entry, trade.stop_price, mark, trade.is_short) {
+                info!(
+                    trade_id = trade.id,
+                    symbol = %trade.symbol,
+                    from = ?trade.stop_price,
+                    to = %be,
+                    mark = %mark,
+                    "Up 1R: moving the stop to break-even"
+                );
+                self.store
+                    .update_trade_stop(trade.id, &be.to_string())
+                    .await?;
+                // The old stop holds the shares; it must be gone before the
+                // new one can rest. If it fired or is still cancelling, the
+                // next pass sees that and places the new one.
+                if self.clear_resting_stops(venue, stops, now).await? {
+                    let mut moved = trade.clone();
+                    moved.stop_price = Some(be);
+                    if let Err(e) = self
+                        .place_resting_stop(&moved, now, cycle, instruments)
+                        .await
+                    {
+                        warn!(
+                            trade_id = trade.id,
+                            symbol = %trade.symbol,
+                            error = %format!("{e:#}"),
+                            "Could not rest the break-even stop — the agent's own check still covers it"
+                        );
+                    }
+                }
+                return Ok(false);
+            }
+        }
+
+        let completed: Vec<crate::venue::types::Candle> = if is_sma_position {
+            venue
+                .candles(&instrument_id, crate::venue::types::CandleInterval::D1, 65)
+                .await
+                .map(|bars| {
+                    bars.into_iter()
+                        .filter(|c| c.ts + Duration::hours(24) <= now)
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        let sma_exit_due = if is_sma_position {
+            let strategy = self.us_strategy.expect("SMA position has strategy config");
+            let minimum_bars = strategy.slow_sma_period.saturating_add(1);
+            if strategy.moving_average_type.eq_ignore_ascii_case("SMA")
+                && strategy.fast_sma_period > 0
+                && strategy.fast_sma_period < strategy.slow_sma_period
+                && completed.len() >= minimum_bars
+                && crate::us::sma_crossover::validate_daily_candles(
+                    &trade.symbol,
+                    &completed,
+                    now,
+                    minimum_bars,
+                    crate::us::sma_crossover::MAX_PERMISSIBLE_STALE_DAYS,
+                )
+                .is_ok()
+            {
+                let closes: Vec<Decimal> = completed.iter().map(|c| c.close).collect();
+                let n = closes.len();
+                if let (Some(fast_curr), Some(slow_curr), Some(fast_prev), Some(slow_prev)) = (
+                    crate::us::sma_crossover::calculate_sma(&closes[..n], strategy.fast_sma_period),
+                    crate::us::sma_crossover::calculate_sma(&closes[..n], strategy.slow_sma_period),
+                    crate::us::sma_crossover::calculate_sma(
+                        &closes[..n - 1],
+                        strategy.fast_sma_period,
+                    ),
+                    crate::us::sma_crossover::calculate_sma(
+                        &closes[..n - 1],
+                        strategy.slow_sma_period,
+                    ),
+                ) {
+                    fast_prev >= slow_prev && fast_curr < slow_curr
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        let (stop_price, stop_trailed) = if is_sma_position {
+            self.ratchet_sma_stop(trade, entry, mark, &completed)
+                .await?
+        } else {
+            (trade.stop_price, false)
+        };
+
+        // A stop resting at the venue fires on real trades. Checking the same
+        // level against a thin quote here could only add false alarms.
+        let stop_rests_at_venue = stops
+            .iter()
+            .any(|o| o.state == "ACCEPTED" || o.state == "PARTIALLY_FILLED");
 
         let rules = ExitRules {
-            stop_price: trade.stop_price,
-            target_price: trade.target_price,
-            max_hold_until: trade
-                .opened_at
-                .map(|opened| opened + Duration::hours(self.max_hold_hours)),
+            is_short: trade.is_short,
+            stop_price: if stop_rests_at_venue {
+                None
+            } else {
+                stop_price
+            },
+            stop_trailed,
+            target_price: if is_sma_position {
+                None
+            } else {
+                trade.target_price
+            },
+            max_hold_until: if is_sma_position {
+                None
+            } else {
+                trade
+                    .opened_at
+                    .map(|opened| opened + Duration::hours(self.max_hold_hours))
+            },
             session_close_due,
             emergency_stop: self.emergency_stop,
+            sma_exit_due,
         };
 
         let Some(reason) = evaluate_exit(mark, now, &rules) else {
@@ -237,19 +517,260 @@ impl VenueExits<'_> {
             "Exit triggered"
         );
 
-        self.submit_exit(
-            venue,
-            trade,
-            &instrument_id,
-            mark,
-            Some(quote.mid),
-            qty,
-            reason,
-            cycle,
-            instruments,
-        )
-        .await?;
+        // The stop holds the shares, so Alpaca refuses a sale until it is gone.
+        if !self.clear_resting_stops(venue, stops, now).await? {
+            return Ok(false);
+        }
+
+        if let Err(e) = self
+            .submit_exit(
+                venue,
+                trade,
+                &instrument_id,
+                // The exit has to cross the spread to fill, however wide it is.
+                quote.taker_price(side),
+                Some(quote.mid),
+                qty,
+                reason,
+                cycle,
+                instruments,
+            )
+            .await
+        {
+            // The stop is already gone. A refused sale leaves the shares with
+            // nothing at the venue guarding them, so put the stop back until
+            // the next pass retries the exit. A sale whose fate is unknown may
+            // be live and holding the shares; reconciliation settles that one.
+            if failed_exit_record(&format!("{e:#}")).0 == "REJECTED" {
+                if let Err(stop_err) = self
+                    .place_resting_stop(trade, now, cycle, instruments)
+                    .await
+                {
+                    warn!(
+                        trade_id = trade.id,
+                        symbol = %trade.symbol,
+                        error = %format!("{stop_err:#}"),
+                        "Exit refused and the stop could not be put back"
+                    );
+                }
+            }
+            return Err(e);
+        }
         Ok(true)
+    }
+
+    /// Take a position's resting stops down. Returns whether the way is clear
+    /// to exit: not if a stop fired first, which has already closed the trade,
+    /// or if one has not finished cancelling, which the next cycle retries.
+    async fn clear_resting_stops(
+        &self,
+        venue: &dyn Venue,
+        stops: &[OrderRecord],
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let reconciler = crate::agent::reconcile::Reconciler {
+            registry: self.registry,
+            store: self.store,
+            order_ttl: Duration::seconds(self.order_ttl_seconds),
+        };
+        let mut clear = true;
+        for stop in stops {
+            if let Some(id) = &stop.venue_order_id {
+                // A refusal usually means it just filled, which the read below
+                // will show.
+                if let Err(e) = venue.cancel_order(id).await {
+                    warn!(venue_order_id = %id, error = %format!("{e:#}"), "Could not cancel a resting stop");
+                }
+            }
+            // A cancel takes a moment to confirm. Leaving it to the next cycle
+            // left the 2 Nov 2026 ORB positions with no stop for a full minute
+            // before the 15:45 sale, so wait a few seconds for it here.
+            let mut report = reconciler.resolve_one(stop, now).await?;
+            for _ in 0..CANCEL_CONFIRM_TRIES {
+                if report.filled > 0 || report.still_open == 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(CANCEL_CONFIRM_WAIT_MS)).await;
+                report = reconciler.resolve_one(stop, now).await?;
+            }
+            clear &= report.filled == 0 && report.still_open == 0;
+        }
+        Ok(clear)
+    }
+
+    /// Put a stop at the venue, so an open position stays protected when this
+    /// process is not running: on 30 Oct 2026 the laptop slept for nearly three
+    /// hours with MSTR open and nothing checking its stop.
+    ///
+    /// A refusal is not retried. It would be refused again every minute, and
+    /// the agent's own check goes on covering the position either way.
+    async fn place_resting_stop(
+        &self,
+        trade: &VenueOpenTrade,
+        now: DateTime<Utc>,
+        cycle: i64,
+        instruments: &mut HashMap<String, Vec<Instrument>>,
+    ) -> Result<()> {
+        let venue_id = VenueId::new(trade.venue_id.clone());
+        let (Some(stop_price), Some(venue)) = (trade.stop_price, self.registry.get(&venue_id))
+        else {
+            return Ok(());
+        };
+        // Outside regular hours it would only queue, and stops do not trigger then.
+        if venue.session_state(now).kind() != Some(SessionKind::Regular)
+            || self.store.protective_stop_rejected(trade.id).await?
+        {
+            return Ok(());
+        }
+
+        let instrument_id = InstrumentId::new(venue_id, trade.symbol.clone());
+        let instrument = self.resolve(venue, &instrument_id, instruments).await?;
+        let side = closing_side(trade.is_short);
+        let client_order_id = format!("{PROTECTIVE_STOP_PREFIX}{}", Uuid::new_v4());
+
+        self.store
+            .insert_order(&OrderRecord {
+                id: None,
+                client_order_id: client_order_id.clone(),
+                venue_order_id: None,
+                venue_id: trade.venue_id.clone(),
+                symbol: trade.symbol.clone(),
+                side: side.to_string(),
+                intent: "EXIT".to_string(),
+                trade_id: Some(trade.id),
+                limit_price: Some(stop_price.to_string()),
+                qty: trade.quantity.to_string(),
+                filled_qty: "0".to_string(),
+                avg_fill_price: None,
+                state: "PENDING".to_string(),
+                reject_reason: Some(ExitReason::StopLoss.as_str().to_string()),
+                cycle: Some(cycle),
+                mid_at_submit: None,
+                submitted_at: None,
+                updated_at: None,
+                // Long enough to outlast the session; the DAY ones end with it.
+                expires_at: Some((now + Duration::hours(24)).to_rfc3339()),
+            })
+            .await?;
+
+        let request = OrderRequest {
+            instrument,
+            side,
+            kind: OrderKind::Stop { price: stop_price },
+            qty: trade.quantity,
+            // Alpaca takes fractional stops as DAY orders only. A whole-share
+            // stop can stay on overnight if this process is not there to close.
+            tif: if trade.quantity.fract().is_zero() {
+                TimeInForce::Gtc
+            } else {
+                TimeInForce::Day
+            },
+            extended_hours: false,
+            client_order_id: client_order_id.clone(),
+        };
+
+        let ack = match venue.place_order(&request).await {
+            Ok(ack) => ack,
+            Err(e) => {
+                let detail = format!("{e:#}");
+                let refused = detail.contains("HTTP 4") || detail.contains("rejected");
+                self.store
+                    .update_order_state(
+                        &client_order_id,
+                        if refused { "REJECTED" } else { "UNKNOWN" },
+                        None,
+                        "0",
+                        None,
+                        Some(&detail),
+                    )
+                    .await?;
+                return Err(e);
+            }
+        };
+
+        // Any fill is left for reconciliation to find, which closes the trade
+        // the same way however the stop came to fire.
+        let state = if crate::agent::reconcile::is_terminal(&ack.state) && ack.filled_qty.is_zero()
+        {
+            crate::agent::reconcile::state_name(&ack.state)
+        } else {
+            "ACCEPTED"
+        };
+        self.store
+            .update_order_state(
+                &client_order_id,
+                state,
+                Some(&ack.venue_order_id),
+                "0",
+                None,
+                match &ack.state {
+                    OrderState::Rejected(reason) => Some(reason.as_str()),
+                    _ => None,
+                },
+            )
+            .await?;
+        info!(
+            trade_id = trade.id,
+            symbol = %trade.symbol,
+            stop = %stop_price,
+            qty = %trade.quantity,
+            state,
+            "Resting stop placed at the venue"
+        );
+        Ok(())
+    }
+
+    /// Raise an SMA position's stop to breakeven and then a trailing ATR
+    /// level as the trade works, persisting any rise. Returns the stop in
+    /// force and whether it now sits above the initial stop.
+    async fn ratchet_sma_stop(
+        &self,
+        trade: &VenueOpenTrade,
+        entry: Decimal,
+        mark: Decimal,
+        completed: &[crate::venue::types::Candle],
+    ) -> Result<(Option<Decimal>, bool)> {
+        let (Some(current), Some(stop_pct), Some(opened), Some(strategy)) = (
+            trade.stop_price,
+            trade.stop_pct,
+            trade.opened_at,
+            self.us_strategy,
+        ) else {
+            return Ok((trade.stop_price, false));
+        };
+        let initial = (trade.entry_price * (Decimal::ONE - stop_pct)).round_dp(2);
+        // Daily bars are stamped at the session's start, so the entry day's
+        // bar is any bar that ends after the fill.
+        let highest_high = completed
+            .iter()
+            .filter(|c| c.ts + Duration::hours(24) > opened)
+            .map(|c| c.high)
+            .fold(mark, Decimal::max);
+        let atr =
+            crate::risk::volatility::atr(completed, crate::us::sma_crossover::TRAILING_ATR_PERIOD);
+        let managed = crate::us::sma_crossover::managed_stop(
+            entry,
+            initial,
+            highest_high,
+            atr,
+            &strategy.sma_trailing_stop(),
+        );
+        let stop = if managed > current {
+            info!(
+                trade_id = trade.id,
+                symbol = %trade.symbol,
+                from = %current,
+                to = %managed,
+                "Raising protective stop"
+            );
+            self.store
+                .update_trade_stop(trade.id, &managed.to_string())
+                .await?;
+            managed
+        } else {
+            current
+        };
+        Ok((Some(stop), stop > initial))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -275,8 +796,10 @@ impl VenueExits<'_> {
                     .iter()
                     .find(|p| p.instrument.symbol.eq_ignore_ascii_case(&trade.symbol))
                 {
-                    if pos.qty > Decimal::ZERO {
-                        qty.min(pos.qty)
+                    // A venue reports a short as a negative quantity.
+                    let held = if trade.is_short { -pos.qty } else { pos.qty };
+                    if held > Decimal::ZERO {
+                        qty.min(held)
                     } else {
                         // Venue explicitly returned this symbol with 0 quantity (already closed/liquidated)
                         warn!(
@@ -285,7 +808,7 @@ impl VenueExits<'_> {
                             "Venue explicitly reports 0 position for symbol — closing local trade record"
                         );
                         let entry = trade.avg_fill_price.unwrap_or(trade.entry_price);
-                        let realized = unrealized_pnl(entry, mark, qty);
+                        let realized = position_pnl(entry, mark, qty, trade.is_short);
                         self.store
                             .close_trade(
                                 trade.id,
@@ -316,7 +839,8 @@ impl VenueExits<'_> {
         // Re-resolve the instrument so lot/tick rules come from the venue
         // rather than being reconstructed from the stored row.
         let instrument = self.resolve(venue, instrument_id, instruments).await?;
-        let limit_price = instrument.round_price(mark, Side::Sell);
+        let side = closing_side(trade.is_short);
+        let limit_price = instrument.round_price(mark, side);
         let client_order_id = Uuid::new_v4().to_string();
 
         self.store
@@ -326,7 +850,7 @@ impl VenueExits<'_> {
                 venue_order_id: None,
                 venue_id: trade.venue_id.clone(),
                 symbol: trade.symbol.clone(),
-                side: Side::Sell.to_string(),
+                side: side.to_string(),
                 intent: "EXIT".to_string(),
                 trade_id: Some(trade.id),
                 limit_price: Some(limit_price.to_string()),
@@ -352,12 +876,19 @@ impl VenueExits<'_> {
             })
             .await?;
 
+        // Alpaca takes fractional-share orders as DAY orders only; a GTC exit
+        // for a fractional position is rejected, so it could never close.
+        let tif = if instrument.asset_class == crate::venue::types::AssetClass::Equity {
+            TimeInForce::Day
+        } else {
+            TimeInForce::Gtc
+        };
         let request = OrderRequest {
             instrument,
-            side: Side::Sell,
+            side,
             kind: OrderKind::Limit { price: limit_price },
             qty: exit_qty,
-            tif: TimeInForce::Gtc,
+            tif,
             extended_hours: false,
             client_order_id: client_order_id.clone(),
         };
@@ -365,29 +896,10 @@ impl VenueExits<'_> {
         let ack = match venue.place_order(&request).await {
             Ok(ack) => ack,
             Err(e) => {
-                let err_str = e.to_string();
-                let is_deterministic = err_str.contains("HTTP 4")
-                    || err_str.contains("rejected")
-                    || err_str.contains("below the venue's minimum")
-                    || err_str.contains("rounds to zero")
-                    || err_str.contains("insufficient qty")
-                    || err_str.contains("not tradable");
-
-                let final_state = if is_deterministic {
-                    "REJECTED"
-                } else {
-                    "UNKNOWN"
-                };
-
+                let err_str = format!("{e:#}");
+                let (final_state, note) = failed_exit_record(&err_str);
                 self.store
-                    .update_order_state(
-                        &client_order_id,
-                        final_state,
-                        None,
-                        "0",
-                        None,
-                        Some(&err_str),
-                    )
+                    .update_order_state(&client_order_id, final_state, None, "0", None, note)
                     .await?;
                 return Err(e);
             }
@@ -425,7 +937,7 @@ impl VenueExits<'_> {
         if matches!(ack.state, OrderState::Filled) && ack.filled_qty > Decimal::ZERO {
             let exit_price = ack.avg_fill_price.unwrap_or(limit_price);
             let entry = trade.avg_fill_price.unwrap_or(trade.entry_price);
-            let realized = unrealized_pnl(entry, exit_price, ack.filled_qty);
+            let realized = position_pnl(entry, exit_price, ack.filled_qty, trade.is_short);
             self.store
                 .close_trade(
                     trade.id,
@@ -542,6 +1054,7 @@ mod tests {
                 horizon_hours: Some(24),
                 client_order_id: Some("entry-1".to_string()),
                 venue_order_id: Some("v-entry-1".to_string()),
+                strategy: None,
             })
             .await
             .expect("insert position");
@@ -590,6 +1103,7 @@ mod tests {
             max_hold_hours: 72,
             order_ttl_seconds: 300,
             emergency_stop: false,
+            us_strategy: None,
         };
         exits.run(Utc::now(), 1).await.expect("first pass");
         let after_first = store.get_unresolved_orders().await.unwrap().len();
@@ -618,6 +1132,7 @@ mod tests {
             max_hold_hours: 72,
             order_ttl_seconds: 300,
             emergency_stop: false,
+            us_strategy: None,
         };
         exits.run(Utc::now(), 1).await.expect("pass");
 
@@ -682,18 +1197,227 @@ mod tests {
         assert_eq!(order.reject_reason.as_deref(), Some("STOP_LOSS"));
     }
 
+    /// An opening-range position, plus a stub venue with it listed.
+    async fn orb_position() -> (Store, i64) {
+        let store = Store::new(":memory:").await.expect("in-memory store");
+        let trade_id = store
+            .insert_venue_trade(&VenueTradeRecord {
+                cycle: 1,
+                venue_id: "stub".to_string(),
+                symbol: "MSTR".to_string(),
+                asset_class: "crypto_spot".to_string(),
+                display_name: None,
+                side: "BUY".to_string(),
+                entry_price: "100".to_string(),
+                quantity: "1.5".to_string(),
+                notional: "150".to_string(),
+                avg_fill_price: Some("100".to_string()),
+                edge_at_entry: "0".to_string(),
+                fair_value: "0".to_string(),
+                confidence: "0".to_string(),
+                risk_pct: "0.01".to_string(),
+                stop_pct: "0.03".to_string(),
+                status: "OPEN".to_string(),
+                stop_price: Some("97".to_string()),
+                target_price: None,
+                horizon_hours: Some(7),
+                client_order_id: Some("entry-1".to_string()),
+                venue_order_id: Some("v-entry-1".to_string()),
+                strategy: Some("orb".to_string()),
+            })
+            .await
+            .expect("insert position");
+        (store, trade_id)
+    }
+
+    fn orb_stub(mark: Decimal, ack: OrderAck) -> StubVenue {
+        StubVenue::with_classes(
+            "stub",
+            TradingSession::Always,
+            &[("MSTR", AssetClass::CryptoSpot)],
+            false,
+        )
+        .quoting(mark)
+        .acking(ack)
+    }
+
+    fn exits<'a>(registry: &'a VenueRegistry, store: &'a Store) -> VenueExits<'a> {
+        VenueExits {
+            registry,
+            store,
+            max_hold_hours: 72,
+            order_ttl_seconds: 300,
+            emergency_stop: false,
+            us_strategy: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_orb_position_gets_one_resting_stop() {
+        let (store, _) = orb_position().await;
+        let registry = VenueRegistry::new(vec![Box::new(orb_stub(
+            dec!(100),
+            ack(OrderState::Accepted, Decimal::ZERO),
+        ))]);
+        let exits = exits(&registry, &store);
+
+        exits.run(Utc::now(), 1).await.unwrap();
+        exits.run(Utc::now(), 2).await.unwrap();
+
+        let orders = store.get_unresolved_orders().await.unwrap();
+        assert_eq!(orders.len(), 1, "no second stop: {orders:?}");
+        assert!(orders[0].is_protective_stop());
+        assert_eq!(store.get_open_venue_trades().await.unwrap().len(), 1);
+    }
+
+    /// Thin quotes must not trip what the venue is already watching on real
+    /// trades, which is the whole point of having it there.
+    #[tokio::test]
+    async fn a_resting_stop_replaces_the_agents_own_check() {
+        let (store, _) = orb_position().await;
+        let registry = VenueRegistry::new(vec![Box::new(orb_stub(
+            dec!(100),
+            ack(OrderState::Accepted, Decimal::ZERO),
+        ))]);
+        exits(&registry, &store).run(Utc::now(), 1).await.unwrap();
+
+        // The stub's mark is now through the 97 stop.
+        let registry = VenueRegistry::new(vec![Box::new(orb_stub(
+            dec!(90),
+            ack(OrderState::Accepted, Decimal::ZERO),
+        ))]);
+        let closed = exits(&registry, &store).run(Utc::now(), 2).await.unwrap();
+
+        assert_eq!(closed, 0);
+        let orders = store.get_unresolved_orders().await.unwrap();
+        assert!(orders.iter().all(|o| o.is_protective_stop()), "{orders:?}");
+    }
+
+    /// A refused stop would be refused again every minute, so it is not retried
+    /// and the agent's own check stays in charge.
+    #[tokio::test]
+    async fn a_refused_stop_is_not_retried_and_the_agent_still_checks() {
+        let (store, _) = orb_position().await;
+        let stub = orb_stub(
+            dec!(100),
+            ack(OrderState::Rejected("no".to_string()), Decimal::ZERO),
+        );
+        let registry = VenueRegistry::new(vec![Box::new(stub)]);
+        let exits_pass = exits(&registry, &store);
+        exits_pass.run(Utc::now(), 1).await.unwrap();
+        exits_pass.run(Utc::now(), 2).await.unwrap();
+        assert!(store.get_unresolved_orders().await.unwrap().is_empty());
+
+        let registry = VenueRegistry::new(vec![Box::new(orb_stub(
+            dec!(90),
+            ack(OrderState::Accepted, Decimal::ZERO),
+        ))]);
+        let closed = exits(&registry, &store).run(Utc::now(), 3).await.unwrap();
+        assert_eq!(closed, 1, "the stop at 97 is breached and nothing rests");
+    }
+
+    /// The stop fired in the moment before the exit was due: the position is
+    /// closed as a stop, and a second sale would open a short.
+    #[tokio::test]
+    async fn a_stop_that_fired_first_closes_the_trade_with_no_exit_order() {
+        let (store, _) = orb_position().await;
+        let registry = VenueRegistry::new(vec![Box::new(orb_stub(
+            dec!(100),
+            ack(OrderState::Accepted, Decimal::ZERO),
+        ))]);
+        let exits_pass = exits(&registry, &store);
+        exits_pass.run(Utc::now(), 1).await.unwrap();
+        let stop = store.get_unresolved_orders().await.unwrap().remove(0);
+
+        let filled = OrderAck {
+            avg_fill_price: Some(dec!(96.5)),
+            ..ack(OrderState::Filled, dec!(1.5))
+        };
+        let registry = VenueRegistry::new(vec![Box::new(
+            orb_stub(dec!(90), ack(OrderState::Accepted, Decimal::ZERO)).answering_orders(filled),
+        )]);
+        let venue = registry.all().next().unwrap();
+        let clear = exits(&registry, &store)
+            .clear_resting_stops(venue, &[stop], Utc::now())
+            .await
+            .unwrap();
+
+        assert!(!clear, "nothing is left to exit");
+        assert!(store.get_open_venue_trades().await.unwrap().is_empty());
+        assert!(store.get_unresolved_orders().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_stop_clears_the_way_to_exit() {
+        let (store, _) = orb_position().await;
+        let registry = VenueRegistry::new(vec![Box::new(orb_stub(
+            dec!(100),
+            ack(OrderState::Accepted, Decimal::ZERO),
+        ))]);
+        let exits_pass = exits(&registry, &store);
+        exits_pass.run(Utc::now(), 1).await.unwrap();
+        let stop = store.get_unresolved_orders().await.unwrap().remove(0);
+
+        let registry = VenueRegistry::new(vec![Box::new(
+            orb_stub(dec!(100), ack(OrderState::Accepted, Decimal::ZERO))
+                .answering_orders(ack(OrderState::Cancelled, Decimal::ZERO)),
+        )]);
+        let venue = registry.all().next().unwrap();
+        let clear = exits(&registry, &store)
+            .clear_resting_stops(venue, &[stop], Utc::now())
+            .await
+            .unwrap();
+
+        assert!(clear);
+        assert_eq!(store.get_open_venue_trades().await.unwrap().len(), 1);
+    }
+
     fn rules(
         stop: Option<Decimal>,
         target: Option<Decimal>,
         deadline: Option<DateTime<Utc>>,
     ) -> ExitRules {
         ExitRules {
+            is_short: false,
             stop_price: stop,
+            stop_trailed: false,
             target_price: target,
             max_hold_until: deadline,
             session_close_due: false,
             emergency_stop: false,
+            sma_exit_due: false,
         }
+    }
+
+    /// RIVN on 2 Nov 2026: entry 13.06524, stop 12.65, so 1R is 0.41524.
+    #[test]
+    fn the_stop_moves_to_break_even_at_one_r_and_only_once() {
+        use rust_decimal_macros::dec;
+        let (entry, stop) = (dec!(13.06524), Some(dec!(12.65)));
+        assert_eq!(
+            breakeven_stop(entry, stop, dec!(13.40), false),
+            None,
+            "under 1R"
+        );
+        assert_eq!(
+            breakeven_stop(entry, stop, dec!(13.49), false),
+            Some(dec!(13.07))
+        );
+        assert_eq!(
+            breakeven_stop(entry, Some(dec!(13.07)), dec!(14), false),
+            None,
+            "already moved"
+        );
+        assert_eq!(breakeven_stop(entry, None, dec!(14), false), None);
+        // A short: entry 100, stop 102, 1R down is 98.
+        assert_eq!(
+            breakeven_stop(dec!(100.004), Some(dec!(102)), dec!(98.5), true),
+            None
+        );
+        assert_eq!(
+            breakeven_stop(dec!(100.004), Some(dec!(102)), dec!(98), true),
+            Some(dec!(100.00))
+        );
     }
 
     #[test]
@@ -788,9 +1512,62 @@ mod tests {
     }
 
     #[test]
+    fn an_unanswered_exit_keeps_its_reason_and_a_refused_one_records_why() {
+        // ORCL, 3 Nov 2026: the call failed without a reply and the sale filled.
+        assert_eq!(
+            failed_exit_record("Failed to place Alpaca order for ORCL: error sending request"),
+            ("UNKNOWN", None)
+        );
+        let refused = "Failed to place Alpaca order for ORCL: HTTP 403: insufficient qty";
+        assert_eq!(failed_exit_record(refused), ("REJECTED", Some(refused)));
+    }
+
+    #[test]
     fn exit_reasons_have_stable_stored_names() {
         assert_eq!(ExitReason::StopLoss.as_str(), "STOP_LOSS");
         assert_eq!(ExitReason::TakeProfit.as_str(), "TAKE_PROFIT");
         assert_eq!(ExitReason::MaxHold.as_str(), "MAX_HOLD");
+        assert_eq!(ExitReason::TrailingStop.as_str(), "TRAILING_STOP");
+    }
+
+    #[test]
+    fn a_short_stops_out_above_and_takes_profit_below() {
+        let mut r = rules(Some(dec!(105)), Some(dec!(90)), None);
+        r.is_short = true;
+        assert_eq!(evaluate_exit(dec!(104), Utc::now(), &r), None);
+        assert_eq!(
+            evaluate_exit(dec!(105), Utc::now(), &r),
+            Some(ExitReason::StopLoss)
+        );
+        assert_eq!(
+            evaluate_exit(dec!(90), Utc::now(), &r),
+            Some(ExitReason::TakeProfit)
+        );
+        // The same levels on a long would be a stop below and a target above.
+        r.is_short = false;
+        assert_eq!(
+            evaluate_exit(dec!(104), Utc::now(), &r),
+            Some(ExitReason::StopLoss)
+        );
+    }
+
+    #[test]
+    fn a_short_profits_when_the_price_falls() {
+        assert_eq!(position_pnl(dec!(100), dec!(95), dec!(4), true), dec!(20));
+        assert_eq!(position_pnl(dec!(100), dec!(103), dec!(4), true), dec!(-12));
+        assert_eq!(position_pnl(dec!(100), dec!(103), dec!(4), false), dec!(12));
+        assert_eq!(closing_side(true), Side::Buy);
+        assert_eq!(closing_side(false), Side::Sell);
+    }
+
+    #[test]
+    fn a_raised_stop_reports_as_a_trailing_stop() {
+        let mut r = rules(Some(dec!(105)), None, None);
+        r.stop_trailed = true;
+        assert_eq!(
+            evaluate_exit(dec!(104), Utc::now(), &r),
+            Some(ExitReason::TrailingStop)
+        );
+        assert_eq!(evaluate_exit(dec!(106), Utc::now(), &r), None);
     }
 }

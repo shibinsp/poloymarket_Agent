@@ -3,6 +3,8 @@
 *.db-journal
 *.db-wal
 *.db-shm
+# Runtime state of the NSE momentum worker
+india_momentum_state.json
 .env
 *.pem
 *.key
@@ -20,3 +22,21 @@ stderr.txt
 # Scratch test files (keep only check_profit.py)
 scratch/*
 !scratch/check_profit.py
+run_paper/
+
+# Research pipeline price cache (rebuilt by research/pipeline/intraday_search.py)
+research/data/
+
+# Backups that hold API keys or local state: never commit
+.env.bak*
+*.bak-*
+*.db.bak*
+# Second build folder used for tests while the agent runs
+target-test/
+# Python caches
+__pycache__/
+*.pyc
+# Runtime research output (rebuilt by the tools)
+research/*.jsonl
+research/*.err
+research/spread_fills.json

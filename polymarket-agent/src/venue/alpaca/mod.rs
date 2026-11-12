@@ -38,14 +38,14 @@ use crate::venue::session::{SessionKind, SessionState, TradingSession};
 use crate::venue::types::{
     AssetClass, Balance, Candle, CandleInterval, Instrument, InstrumentId, InstrumentMeta,
     OrderAck, OrderKind, OrderRef, OrderRequest, Position, Quote, ScanFilter, Settlement,
-    TimeInForce, VenueCapabilities, VenueId,
+    TimeInForce, VenueCapabilities, VenueId, PROTECTIVE_STOP_PREFIX,
 };
 use crate::venue::Venue;
 
 use self::models::{
     is_crypto_symbol, order_state, side_str, split_pair, tif_str, AlpacaAccount, AlpacaAsset,
     AlpacaClock, AlpacaOrder, AlpacaPosition, BarsResponse, CancelAllEntry,
-    CryptoOrderbooksResponse, LatestQuotesResponse, NewOrder,
+    CryptoOrderbooksResponse, LatestQuotesResponse, LatestTradesResponse, NewOrder,
 };
 use self::rest::{AlpacaRest, Api};
 
@@ -243,6 +243,9 @@ pub struct AlpacaVenue {
     assets_ttl: Duration,
     clock: RwLock<Option<Cached<AlpacaClock>>>,
     assets: RwLock<HashMap<&'static str, Cached<AssetListing>>>,
+    /// Single-symbol lookups from the fallback when the class listing fails,
+    /// kept for `assets_ttl` like the listing.
+    symbol_assets: RwLock<HashMap<String, Cached<AlpacaAsset>>>,
     account_ttl: Duration,
     account: RwLock<Option<Cached<AlpacaAccount>>>,
     is_paper: bool,
@@ -303,6 +306,7 @@ impl AlpacaVenue {
             account_ttl: config.account_ttl,
             account: RwLock::new(None),
             assets: RwLock::new(HashMap::new()),
+            symbol_assets: RwLock::new(HashMap::new()),
             is_paper: config.is_paper,
         })
     }
@@ -414,6 +418,7 @@ impl AlpacaVenue {
     pub async fn invalidate_caches(&self) {
         *self.clock.write().await = None;
         self.assets.write().await.clear();
+        self.symbol_assets.write().await.clear();
     }
 
     // === Assets ===========================================================
@@ -467,10 +472,31 @@ impl AlpacaVenue {
     /// Asset metadata for exactly the symbols asked for, fetching only the
     /// classes those symbols belong to.
     async fn assets_for(&self, symbols: &[String]) -> Result<HashMap<String, AlpacaAsset>> {
+        // Symbols the per-symbol fallback already fetched. On a slow line the
+        // class listing (megabytes) timed out every cycle and the fallback
+        // looked up all 91 symbols again each time: 95-117 s cycles on
+        // 3 Nov 2026, with the U.S. entries and exits waiting behind them.
+        let mut out = HashMap::new();
+        {
+            let known = self.symbol_assets.read().await;
+            for symbol in symbols {
+                if let Some(asset) = known.get(symbol).and_then(|c| c.get(self.assets_ttl)) {
+                    out.insert(symbol.clone(), asset);
+                }
+            }
+        }
+        let missing: Vec<String> = symbols
+            .iter()
+            .filter(|s| !out.contains_key(*s))
+            .cloned()
+            .collect();
+        if missing.is_empty() {
+            return Ok(out);
+        }
+        let symbols = &missing[..];
         let wants_equity = symbols.iter().any(|s| !is_crypto_symbol(s));
         let wants_crypto = symbols.iter().any(|s| is_crypto_symbol(s));
 
-        let mut out = HashMap::new();
         for (wanted, class) in [
             (wants_equity, ASSET_CLASS_EQUITY),
             (wants_crypto, ASSET_CLASS_CRYPTO),
@@ -488,14 +514,24 @@ impl AlpacaVenue {
                 }
                 Err(e) => {
                     warn!(class, error = %e, "Batch asset listing failed — falling back to per-symbol lookup");
-                    for symbol in symbols {
-                        let is_crypto = is_crypto_symbol(symbol);
-                        if (class == ASSET_CLASS_CRYPTO && is_crypto)
-                            || (class == ASSET_CLASS_EQUITY && !is_crypto)
-                        {
-                            if let Ok(asset) = self.asset(symbol).await {
-                                out.insert(symbol.clone(), asset);
-                            }
+                    let wanted: Vec<String> = symbols
+                        .iter()
+                        .filter(|s| (class == ASSET_CLASS_CRYPTO) == is_crypto_symbol(s))
+                        .cloned()
+                        .collect();
+                    // Eight at a time, not one by one.
+                    let mut fetched = Vec::with_capacity(wanted.len());
+                    for chunk in wanted.chunks(8) {
+                        let results =
+                            futures_util::future::join_all(chunk.iter().map(|s| self.asset(s)))
+                                .await;
+                        fetched.extend(chunk.iter().cloned().zip(results));
+                    }
+                    let mut known = self.symbol_assets.write().await;
+                    for (symbol, asset) in fetched {
+                        if let Ok(asset) = asset {
+                            known.insert(symbol.clone(), Cached::new(asset.clone()));
+                            out.insert(symbol, asset);
                         }
                     }
                 }
@@ -671,7 +707,7 @@ fn build_new_order(request: &OrderRequest) -> Result<NewOrder> {
         whole
     };
 
-    let (order_type, limit_price) = match request.kind {
+    let (order_type, limit_price, stop_price) = match request.kind {
         OrderKind::Limit { price } => {
             if price <= Decimal::ZERO {
                 bail!("Alpaca limit price must be positive, got {price} for {symbol}");
@@ -682,9 +718,21 @@ fn build_new_order(request: &OrderRequest) -> Result<NewOrder> {
                     "Limit price {price} for {symbol} rounds to zero against the venue's                      tick size"
                 );
             }
-            ("limit", Some(ticked.normalize().to_string()))
+            ("limit", Some(ticked.normalize().to_string()), None)
         }
-        OrderKind::Market => ("market", None),
+        OrderKind::Market => ("market", None, None),
+        OrderKind::Stop { price } => {
+            if crypto {
+                bail!(
+                    "Alpaca stop-market orders are not available on crypto; {symbol} asked for one"
+                );
+            }
+            if price <= Decimal::ZERO {
+                bail!("Alpaca stop price must be positive, got {price} for {symbol}");
+            }
+            let ticked = request.instrument.round_price(price, request.side);
+            ("stop", None, Some(ticked.normalize().to_string()))
+        }
     };
 
     let extended_hours = if crypto {
@@ -730,6 +778,7 @@ fn build_new_order(request: &OrderRequest) -> Result<NewOrder> {
         order_type,
         time_in_force: tif,
         limit_price,
+        stop_price,
         extended_hours,
         client_order_id: request.client_order_id.clone(),
     })
@@ -940,13 +989,38 @@ impl Venue for AlpacaVenue {
             .with_context(|| format!("Alpaca returned no quote for {symbol}"))?;
         let (bid, ask) = (quote.bid_price, quote.ask_price);
         require_two_sided(&symbol, bid, ask)?;
+        let mid = (bid + ask) / dec!(2);
+
+        // IEX's book is often hollow: on 2 Nov 2026 ABNB showed bid 156.75 /
+        // ask 168.57 while it traded at 168, and its midpoint put the
+        // dashboard $5 under the real price. On a wide book the last trade is
+        // the better estimate, so fetch it only then: one more call, rarely.
+        let last = if mid > Decimal::ZERO && (ask - bid) / mid > crate::venue::types::WIDE_SPREAD {
+            match self
+                .rest
+                .get::<LatestTradesResponse>(
+                    Api::Data,
+                    "/v2/stocks/trades/latest",
+                    &[("symbols", symbol.clone()), ("feed", self.feed.clone())],
+                )
+                .await
+            {
+                Ok(r) => r.trades.get(&symbol).map(|t| t.price),
+                Err(e) => {
+                    warn!(symbol = %symbol, error = %format!("{e:#}"), "Wide quote and no last trade; judging it at the midpoint");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         Ok(Quote {
             instrument: id.clone(),
             bid,
             ask,
-            mid: (bid + ask) / dec!(2),
-            last: None,
+            mid,
+            last,
             ts: quote.ts,
             book: None,
         })
@@ -1171,6 +1245,50 @@ impl Venue for AlpacaVenue {
         Ok(())
     }
 
+    /// One order at a time when a protective stop is resting, since the bulk
+    /// endpoint cannot leave one behind. If the book cannot be read, clearing
+    /// everything is the safer failure: the exit pass puts the stops back.
+    #[instrument(skip(self), fields(venue = %self.id))]
+    async fn cancel_all_except_protective(&self) -> Result<()> {
+        let open = match self.open_orders().await {
+            Ok(open) => open,
+            Err(e) => {
+                warn!(error = %format!("{e:#}"), "Could not list open orders — cancelling them all");
+                return self.cancel_all().await;
+            }
+        };
+        if !open
+            .iter()
+            .any(|o| o.client_order_id.starts_with(PROTECTIVE_STOP_PREFIX))
+        {
+            return self.cancel_all().await;
+        }
+
+        let mut failed = Vec::new();
+        for order in open
+            .iter()
+            .filter(|o| !o.client_order_id.starts_with(PROTECTIVE_STOP_PREFIX))
+        {
+            if let Err(e) = self.cancel_order(&order.venue_order_id).await {
+                let detail = format!("{e:#}");
+                // Same as the bulk endpoint: already gone or already done.
+                if detail.contains("HTTP 404") || detail.contains("HTTP 422") {
+                    warn!(order_id = %order.venue_order_id, "Order was no longer cancelable");
+                } else {
+                    failed.push(order.venue_order_id.clone());
+                }
+            }
+        }
+        if !failed.is_empty() {
+            bail!(
+                "Alpaca could not cancel {} order(s): {}",
+                failed.len(),
+                failed.join(", ")
+            );
+        }
+        Ok(())
+    }
+
     #[instrument(skip(self), fields(venue = %self.id))]
     async fn open_orders(&self) -> Result<Vec<OrderAck>> {
         if self.is_paper {
@@ -1359,6 +1477,22 @@ mod tests {
                 base: "BTC".to_string(),
             },
         }
+    }
+
+    #[test]
+    fn a_stop_is_sent_as_a_stop_price_with_no_limit() {
+        let payload = build_new_order(&order(
+            equity_instrument(),
+            OrderKind::Stop {
+                price: dec!(124.73),
+            },
+            TimeInForce::Day,
+            false,
+        ))
+        .unwrap();
+        assert_eq!(payload.order_type, "stop");
+        assert_eq!(payload.stop_price.as_deref(), Some("124.73"));
+        assert_eq!(payload.limit_price, None);
     }
 
     fn order(instrument: Instrument, kind: OrderKind, tif: TimeInForce, ext: bool) -> OrderRequest {

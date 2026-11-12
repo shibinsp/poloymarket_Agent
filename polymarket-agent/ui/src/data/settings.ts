@@ -20,7 +20,7 @@ const KEY = "dashboard_settings";
 
 const DEFAULTS: Settings = {
   intervalSeconds: 30,
-  theme: "system",
+  theme: "dark",
   pricePrecision: 4,
   localDailyBudget: null,
   reduceMotion: false,
@@ -67,6 +67,6 @@ export const settings = {
 
 export function applyTheme(choice: ThemeChoice): void {
   const root = document.documentElement;
-  if (choice === "system") delete root.dataset.theme;
+  if (choice === "system") root.dataset.theme = "dark";
   else root.dataset.theme = choice;
 }
