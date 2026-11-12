@@ -278,6 +278,10 @@ fn config(alpaca: &MockServer, model: &MockServer, poly: &MockServer, db: &str) 
             initial_paper_balance: dec!(100),
             daily_api_budget: dec!(5),
             max_sleep_seconds: 3600,
+            polymarket_capital_usd: None,
+            polymarket_scan_every_cycles: 10,
+            polymarket_underdog: false,
+            polymarket_new_bets: true,
         },
         scanning: ScanningConfig {
             max_markets: 50,
@@ -297,6 +301,9 @@ fn config(alpaca: &MockServer, model: &MockServer, poly: &MockServer, db: &str) 
             high_confidence_edge: dec!(0.01),
             low_confidence_edge: dec!(0.02),
             cache_ttl_seconds: 0,
+            request_timeout_seconds: 15,
+            max_evaluations_per_scan: 10,
+            polymarket: None,
         },
         risk: RiskConfig {
             // Loose enough that the breakers do not fire on the first cycle;
@@ -347,6 +354,10 @@ fn config(alpaca: &MockServer, model: &MockServer, poly: &MockServer, db: &str) 
         us_strategy: polymarket_agent::config::UsStrategyConfig::default(),
         india_strategy: polymarket_agent::config::IndiaStrategyConfig::default(),
         us_orb: polymarket_agent::config::UsOrbConfig::default(),
+        us_options: polymarket_agent::config::UsOptionsConfig::default(),
+        us_spreads: polymarket_agent::config::UsSpreadsConfig::default(),
+        crypto: polymarket_agent::config::CryptoConfig::default(),
+        target: polymarket_agent::config::TargetConfig::default(),
     }
 }
 

@@ -37,6 +37,63 @@ use crate::venue::types::{
 use crate::venue::VenueRegistry;
 
 pub const ORB_STRATEGY: &str = "orb";
+/// The opening burst: at 9:35, the stock in play whose 9:30 bar moved at least
+/// 1% on at least 3x its usual volume, in SPY's direction, traded with that
+/// move; stop at the bar's far side, flat before the close like the ORB. On
+/// May - Oct 2026 SIP bars: 56 trades, +0.14% a trade +/- 0.43%, so a paper
+/// experiment, not an edge.
+pub const BURST_STRATEGY: &str = "us_burst";
+const BURST_RVOL_MIN: Decimal = rust_decimal_macros::dec!(3);
+const BURST_MOVE_MIN: Decimal = rust_decimal_macros::dec!(0.01);
+
+/// Whether a breakout seen at `slot` may still be entered: on time (the bar
+/// right after its signal), or late only when it fired before the stocks in
+/// play could be ranked, this is the first bar after the ranking, and the
+/// last bar still closed beyond the range.
+pub fn late_entry_allowed(signal: usize, slot: usize, ready_slot: usize, still_beyond: bool) -> bool {
+    slot == signal + 1 || (signal + 1 < ready_slot && slot == ready_slot && still_beyond)
+}
+
+/// Whether an ORB entry may still be placed during bar `slot` (0 = 9:30-9:35),
+/// with no entries `last_entry_minute` minutes after the open or later. On
+/// the 210 May-Oct 2026 backtest trades, entries from 10:00 ET lost in both
+/// halves (-$13.60 over 57) while earlier ones made +$88.36; the user set the
+/// 10:00 cutoff on 4 Nov 2026.
+pub fn entry_window_open(slot: usize, last_entry_minute: u32) -> bool {
+    (slot as u64) * (BAR_MINUTES as u64) < u64::from(last_entry_minute)
+}
+
+/// Strategies whose positions are intraday: a resting stop at the venue and
+/// the session-close exit.
+pub fn is_intraday_strategy(strategy: Option<&str>) -> bool {
+    matches!(strategy, Some(ORB_STRATEGY) | Some(BURST_STRATEGY))
+}
+
+/// The day's burst, if any: among (symbol, first bar, relative volume), the
+/// loudest whose 9:30 bar moved at least 1% on 3x volume in SPY's direction,
+/// as (symbol, side, stop).
+pub fn pick_burst(
+    first_bars: &[(String, Bar, Decimal)],
+    spy_up: bool,
+) -> Option<(String, Side, Decimal)> {
+    first_bars
+        .iter()
+        .filter(|(s, b, rvol)| {
+            s != "SPY"
+                && *rvol >= BURST_RVOL_MIN
+                && b.open > Decimal::ZERO
+                && (b.close / b.open - Decimal::ONE).abs() >= BURST_MOVE_MIN
+                && (b.close > b.open) == spy_up
+        })
+        .max_by(|a, b| a.2.cmp(&b.2))
+        .map(|(s, b, _)| {
+            if b.close > b.open {
+                (s.clone(), Side::Buy, b.low)
+            } else {
+                (s.clone(), Side::Sell, b.high)
+            }
+        })
+}
 const VENUE: &str = "alpaca";
 const BAR_MINUTES: i64 = 5;
 /// Earlier sessions read for relative volume, a few past the 14 it averages.
@@ -249,11 +306,35 @@ impl AlpacaBars {
         Err(last.expect("three attempts were made"))
     }
 
-    async fn bars_between(
+    /// Regular-session 5-minute bars between two times for each symbol.
+    pub async fn bars_between(
         &self,
         symbols: &[String],
         start: DateTime<Utc>,
         end: Option<DateTime<Utc>>,
+    ) -> Result<HashMap<String, Vec<Bar>>> {
+        self.fetch_bars(symbols, start, end, "5Min", true).await
+    }
+
+    /// Daily bars since `start` for each symbol, oldest first (the range
+    /// scanner's typical daily range).
+    pub async fn daily_bars(
+        &self,
+        symbols: &[String],
+        start: DateTime<Utc>,
+    ) -> Result<HashMap<String, Vec<Bar>>> {
+        self.fetch_bars(symbols, start, None, "1Day", false).await
+    }
+
+    /// Bars of one timeframe; `regular_only` keeps 9:30-16:00 intraday bars
+    /// only (daily bars are stamped at midnight, so they skip that filter).
+    async fn fetch_bars(
+        &self,
+        symbols: &[String],
+        start: DateTime<Utc>,
+        end: Option<DateTime<Utc>>,
+        timeframe: &str,
+        regular_only: bool,
     ) -> Result<HashMap<String, Vec<Bar>>> {
         let stamp = |t: DateTime<Utc>| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let mut out: HashMap<String, Vec<Bar>> = HashMap::new();
@@ -262,7 +343,7 @@ impl AlpacaBars {
             loop {
                 let mut query = vec![
                     ("symbols", chunk.join(",")),
-                    ("timeframe", "5Min".to_string()),
+                    ("timeframe", timeframe.to_string()),
                     ("start", stamp(start)),
                     ("limit", "10000".to_string()),
                     ("adjustment", "split".to_string()),
@@ -279,7 +360,7 @@ impl AlpacaBars {
                 for (symbol, raw) in page.bars {
                     let list = out.entry(symbol).or_default();
                     for b in raw {
-                        if session_slot(b.t).is_none() {
+                        if regular_only && session_slot(b.t).is_none() {
                             continue;
                         }
                         let d =
@@ -374,17 +455,41 @@ struct Day {
     ranked: bool,
     /// Share of the universe whose first bar closed above its open, percent.
     breadth_up_pct: Decimal,
+    /// The stocks in play's 9:30 bars, with relative volume, for the burst.
+    first_bars: Vec<(String, Bar, Decimal)>,
+    /// SPY's 9:30 bar, open to close, percent.
+    spy_move_pct: Option<Decimal>,
+    /// The burst has had its one chance today.
+    burst_done: bool,
+    /// Today is in `skip_days` and that has been logged.
+    skip_logged: bool,
 }
 
+/// The first bar during which stocks in play can be ranked from SIP volume on
+/// the free plan: SIP bars arrive 15 minutes late, so the 9:30 bar (closing
+/// 9:35) is readable from 9:50, the start of bar 4.
+pub const DELAYED_SIP_READY_SLOT: usize = 4;
+
 pub struct OrbTrader {
+    /// Live bars for signals (IEX on the free plan).
     data: AlpacaBars,
+    /// Bars that pick the stocks in play. The backtest picked from SIP
+    /// (consolidated) volume; IEX's share of the opening bar is a different
+    /// number: on May - Oct 2026 the two lists shared 29% of their picks, and
+    /// IEX picks earned $40 where SIP picks earned $99 on the same trades.
+    rank_data: AlpacaBars,
+    /// The slot from which the ranking is available: 1 with real-time SIP,
+    /// DELAYED_SIP_READY_SLOT with the free plan's 15-minute-late SIP.
+    ready_slot: usize,
     day: Day,
 }
 
 impl OrbTrader {
-    pub fn new(data: AlpacaBars) -> Self {
+    pub fn new(data: AlpacaBars, rank_data: AlpacaBars, ready_slot: usize) -> Self {
         Self {
             data,
+            rank_data,
+            ready_slot: ready_slot.max(1),
             day: Day::default(),
         }
     }
@@ -411,8 +516,15 @@ impl OrbTrader {
                 ..Day::default()
             };
         }
-        // The 9:30 bar closes at 9:35.
-        if slot < 1 {
+        // The 9:30 bar closes at 9:35; its SIP volume is readable from the ready slot.
+        if slot < self.ready_slot || !entry_window_open(slot, cfg.last_entry_minute) {
+            return Ok(0);
+        }
+        if cfg.skip_days.contains(&today) {
+            if !self.day.skip_logged {
+                self.day.skip_logged = true;
+                info!(%today, "ORB: economic event day (FOMC/CPI/jobs); no new entries today");
+            }
             return Ok(0);
         }
         if !self.day.ranked {
@@ -476,7 +588,7 @@ impl OrbTrader {
             fetch.push("SPY".to_string());
         }
         let bars = self.data.bars(&fetch, now - Duration::hours(8)).await?;
-        let market_move_pct = bars
+        let _market_move_pct = bars
             .get("SPY")
             .and_then(|list| {
                 let today_bars: Vec<&Bar> = list
@@ -509,8 +621,23 @@ impl OrbTrader {
                 .unwrap_or_default();
             let completed = |i: usize| i < slot;
             if let Some((index, side)) = first_breakout(high, low, &today_bars, completed) {
-                // Filled during the next bar, as tested; later is a different trade.
-                if slot > index + 1 {
+                // Filled during the next bar, as tested; later is a different
+                // trade. A breakout that came before the ranking could be read
+                // is the exception: taken at the first chance if the last bar
+                // still closed beyond the range (replayed: $74 vs $40 for IEX picks).
+                let last_close = today_bars
+                    .iter()
+                    .find(|(i, _)| *i + 1 == slot)
+                    .map(|(_, b)| b.close);
+                let still_beyond = last_close.is_some_and(|c| {
+                    if side == Side::Buy {
+                        c > high
+                    } else {
+                        c < low
+                    }
+                });
+                let late_ok = late_entry_allowed(index, slot, self.ready_slot, still_beyond);
+                if slot > index + 1 && !late_ok {
                     info!(
                         symbol,
                         index, "ORB signal is stale (missed its entry bar); skipping today"
@@ -555,9 +682,9 @@ impl OrbTrader {
         }
         signals.sort_by(|a, b| (a.0, a.1, &a.2).cmp(&(b.0, b.1, &b.2)));
 
-        let enforce = cfg.desk_mode.eq_ignore_ascii_case("enforce");
+        let _enforce = cfg.desk_mode.eq_ignore_ascii_case("enforce");
         let in_play_today = self.day.candidates.len();
-        let breadth = self.day.breadth_up_pct;
+        let _breadth = self.day.breadth_up_pct;
         let mut placed = 0usize;
         let mut remaining = cap.saturating_sub(entered_today) as usize;
         for (_, std::cmp::Reverse(rvol), symbol, side, stop, vega) in signals {
@@ -603,7 +730,7 @@ impl OrbTrader {
                 },
             };
 
-            // ORION and LUNA: the stock's news and the market's mood.
+            // ORION: the stock's news, read for a trading halt.
             let headlines = match self.data.news(&symbol, now - Duration::hours(24)).await {
                 Ok(h) => h,
                 Err(e) => {
@@ -612,14 +739,9 @@ impl OrbTrader {
                 }
             };
             let orion = desk::orion(&headlines, now);
-            let recent: Vec<Headline> = headlines
-                .into_iter()
-                .filter(|h| now.signed_duration_since(h.at) <= Duration::hours(24))
-                .collect();
-            let luna = desk::luna(&recent, market_move_pct, breadth, side == Side::Buy);
 
             // NOVA: the call.
-            let nova = desk::nova(&titan, &orion, &luna, enforce);
+            let nova = desk::nova(&titan, &orion);
             let card = DecisionCard {
                 at: now,
                 market: "US".to_string(),
@@ -628,7 +750,6 @@ impl OrbTrader {
                 atlas,
                 vega,
                 orion,
-                luna,
                 titan,
                 nova: nova.clone(),
             };
@@ -643,25 +764,22 @@ impl OrbTrader {
                 warn!(symbol, error = %e, "Could not record the decision card");
             }
 
-            let Ok(mut order) = prepared else { continue };
-            match nova.action {
-                desk::Action::Skip => continue,
-                desk::Action::TradeHalf => {
-                    order.qty = if side == Side::Sell || !order.instrument.fractional {
-                        (order.qty / Decimal::from(2)).floor()
-                    } else {
-                        order
-                            .instrument
-                            .round_qty((order.qty / Decimal::from(2)).round_dp(4))
-                    };
-                    if order.qty <= Decimal::ZERO {
-                        continue;
-                    }
-                }
-                desk::Action::Trade => {}
+            let Ok(order) = prepared else { continue };
+            if nova.action == desk::Action::Skip {
+                continue;
             }
             match submit(
-                registry, store, order, &symbol, side, stop, rvol, capital, now, cycle,
+                registry,
+                store,
+                order,
+                &symbol,
+                side,
+                stop,
+                rvol,
+                capital,
+                now,
+                cycle,
+                ORB_STRATEGY,
             )
             .await
             {
@@ -670,15 +788,198 @@ impl OrbTrader {
                     remaining -= 1;
                 }
                 Ok(false) => {}
-                Err(e) => warn!(symbol, error = %e, "ORB entry failed"),
+                Err(e) => {
+                    let detail = format!("{e:#}");
+                    // An order that may have reached the venue counts against
+                    // the cap until it is known not to have: SHOP on 2 Nov 2026
+                    // failed this way and the next signal took its slot.
+                    if !(detail.contains("HTTP 4") || detail.contains("rejected")) {
+                        remaining = remaining.saturating_sub(1);
+                    }
+                    warn!(symbol, error = %detail, remaining, "ORB entry failed");
+                }
             }
         }
         Ok(placed)
     }
 
+    /// The opening burst: one chance a day, during the 9:35 bar, sized like an
+    /// ORB trade and counted in the same daily U.S. trade limit. Runs before
+    /// the ORB pass, whose first entries come a bar later.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_burst(
+        &mut self,
+        registry: &VenueRegistry,
+        store: &Store,
+        cfg: &UsOrbConfig,
+        capital: Decimal,
+        us_max_trades_per_day: Option<u32>,
+        now: DateTime<Utc>,
+        cycle: i64,
+    ) -> Result<bool> {
+        let Some((today, slot)) = session_slot(now) else {
+            return Ok(false);
+        };
+        if self.day.date != Some(today) {
+            self.day = Day {
+                date: Some(today),
+                ..Day::default()
+            };
+        }
+        if slot < self.ready_slot || self.day.burst_done {
+            return Ok(false);
+        }
+        if slot > self.ready_slot {
+            // The entry bar has passed: a missed burst is a missed day.
+            self.day.burst_done = true;
+            return Ok(false);
+        }
+        if !self.day.ranked {
+            self.rank(cfg, today).await?;
+        }
+        self.day.burst_done = true;
+        let Some(spy_move_pct) = self.day.spy_move_pct else {
+            info!("Burst: no SPY 9:30 bar; skipping today");
+            return Ok(false);
+        };
+        let spy_up = spy_move_pct > Decimal::ZERO;
+        let Some((symbol, side, stop)) = pick_burst(&self.day.first_bars, spy_up) else {
+            info!(spy_up, "Burst: no opening burst in SPY's direction today");
+            return Ok(false);
+        };
+        let entered_today = store
+            .count_venue_equity_entries_opened_on(VENUE, now.date_naive())
+            .await?;
+        let cap = us_max_trades_per_day
+            .unwrap_or(cfg.max_trades_per_day)
+            .min(cfg.max_trades_per_day);
+        let (high, low, rvol) = self.day.candidates[&symbol];
+        let first = self
+            .day
+            .first_bars
+            .iter()
+            .find(|(s, _, _)| *s == symbol)
+            .map(|(_, b, _)| *b)
+            .expect("picked from first_bars");
+
+        // Picked late (free-plan SIP is 15 minutes behind): take it only if
+        // the move is still going, the last bar closing beyond the 9:30 bar's
+        // close. Replayed May - Oct 2026: 25 trades, +$37 at $150, where the
+        // IEX pick at 9:35 lost $2.
+        if self.ready_slot > 1 {
+            let bars = self.data.bars(&[symbol.clone()], now - Duration::hours(8)).await?;
+            let last_close = bars
+                .get(&symbol)
+                .and_then(|l| {
+                    l.iter()
+                        .find(|b| session_slot(b.ts) == Some((today, slot - 1)))
+                        .map(|b| b.close)
+                });
+            let going = last_close.is_some_and(|c| {
+                if side == Side::Buy {
+                    c > first.close
+                } else {
+                    c < first.close
+                }
+            });
+            if !going {
+                info!(symbol, ?last_close, first_close = %first.close, "Burst: the move faded before the pick could be made; skipping today");
+                return Ok(false);
+            }
+        }
+
+        let prepared = if entered_today >= cap {
+            Err("daily trade limit reached".to_string())
+        } else if side == Side::Sell && !cfg.allow_short {
+            Err("short selling is off".to_string())
+        } else {
+            match titan_prepare(registry, cfg, capital, &symbol, side, stop, now).await {
+                Ok(p) => p,
+                Err(e) => Err(format!("could not price the order: {e}")),
+            }
+        };
+        let titan = match &prepared {
+            Ok(p) => Titan {
+                allowed: true,
+                reason: "within limits: the burst's one trade today".to_string(),
+                qty: p.qty,
+                notional_usd: (p.qty * p.limit).round_dp(2),
+                risk_usd: (p.qty * (p.limit - stop).abs()).round_dp(2),
+            },
+            Err(reason) => Titan {
+                allowed: false,
+                reason: reason.clone(),
+                qty: Decimal::ZERO,
+                notional_usd: Decimal::ZERO,
+                risk_usd: Decimal::ZERO,
+            },
+        };
+        let headlines = self
+            .data
+            .news(&symbol, now - Duration::hours(24))
+            .await
+            .unwrap_or_default();
+        let orion = desk::orion(&headlines, now);
+        let move_pct = if first.open > Decimal::ZERO {
+            ((first.close / first.open - Decimal::ONE) * Decimal::from(100)).round_dp(2)
+        } else {
+            Decimal::ZERO
+        };
+        let nova = desk::nova(&titan, &orion);
+        let card = DecisionCard {
+            at: now,
+            market: "US".to_string(),
+            strategy: BURST_STRATEGY.to_string(),
+            symbol: symbol.clone(),
+            atlas: Atlas {
+                relative_volume: rvol.round_dp(2),
+                range_high: high,
+                range_low: low,
+                in_play_today: self.day.candidates.len(),
+            },
+            vega: Vega {
+                side: if side == Side::Buy { "LONG" } else { "SHORT" }.to_string(),
+                setup: format!("opening burst: 9:30 bar {move_pct}% on {}x volume", rvol.round_dp(1)),
+                signal_at: {
+                    let m = 9 * 60 + 30 + self.ready_slot as i64 * BAR_MINUTES;
+                    format!("{:02}:{:02} ET", m / 60, m % 60)
+                },
+                trigger_close: first.close,
+                stop,
+                breakout_pct_of_range: Decimal::ZERO,
+            },
+            orion,
+            titan,
+            nova: nova.clone(),
+        };
+        info!(symbol, action = ?nova.action, reasons = ?nova.reasons, "NOVA decision (burst)");
+        if let Err(e) = store.insert_desk_decision(&card).await {
+            warn!(symbol, error = %e, "Could not record the burst's decision card");
+        }
+        self.day.done.insert(symbol.clone());
+        let Ok(order) = prepared else { return Ok(false) };
+        if matches!(nova.action, desk::Action::Skip) {
+            return Ok(false);
+        }
+        submit(
+            registry,
+            store,
+            order,
+            &symbol,
+            side,
+            stop,
+            rvol,
+            capital,
+            now,
+            cycle,
+            BURST_STRATEGY,
+        )
+        .await
+    }
+
     /// Opening ranges and relative volume for the whole universe, once a day.
     async fn rank(&mut self, cfg: &UsOrbConfig, today: NaiveDate) -> Result<()> {
-        let history = self.data.opening_bars(&cfg.symbols, today).await?;
+        let history = self.rank_data.opening_bars(&cfg.symbols, today).await?;
         let mut ranked = Vec::new();
         let (mut up, mut seen) = (0u32, 0u32);
         for symbol in &cfg.symbols {
@@ -699,6 +1000,10 @@ impl OrbTrader {
             if first.close > first.open {
                 up += 1;
             }
+            if symbol == "SPY" && first.open > Decimal::ZERO {
+                self.day.spy_move_pct =
+                    Some((first.close / first.open - Decimal::ONE) * Decimal::from(100));
+            }
             let prior = &prior[prior.len().saturating_sub(14)..];
             let Some(rvol) = relative_volume(first.volume, prior) else {
                 continue;
@@ -708,6 +1013,7 @@ impl OrbTrader {
                 self.day
                     .candidates
                     .insert(symbol.clone(), (first.high, first.low, rvol));
+                self.day.first_bars.push((symbol.clone(), first, rvol));
             }
         }
         self.day.ranked = true;
@@ -820,6 +1126,7 @@ async fn submit(
     capital: Decimal,
     now: DateTime<Utc>,
     cycle: i64,
+    strategy: &str,
 ) -> Result<bool> {
     let Prepared {
         instrument,
@@ -965,7 +1272,7 @@ async fn submit(
             horizon_hours: Some(7),
             client_order_id: Some(client_order_id.clone()),
             venue_order_id: Some(ack.venue_order_id.clone()),
-            strategy: Some(ORB_STRATEGY.to_string()),
+            strategy: Some(strategy.to_string()),
         })
         .await?;
     store
@@ -980,6 +1287,7 @@ async fn submit(
         rvol = %rvol.round_dp(2),
         state,
         trade_id,
+        strategy,
         "ORB entry submitted to the Alpaca paper account"
     );
     Ok(!matches!(ack.state, OrderState::Rejected(_)))
@@ -1007,6 +1315,56 @@ mod tests {
             close,
             volume: dec!(1000),
         }
+    }
+
+    fn first(open: Decimal, close: Decimal) -> Bar {
+        Bar {
+            ts: at(9, 30),
+            open,
+            high: open.max(close) + dec!(0.5),
+            low: open.min(close) - dec!(0.5),
+            close,
+            volume: dec!(1000),
+        }
+    }
+
+    #[test]
+    fn the_burst_is_the_loudest_one_percent_move_with_spy() {
+        let bars = vec![
+            ("AAA".to_string(), first(dec!(100), dec!(101.5)), dec!(4)),
+            ("BBB".to_string(), first(dec!(50), dec!(51)), dec!(9)),
+            ("CCC".to_string(), first(dec!(100), dec!(100.5)), dec!(20)), // only 0.5%
+            ("DDD".to_string(), first(dec!(100), dec!(98)), dec!(15)),    // down
+            ("EEE".to_string(), first(dec!(100), dec!(103)), dec!(2.9)),  // volume too low
+            ("SPY".to_string(), first(dec!(500), dec!(510)), dec!(30)),   // never itself
+        ];
+        assert_eq!(pick_burst(&bars, true), Some(("BBB".into(), Side::Buy, dec!(49.5))));
+        assert_eq!(pick_burst(&bars, false), Some(("DDD".into(), Side::Sell, dec!(100.5))));
+        assert_eq!(pick_burst(&bars[2..3], true), None);
+    }
+
+    #[test]
+    fn a_breakout_before_the_sip_ranking_is_taken_late_only_if_still_beyond() {
+        let ready = DELAYED_SIP_READY_SLOT;
+        // On time: the bar right after the signal, as tested.
+        assert!(late_entry_allowed(5, 6, ready, false));
+        // Fired at 9:35 or 9:40, before the 9:50 ranking: once, at 9:50, if still beyond.
+        assert!(late_entry_allowed(1, ready, ready, true));
+        assert!(late_entry_allowed(2, ready, ready, true));
+        assert!(!late_entry_allowed(1, ready, ready, false), "faded back inside the range");
+        assert!(!late_entry_allowed(1, ready + 1, ready, true), "only the first bar after the ranking");
+        // A signal after the ranking that was missed stays missed.
+        assert!(!late_entry_allowed(5, 7, ready, true));
+        // With real-time SIP (ready slot 1) nothing is late.
+        assert!(!late_entry_allowed(1, 3, 1, true));
+    }
+
+    #[test]
+    fn both_us_intraday_books_get_venue_stops_and_the_close_exit() {
+        assert!(is_intraday_strategy(Some(ORB_STRATEGY)));
+        assert!(is_intraday_strategy(Some(BURST_STRATEGY)));
+        assert!(!is_intraday_strategy(Some("sma_crossover")));
+        assert!(!is_intraday_strategy(None));
     }
 
     fn stock(fractional: bool) -> Instrument {
@@ -1064,6 +1422,16 @@ mod tests {
             first_breakout(dec!(100.1), dec!(99.9), &down, |_| true),
             Some((1, Side::Sell))
         );
+    }
+
+    #[test]
+    fn no_new_entry_from_ten_o_clock() {
+        // Bar 5 is 9:55-10:00, bar 6 starts at 10:00.
+        assert!(entry_window_open(4, 30), "the 9:50 late entry still goes");
+        assert!(entry_window_open(5, 30));
+        assert!(!entry_window_open(6, 30));
+        assert!(!entry_window_open(40, 30));
+        assert!(entry_window_open(77, 390), "the default never cuts off");
     }
 
     #[test]

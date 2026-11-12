@@ -25,6 +25,11 @@ use crate::venue::types::{
 };
 use crate::venue::{Venue, VenueRegistry};
 
+/// How often, and how far apart, to re-read a stop just cancelled before
+/// leaving the exit to the next cycle: about three seconds in all.
+const CANCEL_CONFIRM_TRIES: usize = 6;
+const CANCEL_CONFIRM_WAIT_MS: u64 = 500;
+
 /// Why a position is being closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitReason {
@@ -65,6 +70,27 @@ pub struct ExitRules {
     pub session_close_due: bool,
     pub emergency_stop: bool,
     pub sma_exit_due: bool,
+}
+
+/// How to record an exit order the venue call failed on: the state, and what
+/// to write over the order's stored exit reason.
+///
+/// Only a refusal overwrites the reason, because a refused order never fills.
+/// A timeout or dropped connection may still have reached the venue: on 3 Nov
+/// 2026 ORCL's 15:45 sale came back as an error, filled anyway, and the trade
+/// was closed with the error text as its reason instead of SESSION_CLOSE.
+pub fn failed_exit_record(error: &str) -> (&'static str, Option<&str>) {
+    let refused = error.contains("HTTP 4")
+        || error.contains("rejected")
+        || error.contains("below the venue's minimum")
+        || error.contains("rounds to zero")
+        || error.contains("insufficient qty")
+        || error.contains("not tradable");
+    if refused {
+        ("REJECTED", Some(error))
+    } else {
+        ("UNKNOWN", None)
+    }
 }
 
 /// Decide whether an open long should be closed at the current mark.
@@ -119,6 +145,26 @@ pub fn evaluate_exit(
 }
 
 /// Unrealised P&L of a long position at the current mark.
+/// The break-even stop for a position that has gained at least the risk it
+/// started with (1R), or `None` while it has not, or once the stop is already
+/// at or past the entry. Rounded to a cent on the side that never gives back
+/// more than the entry.
+pub fn breakeven_stop(
+    entry: Decimal,
+    stop: Option<Decimal>,
+    mark: Decimal,
+    is_short: bool,
+) -> Option<Decimal> {
+    let stop = stop?;
+    if !is_short && stop < entry && mark - entry >= entry - stop {
+        Some(entry.round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToPositiveInfinity))
+    } else if is_short && stop > entry && entry - mark >= stop - entry {
+        Some(entry.round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToNegativeInfinity))
+    } else {
+        None
+    }
+}
+
 pub fn unrealized_pnl(entry: Decimal, mark: Decimal, qty: Decimal) -> Decimal {
     (mark - entry) * qty
 }
@@ -215,7 +261,7 @@ impl VenueExits<'_> {
             {
                 Ok(true) => closed += 1,
                 Ok(false) => {
-                    if trade.strategy.as_deref() == Some("orb")
+                    if crate::us::orb::is_intraday_strategy(trade.strategy.as_deref())
                         && trade_stops.is_empty()
                         && !entering.contains(&trade.id)
                     {
@@ -290,6 +336,17 @@ impl VenueExits<'_> {
         // unless the book is too wide for that side to mean anything.
         let side = closing_side(trade.is_short);
         let mark = quote.fair_price(side);
+        if let (Some(spread), Some(last)) = (quote.spread_pct(), quote.last) {
+            if spread > crate::venue::types::WIDE_SPREAD {
+                info!(
+                    symbol = %trade.symbol,
+                    bid = %quote.bid,
+                    ask = %quote.ask,
+                    last = %last,
+                    "Wide quote: marked at the last trade, not the midpoint"
+                );
+            }
+        }
 
         let entry: Decimal = trade.avg_fill_price.unwrap_or(trade.entry_price);
         let qty = trade.quantity;
@@ -303,7 +360,7 @@ impl VenueExits<'_> {
         let is_us_alpaca_equity = is_equity && trade.venue_id.eq_ignore_ascii_case("alpaca");
         // An opening-range breakout is intraday whatever the swing strategy
         // is: it takes the session-close exit, never the SMA rules.
-        let is_orb_position = trade.strategy.as_deref() == Some("orb");
+        let is_orb_position = crate::us::orb::is_intraday_strategy(trade.strategy.as_deref());
         let is_sma_position = is_us_alpaca_equity
             && !is_orb_position
             && self
@@ -314,6 +371,39 @@ impl VenueExits<'_> {
         // session-close exits would invalidate the 20/50-day holding rule.
         let session_close_due =
             is_equity && !is_sma_position && venue.session().is_intraday_exit_due(now, 15);
+
+        // Break-even after +1R for U.S. intraday trades, at the user's request
+        // on 3 Nov 2026 after RIVN went +1.52R and closed at a loss. Tested on
+        // 210 trades: +$74.76 against +$74.45, so protection, not an edge.
+        if is_orb_position && is_us_alpaca_equity && !session_close_due {
+            if let Some(be) = breakeven_stop(entry, trade.stop_price, mark, trade.is_short) {
+                info!(
+                    trade_id = trade.id,
+                    symbol = %trade.symbol,
+                    from = ?trade.stop_price,
+                    to = %be,
+                    mark = %mark,
+                    "Up 1R: moving the stop to break-even"
+                );
+                self.store.update_trade_stop(trade.id, &be.to_string()).await?;
+                // The old stop holds the shares; it must be gone before the
+                // new one can rest. If it fired or is still cancelling, the
+                // next pass sees that and places the new one.
+                if self.clear_resting_stops(venue, stops, now).await? {
+                    let mut moved = trade.clone();
+                    moved.stop_price = Some(be);
+                    if let Err(e) = self.place_resting_stop(&moved, now, cycle, instruments).await {
+                        warn!(
+                            trade_id = trade.id,
+                            symbol = %trade.symbol,
+                            error = %format!("{e:#}"),
+                            "Could not rest the break-even stop — the agent's own check still covers it"
+                        );
+                    }
+                }
+                return Ok(false);
+            }
+        }
 
         let completed: Vec<crate::venue::types::Candle> = if is_sma_position {
             venue
@@ -427,19 +517,38 @@ impl VenueExits<'_> {
             return Ok(false);
         }
 
-        self.submit_exit(
-            venue,
-            trade,
-            &instrument_id,
-            // The exit has to cross the spread to fill, however wide it is.
-            quote.taker_price(side),
-            Some(quote.mid),
-            qty,
-            reason,
-            cycle,
-            instruments,
-        )
-        .await?;
+        if let Err(e) = self
+            .submit_exit(
+                venue,
+                trade,
+                &instrument_id,
+                // The exit has to cross the spread to fill, however wide it is.
+                quote.taker_price(side),
+                Some(quote.mid),
+                qty,
+                reason,
+                cycle,
+                instruments,
+            )
+            .await
+        {
+            // The stop is already gone. A refused sale leaves the shares with
+            // nothing at the venue guarding them, so put the stop back until
+            // the next pass retries the exit. A sale whose fate is unknown may
+            // be live and holding the shares; reconciliation settles that one.
+            if failed_exit_record(&format!("{e:#}")).0 == "REJECTED" {
+                if let Err(stop_err) = self.place_resting_stop(trade, now, cycle, instruments).await
+                {
+                    warn!(
+                        trade_id = trade.id,
+                        symbol = %trade.symbol,
+                        error = %format!("{stop_err:#}"),
+                        "Exit refused and the stop could not be put back"
+                    );
+                }
+            }
+            return Err(e);
+        }
         Ok(true)
     }
 
@@ -466,7 +575,17 @@ impl VenueExits<'_> {
                     warn!(venue_order_id = %id, error = %format!("{e:#}"), "Could not cancel a resting stop");
                 }
             }
-            let report = reconciler.resolve_one(stop, now).await?;
+            // A cancel takes a moment to confirm. Leaving it to the next cycle
+            // left the 2 Nov 2026 ORB positions with no stop for a full minute
+            // before the 15:45 sale, so wait a few seconds for it here.
+            let mut report = reconciler.resolve_one(stop, now).await?;
+            for _ in 0..CANCEL_CONFIRM_TRIES {
+                if report.filled > 0 || report.still_open == 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(CANCEL_CONFIRM_WAIT_MS)).await;
+                report = reconciler.resolve_one(stop, now).await?;
+            }
             clear &= report.filled == 0 && report.still_open == 0;
         }
         Ok(clear)
@@ -770,29 +889,10 @@ impl VenueExits<'_> {
         let ack = match venue.place_order(&request).await {
             Ok(ack) => ack,
             Err(e) => {
-                let err_str = e.to_string();
-                let is_deterministic = err_str.contains("HTTP 4")
-                    || err_str.contains("rejected")
-                    || err_str.contains("below the venue's minimum")
-                    || err_str.contains("rounds to zero")
-                    || err_str.contains("insufficient qty")
-                    || err_str.contains("not tradable");
-
-                let final_state = if is_deterministic {
-                    "REJECTED"
-                } else {
-                    "UNKNOWN"
-                };
-
+                let err_str = format!("{e:#}");
+                let (final_state, note) = failed_exit_record(&err_str);
                 self.store
-                    .update_order_state(
-                        &client_order_id,
-                        final_state,
-                        None,
-                        "0",
-                        None,
-                        Some(&err_str),
-                    )
+                    .update_order_state(&client_order_id, final_state, None, "0", None, note)
                     .await?;
                 return Err(e);
             }
@@ -1282,6 +1382,20 @@ mod tests {
         }
     }
 
+    /// RIVN on 2 Nov 2026: entry 13.06524, stop 12.65, so 1R is 0.41524.
+    #[test]
+    fn the_stop_moves_to_break_even_at_one_r_and_only_once() {
+        use rust_decimal_macros::dec;
+        let (entry, stop) = (dec!(13.06524), Some(dec!(12.65)));
+        assert_eq!(breakeven_stop(entry, stop, dec!(13.40), false), None, "under 1R");
+        assert_eq!(breakeven_stop(entry, stop, dec!(13.49), false), Some(dec!(13.07)));
+        assert_eq!(breakeven_stop(entry, Some(dec!(13.07)), dec!(14), false), None, "already moved");
+        assert_eq!(breakeven_stop(entry, None, dec!(14), false), None);
+        // A short: entry 100, stop 102, 1R down is 98.
+        assert_eq!(breakeven_stop(dec!(100.004), Some(dec!(102)), dec!(98.5), true), None);
+        assert_eq!(breakeven_stop(dec!(100.004), Some(dec!(102)), dec!(98), true), Some(dec!(100.00)));
+    }
+
     #[test]
     fn session_close_triggers_controlled_exit() {
         let mut r = rules(None, None, None);
@@ -1371,6 +1485,17 @@ mod tests {
             unrealized_pnl(dec!(100), dec!(100), dec!(10)),
             Decimal::ZERO
         );
+    }
+
+    #[test]
+    fn an_unanswered_exit_keeps_its_reason_and_a_refused_one_records_why() {
+        // ORCL, 3 Nov 2026: the call failed without a reply and the sale filled.
+        assert_eq!(
+            failed_exit_record("Failed to place Alpaca order for ORCL: error sending request"),
+            ("UNKNOWN", None)
+        );
+        let refused = "Failed to place Alpaca order for ORCL: HTTP 403: insufficient qty";
+        assert_eq!(failed_exit_record(refused), ("REJECTED", Some(refused)));
     }
 
     #[test]

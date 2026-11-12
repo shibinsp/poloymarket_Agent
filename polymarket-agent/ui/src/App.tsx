@@ -9,7 +9,7 @@ import { LearnFromMistakes } from "./pages/LearnFromMistakes";
 import { Costs } from "./pages/Costs";
 import { IndiaTest } from "./pages/IndiaTest";
 import { UsTest } from "./pages/UsTest";
-import { Health } from "./pages/Health";
+import { RangeScanner } from "./pages/RangeScanner";import { Health } from "./pages/Health";
 import { Settings } from "./pages/Settings";
 import { NotFound } from "./pages/NotFound";
 import { applyTheme, settings } from "./data/settings";
@@ -81,6 +81,8 @@ export function App() {
         <IndiaTest />
       ) : path === "/us" ? (
         <UsTest />
+      ) : path === "/scanner" ? (
+        <RangeScanner />
       ) : path === "/health" ? (
         <Health />
       ) : path === "/settings" ? (

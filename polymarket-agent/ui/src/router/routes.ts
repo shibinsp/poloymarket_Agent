@@ -10,11 +10,11 @@ export const ROUTES: RouteDef[] = [
   { path: "/trades", label: "Trades", title: "Trades" },
   { path: "/risk", label: "Risk", title: "Risk and reconciliation" },
   { path: "/cycles", label: "Cycles", title: "Cycles" },
-  { path: "/learn", label: "Learn From Mistakes", title: "Learn from Mistakes · Trade Post-Mortem" },
+  { path: "/learn", label: "Learn From Mistakes", title: "Learn from mistakes · trade reviews" },
   { path: "/costs", label: "Costs", title: "API costs" },
-  { path: "/india", label: "India — Test", title: "India — opening-range breakout (paper)" },
+  { path: "/india", label: "India — Test", title: "India — intraday breakout, opening burst and gap and go (paper)" },
   { path: "/us", label: "US — Test", title: "US — opening-range breakout (Alpaca paper)" },
-  { path: "/health", label: "Health", title: "Health" },
+  { path: "/scanner", label: "Range Scanner", title: "Range scanner · likely high and low for the rest of today" },  { path: "/health", label: "Health", title: "Health" },
   { path: "/settings", label: "Settings", title: "Settings" },
 ];
 

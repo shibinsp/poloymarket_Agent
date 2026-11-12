@@ -19,3 +19,6 @@ all_code.txt
 # Logs and runtime artifacts
 *.log
 public_url.txt
+
+# Local Claude app state
+.claude/scheduled_tasks.lock

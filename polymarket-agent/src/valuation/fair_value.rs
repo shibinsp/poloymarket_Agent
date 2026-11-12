@@ -541,6 +541,9 @@ mod tests {
             high_confidence_edge: dec!(0.06),
             low_confidence_edge: dec!(0.10),
             cache_ttl_seconds: ttl,
+            request_timeout_seconds: 15,
+            max_evaluations_per_scan: 10,
+            polymarket: None,
         };
         let llm = Arc::new(
             LlmClient::new("test-key".to_string(), &config, store.clone_for_parallel())

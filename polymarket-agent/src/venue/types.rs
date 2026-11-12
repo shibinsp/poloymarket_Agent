@@ -256,11 +256,15 @@ impl Quote {
 
     /// The price to judge a position or a signal by: the side that would be
     /// crossed, unless the book is too wide for that side to mean anything,
-    /// when the midpoint is the better estimate. Not a price to send as an
-    /// exit limit, which has to stay marketable.
+    /// when the last trade (or, without one, the midpoint) is the better
+    /// estimate. A hollow book's midpoint can be far off too: ABNB's was $5
+    /// under the market on 2 Nov 2026. Not a price to send as an exit limit,
+    /// which has to stay marketable.
     pub fn fair_price(&self, side: Side) -> Decimal {
         match self.spread_pct() {
-            Some(spread) if spread > WIDE_SPREAD => self.mid,
+            Some(spread) if spread > WIDE_SPREAD => {
+                self.last.filter(|p| *p > Decimal::ZERO).unwrap_or(self.mid)
+            }
             _ => self.taker_price(side),
         }
     }
@@ -346,7 +350,7 @@ pub const PROTECTIVE_STOP_PREFIX: &str = "stop-";
 /// Spread, as a fraction of mid, past which one side of the book says little
 /// about the price. On 30 Oct 2026 IEX showed MSTR at 127.00 / 135.95 while it
 /// traded around 130.40.
-const WIDE_SPREAD: Decimal = rust_decimal_macros::dec!(0.01);
+pub const WIDE_SPREAD: Decimal = rust_decimal_macros::dec!(0.01);
 
 /// An order to send to a venue.
 #[derive(Debug, Clone, PartialEq)]
@@ -631,6 +635,24 @@ mod tests {
         let normal = quote(Decimal::new(8370, 2), Decimal::new(8375, 2));
         assert_eq!(normal.fair_price(Side::Sell), normal.bid);
         assert_eq!(normal.fair_price(Side::Buy), normal.ask);
+    }
+
+    /// ABNB on 2 Nov 2026: IEX bid 156.75 / ask 168.57, last trade 168.11.
+    #[test]
+    fn a_hollow_book_is_judged_at_the_last_trade() {
+        let mut q = Quote {
+            instrument: InstrumentId::new(VenueId::new("stub"), "ABNB"),
+            bid: Decimal::new(15675, 2),
+            ask: Decimal::new(16857, 2),
+            mid: Decimal::new(16266, 2),
+            last: Some(Decimal::new(16811, 2)),
+            ts: Utc::now(),
+            book: None,
+        };
+        assert_eq!(q.fair_price(Side::Sell), Decimal::new(16811, 2));
+        assert_eq!(q.fair_price(Side::Buy), Decimal::new(16811, 2));
+        q.last = None;
+        assert_eq!(q.fair_price(Side::Sell), q.mid);
     }
 
     #[test]

@@ -308,7 +308,7 @@ impl StateReconciler<'_> {
         }
 
         for (symbol, vq) in &venue_qty {
-            if vq.abs() <= DUST {
+            if vq.abs() <= DUST || is_side_book_symbol(symbol) {
                 continue;
             }
             if !local_qty.contains_key(symbol) {
@@ -349,6 +349,14 @@ impl StateReconciler<'_> {
                             for po in paper_orders {
                                 known.insert(po.client_order_id);
                             }
+                        }
+                        // The options book keeps its own ledger (us::options).
+                        if let Ok(ids) = self.store.option_client_order_ids().await {
+                            known.extend(ids);
+                        }
+                        // So does the crypto book (crypto_book).
+                        if let Ok(ids) = self.store.crypto_client_order_ids().await {
+                            known.extend(ids);
                         }
                         Some(
                             acks.into_iter()
@@ -540,6 +548,25 @@ impl StateReconciler<'_> {
     }
 }
 
+/// Positions the options and crypto books hold on the same Alpaca account.
+/// They keep their own ledgers (`us::options`, `crypto_book`), so a contract
+/// like SHOP261106C00137000 or a BTC/USD holding is not a stock-ledger orphan.
+/// The agent's own venue trades never use these (it trades no crypto pairs).
+pub fn is_side_book_symbol(symbol: &str) -> bool {
+    let s = symbol.as_bytes();
+    let occ = s.len() >= 16 && {
+        let tail = &s[s.len() - 15..];
+        let root = &s[..s.len() - 15];
+        !root.is_empty()
+            && root.iter().all(u8::is_ascii_alphabetic)
+            && tail[..6].iter().all(u8::is_ascii_digit)
+            && matches!(tail[6], b'C' | b'P')
+            && tail[7..].iter().all(u8::is_ascii_digit)
+    };
+    let crypto = symbol.contains('/') || matches!(symbol, "BTCUSD" | "ETHUSD");
+    occ || crypto
+}
+
 fn describe(positions: &[OrphanPosition]) -> String {
     positions
         .iter()
@@ -714,6 +741,17 @@ mod tests {
             equity_report("coinbase", Some(dec!(250.50))),
         ];
         assert_eq!(combined_equity(&reports), Some(dec!(4450.50)));
+    }
+
+    #[test]
+    fn option_contracts_and_crypto_belong_to_their_own_books() {
+        assert!(is_side_book_symbol("SHOP261106C00137000"));
+        assert!(is_side_book_symbol("SPY261106P00580000"));
+        assert!(is_side_book_symbol("BTC/USD"));
+        assert!(is_side_book_symbol("ETHUSD"));
+        assert!(!is_side_book_symbol("SHOP"));
+        assert!(!is_side_book_symbol("ORCL"));
+        assert!(!is_side_book_symbol("BRK.B"));
     }
 
     /// Zero would read as a total loss and trip every breaker at once.

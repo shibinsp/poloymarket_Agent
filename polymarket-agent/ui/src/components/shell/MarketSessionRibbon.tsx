@@ -89,7 +89,7 @@ export function MarketSessionRibbon() {
           </Badge>
           {(data.india?.intraday_capital_inr ?? data.india?.capital_allocation_inr) && (
             <span style={{ color: "var(--text-secondary)", fontSize: "11px" }}>
-              (Cap: ₹{Number(data.india?.intraday_capital_inr ?? data.india?.capital_allocation_inr).toLocaleString("en-IN")})
+              (India books: ₹{Number(data.india?.intraday_capital_inr ?? data.india?.capital_allocation_inr).toLocaleString("en-IN", { maximumFractionDigits: 2 })} after losses)
             </span>
           )}
           {data.india?.exit_due && (

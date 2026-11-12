@@ -3,24 +3,21 @@
 //!
 //! - ATLAS scans: which stocks are in play this morning (relative volume).
 //! - VEGA reads the chart: the opening-range breakout, its side and stop.
-//! - ORION tracks the news: the stock's last day of headlines, tagged for
-//!   events that make opening ranges unreliable (earnings, deals, halts...).
-//! - LUNA measures sentiment: headline tone and the market's mood.
+//! - ORION reads the news for one thing only: a trading halt in the last day
+//!   (a halted stock gaps through its stop; the 7 such trades in a 2,490-trade
+//!   backtest lost 160-200 bp in both years).
 //! - TITAN controls risk: every limit, with the size it allows.
-//! - NOVA makes the final call from the five reports.
+//! - NOVA makes the final call: no VEGA signal, no trade; TITAN's block and a
+//!   halt are final; otherwise trade.
 //!
-//! NOVA's rules: no VEGA signal, no trade; TITAN's block is final; a trading
-//! halt in the last day is always a skip (a halted stock gaps through its
-//! stop). ORION's other event vetoes and LUNA's half size are *advisory*: the
-//! card records what they would have done, and only "enforce" mode acts on
-//! them. A backtest over 2,490 ORB trades (Nov 2024 - Oct 2026) found the
-//! earnings/merger/offering veto inconsistent - it cut the held-out year from
-//! +21% to +4%, since news is often what puts a stock in play - while the 7
-//! trades after a halt lost 160-200 bp in both years.
+//! Removed 10 Nov 2026 at the user's request after an audit: LUNA (headline
+//! tone and market mood; it never once objected in 24 live decisions, and mood
+//! filters did not improve 210 backtest trades) and ORION's earnings / merger /
+//! offering veto (advisory only; the backtest found it inconsistent, cutting
+//! the held-out year from +21% to +4%, and it flagged 11 of 14 live trades).
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
 use serde::Serialize;
 
 /// One headline from the news feed.
@@ -58,23 +55,8 @@ pub struct Orion {
     pub headlines_24h: usize,
     pub events: Vec<String>,
     pub latest: Option<String>,
-    /// The advisory event veto, if any (enforced only in "enforce" mode).
-    pub veto: Option<String>,
     /// A trading halt in the last 24h: always a skip.
     pub halted: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct Luna {
-    /// Headline tone for the stock, -1 (all negative) .. +1 (all positive).
-    pub stock_tone: Decimal,
-    /// SPY's move since the open, percent.
-    pub market_move_pct: Decimal,
-    /// Share of the universe whose first bar closed up, percent.
-    pub breadth_up_pct: Decimal,
-    pub mood: String,
-    /// Tone and mood both point the other way from the trade.
-    pub against_trade: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -91,14 +73,13 @@ pub struct Titan {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Action {
     Trade,
-    TradeHalf,
     Skip,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Nova {
     pub action: Action,
-    /// What ORION and LUNA alone would have done (equals `action` when enforced).
+    /// Kept for the stored cards' column; now always equals `action`.
     pub advisory_action: Action,
     pub enforced: bool,
     pub reasons: Vec<String>,
@@ -113,7 +94,6 @@ pub struct DecisionCard {
     pub atlas: Atlas,
     pub vega: Vega,
     pub orion: Orion,
-    pub luna: Luna,
     pub titan: Titan,
     pub nova: Nova,
 }
@@ -191,10 +171,6 @@ const EVENTS: &[(&str, &[&str])] = &[
     ),
 ];
 
-/// Events whose breakouts the advisory veto would skip: the open is driven by
-/// the news rather than by a range being tested. Not enforced by default.
-const ADVISORY_VETO_EVENTS: &[&str] = &["earnings", "merger", "offering"];
-
 pub fn tag_events(text: &str) -> Vec<&'static str> {
     let t = format!(" {} ", text.to_ascii_lowercase());
     EVENTS
@@ -217,10 +193,6 @@ pub fn orion(headlines: &[Headline], now: DateTime<Utc>) -> Orion {
             }
         }
     }
-    let veto = events
-        .iter()
-        .find(|e| ADVISORY_VETO_EVENTS.contains(&e.as_str()))
-        .map(|e| format!("{e} news in the last 24h"));
     let halted = events.iter().any(|e| e == "halt");
     Orion {
         headlines_24h: recent.len(),
@@ -229,12 +201,12 @@ pub fn orion(headlines: &[Headline], now: DateTime<Utc>) -> Orion {
             .max_by_key(|h| h.at)
             .map(|h| h.headline.clone()),
         events,
-        veto,
         halted,
     }
 }
 
-// ---------------------------------------------------------------- LUNA
+// ---------------------------------------------------------------- tone
+// (used by the live news stream's display; no trading decision reads it)
 
 /// Word stems: a headline word counts when it starts with one ("plunges").
 const POSITIVE: &[&str] = &[
@@ -300,85 +272,24 @@ pub fn tone(headlines: &[Headline]) -> Decimal {
     (Decimal::from(pos - neg) / Decimal::from(pos + neg)).round_dp(2)
 }
 
-pub fn luna(
-    headlines: &[Headline],
-    market_move_pct: Decimal,
-    breadth_up_pct: Decimal,
-    long: bool,
-) -> Luna {
-    let stock_tone = tone(headlines);
-    let market_score = if market_move_pct > dec!(0.3) && breadth_up_pct >= dec!(55) {
-        1
-    } else if market_move_pct < dec!(-0.3) && breadth_up_pct <= dec!(45) {
-        -1
-    } else {
-        0
-    };
-    let mood = match market_score {
-        1 => "bullish",
-        -1 => "bearish",
-        _ => "neutral",
-    }
-    .to_string();
-    // Against the trade only when the stock's own news and the market agree
-    // on the other direction: one weak reading alone is noise.
-    let against_trade = if long {
-        stock_tone <= dec!(-0.5) && market_score < 0
-    } else {
-        stock_tone >= dec!(0.5) && market_score > 0
-    };
-    Luna {
-        stock_tone,
-        market_move_pct: market_move_pct.round_dp(2),
-        breadth_up_pct: breadth_up_pct.round_dp(1),
-        mood,
-        against_trade,
-    }
-}
-
 // ---------------------------------------------------------------- NOVA
 
-pub fn nova(titan: &Titan, orion: &Orion, luna: &Luna, enforce: bool) -> Nova {
+pub fn nova(titan: &Titan, orion: &Orion) -> Nova {
     let mut reasons = Vec::new();
-    let advisory_action = if orion.halted {
-        reasons.push("ORION: trading halt in the last 24h (always enforced)".to_string());
-        Action::Skip
-    } else if let Some(v) = &orion.veto {
-        reasons.push(format!("ORION: {v}"));
-        Action::Skip
-    } else if luna.against_trade {
-        reasons.push(format!(
-            "LUNA: tone {} with a {} market is against the trade",
-            luna.stock_tone, luna.mood
-        ));
-        Action::TradeHalf
-    } else {
-        Action::Trade
-    };
     let action = if !titan.allowed {
-        reasons.insert(0, format!("TITAN: {}", titan.reason));
+        reasons.push(format!("TITAN: {}", titan.reason));
         Action::Skip
-    } else if enforce || orion.halted {
-        advisory_action
+    } else if orion.halted {
+        reasons.push("ORION: trading halt in the last 24h".to_string());
+        Action::Skip
     } else {
-        if advisory_action != Action::Trade {
-            reasons.push("advisory only: ORION/LUNA rules are not yet validated".to_string());
-        }
+        reasons.push("VEGA signal confirmed; TITAN passed; no halt".to_string());
         Action::Trade
     };
-    if action == Action::Trade && reasons.is_empty() {
-        reasons.push(
-            "VEGA signal confirmed; TITAN passed; no news or sentiment objection".to_string(),
-        );
-    }
     Nova {
         action,
-        advisory_action: if titan.allowed {
-            advisory_action
-        } else {
-            Action::Skip
-        },
-        enforced: enforce,
+        advisory_action: action,
+        enforced: true,
         reasons,
     }
 }
@@ -386,6 +297,7 @@ pub fn nova(titan: &Titan, orion: &Orion, luna: &Luna, enforce: bool) -> Nova {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal_macros::dec;
 
     fn h(minutes_ago: i64, text: &str) -> Headline {
         Headline {
@@ -411,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn orion_tags_events_and_vetoes_on_earnings_but_not_analyst_notes() {
+    fn orion_tags_events_but_only_a_halt_matters() {
         let news = vec![
             h(30, "Tesla Q3 earnings beat estimates"),
             h(60, "Analyst raises price target"),
@@ -419,25 +331,21 @@ mod tests {
         let o = orion(&news, Utc::now());
         assert_eq!(o.headlines_24h, 2);
         assert!(o.events.contains(&"earnings".to_string()));
-        assert!(o.events.contains(&"analyst".to_string()));
-        assert!(o.veto.as_deref().unwrap().starts_with("earnings"));
-
-        let quiet = orion(&[h(30, "Analyst raises price target")], Utc::now());
-        assert_eq!(quiet.veto, None);
+        assert!(!o.halted);
+        assert_eq!(nova(&titan(true), &o).action, Action::Trade);
     }
 
     #[test]
     fn orion_ignores_news_older_than_a_day() {
-        let o = orion(&[h(60 * 30, "Company announces merger")], Utc::now());
+        let o = orion(&[h(60 * 30, "Shares halted pending news")], Utc::now());
         assert_eq!(o.headlines_24h, 0);
-        assert_eq!(o.veto, None);
+        assert!(!o.halted);
     }
 
     #[test]
     fn tone_counts_positive_and_negative_words() {
         assert_eq!(tone(&[h(1, "Shares surge after record quarter")]), dec!(1));
         assert_eq!(tone(&[h(1, "Stock plunges on downgrade")]), dec!(-1));
-        // jumps, upgrade (+2) against misses (-1): (2 - 1) / 3
         assert_eq!(
             tone(&[h(1, "Stock jumps on upgrade but misses revenue")]),
             dec!(0.33)
@@ -446,72 +354,13 @@ mod tests {
     }
 
     #[test]
-    fn luna_objects_only_when_stock_and_market_agree_against_the_trade() {
-        let bad = [h(1, "Shares sink after downgrade and weak outlook")];
-        assert!(luna(&bad, dec!(-0.8), dec!(30), true).against_trade);
-        assert!(
-            !luna(&bad, dec!(0.8), dec!(70), true).against_trade,
-            "market disagrees"
-        );
-        assert!(
-            !luna(&bad, dec!(-0.8), dec!(30), false).against_trade,
-            "a short wants this"
-        );
-    }
-
-    #[test]
-    fn nova_follows_titan_always_and_orion_luna_only_when_enforced() {
-        let calm_orion = orion(&[], Utc::now());
-        let calm_luna = luna(&[], dec!(0), dec!(50), true);
-        assert_eq!(
-            nova(&titan(true), &calm_orion, &calm_luna, false).action,
-            Action::Trade
-        );
-        assert_eq!(
-            nova(&titan(false), &calm_orion, &calm_luna, false).action,
-            Action::Skip
-        );
-
-        let event = orion(&[h(10, "Company to acquire rival in merger")], Utc::now());
-        let advisory = nova(&titan(true), &event, &calm_luna, false);
-        assert_eq!(advisory.action, Action::Trade);
-        assert_eq!(advisory.advisory_action, Action::Skip);
-        assert_eq!(
-            nova(&titan(true), &event, &calm_luna, true).action,
-            Action::Skip
-        );
-
-        let gloomy = luna(
-            &[h(1, "Shares sink after downgrade and weak outlook")],
-            dec!(-0.8),
-            dec!(30),
-            true,
-        );
-        assert_eq!(
-            nova(&titan(true), &calm_orion, &gloomy, true).action,
-            Action::TradeHalf
-        );
-    }
-
-    #[test]
-    fn a_halt_is_always_a_skip_even_in_advisory_mode() {
-        let calm_luna = luna(&[], dec!(0), dec!(50), true);
+    fn titan_and_a_halt_are_the_only_skips() {
+        let calm = orion(&[], Utc::now());
+        assert_eq!(nova(&titan(true), &calm).action, Action::Trade);
+        assert_eq!(nova(&titan(false), &calm).action, Action::Skip);
         let halted = orion(&[h(20, "Shares halted pending news")], Utc::now());
-        assert!(halted.halted);
-        assert_eq!(halted.veto, None, "a halt is not an advisory veto");
-        let n = nova(&titan(true), &halted, &calm_luna, false);
+        let n = nova(&titan(true), &halted);
         assert_eq!(n.action, Action::Skip);
         assert!(n.reasons[0].contains("halt"));
-
-        // Earnings news stays advisory.
-        let earnings = orion(
-            &[h(20, "Company reports results, EPS above estimates")],
-            Utc::now(),
-        );
-        assert!(!earnings.halted);
-        assert_eq!(
-            nova(&titan(true), &earnings, &calm_luna, false).action,
-            Action::Trade
-        );
     }
 }

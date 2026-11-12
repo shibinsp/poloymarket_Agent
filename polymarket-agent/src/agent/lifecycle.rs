@@ -44,6 +44,10 @@ use crate::valuation::fair_value::{ValuationEngine, ValuationResult};
 use crate::valuation::llm::LlmClient;
 use crate::venue::VenueRegistry;
 
+/// How long to let a fresh intraday entry fill before stopping it. Alpaca
+/// filled the 2 Nov 2026 entries in 1.5-3.5 s.
+const ENTRY_FILL_WAIT_SECS: u64 = 4;
+
 pub struct Agent {
     config: AppConfig,
     store: Store,
@@ -78,6 +82,8 @@ pub struct Agent {
     /// The day's valuation spend. Held here as well as inside the LLM client
     /// so a batch can be sized to what is affordable before it is spawned.
     budget: Arc<BudgetLedger>,
+    /// When the Polymarket loop last scanned, when it runs alongside venues.
+    last_polymarket_scan: Option<DateTime<Utc>>,
 }
 
 /// Scan the legacy Polymarket universe, or nothing when it is not configured.
@@ -180,9 +186,40 @@ impl Agent {
                 .with_budget(budget.clone()),
             );
             llm_client = Some(client.clone());
+            // Polymarket can value on a model of its own while every other
+            // path keeps the main one. An override on the main endpoint
+            // (another NVIDIA model) uses the main key, never the Gemini one.
+            let same_host = config.valuation.polymarket.as_ref().is_some_and(|o| {
+                o.base_url.is_none() || o.base_url == config.valuation.base_url
+            });
+            let polymarket_key = if same_host {
+                Some(api_key)
+            } else {
+                secrets.polymarket_llm_api_key.as_ref()
+            };
+            let polymarket_client = match (&config.valuation.polymarket, polymarket_key) {
+                (Some(_), Some(key)) => {
+                    let pm_config = config.valuation.for_polymarket();
+                    info!(model = %pm_config.model, "Polymarket valuations use their own model");
+                    Arc::new(
+                        LlmClient::new(
+                            key.expose_secret().to_string(),
+                            &pm_config,
+                            store.clone_for_parallel(),
+                        )?
+                        .with_content_export(config.telemetry.exports_content())
+                        .with_budget(budget.clone()),
+                    )
+                }
+                (Some(_), None) => {
+                    warn!("[valuation.polymarket] is set but POLYMARKET_LLM_API_KEY is not — Polymarket uses the main model");
+                    client
+                }
+                _ => client,
+            };
             Some(ValuationEngine::new(
-                client,
-                config.valuation.clone(),
+                polymarket_client,
+                config.valuation.for_polymarket(),
                 valuation_store,
             ))
         } else {
@@ -218,13 +255,26 @@ impl Agent {
                 let feed = std::env::var("ALPACA_FEED_TYPE")
                     .unwrap_or_else(|_| "iex".to_string())
                     .to_ascii_lowercase();
-                info!(universe = config.us_orb.symbols.len(), %feed, "U.S. opening-range breakout enabled (paper)");
+                // Stocks in play are ranked from SIP volume, as backtested. With
+                // only IEX live, SIP is 15 minutes late, so ranking waits for 9:50.
+                let ready_slot = if feed == "sip" {
+                    1
+                } else {
+                    crate::us::orb::DELAYED_SIP_READY_SLOT
+                };
+                info!(universe = config.us_orb.symbols.len(), %feed, ready_slot, "U.S. opening-range breakout enabled (paper)");
                 Some(crate::us::orb::OrbTrader::new(
                     crate::us::orb::AlpacaBars::new(
                         key.expose_secret().to_string(),
                         secret.expose_secret().to_string(),
                         feed,
                     ),
+                    crate::us::orb::AlpacaBars::new(
+                        key.expose_secret().to_string(),
+                        secret.expose_secret().to_string(),
+                        "sip".to_string(),
+                    ),
+                    ready_slot,
                 ))
             }
             (true, _, _) => {
@@ -279,6 +329,7 @@ impl Agent {
             llm: llm_client,
             kill_switch,
             budget,
+            last_polymarket_scan: None,
         })
     }
 
@@ -385,6 +436,31 @@ impl Agent {
         // Anything raised since the last cycle — by the poller, the
         // dashboard, or a signal — gets its side effects now.
         self.apply_pending_halt().await;
+    }
+
+    /// Mark, stop and close continuous-asset positions; places the resting
+    /// stops for intraday entries.
+    async fn run_venue_exits(&self) {
+        let exits = VenueExits {
+            registry: &self.venues,
+            store: &self.store,
+            max_hold_hours: self.config.exits_continuous.max_hold_hours,
+            order_ttl_seconds: self.config.execution.order_ttl_seconds as i64,
+            emergency_stop: self.config.risk.emergency_stop,
+            // The selectable rule strategy is paper-only. Do not let its
+            // swing exits alter live positions created by the generic
+            // valuation path.
+            us_strategy: (self.config.agent.mode == AgentMode::Paper)
+                .then_some(&self.config.us_strategy),
+        };
+        match exits
+            .run(chrono::Utc::now(), self.cycle_number as i64)
+            .await
+        {
+            Ok(0) => {}
+            Ok(closed) => info!(closed, "Closed continuous positions this cycle"),
+            Err(e) => warn!(error = %e, "Venue exit pass failed"),
+        }
     }
 
     /// Resolve outstanding orders before anything else looks at positions. An
@@ -643,9 +719,23 @@ impl Agent {
             0
         });
 
-        if let Some(trip) =
-            circuit_breaker::evaluate(equity, &marks, trades_today, losses, &self.config.risk)
-        {
+        // The U.S. stock books' own P&L for their cash limit; the options and
+        // crypto books on the same Alpaca account answer to limits of their own.
+        let us_book_day_pnl = match self.store.venue_equity_day_pnl("alpaca", today).await {
+            Ok(v) => Some(v),
+            Err(e) => {
+                warn!(error = %e, "Could not read the U.S. stock books' P&L — the U.S. limit uses the whole account");
+                None
+            }
+        };
+        if let Some(trip) = circuit_breaker::evaluate(
+            equity,
+            &marks,
+            trades_today,
+            losses,
+            us_book_day_pnl,
+            &self.config.risk,
+        ) {
             self.raise_halt(Halt::new(
                 HaltSource::CircuitBreaker,
                 trip.scope(),
@@ -786,26 +876,7 @@ impl Agent {
         // state: being unable to open new positions must never mean being
         // unable to close existing ones.
         if !self.venues.is_empty() {
-            let exits = VenueExits {
-                registry: &self.venues,
-                store: &self.store,
-                max_hold_hours: self.config.exits_continuous.max_hold_hours,
-                order_ttl_seconds: self.config.execution.order_ttl_seconds as i64,
-                emergency_stop: self.config.risk.emergency_stop,
-                // The selectable rule strategy is paper-only. Do not let its
-                // swing exits alter live positions created by the generic
-                // valuation path.
-                us_strategy: (self.config.agent.mode == AgentMode::Paper)
-                    .then_some(&self.config.us_strategy),
-            };
-            match exits
-                .run(chrono::Utc::now(), self.cycle_number as i64)
-                .await
-            {
-                Ok(0) => {}
-                Ok(closed) => info!(closed, "Closed continuous positions this cycle"),
-                Err(e) => warn!(error = %e, "Venue exit pass failed"),
-            }
+            self.run_venue_exits().await;
         }
 
         // Check for resolved markets and settle trades.
@@ -895,11 +966,13 @@ impl Agent {
                     cycle = self.cycle_number,
                     "Low fuel mode — reduced operations"
                 );
-                match scan_legacy(self.scanner.as_ref()).await {
+                let due = self.polymarket_cycle();
+                let scanner = self.scanner.as_ref().filter(|_| due);
+                match scan_legacy(scanner).await {
                     Ok(candidates) => {
                         markets_scanned = candidates.len() as i64;
-                        if self.has_valuation_engine() && budget_available {
-                            let bankroll = self.effective_bankroll().await;
+                        if self.has_valuation_engine() && budget_available && !candidates.is_empty() {
+                            let bankroll = self.polymarket_bankroll().await;
                             let result = self.evaluate_and_trade(&candidates, bankroll, 1).await;
                             opportunities_found = result.opportunities as i64;
                             trades_placed = result.trades as i64;
@@ -927,7 +1000,9 @@ impl Agent {
             }
             AgentState::Alive => {
                 info!(cycle = self.cycle_number, "Normal operation");
-                match scan_legacy(self.scanner.as_ref()).await {
+                let due = self.polymarket_cycle();
+                let scanner = self.scanner.as_ref().filter(|_| due);
+                match scan_legacy(scanner).await {
                     Ok(candidates) => {
                         markets_scanned = candidates.len() as i64;
                         info!(
@@ -935,11 +1010,14 @@ impl Agent {
                             "Scan complete — candidates found"
                         );
 
-                        if self.has_valuation_engine() && budget_available {
-                            let bankroll = self.effective_bankroll().await;
-                            let result = self.evaluate_and_trade(&candidates, bankroll, 10).await;
+                        if !candidates.is_empty() && self.config.agent.polymarket_underdog {
+                            trades_placed += self.run_underdog(&candidates).await as i64;
+                        }
+                        if self.has_valuation_engine() && budget_available && !candidates.is_empty() {
+                            let bankroll = self.polymarket_bankroll().await;
+                            let result = self.evaluate_and_trade(&candidates, bankroll, self.config.valuation.max_evaluations_per_scan).await;
                             opportunities_found = result.opportunities as i64;
-                            trades_placed = result.trades as i64;
+                            trades_placed += result.trades as i64;
                             cycle_api_cost = result.api_cost;
                         } else {
                             opportunities_found = candidates.len() as i64;
@@ -968,14 +1046,47 @@ impl Agent {
 
         // Intraday U.S. breakouts: same state gate as every entry path, but it
         // spends no model budget, so the API budget does not gate it.
+        let placed_before_orb = trades_placed;
         if self.opens_positions() {
             if let Some(orb) = self.orb.as_mut() {
-                let capital = self
+                let base = self
                     .config
                     .us_orb
                     .capital_usd
                     .or(self.config.risk.us_capital_allocation_usd)
                     .unwrap_or(rust_decimal_macros::dec!(1000));
+                // Only the capital trades, never the profits; a net loss shrinks
+                // it (the user's rule, 3 Nov 2026, as on the India books).
+                let realized = self
+                    .store
+                    .strategies_realized_since(
+                        &[crate::us::orb::ORB_STRATEGY, crate::us::orb::BURST_STRATEGY],
+                        self.config.us_orb.capital_since,
+                    )
+                    .await
+                    .unwrap_or_else(|e| {
+                        warn!(error = %e, "Could not read the U.S. book's P&L; sizing from the base capital");
+                        Decimal::ZERO
+                    });
+                let capital = crate::india::orb::trading_cash(base, realized);
+                if self.config.us_orb.burst {
+                    match orb
+                        .run_burst(
+                            &self.venues,
+                            &self.store,
+                            &self.config.us_orb,
+                            capital,
+                            self.config.risk.us_max_trades_per_day,
+                            Utc::now(),
+                            self.cycle_number as i64,
+                        )
+                        .await
+                    {
+                        Ok(true) => trades_placed += 1,
+                        Ok(false) => {}
+                        Err(e) => warn!(error = %e, "Burst pass failed"),
+                    }
+                }
                 match orb
                     .run(
                         &self.venues,
@@ -992,6 +1103,15 @@ impl Agent {
                     Err(e) => warn!(error = %e, "ORB pass failed"),
                 }
             }
+        }
+        // Stop the new entries now rather than on the next cycle: on 2 Nov
+        // 2026 their stops reached Alpaca 30-60 s after the fills. Fractional
+        // orders cannot carry an attached stop at Alpaca, so confirm the fills
+        // and run the exit pass, which places them.
+        if trades_placed > placed_before_orb {
+            tokio::time::sleep(std::time::Duration::from_secs(ENTRY_FILL_WAIT_SECS)).await;
+            self.resolve_outstanding_orders().await;
+            self.run_venue_exits().await;
         }
 
         // Venue path: continuous assets (crypto, equities). Runs alongside the
@@ -1157,7 +1277,12 @@ impl Agent {
                 {
                     Ok(Some(v)) => v,
                     Ok(None) => return None,
-                    Err(_) => return None,
+                    Err(e) => {
+                        // Logged: a model that no longer exists failed every
+                        // valuation silently for weeks (found 3 Nov 2026).
+                        warn!(market = %candidate.market.question, error = %format!("{e:#}"), "Valuation failed");
+                        return None;
+                    }
                 };
 
                 let edge = match evaluate_edge(&candidate, &valuation, &config) {
@@ -1410,6 +1535,105 @@ impl Agent {
         result
     }
 
+    /// The "underdog a week out" paper book (see `poly_underdog`): no model
+    /// call, a fixed stake, held to settlement. Paper mode only. Returns the
+    /// number of bets placed.
+    async fn run_underdog(&mut self, candidates: &[MarketCandidate]) -> usize {
+        use crate::agent::poly_underdog as ud;
+        if self.config.agent.mode != AgentMode::Paper {
+            return 0;
+        }
+        let Some(polymarket) = self.polymarket.clone() else {
+            return 0;
+        };
+        let open = match self.store.get_open_trades().await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(error = %e, "Underdog book: could not read open trades");
+                return 0;
+            }
+        };
+        let held: std::collections::HashSet<String> =
+            open.iter().map(|t| t.market_id.clone()).collect();
+        let mut open_usd: Decimal = open
+            .iter()
+            .filter(|t| t.strategy.as_deref() == Some(ud::STRATEGY))
+            .filter_map(|t| {
+                Some(Decimal::from_str(&t.entry_price).ok()? * Decimal::from_str(&t.size).ok()?)
+            })
+            .sum();
+        let mut wallet = self.polymarket_bankroll().await;
+        let now = Utc::now();
+        let mut placed = 0;
+        for c in candidates {
+            if placed >= ud::MAX_NEW_PER_SCAN
+                || open_usd + ud::STAKE_USD > ud::MAX_OPEN_USD
+                || wallet < ud::STAKE_USD
+            {
+                break;
+            }
+            if held.contains(&c.market.condition_id) {
+                continue;
+            }
+            let Some((side, price)) = ud::pick(c, now) else {
+                continue;
+            };
+            let token = match side {
+                crate::market::models::Side::Yes => c
+                    .market
+                    .tokens
+                    .iter()
+                    .find(|t| t.outcome.eq_ignore_ascii_case("yes"))
+                    .or_else(|| c.market.tokens.first()),
+                crate::market::models::Side::No => c
+                    .market
+                    .tokens
+                    .iter()
+                    .find(|t| t.outcome.eq_ignore_ascii_case("no"))
+                    .or_else(|| c.market.tokens.last()),
+            };
+            let Some(token) = token else { continue };
+            let prepared = order::PreparedOrder {
+                token_id: token.token_id.clone(),
+                side,
+                price,
+                size: ud::STAKE_USD / price,
+                market_id: c.market.condition_id.clone(),
+                market_question: c.market.question.clone(),
+                edge: Decimal::ZERO,
+                fair_value: price,
+                confidence: Decimal::ZERO,
+                kelly_raw: Decimal::ZERO,
+                kelly_adjusted: Decimal::ZERO,
+            };
+            let execution = order::execute_order(&polymarket, &prepared).await;
+            if execution.status != OrderStatus::Filled {
+                continue;
+            }
+            match fills::record_trade(&self.store, &prepared, &execution, self.cycle_number).await {
+                Ok(Some(id)) => {
+                    if let Err(e) = self.store.set_trade_strategy(id, ud::STRATEGY).await {
+                        warn!(trade_id = id, error = %e, "Underdog book: could not tag the trade");
+                    }
+                    info!(
+                        market = %c.market.question,
+                        side = %side,
+                        price = %price,
+                        stake_usd = %ud::STAKE_USD,
+                        ends = %c.market.end_date,
+                        "Underdog bet placed (paper, held to settlement)"
+                    );
+                    placed += 1;
+                    open_usd += ud::STAKE_USD;
+                    wallet -= ud::STAKE_USD;
+                }
+                Ok(None) => {}
+                Err(e) => warn!(error = %e, "Underdog book: bet not recorded"),
+            }
+        }
+        placed
+    }
+
     /// Re-evaluate open positions for stop-loss exit signals (RISK-01).
     /// Fetches current YES price from Gamma and evaluates against max loss threshold.
     /// In paper mode, marks positions as CANCELLED. In live mode, places sell orders.
@@ -1425,6 +1649,11 @@ impl Agent {
         };
 
         for trade in &open_trades {
+            // The underdog book holds to settlement; its edge is in the
+            // payout, and a price stop would cut most of its winners.
+            if trade.strategy.as_deref() == Some(crate::agent::poly_underdog::STRATEGY) {
+                continue;
+            }
             let trade_id = match trade.id {
                 Some(id) => id,
                 None => continue,
@@ -1548,20 +1777,13 @@ impl Agent {
     ) -> Option<String> {
         // Query the Gamma API to get market tokens
         let polymarket = self.polymarket.as_ref()?;
-        let url = format!("{}/markets", polymarket.gamma_base_url());
-        let markets: Vec<serde_json::Value> = match polymarket
-            .http_client()
-            .get(&url)
-            .query(&[("condition_id", market_id)])
-            .send()
-            .await
-        {
-            Ok(resp) => match resp.json().await {
-                Ok(m) => m,
-                Err(_) => return None,
-            },
-            Err(_) => return None,
-        };
+        let markets = crate::market::polymarket::gamma_markets_by_condition_id(
+            polymarket.http_client(),
+            polymarket.gamma_base_url(),
+            market_id,
+        )
+        .await
+        .ok()?;
 
         let market = markets.first()?;
         let token_ids = market
@@ -1619,14 +1841,19 @@ impl Agent {
     /// same currency. Every venue here reports US dollars; a venue that did
     /// not would need this to become per-currency rather than a total.
     async fn current_balance(&self) -> Decimal {
-        if let Some(polymarket) = self.polymarket.as_ref() {
-            return match polymarket.get_balance().await {
-                Ok(balance) => balance,
-                Err(e) => {
-                    warn!(error = %e, "Failed to get balance, using zero");
-                    Decimal::ZERO
-                }
-            };
+        // With venues configured, the agent's balance is theirs; Polymarket
+        // then runs alongside on its own wallet (`polymarket_bankroll`), so a
+        // $100 paper wallet never drives the survival ladder of the whole agent.
+        if self.venues.is_empty() {
+            if let Some(polymarket) = self.polymarket.as_ref() {
+                return match polymarket.get_balance().await {
+                    Ok(balance) => balance,
+                    Err(e) => {
+                        warn!(error = %e, "Failed to get balance, using zero");
+                        Decimal::ZERO
+                    }
+                };
+            }
         }
 
         let mut total = Decimal::ZERO;
@@ -1720,6 +1947,78 @@ impl Agent {
     }
 
     /// Calculate effective bankroll: wallet balance minus reserve and unrealized exposure.
+    /// What the Polymarket loop may bet with. Alone (no venues), the agent's
+    /// own bankroll. Alongside venues, its own paper wallet, rebuilt from the
+    /// ledger: the starting balance plus realized P&L minus the cost of open
+    /// positions. The simulated wallet is set to match, so a fill can never
+    /// spend money the book does not have.
+    async fn polymarket_bankroll(&self) -> Decimal {
+        if self.venues.is_empty() {
+            return self.effective_bankroll().await;
+        }
+        let Some(polymarket) = self.polymarket.as_ref() else {
+            return Decimal::ZERO;
+        };
+        let wallet = match self.store.polymarket_book().await {
+            Ok((open_cost, realized)) => {
+                self.config
+                    .agent
+                    .polymarket_capital_usd
+                    .unwrap_or(self.config.agent.initial_paper_balance)
+                    + realized
+                    - open_cost
+            }
+            Err(e) => {
+                warn!(error = %e, "Could not read the Polymarket book; no new Polymarket bets this cycle");
+                return Decimal::ZERO;
+            }
+        };
+        polymarket.set_paper_balance(wallet).await;
+        wallet.max(Decimal::ZERO)
+    }
+
+    /// Whether this cycle runs the Polymarket scan. Alongside venues it runs
+    /// every `polymarket_scan_every_cycles` cycles: each scan can start up to
+    /// ten model valuations, and the US and India books run every minute.
+    fn polymarket_cycle(&mut self) -> bool {
+        if !self.config.agent.polymarket_new_bets {
+            return false;
+        }
+        if self.venues.is_empty() {
+            return true;
+        }
+        let now = Utc::now();
+        // A scan takes 7-8 minutes (Gamma, ~400 order books, news) and blocks
+        // this loop, which also runs the U.S. intraday entries, stops and
+        // 15:45 exit. So no scans while the U.S. market is open or about to
+        // open (found 3 Nov 2026); Polymarket keeps the other 17 hours.
+        if self.orb.is_some() {
+            if let Some(alpaca) = self.venues.get(&crate::venue::types::VenueId::new("alpaca")) {
+                let regular = |t| {
+                    alpaca.session_state(t).kind() == Some(crate::venue::session::SessionKind::Regular)
+                };
+                if regular(now) || regular(now + Duration::minutes(20)) {
+                    return false;
+                }
+            }
+        }
+        let due = self
+            .last_polymarket_scan
+            .is_none_or(|t| now - t >= self.polymarket_interval() - Duration::seconds(5));
+        if due {
+            self.last_polymarket_scan = Some(now);
+        }
+        due
+    }
+
+    /// The time between Polymarket scans alongside venues.
+    fn polymarket_interval(&self) -> Duration {
+        Duration::seconds(
+            (self.config.agent.cycle_interval_seconds
+                * self.config.agent.polymarket_scan_every_cycles.max(1)) as i64,
+        )
+    }
+
     async fn effective_bankroll(&self) -> Decimal {
         let balance = self.current_balance().await;
         let unrealized = fills::unrealized_exposure(&self.store)
@@ -1820,11 +2119,19 @@ impl Agent {
     /// registry stays private — `main` schedules without knowing what a
     /// session is.
     pub fn next_wake(&self, now: DateTime<Utc>) -> WakePlan {
+        // Polymarket never closes: while it runs alongside venues, the
+        // closed-market sleep is capped at its scan interval.
+        let max_sleep = Duration::seconds(self.config.agent.max_sleep_seconds as i64);
+        let max_sleep = if self.polymarket.is_some() && !self.venues.is_empty() {
+            max_sleep.min(self.polymarket_interval())
+        } else {
+            max_sleep
+        };
         scheduler::next_wake(
             &self.venues,
             now,
             Duration::seconds(self.config.agent.cycle_interval_seconds as i64),
-            Duration::seconds(self.config.agent.max_sleep_seconds as i64),
+            max_sleep,
         )
     }
 }

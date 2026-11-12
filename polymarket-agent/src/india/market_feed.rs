@@ -29,6 +29,9 @@ use crate::strategy::pullback::FiveMinCandle;
 pub const UPSTOX_API_BASE: &str = "https://api.upstox.com/v2";
 pub const UPSTOX_V3_FEED_AUTHORIZE: &str =
     "https://api.upstox.com/v3/feed/market-data-feed/authorize";
+/// In the NSE session, a V3 stream with no frame for this long is treated as
+/// dead and reconnected.
+const STREAM_IDLE_SECS: u64 = 30;
 
 /// Real-time live market tick for an NSE equity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +114,9 @@ struct UpstoxQuoteFullResponse {
 
 #[derive(Debug, Deserialize)]
 struct UpstoxFullQuoteItem {
+    /// "NSE_EQ|<ISIN>". The map key uses the trading symbol ("NSE_EQ:TMPV"),
+    /// which drifts after renames such as Tata Motors' 2025 demerger.
+    pub instrument_token: Option<String>,
     pub last_price: Option<f64>,
     pub ohlc: Option<UpstoxOhlcItem>,
     pub volume: Option<i64>,
@@ -405,12 +411,19 @@ impl UpstoxLiveMarketFeed {
 
         for inst in &watchlist {
             let key = &inst.upstox_key;
-            let maybe_item = items.get(key).or_else(|| {
-                items
-                    .iter()
-                    .find(|(k, _)| k.contains(&inst.symbol))
-                    .map(|(_, v)| v)
-            });
+            let maybe_item = items
+                .get(key)
+                .or_else(|| {
+                    items
+                        .values()
+                        .find(|v| v.instrument_token.as_deref() == Some(key.as_str()))
+                })
+                .or_else(|| {
+                    items
+                        .iter()
+                        .find(|(k, _)| k.contains(&inst.symbol))
+                        .map(|(_, v)| v)
+                });
 
             if let Some(item) = maybe_item {
                 if let Some(lp_f64) = item.last_price {
@@ -950,12 +963,48 @@ impl UpstoxLiveMarketFeed {
                                     info!("Subscribed once to NSE watchlist instruments on Upstox V3 feed");
                                 }
 
-                                // Stream message loop
-                                while let Some(msg_result) = ws_stream.next().await {
+                                // Stream message loop. On 5 Nov 2026 the stream went
+                                // silent at 09:09 IST with the socket still open, and
+                                // the loop waited on it all day. In the session, no
+                                // frame for STREAM_IDLE_SECS means reconnect.
+                                let mut last_frame = std::time::Instant::now();
+                                let mut minute_start = std::time::Instant::now();
+                                let (mut frames, mut stream_ticks) = (0u64, 0u64);
+                                loop {
+                                    if minute_start.elapsed().as_secs() >= 60 {
+                                        if detect_nse_session(Utc::now()).is_trading_active {
+                                            info!(frames, ticks = stream_ticks, "Upstox V3 stream, last minute");
+                                        }
+                                        minute_start = std::time::Instant::now();
+                                        frames = 0;
+                                        stream_ticks = 0;
+                                    }
+                                    let next = tokio::time::timeout(
+                                        std::time::Duration::from_secs(10),
+                                        ws_stream.next(),
+                                    )
+                                    .await;
+                                    let msg_result = match next {
+                                        Ok(Some(m)) => m,
+                                        Ok(None) => break,
+                                        Err(_) => {
+                                            let idle = last_frame.elapsed().as_secs();
+                                            if idle >= STREAM_IDLE_SECS
+                                                && detect_nse_session(Utc::now()).is_trading_active
+                                            {
+                                                warn!(idle_secs = idle, "Upstox V3 stream silent in the session; reconnecting");
+                                                break;
+                                            }
+                                            continue;
+                                        }
+                                    };
+                                    last_frame = std::time::Instant::now();
                                     match msg_result {
                                         Ok(Message::Binary(bin_bytes)) => {
+                                            frames += 1;
                                             let parsed_ticks =
                                                 parse_upstox_protobuf_feed(&bin_bytes);
+                                            stream_ticks += parsed_ticks.len() as u64;
                                             if !parsed_ticks.is_empty() {
                                                 self.process_incoming_ticks(parsed_ticks).await;
                                             }

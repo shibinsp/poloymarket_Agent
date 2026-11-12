@@ -10,7 +10,8 @@ import { ColumnChart } from "../components/charts/ColumnChart";
 import { DonutChart } from "../components/charts/DonutChart";
 import { ChartOrTable } from "../components/charts/ChartOrTable";
 import { Link } from "../router/Link";
-import { RecentStrategyTrades, usePolled, type IndiaIntraday, type RiskSnapshot, type UsOrbTrade } from "../components/live/StrategyLedgers";
+import { RecentStrategyTrades, usePolled, type IndiaIntraday, type RiskSnapshot, type UsBook, type UsOptionsBook, type UsOrbTrade } from "../components/live/StrategyLedgers";
+import { TargetTracker } from "../components/live/TargetTracker";
 import { cyclesAscending } from "../data/derive";
 import { num } from "../lib/decimal";
 import { int, money, moneyInr, pctFromFraction } from "../lib/format";
@@ -24,30 +25,44 @@ import type {
 export function Overview() {
   const intraday = usePolled<IndiaIntraday>("/api/india/intraday");
   const risk = usePolled<RiskSnapshot>("/api/risk");
-  const usOrbTrades = usePolled<{ trades: UsOrbTrade[] }>("/api/us/orb/trades");
+  const usOrbTrades = usePolled<{ trades: UsOrbTrade[]; book: UsBook | null }>("/api/us/orb/trades");
+  const usOptions = usePolled<{ book: UsOptionsBook | null }>("/api/us/options");
   const cycles = useDataset<CycleRecord[]>("cyclesAll");
   const us = useDataset<UsPaperStatusResponse>("usPaper");
   const health = useDataset<Health>("health");
 
   const FX = 86.5;
 
-  // India: the intraday breakout's own Rs 2,500 ledger, not the older sandbox book.
+  // India: the intraday books. Losing trades come off the capital; winning
+  // trades are set aside and never added back or netted against a loss.
   const indiaBaseInr = num(intraday?.capital_inr ?? null) ?? 0;
   const indiaProfit = num(intraday?.pnl_total_inr ?? null) ?? 0;
-  const indiaCurrentInr = indiaBaseInr + indiaProfit;
+  const indiaLosses = num(intraday?.losses_inr ?? null) ?? Math.min(indiaProfit, 0);
+  const indiaKeptProfit = num(intraday?.profits_inr ?? null) ?? Math.max(indiaProfit, 0);
+  const indiaCurrentInr = num(intraday?.trading_capital_inr ?? null) ?? indiaBaseInr + indiaLosses;
   const indiaUsdEquivalent = indiaCurrentInr / FX;
   const indiaProfitPct = indiaBaseInr > 0 ? (indiaProfit / indiaBaseInr) * 100 : 0;
   const indiaTradeCount = intraday?.trades.length ?? 0;
 
-  // US: the Alpaca paper account's own equity. Summing the trades table mixed
-  // in trades from an earlier Alpaca account, so it no longer matches Alpaca.
-  const usStrategyCapitalUsd = num(us.data?.base_capital_usd ?? null) ?? 0;
-  const usCurrentUsd = num(risk?.current_equity ?? null) ?? 0;
-  const usDayStartUsd = num(risk?.starting_equity ?? null) ?? usCurrentUsd;
-  const usProfit = usCurrentUsd - usDayStartUsd;
+  // US: the $500 strategy book (capital + its P&L since it started), which is
+  // all the agent trades. The Alpaca paper account holds more; only its
+  // equity is shown, as a note.
+  const usBook = usOrbTrades?.book ?? null;
+  const usAccountUsd = num(risk?.current_equity ?? null) ?? 0;
+  const usStrategyCapitalUsd = num(usBook?.capital_usd ?? null) ?? num(us.data?.base_capital_usd ?? null) ?? 0;
+  const usCurrentUsd = num(usBook?.value_usd ?? null) ?? usStrategyCapitalUsd;
+  const usProfit = num(usBook?.pnl_today_usd ?? null) ?? 0;
+  const usBookPnl = num(usBook?.pnl_total_usd ?? null) ?? 0;
+  const usTradingCapital = num(usBook?.trading_capital_usd ?? null) ?? usStrategyCapitalUsd;
   const usInrEquivalent = usCurrentUsd * FX;
+  // The options book: its own $500, closed trades only.
+  const usOptionsBook = usOptions?.book ?? null;
+  const usOptionsPnl = num(usOptionsBook?.pnl_total_usd ?? null) ?? 0;
 
   const currentBankroll = usCurrentUsd + indiaUsdEquivalent;
+  // Booked profit only: closed trades in both markets, open positions left out
+  // until they close (the user's ask, 3 Nov 2026).
+  const combinedProfitUsd = usBookPnl + usOptionsPnl + indiaProfit / FX;
 
   // Both strategies' closed trades: what the win rate and net profit are about.
   const usTrades = usOrbTrades?.trades ?? [];
@@ -76,7 +91,7 @@ export function Overview() {
       sublabel: `₹${indiaCurrentInr.toLocaleString("en-IN", { maximumFractionDigits: 2 })}`,
     },
     {
-      label: "Alpaca paper account (USD)",
+      label: "US intraday book (USD)",
       value: usCurrentUsd,
       color: "var(--series-2)",
       sublabel: `$${usCurrentUsd.toFixed(2)}`,
@@ -85,6 +100,7 @@ export function Overview() {
 
   return (
     <div className="page">
+      <TargetTracker />
       {/* 1. EXECUTIVE SUMMARY: PORTFOLIO & REAL-TIME CAPITAL */}
       <div className="card" style={{ padding: "16px 20px" }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px", flexWrap: "wrap", gap: "10px" }}>
@@ -120,6 +136,9 @@ export function Overview() {
               <span style={{ color: "var(--text-muted)", marginLeft: "6px" }}>(Capital: ₹{indiaBaseInr.toLocaleString("en-IN")})</span>
             </div>
             <div style={{ fontSize: "11px", color: "var(--text-muted)", marginTop: "2px" }}>
+              Losses taken off: {signedInr(indiaLosses)} · Profit kept aside: {signedInr(indiaKeptProfit)}
+            </div>
+            <div style={{ fontSize: "11px", color: "var(--text-muted)", marginTop: "2px" }}>
               USD Value: ${indiaUsdEquivalent.toFixed(2)} · {indiaTradeCount} {indiaTradeCount === 1 ? "trade" : "trades"}
             </div>
             <div style={{ marginTop: "10px", fontSize: "12px" }}>
@@ -131,18 +150,26 @@ export function Overview() {
           <div style={{ padding: "14px", background: "var(--surface-2)", borderRadius: "var(--radius-sm)", border: "1px solid var(--border)" }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
               <span style={{ fontWeight: "600", fontSize: "13px", color: "var(--text-secondary)" }}>🇺🇸 US Equities & ETFs</span>
-              <Badge tone="good">$ Alpaca paper account</Badge>
+              <Badge tone="good">$ Intraday book · Alpaca paper</Badge>
             </div>
             <div style={{ fontSize: "24px", fontWeight: "700", color: "var(--text-primary)", fontVariantNumeric: "tabular-nums" }}>
               {money(usCurrentUsd)}
             </div>
-            <div style={{ fontSize: "12px", marginTop: "4px", color: usProfit >= 0 ? "var(--status-good)" : "var(--status-critical)" }}>
-              Today: <strong>{signedUsd(usProfit)}</strong>
-              <span style={{ color: "var(--text-muted)", marginLeft: "6px" }}>(Strategy capital: ${usStrategyCapitalUsd.toFixed(0)})</span>
+            <div style={{ fontSize: "12px", marginTop: "4px", color: usBookPnl >= 0 ? "var(--status-good)" : "var(--status-critical)" }}>
+              P&L: <strong>{signedUsd(usBookPnl)}</strong> · today {signedUsd(usProfit)}
+              <span style={{ color: "var(--text-muted)", marginLeft: "6px" }}>(Capital: ${usStrategyCapitalUsd.toFixed(0)})</span>
             </div>
             <div style={{ fontSize: "11px", color: "var(--text-muted)", marginTop: "2px" }}>
-              INR Value: ₹{usInrEquivalent.toFixed(0)} · live equity from Alpaca
+              Trades with ${usTradingCapital.toFixed(2)} (capital only, profits not reinvested) · INR ₹{usInrEquivalent.toFixed(0)}
             </div>
+            <div style={{ fontSize: "11px", color: "var(--text-muted)", marginTop: "2px" }}>
+              Whole Alpaca paper account: {money(usAccountUsd)} (not traded)
+            </div>
+            {usOptionsBook && (
+              <div style={{ fontSize: "11px", color: "var(--text-muted)", marginTop: "2px" }}>
+                Options book: {money(num(usOptionsBook.trading_capital_usd))} to trade · closed P&L {signedUsd(usOptionsPnl)}
+              </div>
+            )}
             <div style={{ marginTop: "10px", fontSize: "12px" }}>
               <Link to="/us">US trades →</Link>
             </div>
@@ -151,14 +178,18 @@ export function Overview() {
           {/* Combined Total Tile */}
           <div style={{ padding: "14px", background: "var(--surface-2)", borderRadius: "var(--radius-sm)", border: "1px solid var(--border-strong)" }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
-              <span style={{ fontWeight: "600", fontSize: "13px", color: "var(--text-secondary)" }}>🌐 Combined Portfolio</span>
-              <Badge tone="neutral">Paper money only</Badge>
+              <span style={{ fontWeight: "600", fontSize: "13px", color: "var(--text-secondary)" }}>🌐 Combined Profit</span>
+              <Badge tone="neutral">Closed trades only</Badge>
             </div>
-            <div style={{ fontSize: "24px", fontWeight: "700", color: "var(--status-good)", fontVariantNumeric: "tabular-nums" }}>
-              {money(currentBankroll)}
+            <div style={{ fontSize: "24px", fontWeight: "700", color: combinedProfitUsd >= 0 ? "var(--status-good)" : "var(--status-critical)", fontVariantNumeric: "tabular-nums" }}>
+              {signedUsd(combinedProfitUsd)}
             </div>
             <div style={{ fontSize: "12px", marginTop: "4px", color: "var(--text-secondary)" }}>
-              India {signedInr(indiaProfit)} all time · US {signedUsd(usProfit)} today
+              India {signedInr(indiaProfit)} · US {signedUsd(usBookPnl)}
+              {usOptionsBook && <> · US options {signedUsd(usOptionsPnl)}</>}
+            </div>
+            <div style={{ fontSize: "11px", color: "var(--text-muted)", marginTop: "2px" }}>
+              Booked when a trade closes; open trades are not counted · ₹ at $1 = ₹{FX}
             </div>
             <div style={{ marginTop: "10px", fontSize: "12px" }}>
               <Link to="/trades">All trades →</Link>

@@ -35,6 +35,222 @@ pub struct AppConfig {
     /// Intraday opening-range breakout on U.S. stocks in play (paper only).
     #[serde(default)]
     pub us_orb: UsOrbConfig,
+    /// Options bought on the ORB / burst stock entries (paper only).
+    #[serde(default)]
+    pub us_options: UsOptionsConfig,
+    /// Same-day bear call spreads on SPY and QQQ (paper only).
+    #[serde(default)]
+    pub us_spreads: UsSpreadsConfig,
+    /// BTC + ETH on a 60-day momentum rule with a news guard (paper only).
+    #[serde(default)]
+    pub crypto: CryptoConfig,
+    /// The daily profit target the dashboard tracks (display only).
+    #[serde(default)]
+    pub target: TargetConfig,
+}
+
+/// The user's daily profit target (4 Nov 2026: "we need to make 500 rupees a
+/// day"), tracked on the dashboard across every book. Display only: no
+/// strategy reads it, so it can never push the agent into bigger bets.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct TargetConfig {
+    #[serde(default = "default_target_inr")]
+    pub daily_inr: Decimal,
+    /// Rupees per dollar for converting the dollar books. Update by hand.
+    #[serde(default = "default_usd_inr")]
+    pub usd_inr: Decimal,
+    /// First UTC day counted.
+    #[serde(default = "default_target_since")]
+    pub since: String,
+}
+
+impl Default for TargetConfig {
+    fn default() -> Self {
+        Self { daily_inr: default_target_inr(), usd_inr: default_usd_inr(), since: default_target_since() }
+    }
+}
+
+fn default_target_inr() -> Decimal {
+    rust_decimal_macros::dec!(500)
+}
+
+fn default_usd_inr() -> Decimal {
+    rust_decimal_macros::dec!(88)
+}
+
+fn default_target_since() -> String {
+    "2026-11-03".to_string()
+}
+
+/// The crypto books. See `crypto_book` for the rules and the backtest.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct CryptoConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Each book's capital, split evenly across the coins. Losing trades come
+    /// off it; profits are set aside and never traded.
+    #[serde(default = "default_crypto_capital")]
+    pub capital_usd: Decimal,
+    #[serde(default = "default_crypto_symbols")]
+    pub symbols: Vec<String>,
+    /// Hold while the last daily close is above the close this many days earlier.
+    #[serde(default = "default_crypto_lookback")]
+    pub lookback_days: usize,
+    /// Let severe news veto a buy or move the book to cash.
+    #[serde(default = "default_true")]
+    pub news_guard: bool,
+}
+
+impl Default for CryptoConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            capital_usd: default_crypto_capital(),
+            symbols: default_crypto_symbols(),
+            lookback_days: default_crypto_lookback(),
+            news_guard: true,
+        }
+    }
+}
+
+fn default_crypto_capital() -> Decimal {
+    rust_decimal_macros::dec!(20)
+}
+
+fn default_crypto_symbols() -> Vec<String> {
+    vec!["BTC/USD".to_string(), "ETH/USD".to_string()]
+}
+
+fn default_crypto_lookback() -> usize {
+    60
+}
+
+/// The U.S. credit-spread book. See `us::spreads` for the rules and the backtest.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct UsSpreadsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_spread_underlyings")]
+    pub underlyings: Vec<String>,
+    /// The short call's strike: at least this far above the price.
+    #[serde(default = "default_spread_otm")]
+    pub otm_pct: Decimal,
+    /// Dollars between the short and the long strike.
+    #[serde(default = "default_spread_width")]
+    pub width: Decimal,
+    /// New York minutes since midnight to sell (660 = 11:00).
+    #[serde(default = "default_spread_entry")]
+    pub entry_minute: u32,
+    /// New York minutes since midnight to buy back (950 = 15:50).
+    #[serde(default = "default_spread_exit")]
+    pub exit_minute: u32,
+    /// No spread for less credit than this, a share.
+    #[serde(default = "default_spread_min_credit")]
+    pub min_credit: Decimal,
+    /// Spreads per underlying.
+    #[serde(default = "default_spread_qty")]
+    pub qty: i64,
+}
+
+impl Default for UsSpreadsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            underlyings: default_spread_underlyings(),
+            otm_pct: default_spread_otm(),
+            width: default_spread_width(),
+            entry_minute: default_spread_entry(),
+            exit_minute: default_spread_exit(),
+            min_credit: default_spread_min_credit(),
+            qty: default_spread_qty(),
+        }
+    }
+}
+
+fn default_spread_underlyings() -> Vec<String> {
+    vec!["SPY".to_string(), "QQQ".to_string()]
+}
+fn default_spread_otm() -> Decimal {
+    rust_decimal_macros::dec!(0.006)
+}
+fn default_spread_width() -> Decimal {
+    rust_decimal_macros::dec!(2)
+}
+fn default_spread_entry() -> u32 {
+    11 * 60
+}
+fn default_spread_exit() -> u32 {
+    15 * 60 + 50
+}
+fn default_spread_min_credit() -> Decimal {
+    rust_decimal_macros::dec!(0.05)
+}
+fn default_spread_qty() -> i64 {
+    1
+}
+
+/// The U.S. options book. See `us::options` for the rules and the backtest.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct UsOptionsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// The book's own capital. Losing trades come off it; profits are set
+    /// aside and never traded (the user's rule, 3 Nov 2026).
+    #[serde(default = "default_options_capital")]
+    pub capital_usd: Decimal,
+    /// Widest bid-ask spread accepted, as a fraction of the mid.
+    #[serde(default = "default_options_max_spread")]
+    pub max_spread_pct: Decimal,
+    /// Expiry window in calendar days from the trade day.
+    #[serde(default = "default_options_min_days")]
+    pub min_days_to_expiry: i64,
+    #[serde(default = "default_options_max_days")]
+    pub max_days_to_expiry: i64,
+    /// The book's own daily loss limit (4 Nov 2026): no new option entry once
+    /// today's closed option trades have lost this much. Each trade can lose
+    /// at most its premium, a third of the book. It replaces the U.S. stock
+    /// books' $20 limit, which no longer counts the options book.
+    #[serde(default = "default_options_daily_loss")]
+    pub max_daily_loss_usd: Decimal,
+    /// Buy calls on long breakouts only; skip the puts (4 Nov 2026, the
+    /// user's choice after research: on May-Oct 2026 calls made +$2,288 on 53
+    /// trades and passed every check, puts lost $262 on 58).
+    #[serde(default)]
+    pub calls_only: bool,
+}
+
+impl Default for UsOptionsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            capital_usd: default_options_capital(),
+            max_spread_pct: default_options_max_spread(),
+            min_days_to_expiry: default_options_min_days(),
+            max_days_to_expiry: default_options_max_days(),
+            max_daily_loss_usd: default_options_daily_loss(),
+            calls_only: false,
+        }
+    }
+}
+
+fn default_options_daily_loss() -> Decimal {
+    rust_decimal_macros::dec!(100)
+}
+
+fn default_options_capital() -> Decimal {
+    rust_decimal_macros::dec!(500)
+}
+
+fn default_options_max_spread() -> Decimal {
+    rust_decimal_macros::dec!(0.10)
+}
+
+fn default_options_min_days() -> i64 {
+    2
+}
+
+fn default_options_max_days() -> i64 {
+    9
 }
 
 /// The "stocks in play" opening-range breakout. See `us::orb` for the rules
@@ -62,6 +278,10 @@ pub struct UsOrbConfig {
     /// Capital the sizing and loss limit use; defaults to the U.S. allocation.
     #[serde(default)]
     pub capital_usd: Option<Decimal>,
+    /// The day the book started on that capital. Trades size from the capital
+    /// less any net loss since then, never more: profits are not reinvested.
+    #[serde(default)]
+    pub capital_since: Option<chrono::NaiveDate>,
     #[serde(default = "default_true")]
     pub allow_short: bool,
     /// How far past the touch the marketable entry limit may fill.
@@ -71,6 +291,22 @@ pub struct UsOrbConfig {
     /// decision card but do not change orders. "enforce": they do.
     #[serde(default = "default_desk_mode")]
     pub desk_mode: String,
+    /// Also run the opening burst (`us::orb`, BURST_STRATEGY): one trade at
+    /// 9:35 on the loudest first-bar move, sharing the daily trade limit.
+    #[serde(default)]
+    pub burst: bool,
+    /// No new ORB entry this many minutes after the 9:30 open or later
+    /// (30 = nothing from 10:00 ET). The default, 390, never cuts off.
+    #[serde(default = "default_orb_last_entry_minute")]
+    pub last_entry_minute: u32,
+    /// New York dates with no new ORB or burst entries (FOMC decisions, CPI
+    /// and jobs reports). Open positions are still managed.
+    #[serde(default)]
+    pub skip_days: Vec<chrono::NaiveDate>,
+}
+
+fn default_orb_last_entry_minute() -> u32 {
+    390
 }
 
 fn default_desk_mode() -> String {
@@ -88,9 +324,13 @@ impl Default for UsOrbConfig {
             max_trades_per_day: default_orb_max_trades(),
             daily_loss_pct: default_orb_daily_loss_pct(),
             capital_usd: None,
+            capital_since: None,
             allow_short: true,
             max_entry_slippage_pct: default_orb_max_entry_slippage(),
             desk_mode: default_desk_mode(),
+            burst: false,
+            last_entry_minute: default_orb_last_entry_minute(),
+            skip_days: Vec::new(),
         }
     }
 }
@@ -129,6 +369,39 @@ pub struct IndiaStrategyConfig {
     /// Paper capital of the intraday breakout book, in rupees.
     #[serde(default = "default_india_intraday_capital")]
     pub intraday_capital_inr: Decimal,
+    /// Intraday books run side by side with `strategy`, each on its own
+    /// capital: "burst" (opening burst), "gapgo" (gap and go). Empty runs
+    /// `strategy` alone.
+    #[serde(default)]
+    pub also_run: Vec<String>,
+    /// Paper capital of the opening-burst book, in rupees.
+    #[serde(default = "default_india_intraday_capital")]
+    pub burst_capital_inr: Decimal,
+    /// Paper capital of the gap-and-go book, in rupees.
+    #[serde(default = "default_india_intraday_capital")]
+    pub gapgo_capital_inr: Decimal,
+    /// The ORB follows its signals on a tracking ledger and trades nothing.
+    #[serde(default)]
+    pub orb_track_only: bool,
+    /// Only long breakouts trade on the ORB book; shorts are tracked.
+    #[serde(default)]
+    pub orb_longs_only: bool,
+    /// Whether TimesFM may veto a burst trade. Off, its forecast is still
+    /// recorded on the decision card but the trade goes ahead.
+    #[serde(default = "default_true")]
+    pub burst_timesfm_veto: bool,
+}
+
+impl IndiaStrategyConfig {
+    /// Whether the opening-burst book runs.
+    pub fn runs_burst(&self) -> bool {
+        self.also_run.iter().any(|s| s.eq_ignore_ascii_case("burst"))
+    }
+
+    /// Whether the gap-and-go book runs.
+    pub fn runs_gapgo(&self) -> bool {
+        self.also_run.iter().any(|s| s.eq_ignore_ascii_case("gapgo"))
+    }
 }
 
 fn default_india_intraday_capital() -> Decimal {
@@ -140,6 +413,12 @@ impl Default for IndiaStrategyConfig {
         Self {
             strategy: default_india_strategy(),
             intraday_capital_inr: default_india_intraday_capital(),
+            also_run: Vec::new(),
+            burst_capital_inr: default_india_intraday_capital(),
+            gapgo_capital_inr: default_india_intraday_capital(),
+            orb_track_only: false,
+            orb_longs_only: false,
+            burst_timesfm_veto: true,
         }
     }
 }
@@ -179,6 +458,29 @@ pub struct AgentConfig {
     /// middle of it. Default: 1 hour.
     #[serde(default = "default_max_sleep_seconds")]
     pub max_sleep_seconds: u64,
+    /// Paper capital of the Polymarket loop when it runs alongside venues;
+    /// None falls back to `initial_paper_balance`.
+    #[serde(default)]
+    pub polymarket_capital_usd: Option<Decimal>,
+    /// Alongside venues, scan Polymarket every this many cycles.
+    #[serde(default = "default_polymarket_scan_every")]
+    pub polymarket_scan_every_cycles: u64,
+    /// The Polymarket "underdog a week out" paper book (agent::poly_underdog).
+    #[serde(default = "default_true_underdog")]
+    pub polymarket_underdog: bool,
+    /// Whether Polymarket scans (and so places new bets) at all. False pauses
+    /// every Polymarket entry; open bets still settle through the resolution
+    /// check each cycle. Paused 11 Nov 2026 pending a full re-test.
+    #[serde(default = "default_true_underdog")]
+    pub polymarket_new_bets: bool,
+}
+
+fn default_true_underdog() -> bool {
+    true
+}
+
+fn default_polymarket_scan_every() -> u64 {
+    10
 }
 
 fn default_daily_api_budget() -> Decimal {
@@ -266,6 +568,60 @@ pub struct ValuationConfig {
     pub high_confidence_edge: Decimal,
     pub low_confidence_edge: Decimal,
     pub cache_ttl_seconds: u64,
+    /// How long one model call may take. Free hosted endpoints queue: the one
+    /// model still served on the NVIDIA key on 3 Nov 2026 took ~78 s.
+    #[serde(default = "default_request_timeout_seconds")]
+    pub request_timeout_seconds: u64,
+    /// Markets valued per Polymarket scan (the top of the scan, by volume).
+    #[serde(default = "default_max_evaluations")]
+    pub max_evaluations_per_scan: usize,
+    /// A different model for Polymarket valuations only, keyed by
+    /// `POLYMARKET_LLM_API_KEY`. Everything else keeps the model above.
+    #[serde(default)]
+    pub polymarket: Option<ModelOverride>,
+}
+
+/// Where a second valuation model lives: an OpenAI-compatible endpoint with
+/// its own key. Unset fields fall back to the main `[valuation]` settings.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelOverride {
+    pub model: String,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub request_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+}
+
+impl ValuationConfig {
+    /// These settings with the Polymarket model swapped in, when there is one.
+    pub fn for_polymarket(&self) -> ValuationConfig {
+        let mut config = self.clone();
+        if let Some(o) = &self.polymarket {
+            config.provider = LlmProvider::OpenAiCompatible;
+            config.model = o.model.clone();
+            if o.base_url.is_some() {
+                config.base_url = o.base_url.clone();
+            }
+            if let Some(t) = o.request_timeout_seconds {
+                config.request_timeout_seconds = t;
+            }
+            if let Some(m) = o.max_tokens {
+                config.max_tokens = m;
+            }
+            config.polymarket = None;
+        }
+        config
+    }
+}
+
+fn default_request_timeout_seconds() -> u64 {
+    15
+}
+
+fn default_max_evaluations() -> usize {
+    10
 }
 
 impl AppConfig {
@@ -876,6 +1232,8 @@ pub struct Secrets {
     /// API key for the configured valuation provider. Read from `LLM_API_KEY`,
     /// falling back to `ANTHROPIC_API_KEY`.
     pub llm_api_key: Option<SecretString>,
+    /// Key for `[valuation.polymarket]`, read from `POLYMARKET_LLM_API_KEY`.
+    pub polymarket_llm_api_key: Option<SecretString>,
     /// A capability URL: anyone holding it can post to the channel.
     pub discord_webhook_url: Option<SecretString>,
     pub noaa_api_token: Option<SecretString>,
@@ -973,6 +1331,7 @@ impl Secrets {
             // blank `LLM_API_KEY=` line in .env.example would shadow the
             // ANTHROPIC_API_KEY fallback with Some("").
             llm_api_key: secret_env("LLM_API_KEY").or_else(|| secret_env("ANTHROPIC_API_KEY")),
+            polymarket_llm_api_key: secret_env("POLYMARKET_LLM_API_KEY"),
             discord_webhook_url: secret_env("DISCORD_WEBHOOK_URL"),
             noaa_api_token: secret_env("NOAA_API_TOKEN"),
             espn_api_key: secret_env("ESPN_API_KEY"),

@@ -186,6 +186,20 @@ pub struct EquityQuote {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct LatestTradesResponse {
+    #[serde(default)]
+    pub trades: std::collections::HashMap<String, EquityTrade>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EquityTrade {
+    #[serde(rename = "t")]
+    pub ts: DateTime<Utc>,
+    #[serde(rename = "p", deserialize_with = "de_decimal")]
+    pub price: Decimal,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct CryptoOrderbooksResponse {
     #[serde(default)]
     pub orderbooks: std::collections::HashMap<String, CryptoOrderbook>,

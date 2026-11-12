@@ -127,11 +127,14 @@ pub fn build_registry_reporting(
                     // other venues said. The legacy Polymarket loop, which has
                     // its own equity, runs when no venue is configured.
                     if !venue.reports_equity() {
+                        // Left out of the registry only: the Polymarket loop
+                        // (its own scanner, valuation and paper wallet) still
+                        // runs alongside the other venues.
                         skip(
                             &venue_config.id,
-                            "Polymarket cannot report account equity, so the risk limits \
-                             could not be evaluated for any venue while it is enabled — \
-                             leave `[[venues]]` unset to use the legacy Polymarket loop"
+                            "Polymarket cannot report account equity, so it stays out of the \
+                             venue registry and its risk limits; it runs as its own loop with \
+                             its own wallet ([agent] polymarket_capital_usd) instead"
                                 .to_string(),
                         );
                     } else {

@@ -17,10 +17,7 @@ use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
 use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::auth::Normal;
-use polymarket_client_sdk::clob::types::request::{
-    BalanceAllowanceRequest, OrderBookSummaryRequest, PriceHistoryRequest,
-};
-use polymarket_client_sdk::clob::types::response::OrderBookSummaryResponse;
+use polymarket_client_sdk::clob::types::request::{BalanceAllowanceRequest, PriceHistoryRequest};
 use polymarket_client_sdk::clob::types::{Interval, OrderType, Side as ClobSide, TimeRange};
 use polymarket_client_sdk::clob::Client as ClobClient;
 use polymarket_client_sdk::types::{Decimal as SdkDecimal, U256};
@@ -39,6 +36,64 @@ use crate::market::models::{
 use crate::venue::types::{OrderState as VenueOrderState, Side as VenueSide};
 
 type Limiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
+
+/// Look one market up on Gamma by its condition id, open or closed.
+///
+/// Gamma's filter is `condition_ids` (plural). It ignores an unknown
+/// `condition_id` and answers with its default page of 20 unrelated open
+/// markets, so every by-id lookup used to read some other market (found
+/// 9 Nov 2026: no Polymarket bet had ever settled, and exits were priced off
+/// the wrong market). Gamma also hides closed markets unless asked with
+/// `closed=true` and hides open ones when asked with it, so this asks for an
+/// open market first and then a closed one. Only rows whose `conditionId`
+/// matches are returned.
+pub(crate) async fn gamma_markets_by_condition_id(
+    http: &reqwest::Client,
+    gamma_base_url: &str,
+    condition_id: &str,
+) -> Result<Vec<serde_json::Value>> {
+    let url = format!("{}/markets", gamma_base_url);
+    for closed in ["false", "true"] {
+        let resp = http
+            .get(&url)
+            .query(&[("condition_ids", condition_id), ("closed", closed)])
+            .send()
+            .await
+            .context("HTTP request to Gamma API failed")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Gamma API returned {status}: {body}");
+        }
+        let rows: Vec<serde_json::Value> =
+            resp.json().await.context("Failed to decode Gamma markets")?;
+        let matching: Vec<_> = rows
+            .into_iter()
+            .filter(|m| {
+                m.get("conditionId")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|c| c.eq_ignore_ascii_case(condition_id))
+            })
+            .collect();
+        if !matching.is_empty() {
+            return Ok(matching);
+        }
+    }
+    Ok(Vec::new())
+}
+
+/// Typed form of [`gamma_markets_by_condition_id`].
+pub(crate) async fn gamma_markets_by_condition_id_as<T: serde::de::DeserializeOwned>(
+    http: &reqwest::Client,
+    gamma_base_url: &str,
+    condition_id: &str,
+) -> Result<Vec<T>> {
+    gamma_markets_by_condition_id(http, gamma_base_url, condition_id)
+        .await?
+        .into_iter()
+        .map(|v| serde_json::from_value(v).context("Failed to decode Gamma market"))
+        .collect()
+}
 
 #[derive(Debug)]
 pub struct MarketFilters {
@@ -207,7 +262,7 @@ impl PolymarketClient {
 
             let url = format!("{}/markets", self.gamma_base_url);
 
-            let gamma_markets: Vec<GammaMarketResponse> = self
+            let page: Result<Vec<GammaMarketResponse>> = self
                 .with_retry(|| {
                     let url = url.clone();
                     let end_min = now.to_rfc3339();
@@ -242,8 +297,20 @@ impl PolymarketClient {
                             .map_err(|e| anyhow::anyhow!("Deserialization error: {e}"))
                     }
                 })
-                .await
-                .context("Failed to fetch markets from Gamma API")?;
+                .await;
+            // Pages come most-traded first. Gamma now refuses deep offsets
+            // ("offset too large, use /markets/keyset"), and failing the whole
+            // scan on that threw away every market already fetched: on
+            // 3 Nov 2026 each scan saw none. A later page that fails ends the
+            // listing with what it has; only a failed first page is an error.
+            let gamma_markets = match page {
+                Ok(m) => m,
+                Err(e) if offset > 0 => {
+                    warn!(offset, kept = all_markets.len(), error = %e, "Gamma stopped paging; using the markets fetched so far");
+                    break;
+                }
+                Err(e) => return Err(e).context("Failed to fetch markets from Gamma API"),
+            };
 
             if gamma_markets.is_empty() {
                 break;
@@ -283,29 +350,10 @@ impl PolymarketClient {
     pub async fn get_market_by_condition_id(&self, condition_id: &str) -> Result<Option<Market>> {
         self.rate_limit().await;
 
-        let url = format!("{}/markets", self.gamma_base_url);
         let gamma_markets: Vec<GammaMarketResponse> = self
-            .with_retry(|| {
-                let url = url.clone();
-                async move {
-                    let resp = self
-                        .http
-                        .get(&url)
-                        .query(&[("condition_id", condition_id)])
-                        .send()
-                        .await
-                        .map_err(|e| anyhow::anyhow!("HTTP error: {e}"))?;
-
-                    if !resp.status().is_success() {
-                        let status = resp.status();
-                        let body = resp.text().await.unwrap_or_default();
-                        return Err(anyhow::anyhow!("Gamma API {status}: {body}"));
-                    }
-
-                    resp.json::<Vec<GammaMarketResponse>>()
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Failed to decode Gamma market: {e}"))
-                }
+            .with_retry(|| async move {
+                gamma_markets_by_condition_id_as(&self.http, &self.gamma_base_url, condition_id)
+                    .await
             })
             .await
             .with_context(|| format!("Failed to fetch market {condition_id}"))?;
@@ -319,27 +367,43 @@ impl PolymarketClient {
     #[instrument(skip(self), fields(token_id = %token_id))]
     pub async fn get_order_book(&self, token_id: &str) -> Result<OrderBookSnapshot> {
         self.rate_limit().await;
+        parse_token_id(token_id)?;
 
-        let token_u256 = parse_token_id(token_id)?;
-
-        let request = OrderBookSummaryRequest::builder()
-            .token_id(token_u256)
-            .build();
-
-        let response: OrderBookSummaryResponse = self
+        // Read straight from the CLOB's /book. The SDK's typed response
+        // rejects the prices the API now sends as strings ("0.99"), and every
+        // rejection retried with backoff: a 400-market scan took 8+ minutes
+        // and found nothing (3 Nov 2026).
+        let url = format!(
+            "{}/book",
+            self.config.polymarket.clob_base_url.trim_end_matches('/')
+        );
+        let book: RawBook = self
             .with_retry(|| {
-                let req = &request;
+                let url = url.clone();
                 async move {
-                    self.clob
-                        .order_book(req)
+                    let resp = self
+                        .http
+                        .get(&url)
+                        .query(&[("token_id", token_id)])
+                        .send()
                         .await
-                        .map_err(|e| anyhow::anyhow!("{e}"))
+                        .map_err(|e| anyhow::anyhow!("HTTP error: {e}"))?;
+                    if !resp.status().is_success() {
+                        anyhow::bail!("CLOB /book {}", resp.status());
+                    }
+                    resp.json::<RawBook>()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Unreadable order book: {e}"))
                 }
             })
             .await
             .context("Failed to fetch order book")?;
 
-        Ok(convert_order_book(token_id, &response))
+        Ok(snapshot_from_levels(
+            token_id,
+            book.bids.iter().filter_map(RawLevel::parse).collect(),
+            book.asks.iter().filter_map(RawLevel::parse).collect(),
+        ))
     }
 
     // === Price History ===
@@ -402,17 +466,8 @@ impl PolymarketClient {
     pub async fn get_current_yes_price(&self, condition_id: &str) -> Result<Decimal> {
         self.rate_limit().await;
 
-        let url = format!("{}/markets", self.gamma_base_url);
-        let markets: Vec<GammaMarketResponse> = self
-            .http
-            .get(&url)
-            .query(&[("condition_id", condition_id)])
-            .send()
-            .await
-            .context("HTTP request to Gamma API failed")?
-            .json()
-            .await
-            .context("Failed to parse Gamma response")?;
+        let markets: Vec<GammaMarketResponse> =
+            gamma_markets_by_condition_id_as(&self.http, &self.gamma_base_url, condition_id).await?;
 
         let market = markets.first().context("Market not found on Gamma")?;
         let prices_str = market.outcome_prices.as_deref().unwrap_or("[]");
@@ -600,6 +655,18 @@ impl PolymarketClient {
 
         info!(balance = %balance, "Live balance retrieved");
         Ok(balance)
+    }
+
+    /// Paper mode: set the simulated balance to what the ledger says it is.
+    /// The in-memory wallet starts at `initial_paper_balance` on every restart
+    /// and is never credited when a market settles, so the agent rebuilds it
+    /// from the trades table each cycle. No effect outside paper mode.
+    pub async fn set_paper_balance(&self, balance: Decimal) {
+        if self.config.agent.mode == AgentMode::Paper {
+            if let Some(ref state) = self.paper_state {
+                state.lock().await.balance = balance.max(Decimal::ZERO);
+            }
+        }
     }
 
     /// Get the wallet address for the authenticated account.
@@ -1138,25 +1205,46 @@ fn convert_gamma_response(gm: &GammaMarketResponse) -> Option<Market> {
 }
 
 /// Convert SDK order book response to our domain type.
-fn convert_order_book(token_id: &str, response: &OrderBookSummaryResponse) -> OrderBookSnapshot {
-    let bids: Vec<PriceLevel> = response
-        .bids
-        .iter()
-        .map(|o| PriceLevel {
-            price: o.price,
-            size: o.size,
-        })
-        .collect();
+/// The CLOB's /book as it arrives: prices and sizes are strings.
+#[derive(Debug, Deserialize)]
+struct RawBook {
+    #[serde(default)]
+    bids: Vec<RawLevel>,
+    #[serde(default)]
+    asks: Vec<RawLevel>,
+}
 
-    let asks: Vec<PriceLevel> = response
-        .asks
-        .iter()
-        .map(|o| PriceLevel {
-            price: o.price,
-            size: o.size,
-        })
-        .collect();
+#[derive(Debug, Deserialize)]
+struct RawLevel {
+    price: serde_json::Value,
+    size: serde_json::Value,
+}
 
+impl RawLevel {
+    fn parse(&self) -> Option<PriceLevel> {
+        let d = |v: &serde_json::Value| match v {
+            serde_json::Value::String(s) => Decimal::from_str(s).ok(),
+            serde_json::Value::Number(n) => Decimal::from_str(&n.to_string()).ok(),
+            _ => None,
+        };
+        Some(PriceLevel {
+            price: d(&self.price)?,
+            size: d(&self.size)?,
+        })
+    }
+}
+
+/// A snapshot with the book sorted best first. The CLOB lists bids lowest
+/// first and asks highest first (best last), so taking `first()` as the best
+/// price read a 1c bid and a 99c ask: every market showed a ~98c spread and
+/// the spread filter rejected all of them.
+fn snapshot_from_levels(
+    token_id: &str,
+    mut bids: Vec<PriceLevel>,
+    mut asks: Vec<PriceLevel>,
+) -> OrderBookSnapshot {
+    bids.sort_by(|a, b| b.price.cmp(&a.price));
+    asks.sort_by(|a, b| a.price.cmp(&b.price));
     let best_bid = bids.first().map(|b| b.price).unwrap_or(Decimal::ZERO);
     let best_ask = asks.first().map(|a| a.price).unwrap_or(Decimal::ONE);
     let midpoint = (best_bid + best_ask) / dec!(2);
@@ -1208,10 +1296,6 @@ fn compute_adverse_selection(seed: u64) -> bool {
 mod tests {
     use super::*;
 
-    fn deserialize_order_book(json: &str) -> OrderBookSummaryResponse {
-        serde_json::from_str(json).expect("valid order book JSON")
-    }
-
     /// A paper-mode client whose Gamma base URL points at a mock server.
     /// Paper mode needs no private key, and `ClobClient::new` only parses its
     /// base URL, so the whole Gamma path is exercisable offline.
@@ -1250,11 +1334,19 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/markets"))
-            .and(wiremock::matchers::query_param("condition_id", "0xdead"))
+            .and(wiremock::matchers::query_param("condition_ids", "0xdead"))
+            .and(wiremock::matchers::query_param("closed", "true"))
             .respond_with(
                 wiremock::ResponseTemplate::new(200)
                     .set_body_json(gamma_market_json("0xdead", true)),
             )
+            .mount(&server)
+            .await;
+        // Like Gamma, the open-markets query hides a closed market.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/markets"))
+            .and(wiremock::matchers::query_param("closed", "false"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
             .mount(&server)
             .await;
 
@@ -1267,6 +1359,30 @@ mod tests {
 
         assert_eq!(market.condition_id, "0xdead");
         assert_eq!(market.tokens.len(), 2);
+    }
+
+    /// Found 9 Nov 2026: Gamma ignored the old `condition_id` filter and
+    /// answered with its default page of unrelated markets, and the first of
+    /// those was read as ours. A row for another market must never be used.
+    #[tokio::test]
+    async fn another_markets_row_is_never_taken_for_ours() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/markets"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(gamma_market_json("0xsomeoneelse", false)),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client_against(&server.uri()).await;
+        assert!(client
+            .get_market_by_condition_id("0xours")
+            .await
+            .expect("lookup succeeds")
+            .is_none());
+        assert!(client.get_current_yes_price("0xours").await.is_err());
     }
 
     #[tokio::test]
@@ -1379,41 +1495,38 @@ mod tests {
         assert!(state.positions.is_empty());
     }
 
+    fn raw_book(json: &str) -> OrderBookSnapshot {
+        let raw: RawBook = serde_json::from_str(json).expect("valid order book JSON");
+        snapshot_from_levels(
+            "12345",
+            raw.bids.iter().filter_map(RawLevel::parse).collect(),
+            raw.asks.iter().filter_map(RawLevel::parse).collect(),
+        )
+    }
+
     #[test]
     fn test_spread_calculation() {
-        let json = r#"{
-            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
-            "asset_id": "0",
-            "timestamp": "1700000000000",
-            "bids": [{"price": 0.60, "size": 100}],
-            "asks": [{"price": 0.70, "size": 100}],
-            "min_order_size": 1,
-            "neg_risk": false,
-            "tick_size": 0.01
-        }"#;
-        let response = deserialize_order_book(json);
-
-        let book = convert_order_book("12345", &response);
+        let book = raw_book(r#"{"bids": [{"price": 0.60, "size": 100}], "asks": [{"price": 0.70, "size": 100}]}"#);
         assert_eq!(book.spread, dec!(0.10));
         assert_eq!(book.midpoint, dec!(0.65));
         assert_eq!(book.implied_probability, dec!(0.65));
     }
 
+    /// The live CLOB sends strings, bids lowest first and asks highest first.
+    #[test]
+    fn the_best_prices_are_found_whatever_order_the_book_arrives_in() {
+        let book = raw_book(
+            r#"{"bids": [{"price": "0.01", "size": "500"}, {"price": "0.42", "size": "80"}],
+                "asks": [{"price": "0.99", "size": "900"}, {"price": "0.45", "size": "60"}]}"#,
+        );
+        assert_eq!(book.bids[0].price, dec!(0.42));
+        assert_eq!(book.asks[0].price, dec!(0.45));
+        assert_eq!(book.spread, dec!(0.03));
+    }
+
     #[test]
     fn test_empty_order_book() {
-        let json = r#"{
-            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
-            "asset_id": "0",
-            "timestamp": "1700000000000",
-            "bids": [],
-            "asks": [],
-            "min_order_size": 1,
-            "neg_risk": false,
-            "tick_size": 0.01
-        }"#;
-        let response = deserialize_order_book(json);
-
-        let book = convert_order_book("12345", &response);
+        let book = raw_book(r#"{"bids": [], "asks": []}"#);
         assert_eq!(book.bids.len(), 0);
         assert_eq!(book.asks.len(), 0);
         assert_eq!(book.midpoint, dec!(0.5));

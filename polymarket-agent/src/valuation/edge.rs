@@ -161,6 +161,9 @@ mod tests {
             high_confidence_edge: dec!(0.06),
             low_confidence_edge: dec!(0.10),
             cache_ttl_seconds: 300,
+            request_timeout_seconds: 15,
+            max_evaluations_per_scan: 10,
+            polymarket: None,
         }
     }
 

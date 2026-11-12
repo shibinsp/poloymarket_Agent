@@ -45,7 +45,7 @@ use crate::venue::Venue;
 use self::models::{
     is_crypto_symbol, order_state, side_str, split_pair, tif_str, AlpacaAccount, AlpacaAsset,
     AlpacaClock, AlpacaOrder, AlpacaPosition, BarsResponse, CancelAllEntry,
-    CryptoOrderbooksResponse, LatestQuotesResponse, NewOrder,
+    CryptoOrderbooksResponse, LatestQuotesResponse, LatestTradesResponse, NewOrder,
 };
 use self::rest::{AlpacaRest, Api};
 
@@ -243,6 +243,9 @@ pub struct AlpacaVenue {
     assets_ttl: Duration,
     clock: RwLock<Option<Cached<AlpacaClock>>>,
     assets: RwLock<HashMap<&'static str, Cached<AssetListing>>>,
+    /// Single-symbol lookups from the fallback when the class listing fails,
+    /// kept for `assets_ttl` like the listing.
+    symbol_assets: RwLock<HashMap<String, Cached<AlpacaAsset>>>,
     account_ttl: Duration,
     account: RwLock<Option<Cached<AlpacaAccount>>>,
     is_paper: bool,
@@ -303,6 +306,7 @@ impl AlpacaVenue {
             account_ttl: config.account_ttl,
             account: RwLock::new(None),
             assets: RwLock::new(HashMap::new()),
+            symbol_assets: RwLock::new(HashMap::new()),
             is_paper: config.is_paper,
         })
     }
@@ -414,6 +418,7 @@ impl AlpacaVenue {
     pub async fn invalidate_caches(&self) {
         *self.clock.write().await = None;
         self.assets.write().await.clear();
+        self.symbol_assets.write().await.clear();
     }
 
     // === Assets ===========================================================
@@ -467,10 +472,31 @@ impl AlpacaVenue {
     /// Asset metadata for exactly the symbols asked for, fetching only the
     /// classes those symbols belong to.
     async fn assets_for(&self, symbols: &[String]) -> Result<HashMap<String, AlpacaAsset>> {
+        // Symbols the per-symbol fallback already fetched. On a slow line the
+        // class listing (megabytes) timed out every cycle and the fallback
+        // looked up all 91 symbols again each time: 95-117 s cycles on
+        // 3 Nov 2026, with the U.S. entries and exits waiting behind them.
+        let mut out = HashMap::new();
+        {
+            let known = self.symbol_assets.read().await;
+            for symbol in symbols {
+                if let Some(asset) = known.get(symbol).and_then(|c| c.get(self.assets_ttl)) {
+                    out.insert(symbol.clone(), asset);
+                }
+            }
+        }
+        let missing: Vec<String> = symbols
+            .iter()
+            .filter(|s| !out.contains_key(*s))
+            .cloned()
+            .collect();
+        if missing.is_empty() {
+            return Ok(out);
+        }
+        let symbols = &missing[..];
         let wants_equity = symbols.iter().any(|s| !is_crypto_symbol(s));
         let wants_crypto = symbols.iter().any(|s| is_crypto_symbol(s));
 
-        let mut out = HashMap::new();
         for (wanted, class) in [
             (wants_equity, ASSET_CLASS_EQUITY),
             (wants_crypto, ASSET_CLASS_CRYPTO),
@@ -488,14 +514,23 @@ impl AlpacaVenue {
                 }
                 Err(e) => {
                     warn!(class, error = %e, "Batch asset listing failed — falling back to per-symbol lookup");
-                    for symbol in symbols {
-                        let is_crypto = is_crypto_symbol(symbol);
-                        if (class == ASSET_CLASS_CRYPTO && is_crypto)
-                            || (class == ASSET_CLASS_EQUITY && !is_crypto)
-                        {
-                            if let Ok(asset) = self.asset(symbol).await {
-                                out.insert(symbol.clone(), asset);
-                            }
+                    let wanted: Vec<String> = symbols
+                        .iter()
+                        .filter(|s| (class == ASSET_CLASS_CRYPTO) == is_crypto_symbol(s))
+                        .cloned()
+                        .collect();
+                    // Eight at a time, not one by one.
+                    let mut fetched = Vec::with_capacity(wanted.len());
+                    for chunk in wanted.chunks(8) {
+                        let results =
+                            futures_util::future::join_all(chunk.iter().map(|s| self.asset(s))).await;
+                        fetched.extend(chunk.iter().cloned().zip(results));
+                    }
+                    let mut known = self.symbol_assets.write().await;
+                    for (symbol, asset) in fetched {
+                        if let Ok(asset) = asset {
+                            known.insert(symbol.clone(), Cached::new(asset.clone()));
+                            out.insert(symbol, asset);
                         }
                     }
                 }
@@ -953,13 +988,38 @@ impl Venue for AlpacaVenue {
             .with_context(|| format!("Alpaca returned no quote for {symbol}"))?;
         let (bid, ask) = (quote.bid_price, quote.ask_price);
         require_two_sided(&symbol, bid, ask)?;
+        let mid = (bid + ask) / dec!(2);
+
+        // IEX's book is often hollow: on 2 Nov 2026 ABNB showed bid 156.75 /
+        // ask 168.57 while it traded at 168, and its midpoint put the
+        // dashboard $5 under the real price. On a wide book the last trade is
+        // the better estimate, so fetch it only then: one more call, rarely.
+        let last = if mid > Decimal::ZERO && (ask - bid) / mid > crate::venue::types::WIDE_SPREAD {
+            match self
+                .rest
+                .get::<LatestTradesResponse>(
+                    Api::Data,
+                    "/v2/stocks/trades/latest",
+                    &[("symbols", symbol.clone()), ("feed", self.feed.clone())],
+                )
+                .await
+            {
+                Ok(r) => r.trades.get(&symbol).map(|t| t.price),
+                Err(e) => {
+                    warn!(symbol = %symbol, error = %format!("{e:#}"), "Wide quote and no last trade; judging it at the midpoint");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         Ok(Quote {
             instrument: id.clone(),
             bid,
             ask,
-            mid: (bid + ask) / dec!(2),
-            last: None,
+            mid,
+            last,
             ts: quote.ts,
             book: None,
         })

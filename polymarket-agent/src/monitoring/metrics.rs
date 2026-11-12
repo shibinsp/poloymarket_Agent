@@ -428,6 +428,7 @@ mod tests {
             pnl: None,
             created_at: None,
             resolved_at: None,
+            ..Default::default()
         };
         let id1 = store.insert_trade(&trade).await.unwrap();
 

@@ -216,6 +216,11 @@ export interface TradeRecord {
   realized_pnl?: string;
   unrealized_pnl?: string;
   mark_price?: string;
+  client_order_id?: string;
+  venue_order_id?: string;
+  stop_price?: string;
+  target_price?: string;
+  strategy?: string;
 }
 
 /** Every value the `trades.status` CHECK constraint allows. */

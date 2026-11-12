@@ -12,18 +12,28 @@ pub struct Store {
     pool: SqlitePool,
 }
 
-#[derive(Debug, Clone, FromRow, Serialize)]
+#[derive(Debug, Clone, FromRow, Serialize, Default)]
 pub struct TradeRecord {
     pub id: Option<i64>,
     pub cycle: i64,
+    #[sqlx(default)]
+    pub venue_id: Option<String>,
     pub market_id: String,
+    #[sqlx(default)]
+    pub symbol: Option<String>,
+    #[sqlx(default)]
+    pub asset_class: Option<String>,
     pub market_question: Option<String>,
     pub direction: String,
+    #[sqlx(default)]
+    pub side: Option<String>,
     pub entry_price: String,
     pub size: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[sqlx(default)]
     pub quantity: Option<String>,
+    #[sqlx(default)]
+    pub avg_fill_price: Option<String>,
     pub edge_at_entry: String,
     pub claude_fair_value: String,
     pub confidence: String,
@@ -31,6 +41,28 @@ pub struct TradeRecord {
     pub kelly_adjusted: String,
     pub status: String,
     pub pnl: Option<String>,
+    #[sqlx(default)]
+    pub realized_pnl: Option<String>,
+    #[sqlx(default)]
+    pub unrealized_pnl: Option<String>,
+    #[sqlx(default)]
+    pub mark_price: Option<String>,
+    #[sqlx(default)]
+    pub marked_at: Option<String>,
+    #[sqlx(default)]
+    pub close_reason: Option<String>,
+    #[sqlx(default)]
+    pub closed_at: Option<String>,
+    #[sqlx(default)]
+    pub venue_order_id: Option<String>,
+    #[sqlx(default)]
+    pub client_order_id: Option<String>,
+    #[sqlx(default)]
+    pub stop_price: Option<String>,
+    #[sqlx(default)]
+    pub target_price: Option<String>,
+    #[sqlx(default)]
+    pub strategy: Option<String>,
     pub created_at: Option<String>,
     pub resolved_at: Option<String>,
 }
@@ -149,6 +181,17 @@ impl Store {
         .context("Failed to insert trade")?;
 
         Ok(result.last_insert_rowid())
+    }
+
+    /// Tag a trade with the strategy that opened it.
+    pub async fn set_trade_strategy(&self, id: i64, strategy: &str) -> Result<()> {
+        sqlx::query("UPDATE trades SET strategy = ? WHERE id = ?")
+            .bind(strategy)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to tag trade strategy")?;
+        Ok(())
     }
 
     pub async fn update_trade_status(
@@ -746,8 +789,12 @@ impl Store {
     /// willing to take a new view in a day, and an entry that filled in three
     /// parts is still one decision.
     pub async fn count_trades_opened_on(&self, day: chrono::NaiveDate) -> Result<u32> {
+        // Polymarket paper bets are left out: the underdog loop places many
+        // $2 bets a day, bounded by its own $50 cash, and on 11 Nov 2026 its
+        // 21 bets tripped this shared cap and halted the stock books for the
+        // whole U.S. session.
         let count_legacy: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM trades WHERE date(created_at) = ?")
+            sqlx::query_scalar("SELECT COUNT(*) FROM trades WHERE date(created_at) = ? AND venue_id <> 'polymarket'")
                 .bind(day.to_string())
                 .fetch_one(&self.pool)
                 .await
@@ -792,10 +839,11 @@ impl Store {
         Ok(count.max(0) as u32)
     }
 
-    /// Open a position in the NSE intraday paper book.
+    /// Open a position in one strategy's NSE intraday paper book.
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_intraday_trade(
         &self,
+        strategy: &str,
         day: &str,
         symbol: &str,
         is_buy: bool,
@@ -806,9 +854,10 @@ impl Store {
         at: DateTime<Utc>,
     ) -> Result<i64> {
         let result = sqlx::query(
-            "INSERT INTO india_intraday_trades (day, symbol, is_buy, qty, entry_price, stop_price, capital, entry_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO india_intraday_trades (strategy, day, symbol, is_buy, qty, entry_price, stop_price, capital, entry_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
+        .bind(strategy)
         .bind(day)
         .bind(symbol)
         .bind(is_buy)
@@ -824,11 +873,12 @@ impl Store {
     }
 
     #[allow(clippy::type_complexity)]
-    pub async fn open_intraday_trades(&self) -> Result<Vec<IntradayOpen>> {
+    pub async fn open_intraday_trades(&self, strategy: &str) -> Result<Vec<IntradayOpen>> {
         let rows: Vec<(i64, String, String, bool, i64, String, String, String)> = sqlx::query_as(
             "SELECT id, day, symbol, is_buy, qty, entry_price, stop_price, entry_at
-             FROM india_intraday_trades WHERE exit_at IS NULL ORDER BY id",
+             FROM india_intraday_trades WHERE exit_at IS NULL AND strategy = ? ORDER BY id",
         )
+        .bind(strategy)
         .fetch_all(&self.pool)
         .await
         .context("Failed to read open intraday trades")?;
@@ -874,10 +924,16 @@ impl Store {
         Ok(())
     }
 
-    /// (trades opened on `day`, P&L closed on `day`, P&L closed ever).
-    pub async fn intraday_totals(&self, day: &str) -> Result<(i64, Decimal, Decimal)> {
+    /// One strategy's (trades opened on `day`, P&L closed on `day`, P&L
+    /// closed ever).
+    pub async fn intraday_totals(
+        &self,
+        strategy: &str,
+        day: &str,
+    ) -> Result<(i64, Decimal, Decimal)> {
         let rows: Vec<(String, Option<String>)> =
-            sqlx::query_as("SELECT day, pnl FROM india_intraday_trades")
+            sqlx::query_as("SELECT day, pnl FROM india_intraday_trades WHERE strategy = ?")
+                .bind(strategy)
                 .fetch_all(&self.pool)
                 .await
                 .context("Failed to read intraday totals")?;
@@ -896,12 +952,1090 @@ impl Store {
         Ok((count, today, all))
     }
 
+    /// Whether the pre-FOMC book already bought for this meeting.
+    pub async fn prefomc_has(&self, symbol: &str, fomc_day: &str) -> Result<bool> {
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM us_prefomc_trades WHERE symbol = ? AND fomc_day = ?")
+            .bind(symbol)
+            .bind(fomc_day)
+            .fetch_one(&self.pool)
+            .await
+            .context("Failed to read pre-FOMC trades")?;
+        Ok(n > 0)
+    }
+
+    /// Open pre-FOMC positions: (id, qty, entry price).
+    pub async fn prefomc_open(&self) -> Result<Vec<(i64, String, String)>> {
+        sqlx::query_as("SELECT id, qty, entry_price FROM us_prefomc_trades WHERE exit_at IS NULL ORDER BY id")
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to read open pre-FOMC trades")
+    }
+
+    pub async fn prefomc_realized(&self) -> Result<Decimal> {
+        let rows: Vec<(Option<String>,)> = sqlx::query_as("SELECT pnl FROM us_prefomc_trades WHERE pnl IS NOT NULL")
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to read pre-FOMC P&L")?;
+        Ok(rows.into_iter().filter_map(|r| r.0.and_then(|p| Decimal::from_str(&p).ok())).sum())
+    }
+
+    pub async fn prefomc_open_trade(&self, symbol: &str, qty: Decimal, fomc_day: &str, day: &str, price: Decimal, at: DateTime<Utc>) -> Result<i64> {
+        let r = sqlx::query(
+            "INSERT INTO us_prefomc_trades (symbol, qty, fomc_day, entry_day, entry_price, entry_at) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(symbol)
+        .bind(qty.to_string())
+        .bind(fomc_day)
+        .bind(day)
+        .bind(price.to_string())
+        .bind(at.to_rfc3339())
+        .execute(&self.pool)
+        .await
+        .context("Failed to open a pre-FOMC trade")?;
+        Ok(r.last_insert_rowid())
+    }
+
+    pub async fn prefomc_close_trade(&self, id: i64, day: &str, price: Decimal, pnl: Decimal, at: DateTime<Utc>) -> Result<()> {
+        sqlx::query("UPDATE us_prefomc_trades SET exit_day = ?, exit_price = ?, pnl = ?, exit_at = ? WHERE id = ? AND exit_at IS NULL")
+            .bind(day)
+            .bind(price.to_string())
+            .bind(pnl.round_dp(4).to_string())
+            .bind(at.to_rfc3339())
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to close a pre-FOMC trade")?;
+        Ok(())
+    }
+
+    /// Every pre-FOMC trade, newest first, as JSON.
+    pub async fn prefomc_trades(&self, limit: i64) -> Result<Vec<serde_json::Value>> {
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(i64, String, String, String, String, String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT id, symbol, qty, fomc_day, entry_day, entry_price, exit_day, exit_price, pnl FROM us_prefomc_trades ORDER BY id DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read pre-FOMC trades")?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.0, "symbol": r.1, "qty": r.2, "fomc_day": r.3, "entry_day": r.4, "entry_price": r.5,
+                    "exit_day": r.6, "exit_price": r.7, "pnl": r.8, "status": if r.6.is_some() { "CLOSED" } else { "OPEN" },
+                })
+            })
+            .collect())
+    }
+
+    /// Whether the Turnaround Tuesday book already acted on this Monday (a trade or a skip).
+    pub async fn turnaround_entered_on(&self, symbol: &str, day: &str) -> Result<bool> {
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM us_turnaround_trades WHERE symbol = ? AND entry_day = ?")
+            .bind(symbol)
+            .bind(day)
+            .fetch_one(&self.pool)
+            .await
+            .context("Failed to read Turnaround Tuesday entries")?;
+        Ok(n > 0)
+    }
+
+    /// Record a Monday with no signal, so a restart does not re-decide it.
+    /// Stored as a closed zero-size row (qty 0, pnl 0) marked SKIP.
+    pub async fn turnaround_mark_skip(&self, symbol: &str, day: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT OR IGNORE INTO us_turnaround_trades (symbol, qty, entry_day, entry_price, friday_close, sma25, entry_at, exit_day, exit_price, exit_at, pnl)
+             VALUES (?, '0', ?, '0', 'SKIP', 'SKIP', ?, ?, '0', ?, '0')",
+        )
+        .bind(symbol)
+        .bind(day)
+        .bind(&now)
+        .bind(day)
+        .bind(&now)
+        .execute(&self.pool)
+        .await
+        .context("Failed to record a Turnaround Tuesday skip")?;
+        Ok(())
+    }
+
+    /// Open Turnaround Tuesday positions: (id, symbol, qty, entry price, entry day).
+    pub async fn turnaround_open(&self) -> Result<Vec<(i64, String, String, String, String)>> {
+        sqlx::query_as(
+            "SELECT id, symbol, qty, entry_price, entry_day FROM us_turnaround_trades WHERE exit_at IS NULL ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read open Turnaround Tuesday trades")
+    }
+
+    /// Sum of closed Turnaround Tuesday P&L.
+    pub async fn turnaround_realized(&self) -> Result<Decimal> {
+        let rows: Vec<(Option<String>,)> = sqlx::query_as("SELECT pnl FROM us_turnaround_trades WHERE pnl IS NOT NULL")
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to read Turnaround Tuesday P&L")?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| r.0.and_then(|p| Decimal::from_str(&p).ok()))
+            .sum())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn turnaround_open_trade(
+        &self,
+        symbol: &str,
+        qty: Decimal,
+        day: &str,
+        price: Decimal,
+        friday_close: Decimal,
+        sma25: Decimal,
+        at: DateTime<Utc>,
+    ) -> Result<i64> {
+        let r = sqlx::query(
+            "INSERT INTO us_turnaround_trades (symbol, qty, entry_day, entry_price, friday_close, sma25, entry_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(symbol)
+        .bind(qty.to_string())
+        .bind(day)
+        .bind(price.to_string())
+        .bind(friday_close.to_string())
+        .bind(sma25.round_dp(4).to_string())
+        .bind(at.to_rfc3339())
+        .execute(&self.pool)
+        .await
+        .context("Failed to open a Turnaround Tuesday trade")?;
+        Ok(r.last_insert_rowid())
+    }
+
+    pub async fn turnaround_close_trade(&self, id: i64, day: &str, price: Decimal, pnl: Decimal, at: DateTime<Utc>) -> Result<()> {
+        sqlx::query(
+            "UPDATE us_turnaround_trades SET exit_day = ?, exit_price = ?, pnl = ?, exit_at = ? WHERE id = ? AND exit_at IS NULL",
+        )
+        .bind(day)
+        .bind(price.to_string())
+        .bind(pnl.round_dp(4).to_string())
+        .bind(at.to_rfc3339())
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .context("Failed to close a Turnaround Tuesday trade")?;
+        Ok(())
+    }
+
+    /// Every Turnaround Tuesday trade (skip weeks left out), newest first, as JSON.
+    pub async fn turnaround_trades(&self, limit: i64) -> Result<Vec<serde_json::Value>> {
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(i64, String, String, String, String, String, String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT id, symbol, qty, entry_day, entry_price, friday_close, sma25, exit_day, exit_price, pnl
+             FROM us_turnaround_trades WHERE friday_close <> 'SKIP' ORDER BY id DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read Turnaround Tuesday trades")?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.0, "symbol": r.1, "qty": r.2, "entry_day": r.3, "entry_price": r.4,
+                    "friday_close": r.5, "sma25": r.6, "exit_day": r.7, "exit_price": r.8, "pnl": r.9,
+                    "status": if r.7.is_some() { "CLOSED" } else { "OPEN" },
+                })
+            })
+            .collect())
+    }
+
+    /// Open IBS positions: (id, symbol, qty, entry price, entry day).
+    pub async fn ibs_open(&self) -> Result<Vec<(i64, String, String, String, String)>> {
+        sqlx::query_as(
+            "SELECT id, symbol, qty, entry_price, entry_day FROM us_ibs_trades WHERE exit_at IS NULL ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read open IBS trades")
+    }
+
+    /// Sum of closed IBS P&L.
+    pub async fn ibs_realized(&self) -> Result<Decimal> {
+        let rows: Vec<(Option<String>,)> = sqlx::query_as("SELECT pnl FROM us_ibs_trades WHERE pnl IS NOT NULL")
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to read IBS P&L")?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| r.0.and_then(|p| Decimal::from_str(&p).ok()))
+            .sum())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn ibs_open_trade(
+        &self,
+        symbol: &str,
+        qty: Decimal,
+        day: &str,
+        price: Decimal,
+        ibs: Decimal,
+        at: DateTime<Utc>,
+    ) -> Result<i64> {
+        let r = sqlx::query(
+            "INSERT INTO us_ibs_trades (symbol, qty, entry_day, entry_price, entry_ibs, entry_at) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(symbol)
+        .bind(qty.to_string())
+        .bind(day)
+        .bind(price.to_string())
+        .bind(ibs.round_dp(3).to_string())
+        .bind(at.to_rfc3339())
+        .execute(&self.pool)
+        .await
+        .context("Failed to open an IBS trade")?;
+        Ok(r.last_insert_rowid())
+    }
+
+    pub async fn ibs_close_trade(
+        &self,
+        id: i64,
+        day: &str,
+        price: Decimal,
+        ibs: Decimal,
+        pnl: Decimal,
+        at: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE us_ibs_trades SET exit_day = ?, exit_price = ?, exit_ibs = ?, pnl = ?, exit_at = ? WHERE id = ? AND exit_at IS NULL",
+        )
+        .bind(day)
+        .bind(price.to_string())
+        .bind(ibs.round_dp(3).to_string())
+        .bind(pnl.round_dp(4).to_string())
+        .bind(at.to_rfc3339())
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .context("Failed to close an IBS trade")?;
+        Ok(())
+    }
+
+    /// Every IBS trade, newest first, as JSON.
+    pub async fn ibs_trades(&self, limit: i64) -> Result<Vec<serde_json::Value>> {
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(i64, String, String, String, String, String, Option<String>, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT id, symbol, qty, entry_day, entry_price, entry_ibs, exit_day, exit_price, exit_ibs, pnl
+             FROM us_ibs_trades ORDER BY id DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read IBS trades")?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.0, "symbol": r.1, "qty": r.2, "entry_day": r.3, "entry_price": r.4,
+                    "entry_ibs": r.5, "exit_day": r.6, "exit_price": r.7, "exit_ibs": r.8, "pnl": r.9,
+                    "status": if r.6.is_some() { "CLOSED" } else { "OPEN" },
+                })
+            })
+            .collect())
+    }
+
+    /// Closed IBS trades for the ladder: (id, exit day, symbol, qty, entry, pnl).
+    #[allow(clippy::type_complexity)]
+    pub async fn us_ladder_ibs_sources(
+        &self,
+    ) -> Result<Vec<(i64, String, String, String, String, String)>> {
+        sqlx::query_as(
+            "SELECT id, exit_day, symbol, qty, entry_price, pnl FROM us_ibs_trades WHERE pnl IS NOT NULL ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read IBS trades for the ladder")
+    }
+
+    /// Closed US breakout trades from `since_utc` on: (id, symbol, created_at,
+    /// quantity, avg fill, realized pnl).
+    #[allow(clippy::type_complexity)]
+    pub async fn us_ladder_orb_sources(
+        &self,
+        since_utc: &str,
+    ) -> Result<Vec<(i64, String, String, String, String, String)>> {
+        sqlx::query_as(
+            "SELECT id, symbol, created_at, CAST(quantity AS TEXT), CAST(avg_fill_price AS TEXT), CAST(realized_pnl AS TEXT)
+             FROM trades WHERE venue_id = 'alpaca' AND strategy = 'orb' AND status = 'CLOSED'
+               AND realized_pnl IS NOT NULL AND avg_fill_price IS NOT NULL
+               AND COALESCE(close_reason, '') NOT LIKE 'Failed%' AND created_at >= ?
+             ORDER BY id",
+        )
+        .bind(since_utc)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read breakout trades for the ladder")
+    }
+
+    /// Every US breakout entry's created_at from `since_utc` on, closed or not.
+    pub async fn us_ladder_orb_entries(&self, since_utc: &str) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT created_at FROM trades WHERE venue_id = 'alpaca' AND strategy = 'orb'
+               AND avg_fill_price IS NOT NULL AND created_at >= ?
+               AND COALESCE(close_reason, '') NOT LIKE 'Failed%'",
+        )
+        .bind(since_utc)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read breakout entries for the ladder")?;
+        Ok(rows.into_iter().map(|r| r.0).collect())
+    }
+
+    /// Closed option trades from `since_day`: (id, day, contract, entry, exit).
+    pub async fn us_ladder_option_sources(
+        &self,
+        since_day: &str,
+    ) -> Result<Vec<(i64, String, String, String, String)>> {
+        sqlx::query_as(
+            "SELECT id, day, contract, entry_price, exit_price FROM us_option_trades
+             WHERE status = 'CLOSED' AND entry_price IS NOT NULL AND exit_price IS NOT NULL AND day >= ?
+             ORDER BY id",
+        )
+        .bind(since_day)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read option trades for the ladder")
+    }
+
+    /// Spread trades from `since_day`: (id, day, underlying, short, long,
+    /// credit, debit, status). Open ones included so a day waits for all.
+    #[allow(clippy::type_complexity)]
+    pub async fn us_ladder_spread_sources(
+        &self,
+        since_day: &str,
+    ) -> Result<Vec<(i64, String, String, String, String, Option<String>, Option<String>, String)>> {
+        sqlx::query_as(
+            "SELECT id, day, underlying, short_strike, long_strike, entry_credit, exit_debit, status
+             FROM us_spread_trades WHERE day >= ? ORDER BY id",
+        )
+        .bind(since_day)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read spread trades for the ladder")
+    }
+
+    /// Source ids already on a ladder book.
+    pub async fn us_ladder_done(&self, book: &str) -> Result<std::collections::HashSet<i64>> {
+        let rows: Vec<(i64,)> =
+            sqlx::query_as("SELECT DISTINCT source_id FROM us_ladder_trades WHERE book = ?")
+                .bind(book)
+                .fetch_all(&self.pool)
+                .await
+                .context("Failed to read the US ladder")?;
+        Ok(rows.into_iter().map(|r| r.0).collect())
+    }
+
+    /// One amount's ladder rows: (day, units, pnl).
+    pub async fn us_ladder_rows(
+        &self,
+        book: &str,
+        amount: i64,
+    ) -> Result<Vec<(String, String, String)>> {
+        sqlx::query_as(
+            "SELECT day, units, pnl FROM us_ladder_trades WHERE book = ? AND amount = ? ORDER BY id",
+        )
+        .bind(book)
+        .bind(amount)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read US ladder rows")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_us_ladder(
+        &self,
+        book: &str,
+        amount: i64,
+        source_id: i64,
+        day: &str,
+        symbol: &str,
+        units: Decimal,
+        pnl: Decimal,
+        at: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO us_ladder_trades (book, amount, source_id, day, symbol, units, pnl, recorded_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(book)
+        .bind(amount)
+        .bind(source_id)
+        .bind(day)
+        .bind(symbol)
+        .bind(units.to_string())
+        .bind(pnl.round_dp(2).to_string())
+        .bind(at.to_rfc3339())
+        .execute(&self.pool)
+        .await
+        .context("Failed to record a US ladder row")?;
+        Ok(())
+    }
+
+    /// Sum of a book's losing trades only (zero or negative). Profits are set
+    /// aside, so they never offset a loss in the cash the book may trade.
+    pub async fn intraday_losses(&self, strategy: &str) -> Result<Decimal> {
+        let rows: Vec<(Option<String>,)> =
+            sqlx::query_as("SELECT pnl FROM india_intraday_trades WHERE strategy = ?")
+                .bind(strategy)
+                .fetch_all(&self.pool)
+                .await
+                .context("Failed to read intraday losses")?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(p,)| p.as_deref().and_then(|p| Decimal::from_str(p).ok()))
+            .filter(|v| v.is_sign_negative())
+            .sum())
+    }
+
+    /// ORB and burst stock trades opened at or after `since` (UTC, the
+    /// `created_at` format): (id, symbol, side, status). The options book
+    /// mirrors these.
+    pub async fn us_orb_stock_trades_since(
+        &self,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<(i64, String, String, String)>> {
+        sqlx::query_as(
+            "SELECT id, symbol, side, status FROM trades
+             WHERE strategy IN ('orb', 'us_burst') AND created_at >= ?
+             ORDER BY id",
+        )
+        .bind(since.format("%Y-%m-%d %H:%M:%S").to_string())
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read ORB stock trades")
+    }
+
+    /// Record an options entry order as sent.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_option_trade(
+        &self,
+        day: &str,
+        stock_trade_id: i64,
+        underlying: &str,
+        contract: &str,
+        is_call: bool,
+        qty: i64,
+        limit_price: &str,
+        client_order_id: &str,
+        venue_order_id: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> Result<i64> {
+        let result = sqlx::query(
+            "INSERT INTO us_option_trades (day, stock_trade_id, underlying, contract, is_call, qty,
+                 limit_price, client_order_id, venue_order_id, status, entry_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)",
+        )
+        .bind(day)
+        .bind(stock_trade_id)
+        .bind(underlying)
+        .bind(contract)
+        .bind(is_call)
+        .bind(qty)
+        .bind(limit_price)
+        .bind(client_order_id)
+        .bind(venue_order_id)
+        .bind(at.to_rfc3339())
+        .execute(&self.pool)
+        .await
+        .context("Failed to record option entry")?;
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Alpaca accepted the entry order.
+    pub async fn set_option_order_id(&self, id: i64, venue_order_id: &str) -> Result<()> {
+        sqlx::query("UPDATE us_option_trades SET venue_order_id = ? WHERE id = ?")
+            .bind(venue_order_id)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to record option order id")?;
+        Ok(())
+    }
+
+    /// Stock trades that already have an option row (taken or tried).
+    pub async fn option_stock_ids(&self) -> Result<std::collections::HashSet<i64>> {
+        let rows: Vec<(i64,)> = sqlx::query_as("SELECT stock_trade_id FROM us_option_trades")
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to read option rows")?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    /// Option rows still in flight: PENDING, OPEN or CLOSING.
+    pub async fn live_option_trades(&self) -> Result<Vec<OptionTrade>> {
+        sqlx::query_as(
+            "SELECT id, day, stock_trade_id, contract, qty, client_order_id, venue_order_id, status,
+                    entry_price, exit_order_id, entry_at
+             FROM us_option_trades WHERE status IN ('PENDING', 'OPEN', 'CLOSING') ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read live option trades")
+    }
+
+    /// Entry filled: the position is open.
+    pub async fn option_opened(&self, id: i64, entry_price: &str, qty: i64) -> Result<()> {
+        sqlx::query("UPDATE us_option_trades SET status = 'OPEN', entry_price = ?, qty = ? WHERE id = ?")
+            .bind(entry_price)
+            .bind(qty)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to open option trade")?;
+        Ok(())
+    }
+
+    /// Entry never filled (cancelled or rejected): nothing was bought.
+    pub async fn option_cancelled(&self, id: i64, reason: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE us_option_trades SET status = 'CANCELLED', exit_reason = ?, pnl = '0' WHERE id = ?",
+        )
+        .bind(reason)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .context("Failed to cancel option trade")?;
+        Ok(())
+    }
+
+    /// Exit order sent.
+    pub async fn option_closing(
+        &self,
+        id: i64,
+        exit_client_order_id: &str,
+        exit_order_id: Option<&str>,
+        reason: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE us_option_trades SET status = 'CLOSING', exit_client_order_id = ?, exit_order_id = ?,
+                 exit_reason = ? WHERE id = ?",
+        )
+        .bind(exit_client_order_id)
+        .bind(exit_order_id)
+        .bind(reason)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .context("Failed to mark option closing")?;
+        Ok(())
+    }
+
+    /// Exit filled: book the P&L.
+    pub async fn option_closed(
+        &self,
+        id: i64,
+        exit_price: &str,
+        pnl: &str,
+        at: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE us_option_trades SET status = 'CLOSED', exit_price = ?, pnl = ?, exit_at = ? WHERE id = ?",
+        )
+        .bind(exit_price)
+        .bind(pnl)
+        .bind(at.to_rfc3339())
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .context("Failed to close option trade")?;
+        Ok(())
+    }
+
+    /// Exit order died unfilled: back to OPEN so the next pass sells again.
+    pub async fn option_reopen(&self, id: i64) -> Result<()> {
+        sqlx::query("UPDATE us_option_trades SET status = 'OPEN', exit_order_id = NULL WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to reopen option trade")?;
+        Ok(())
+    }
+
+    /// (entries today, P&L today, P&L total, losing trades only) for the book.
+    pub async fn option_totals(&self, day: &str) -> Result<(i64, Decimal, Decimal, Decimal)> {
+        let rows: Vec<(String, String, Option<String>)> =
+            sqlx::query_as("SELECT day, status, pnl FROM us_option_trades")
+                .fetch_all(&self.pool)
+                .await
+                .context("Failed to read option totals")?;
+        let (mut n, mut today, mut all, mut losses) = (0i64, Decimal::ZERO, Decimal::ZERO, Decimal::ZERO);
+        for (d, status, pnl) in rows {
+            if d == day && status != "CANCELLED" {
+                n += 1;
+            }
+            let v = pnl.as_deref().and_then(|p| Decimal::from_str(p).ok()).unwrap_or_default();
+            all += v;
+            if v.is_sign_negative() {
+                losses += v;
+            }
+            if d == day {
+                today += v;
+            }
+        }
+        Ok((n, today, all, losses))
+    }
+
+    // ---- U.S. credit-spread book (us::spreads) ----
+
+    /// Record a spread entry about to be sent; returns the row id.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_spread_trade(
+        &self,
+        day: &str,
+        underlying: &str,
+        short_contract: &str,
+        long_contract: &str,
+        short_strike: &str,
+        long_strike: &str,
+        underlying_price: &str,
+        qty: i64,
+        limit_credit: &str,
+        client_order_id: &str,
+        at: DateTime<Utc>,
+    ) -> Result<i64> {
+        let result = sqlx::query(
+            "INSERT INTO us_spread_trades (day, underlying, short_contract, long_contract, short_strike,
+                 long_strike, underlying_price, qty, limit_credit, client_order_id, status, entry_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)",
+        )
+        .bind(day)
+        .bind(underlying)
+        .bind(short_contract)
+        .bind(long_contract)
+        .bind(short_strike)
+        .bind(long_strike)
+        .bind(underlying_price)
+        .bind(qty)
+        .bind(limit_credit)
+        .bind(client_order_id)
+        .bind(at.to_rfc3339())
+        .execute(&self.pool)
+        .await
+        .context("Failed to record spread trade")?;
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Run one fixed UPDATE on a spread row: the binds, then the id.
+    async fn spread_update(&self, sql: &str, binds: &[&str], id: i64) -> Result<()> {
+        let mut q = sqlx::query(sql);
+        for b in binds {
+            q = q.bind(*b);
+        }
+        q.bind(id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to update spread trade")?;
+        Ok(())
+    }
+
+    pub async fn set_spread_order_id(&self, id: i64, order_id: &str) -> Result<()> {
+        self.spread_update("UPDATE us_spread_trades SET venue_order_id = ? WHERE id = ?", &[order_id], id)
+            .await
+    }
+
+    /// The entry sent again at a new credit (the mid went unfilled).
+    pub async fn spread_resend(&self, id: i64, limit_credit: &str, client_order_id: &str, order_id: &str, at: DateTime<Utc>) -> Result<()> {
+        self.spread_update(
+            "UPDATE us_spread_trades SET limit_credit = ?, client_order_id = ?, venue_order_id = ?, entry_at = ? WHERE id = ?",
+            &[limit_credit, client_order_id, order_id, &at.to_rfc3339()],
+            id,
+        )
+        .await
+    }
+
+    /// Entry filled for `credit` a share.
+    pub async fn spread_opened(&self, id: i64, credit: &str) -> Result<()> {
+        self.spread_update(
+            "UPDATE us_spread_trades SET status = 'OPEN', entry_credit = ? WHERE id = ?",
+            &[credit],
+            id,
+        )
+        .await
+    }
+
+    /// Entry never filled, or skipped: nothing was sold.
+    pub async fn spread_cancelled(&self, id: i64, reason: &str) -> Result<()> {
+        self.spread_update(
+            "UPDATE us_spread_trades SET status = 'CANCELLED', exit_reason = ?, pnl = '0' WHERE id = ?",
+            &[reason],
+            id,
+        )
+        .await
+    }
+
+    /// Buy-back order sent.
+    pub async fn spread_closing(&self, id: i64, client_order_id: &str, order_id: &str, reason: &str) -> Result<()> {
+        self.spread_update(
+            "UPDATE us_spread_trades SET status = 'CLOSING', exit_client_order_id = ?, exit_order_id = ?,
+                 exit_reason = ?, exit_tries = exit_tries + 1 WHERE id = ?",
+            &[client_order_id, order_id, reason],
+            id,
+        )
+        .await
+    }
+
+    /// Buy-back order died unfilled: open again, so the next pass retries.
+    pub async fn spread_reopen(&self, id: i64) -> Result<()> {
+        self.spread_update(
+            "UPDATE us_spread_trades SET status = 'OPEN', exit_order_id = NULL WHERE id = ?",
+            &[],
+            id,
+        )
+        .await
+    }
+
+    /// Bought back (or settled) for `debit` a share.
+    pub async fn spread_closed(&self, id: i64, debit: &str, pnl: &str, reason: &str, at: DateTime<Utc>) -> Result<()> {
+        self.spread_update(
+            "UPDATE us_spread_trades SET status = 'CLOSED', exit_debit = ?, pnl = ?, exit_reason = ?,
+                 exit_at = ? WHERE id = ?",
+            &[debit, pnl, reason, &at.to_rfc3339()],
+            id,
+        )
+        .await
+    }
+
+    /// Spreads in flight: entries sent, open, or being bought back.
+    pub async fn live_spread_trades(&self) -> Result<Vec<SpreadTrade>> {
+        sqlx::query_as(
+            "SELECT id, day, underlying, short_contract, long_contract, short_strike, long_strike, qty,
+                    client_order_id, venue_order_id, status, entry_credit, entry_at, exit_order_id, exit_tries
+             FROM us_spread_trades WHERE status IN ('PENDING', 'OPEN', 'CLOSING') ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read live spread trades")
+    }
+
+    /// Underlyings that already have a spread row today (any status).
+    pub async fn spread_underlyings_on(&self, day: &str) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as("SELECT underlying FROM us_spread_trades WHERE day = ?")
+            .bind(day)
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to read today's spreads")?;
+        Ok(rows.into_iter().map(|(u,)| u).collect())
+    }
+
+    /// (spreads today, P&L today, P&L in total, losses in total) in dollars.
+    pub async fn spread_totals(&self, day: &str) -> Result<(i64, Decimal, Decimal, Decimal)> {
+        let rows: Vec<(String, String, Option<String>)> =
+            sqlx::query_as("SELECT day, status, pnl FROM us_spread_trades")
+                .fetch_all(&self.pool)
+                .await
+                .context("Failed to read spread totals")?;
+        let (mut n, mut today, mut all, mut losses) = (0i64, Decimal::ZERO, Decimal::ZERO, Decimal::ZERO);
+        for (d, status, pnl) in rows {
+            if d == day && status != "CANCELLED" {
+                n += 1;
+            }
+            let v = pnl.as_deref().and_then(|p| Decimal::from_str(p).ok()).unwrap_or_default();
+            all += v;
+            if v.is_sign_negative() {
+                losses += v;
+            }
+            if d == day {
+                today += v;
+            }
+        }
+        Ok((n, today, all, losses))
+    }
+
+    /// The latest spread trades as JSON, newest first.
+    pub async fn recent_spread_trades(&self, limit: i64) -> Result<Vec<serde_json::Value>> {
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT day, underlying, short_strike, long_strike, underlying_price, qty, status,
+                    entry_credit, exit_debit, exit_reason, pnl, entry_at, exit_at
+             FROM us_spread_trades ORDER BY id DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read spread trades")?;
+        Ok(rows
+            .into_iter()
+            .map(|(day, underlying, ks, kl, px, qty, status, credit, debit, reason, pnl, entry_at, exit_at)| {
+                serde_json::json!({
+                    "day": day, "underlying": underlying, "short_strike": ks, "long_strike": kl,
+                    "underlying_price": px, "qty": qty, "status": status, "entry_credit": credit,
+                    "exit_debit": debit, "exit_reason": reason, "pnl": pnl,
+                    "entry_at": entry_at, "exit_at": exit_at,
+                })
+            })
+            .collect())
+    }
+
+    /// Every client order id the options and spread books have sent,
+    /// entries and exits. The reconciler counts these as known, not as orphans.
+    pub async fn option_client_order_ids(&self) -> Result<Vec<String>> {
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT client_order_id, exit_client_order_id FROM us_option_trades
+             UNION ALL SELECT client_order_id, exit_client_order_id FROM us_spread_trades",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read option order ids")?;
+        Ok(rows
+            .into_iter()
+            .flat_map(|(a, b)| std::iter::once(a).chain(b))
+            .collect())
+    }
+
+    /// The latest option trades as JSON, newest first.
+    pub async fn recent_option_trades(&self, limit: i64) -> Result<Vec<serde_json::Value>> {
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(String, String, String, bool, i64, String, Option<String>, Option<String>, Option<String>, Option<String>, String, Option<String>)> =
+            sqlx::query_as(
+                "SELECT day, underlying, contract, is_call, qty, status, entry_price, exit_price,
+                        exit_reason, pnl, entry_at, exit_at
+                 FROM us_option_trades ORDER BY id DESC LIMIT ?",
+            )
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to read option trades")?;
+        Ok(rows
+            .into_iter()
+            .map(|(day, underlying, contract, is_call, qty, status, entry, exit, reason, pnl, entry_at, exit_at)| {
+                serde_json::json!({
+                    "day": day, "underlying": underlying, "contract": contract,
+                    "kind": if is_call { "CALL" } else { "PUT" }, "qty": qty, "status": status,
+                    "entry_price": entry, "exit_price": exit, "exit_reason": reason, "pnl": pnl,
+                    "entry_at": entry_at, "exit_at": exit_at,
+                })
+            })
+            .collect())
+    }
+
+    /// The open crypto position of a book in one coin: (id, qty, cost).
+    pub async fn crypto_open(&self, book: &str, symbol: &str) -> Result<Option<(i64, Decimal, Decimal)>> {
+        let row: Option<(i64, String, String)> = sqlx::query_as(
+            "SELECT id, qty, cost FROM crypto_trades WHERE book = ? AND symbol = ? AND status = 'OPEN'
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(book)
+        .bind(symbol)
+        .fetch_optional(&self.pool)
+        .await
+        .context("Failed to read open crypto trade")?;
+        Ok(row.map(|(id, q, c)| {
+            (id, Decimal::from_str(&q).unwrap_or_default(), Decimal::from_str(&c).unwrap_or_default())
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn crypto_insert_open(
+        &self,
+        book: &str,
+        symbol: &str,
+        qty: Decimal,
+        cost: Decimal,
+        price: Decimal,
+        reason: &str,
+        client_order_id: Option<&str>,
+    ) -> Result<i64> {
+        let r = sqlx::query(
+            "INSERT INTO crypto_trades (book, symbol, status, qty, cost, entry_price, entry_at, entry_reason, client_order_id)
+             VALUES (?, ?, 'OPEN', ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(book)
+        .bind(symbol)
+        .bind(qty.to_string())
+        .bind(cost.round_dp(6).to_string())
+        .bind(price.to_string())
+        .bind(Utc::now().to_rfc3339())
+        .bind(reason)
+        .bind(client_order_id)
+        .execute(&self.pool)
+        .await
+        .context("Failed to record crypto entry")?;
+        Ok(r.last_insert_rowid())
+    }
+
+    pub async fn crypto_close(
+        &self,
+        id: i64,
+        price: Decimal,
+        proceeds: Decimal,
+        cost: Decimal,
+        reason: &str,
+        exit_client_order_id: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE crypto_trades SET status = 'CLOSED', exit_price = ?, exit_at = ?, exit_reason = ?,
+                    proceeds = ?, pnl = ?, exit_client_order_id = ? WHERE id = ?",
+        )
+        .bind(price.to_string())
+        .bind(Utc::now().to_rfc3339())
+        .bind(reason)
+        .bind(proceeds.round_dp(6).to_string())
+        .bind((proceeds - cost).round_dp(6).to_string())
+        .bind(exit_client_order_id)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .context("Failed to record crypto exit")?;
+        Ok(())
+    }
+
+    /// (losses, profits) of a crypto book's closed trades. Losses come off the
+    /// capital; profits are set aside.
+    pub async fn crypto_realized(&self, book: &str) -> Result<(Decimal, Decimal)> {
+        let rows: Vec<(Option<String>,)> =
+            sqlx::query_as("SELECT pnl FROM crypto_trades WHERE book = ? AND status = 'CLOSED'")
+                .bind(book)
+                .fetch_all(&self.pool)
+                .await
+                .context("Failed to read crypto P&L")?;
+        let (mut losses, mut profits) = (Decimal::ZERO, Decimal::ZERO);
+        for (p,) in rows {
+            let v = p.as_deref().and_then(|p| Decimal::from_str(p).ok()).unwrap_or_default();
+            if v.is_sign_negative() {
+                losses += v;
+            } else {
+                profits += v;
+            }
+        }
+        Ok((losses, profits))
+    }
+
+    /// Every Alpaca client order id the crypto book has sent.
+    pub async fn crypto_client_order_ids(&self) -> Result<Vec<String>> {
+        let rows: Vec<(Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT client_order_id, exit_client_order_id FROM crypto_trades")
+                .fetch_all(&self.pool)
+                .await
+                .context("Failed to read crypto order ids")?;
+        Ok(rows.into_iter().flat_map(|(a, b)| a.into_iter().chain(b)).collect())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_crypto_check(
+        &self,
+        day: &str,
+        symbol: &str,
+        kind: &str,
+        price: Decimal,
+        chg: (Option<Decimal>, Option<Decimal>, Option<Decimal>),
+        rule_says: &str,
+        news_risk: &str,
+        news_reason: &str,
+        market_view: &str,
+        headlines: &str,
+        action: &str,
+    ) -> Result<()> {
+        let pct = |x: Option<Decimal>| x.map(|v| (v * Decimal::ONE_HUNDRED).round_dp(2).to_string());
+        sqlx::query(
+            "INSERT INTO crypto_checks (at, day, symbol, kind, price, chg_24h, chg_7d, chg_60d, rule_says,
+                                        news_risk, news_reason, market_view, headlines, action)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(day)
+        .bind(symbol)
+        .bind(kind)
+        .bind(price.to_string())
+        .bind(pct(chg.0))
+        .bind(pct(chg.1))
+        .bind(pct(chg.2))
+        .bind(rule_says)
+        .bind(news_risk)
+        .bind(news_reason)
+        .bind(market_view)
+        .bind(headlines)
+        .bind(action)
+        .execute(&self.pool)
+        .await
+        .context("Failed to record crypto check")?;
+        Ok(())
+    }
+
+    /// When the last check of this kind ran for a coin (RFC 3339), if ever.
+    pub async fn crypto_last_check(&self, symbol: &str, kind: &str) -> Result<Option<(String, String)>> {
+        sqlx::query_as("SELECT day, at FROM crypto_checks WHERE symbol = ? AND kind = ? ORDER BY id DESC LIMIT 1")
+            .bind(symbol)
+            .bind(kind)
+            .fetch_optional(&self.pool)
+            .await
+            .context("Failed to read last crypto check")
+    }
+
+    /// Crypto trades and checks as JSON, newest first.
+    pub async fn crypto_recent(&self, limit: i64) -> Result<(Vec<serde_json::Value>, Vec<serde_json::Value>)> {
+        #[allow(clippy::type_complexity)]
+        let trades: Vec<(String, String, String, String, String, String, String, String, Option<String>, Option<String>, Option<String>, Option<String>)> =
+            sqlx::query_as(
+                "SELECT book, symbol, status, qty, cost, entry_price, entry_at, entry_reason,
+                        exit_price, exit_at, exit_reason, pnl
+                 FROM crypto_trades ORDER BY id DESC LIMIT ?",
+            )
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to read crypto trades")?;
+        #[allow(clippy::type_complexity)]
+        let checks: Vec<(String, String, String, String, Option<String>, Option<String>, Option<String>, String, String, Option<String>, Option<String>, Option<String>, String)> =
+            sqlx::query_as(
+                "SELECT at, symbol, kind, price, chg_24h, chg_7d, chg_60d, rule_says, news_risk,
+                        news_reason, market_view, headlines, action
+                 FROM crypto_checks ORDER BY id DESC LIMIT ?",
+            )
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to read crypto checks")?;
+        Ok((
+            trades
+                .into_iter()
+                .map(|(book, symbol, status, qty, cost, entry, entry_at, why, exit, exit_at, exit_why, pnl)| {
+                    serde_json::json!({
+                        "book": book, "symbol": symbol, "status": status, "qty": qty, "cost": cost,
+                        "entry_price": entry, "entry_at": entry_at, "entry_reason": why,
+                        "exit_price": exit, "exit_at": exit_at, "exit_reason": exit_why, "pnl": pnl,
+                    })
+                })
+                .collect(),
+            checks
+                .into_iter()
+                .map(|(at, symbol, kind, price, c24, c7, c60, rule, risk, reason, view, heads, action)| {
+                    serde_json::json!({
+                        "at": at, "symbol": symbol, "kind": kind, "price": price,
+                        "chg_24h_pct": c24, "chg_7d_pct": c7, "chg_60d_pct": c60,
+                        "rule_says": rule, "news_risk": risk, "news_reason": reason,
+                        "market_view": view, "headlines": heads, "action": action,
+                    })
+                })
+                .collect(),
+        ))
+    }
+
     /// The latest intraday trades as JSON, newest first.
     pub async fn recent_intraday_trades(&self, limit: i64) -> Result<Vec<serde_json::Value>> {
         #[allow(clippy::type_complexity)]
-        let rows: Vec<(String, String, bool, i64, String, String, String, Option<String>, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT day, symbol, is_buy, qty, entry_price, stop_price, entry_at, exit_price, exit_reason, charges, pnl
-             FROM india_intraday_trades ORDER BY id DESC LIMIT ?",
+        let rows: Vec<(String, String, bool, i64, String, String, String, Option<String>, Option<String>, Option<String>, Option<String>, String)> = sqlx::query_as(
+            "SELECT day, symbol, is_buy, qty, entry_price, stop_price, entry_at, exit_price, exit_reason, charges, pnl, strategy
+             FROM india_intraday_trades WHERE strategy NOT GLOB '*_cap[0-9]*' ORDER BY id DESC LIMIT ?",
         )
         .bind(limit)
         .fetch_all(&self.pool)
@@ -913,9 +2047,200 @@ impl Store {
                 serde_json::json!({
                     "day": r.0, "symbol": r.1, "side": if r.2 { "LONG" } else { "SHORT" }, "qty": r.3,
                     "entry_price": r.4, "stop_price": r.5, "entry_at": r.6, "exit_price": r.7,
-                    "exit_reason": r.8, "charges": r.9, "pnl": r.10,
+                    "exit_reason": r.8, "charges": r.9, "pnl": r.10, "strategy": r.11,
                 })
             })
+            .collect())
+    }
+
+    /// The Polymarket paper book from the ledger: (cost of open positions,
+    /// realized P&L of settled or exited ones). Polymarket trades are the
+    /// YES / NO ones; every other venue records BUY / SELL.
+    pub async fn polymarket_book(&self) -> Result<(Decimal, Decimal)> {
+        let rows: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT status, entry_price, size, pnl FROM trades WHERE direction IN ('YES', 'NO')",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read the Polymarket book")?;
+        let (mut open_cost, mut realized) = (Decimal::ZERO, Decimal::ZERO);
+        for (status, price, size, pnl) in rows {
+            if status == "OPEN" {
+                if let (Ok(p), Ok(s)) = (Decimal::from_str(&price), Decimal::from_str(&size)) {
+                    open_cost += p * s;
+                }
+            } else if let Some(v) = pnl.as_deref().and_then(|v| Decimal::from_str(v).ok()) {
+                realized += v;
+            }
+        }
+        Ok((open_cost, realized))
+    }
+
+    /// Polymarket trades, newest first, for the dashboard.
+    pub async fn recent_polymarket_trades(&self, limit: i64) -> Result<Vec<serde_json::Value>> {
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(i64, String, Option<String>, String, String, String, Option<String>, String, Option<String>, Option<String>, Option<String>)> =
+            sqlx::query_as(
+                "SELECT id, market_id, market_question, direction, entry_price, size, claude_fair_value,
+                        status, pnl, created_at, resolved_at
+                 FROM trades WHERE direction IN ('YES', 'NO') ORDER BY id DESC LIMIT ?",
+            )
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to read Polymarket trades")?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.0, "market_id": r.1, "question": r.2, "side": r.3, "entry_price": r.4,
+                    "size": r.5, "fair_value": r.6, "status": r.7, "pnl": r.8, "entry_at": r.9,
+                    "closed_at": r.10,
+                })
+            })
+            .collect())
+    }
+
+    /// Closed NSE intraday trades (any book) that have no post-mortem yet.
+    pub async fn unreviewed_intraday_trades(&self) -> Result<Vec<ClosedTrade>> {
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(i64, String, String, bool, String, String, Option<String>, String, Option<String>, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT t.id, t.strategy, t.symbol, t.is_buy, t.entry_price, t.stop_price, t.exit_price,
+                    t.entry_at, t.exit_at, t.exit_reason, t.pnl, t.charges
+             FROM india_intraday_trades t
+             LEFT JOIN trade_reviews r
+               ON r.market = 'IN' AND r.strategy = t.strategy AND r.trade_ref = t.id
+             WHERE t.exit_at IS NOT NULL AND r.id IS NULL AND t.strategy NOT GLOB '*_cap[0-9]*'
+             ORDER BY t.id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read unreviewed intraday trades")?;
+        let dec = |s: &str| Decimal::from_str(s).ok();
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                Some(ClosedTrade {
+                    market: "IN".into(),
+                    strategy: r.1,
+                    trade_ref: r.0,
+                    symbol: r.2,
+                    is_buy: r.3,
+                    entry_price: dec(&r.4)?,
+                    stop_price: dec(&r.5)?,
+                    exit_price: dec(r.6.as_deref()?)?,
+                    entry_at: parse_db_time(&r.7)?,
+                    exit_at: parse_db_time(r.8.as_deref()?)?,
+                    exit_reason: r.9,
+                    pnl: dec(r.10.as_deref()?)?,
+                    charges: r.11.as_deref().and_then(dec),
+                })
+            })
+            .collect())
+    }
+
+    /// One strategy's closed trades on one venue that have no post-mortem yet.
+    /// A closed trade's mark is its exit price.
+    pub async fn unreviewed_venue_trades(
+        &self,
+        venue_id: &str,
+        strategy: &str,
+    ) -> Result<Vec<ClosedTrade>> {
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(i64, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT t.id, t.symbol, t.side, COALESCE(t.avg_fill_price, t.entry_price), t.stop_price,
+                    t.mark_price, t.created_at, t.closed_at, t.close_reason, t.realized_pnl
+             FROM trades t
+             LEFT JOIN trade_reviews r
+               ON r.market = 'US' AND r.strategy = t.strategy AND r.trade_ref = t.id
+             WHERE t.venue_id = ? AND t.strategy = ? AND t.status = 'CLOSED' AND r.id IS NULL
+             ORDER BY t.id",
+        )
+        .bind(venue_id)
+        .bind(strategy)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read unreviewed venue trades")?;
+        let dec = |s: Option<String>| s.as_deref().and_then(|v| Decimal::from_str(v).ok());
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                Some(ClosedTrade {
+                    market: "US".into(),
+                    strategy: strategy.to_string(),
+                    trade_ref: r.0,
+                    symbol: r.1?,
+                    is_buy: r.2.as_deref() != Some("SELL"),
+                    entry_price: dec(r.3)?,
+                    stop_price: dec(r.4)?,
+                    exit_price: dec(r.5)?,
+                    entry_at: parse_db_time(r.6.as_deref()?)?,
+                    exit_at: parse_db_time(r.7.as_deref()?)?,
+                    exit_reason: r.8,
+                    pnl: dec(r.9)?,
+                    charges: None,
+                })
+            })
+            .collect())
+    }
+
+    /// File a trade's post-mortem. A second review of the same trade is ignored.
+    pub async fn insert_trade_review(
+        &self,
+        t: &ClosedTrade,
+        r: &TradeReviewRow,
+        at: DateTime<Utc>,
+    ) -> Result<()> {
+        let s = |d: Option<Decimal>| d.map(|v| v.to_string());
+        sqlx::query(
+            "INSERT OR IGNORE INTO trade_reviews
+               (market, strategy, trade_ref, symbol, side, day, entry_at, exit_at, entry_price,
+                stop_price, exit_price, exit_reason, pnl, charges, minutes_held, mfe_r, mae_r,
+                index_move_pct, label, lesson, reviewed_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&t.market)
+        .bind(&t.strategy)
+        .bind(t.trade_ref)
+        .bind(&t.symbol)
+        .bind(if t.is_buy { "LONG" } else { "SHORT" })
+        .bind(&r.day)
+        .bind(t.entry_at.to_rfc3339())
+        .bind(t.exit_at.to_rfc3339())
+        .bind(t.entry_price.to_string())
+        .bind(t.stop_price.to_string())
+        .bind(t.exit_price.to_string())
+        .bind(&t.exit_reason)
+        .bind(t.pnl.to_string())
+        .bind(s(t.charges))
+        .bind(r.minutes_held)
+        .bind(s(r.mfe_r))
+        .bind(s(r.mae_r))
+        .bind(s(r.index_move_pct))
+        .bind(&r.label)
+        .bind(&r.lesson)
+        .bind(at.to_rfc3339())
+        .execute(&self.pool)
+        .await
+        .context("Failed to store trade review")?;
+        Ok(())
+    }
+
+    /// The latest post-mortems as JSON, newest trade first.
+    pub async fn recent_trade_reviews(&self, limit: i64) -> Result<Vec<serde_json::Value>> {
+        let rows: Vec<StoredReview> = sqlx::query_as(
+            "SELECT market, strategy, trade_ref, symbol, side, day, entry_at, exit_at, entry_price,
+                    stop_price, exit_price, exit_reason, pnl, charges, minutes_held, mfe_r, mae_r,
+                    index_move_pct, label, lesson
+             FROM trade_reviews ORDER BY entry_at DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read trade reviews")?;
+        Ok(rows
+            .into_iter()
+            .map(|r| serde_json::to_value(r).unwrap_or_default())
             .collect())
     }
 
@@ -946,6 +2271,7 @@ impl Store {
                     "id": r.0, "symbol": r.1, "side": r.2, "qty": r.3, "entry_price": r.4,
                     "stop_price": r.5, "mark_price": r.6, "realized_pnl": r.7, "unrealized_pnl": r.8,
                     "close_reason": r.9, "status": r.10, "entry_at": r.11, "closed_at": r.12,
+                    "strategy": strategy,
                 })
             })
             .collect())
@@ -1017,6 +2343,57 @@ impl Store {
 
     /// Today's P&L for one strategy's venue trades: realized on positions
     /// closed today plus the latest mark on those still open.
+    /// Realized P&L of these strategies' trades closed on or after `since`
+    /// (UTC date), or ever when `since` is None.
+    pub async fn strategies_realized_since(
+        &self,
+        strategies: &[&str],
+        since: Option<chrono::NaiveDate>,
+    ) -> Result<Decimal> {
+        let mut total = Decimal::ZERO;
+        for strategy in strategies {
+            let rows: Vec<(Option<String>,)> = sqlx::query_as(
+                "SELECT realized_pnl FROM trades
+                 WHERE strategy = ? AND status = 'CLOSED' AND substr(closed_at, 1, 10) >= ?",
+            )
+            .bind(strategy)
+            .bind(since.map(|d| d.to_string()).unwrap_or_default())
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to read strategy realized P&L")?;
+            for (v,) in rows {
+                if let Some(v) = v.as_deref().and_then(|v| Decimal::from_str(v).ok()) {
+                    total += v;
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    /// Today's P&L of every equity trade on a venue: closed today (realized)
+    /// plus still open (marked). The U.S. stock books' figure for the
+    /// circuit breaker; options and crypto live in tables of their own.
+    pub async fn venue_equity_day_pnl(&self, venue: &str, day: chrono::NaiveDate) -> Result<Decimal> {
+        let rows: Vec<(Option<String>, Option<String>, String)> = sqlx::query_as(
+            "SELECT realized_pnl, unrealized_pnl, status FROM trades
+             WHERE venue_id = ? AND asset_class = 'equity'
+               AND (date(closed_at) = ? OR status IN ('OPEN', 'PARTIAL'))",
+        )
+        .bind(venue)
+        .bind(day.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read the venue's day P&L")?;
+        let mut total = Decimal::ZERO;
+        for (realized, unrealized, status) in rows {
+            let v = if status == "CLOSED" { realized } else { unrealized };
+            if let Some(v) = v.as_deref().and_then(|v| Decimal::from_str(v).ok()) {
+                total += v;
+            }
+        }
+        Ok(total)
+    }
+
     pub async fn strategy_day_pnl(
         &self,
         strategy: &str,
@@ -1075,8 +2452,11 @@ impl Store {
     /// time, so the streak read zero during an actual losing run.
     pub async fn consecutive_losses(&self) -> Result<u32> {
         let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            // Polymarket paper bets are left out, as in count_trades_opened_on:
+            // on 11 Nov 2026 its run of lost underdog bets tripped this limit
+            // and halted the stock books for the U.S. session.
             "SELECT status, pnl FROM trades
-             WHERE status IN ('CLOSED', 'RESOLVED_WIN', 'RESOLVED_LOSS')
+             WHERE status IN ('CLOSED', 'RESOLVED_WIN', 'RESOLVED_LOSS') AND venue_id <> 'polymarket'
              ORDER BY COALESCE(resolved_at, closed_at, created_at) DESC, id DESC
              LIMIT 50",
         )
@@ -1224,6 +2604,53 @@ impl Store {
         .fetch_all(&self.pool)
         .await
         .context("Failed to fetch daily equity")
+    }
+
+    /// Closed P&L per day of the real India books (shadow and tracking ledgers
+    /// left out), in rupees, from `since` on. For the daily target tracker.
+    pub async fn india_real_pnl_by_day(
+        &self,
+        since: &str,
+    ) -> Result<std::collections::BTreeMap<String, Decimal>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT day, pnl FROM india_intraday_trades
+             WHERE pnl IS NOT NULL AND day >= ?
+               AND strategy IN ('india_orb', 'india_burst', 'india_gapgo')",
+        )
+        .bind(since)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read India P&L by day")?;
+        let mut out = std::collections::BTreeMap::new();
+        for (day, pnl) in rows {
+            if let Ok(v) = Decimal::from_str(&pnl) {
+                *out.entry(day).or_insert(Decimal::ZERO) += v;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Closed Polymarket P&L per UTC day from `since` on, in dollars.
+    pub async fn polymarket_pnl_by_day(
+        &self,
+        since: &str,
+    ) -> Result<std::collections::BTreeMap<String, Decimal>> {
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT date(closed_at), realized_pnl FROM trades
+             WHERE asset_class = 'prediction_binary' AND status = 'CLOSED'
+               AND closed_at IS NOT NULL AND date(closed_at) >= ?",
+        )
+        .bind(since)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to read Polymarket P&L by day")?;
+        let mut out = std::collections::BTreeMap::new();
+        for (day, pnl) in rows {
+            if let Some(v) = pnl.as_deref().and_then(|p| Decimal::from_str(p).ok()) {
+                *out.entry(day).or_insert(Decimal::ZERO) += v;
+            }
+        }
+        Ok(out)
     }
 
     /// Reconciliation history, newest first.
@@ -1871,6 +3298,76 @@ struct VenueOpenTradeRow {
 }
 
 /// An open position in the NSE intraday paper book.
+/// A closed strategy trade waiting for its post-mortem (src/review.rs).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClosedTrade {
+    /// "IN" or "US".
+    pub market: String,
+    pub strategy: String,
+    /// The row id in the trade's own table.
+    pub trade_ref: i64,
+    pub symbol: String,
+    pub is_buy: bool,
+    pub entry_price: Decimal,
+    pub stop_price: Decimal,
+    pub exit_price: Decimal,
+    pub entry_at: DateTime<Utc>,
+    pub exit_at: DateTime<Utc>,
+    pub exit_reason: Option<String>,
+    pub pnl: Decimal,
+    /// Round-trip charges, where the book records them (India).
+    pub charges: Option<Decimal>,
+}
+
+/// A finished post-mortem, as stored.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TradeReviewRow {
+    pub day: String,
+    pub minutes_held: i64,
+    pub mfe_r: Option<Decimal>,
+    pub mae_r: Option<Decimal>,
+    pub index_move_pct: Option<Decimal>,
+    pub label: String,
+    pub lesson: String,
+}
+
+#[derive(Debug, FromRow, Serialize)]
+struct StoredReview {
+    market: String,
+    strategy: String,
+    trade_ref: i64,
+    symbol: String,
+    side: String,
+    day: String,
+    entry_at: String,
+    exit_at: String,
+    entry_price: String,
+    stop_price: String,
+    exit_price: String,
+    exit_reason: Option<String>,
+    pnl: String,
+    charges: Option<String>,
+    minutes_held: i64,
+    mfe_r: Option<String>,
+    mae_r: Option<String>,
+    index_move_pct: Option<String>,
+    label: String,
+    lesson: String,
+}
+
+/// Timestamps in this database are RFC 3339 or SQLite's "YYYY-MM-DD HH:MM:SS"
+/// (UTC).
+fn parse_db_time(s: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s)
+        .map(|t| t.with_timezone(&Utc))
+        .ok()
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+                .ok()
+                .map(|t| t.and_utc())
+        })
+}
+
 #[derive(Debug, Clone)]
 pub struct IntradayOpen {
     pub id: i64,
@@ -1881,6 +3378,42 @@ pub struct IntradayOpen {
     pub entry_price: Decimal,
     pub stop_price: Decimal,
     pub entry_at: DateTime<Utc>,
+}
+
+/// One row of the U.S. options book still in flight.
+/// A credit spread in flight (us::spreads).
+#[derive(Debug, Clone, FromRow)]
+pub struct SpreadTrade {
+    pub id: i64,
+    pub day: String,
+    pub underlying: String,
+    pub short_contract: String,
+    pub long_contract: String,
+    pub short_strike: String,
+    pub long_strike: String,
+    pub qty: i64,
+    pub client_order_id: String,
+    pub venue_order_id: Option<String>,
+    pub status: String,
+    pub entry_credit: Option<String>,
+    pub entry_at: String,
+    pub exit_order_id: Option<String>,
+    pub exit_tries: i64,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct OptionTrade {
+    pub id: i64,
+    pub day: String,
+    pub stock_trade_id: i64,
+    pub contract: String,
+    pub qty: i64,
+    pub client_order_id: String,
+    pub venue_order_id: Option<String>,
+    pub status: String,
+    pub entry_price: Option<String>,
+    pub exit_order_id: Option<String>,
+    pub entry_at: String,
 }
 
 /// An open continuous-asset position, with decimals parsed.
@@ -2078,7 +3611,6 @@ mod tests {
                 breakout_pct_of_range: dec!(25),
             },
             orion: orion(&[], Utc::now()),
-            luna: luna(&[], dec!(0.2), dec!(52), true),
             titan: Titan {
                 allowed: true,
                 reason: "within limits".into(),
@@ -2107,26 +3639,71 @@ mod tests {
     async fn the_intraday_book_opens_closes_and_totals() {
         let store = Store::new(":memory:").await.unwrap();
         store
-            .insert_intraday_trade("2026-11-02", "ITC", false, 9, "250", "255", "2500", Utc::now())
+            .insert_intraday_trade("orb", "2026-11-02", "ITC", false, 9, "250", "255", "2500", Utc::now())
             .await
             .unwrap();
-        let open = store.open_intraday_trades().await.unwrap();
-        assert_eq!(open.len(), 1);
+        store
+            .insert_intraday_trade("burst", "2026-11-02", "TCS", true, 2, "3000", "2970", "10000", Utc::now())
+            .await
+            .unwrap();
+        let open = store.open_intraday_trades("orb").await.unwrap();
+        assert_eq!(open.len(), 1, "each strategy sees only its own book");
         assert!(!open[0].is_buy);
         store
             .close_intraday_trade(open[0].id, "245", "FLAT_1515", "3.50", "41.50", Utc::now())
             .await
             .unwrap();
-        assert!(store.open_intraday_trades().await.unwrap().is_empty());
+        assert!(store.open_intraday_trades("orb").await.unwrap().is_empty());
+        assert_eq!(store.open_intraday_trades("burst").await.unwrap().len(), 1);
         assert_eq!(
-            store.intraday_totals("2026-11-02").await.unwrap(),
+            store.intraday_totals("orb", "2026-11-02").await.unwrap(),
             (1, dec!(41.50), dec!(41.50))
         );
         assert_eq!(
-            store.intraday_totals("2026-11-03").await.unwrap(),
+            store.intraday_totals("orb", "2026-11-03").await.unwrap(),
             (0, Decimal::ZERO, dec!(41.50))
         );
-        assert_eq!(store.recent_intraday_trades(5).await.unwrap()[0]["side"], "SHORT");
+        assert_eq!(
+            store.intraday_totals("burst", "2026-11-02").await.unwrap(),
+            (1, Decimal::ZERO, Decimal::ZERO)
+        );
+        let recent = store.recent_intraday_trades(5).await.unwrap();
+        assert_eq!(recent[0]["strategy"], "burst");
+        assert_eq!(recent[1]["side"], "SHORT");
+    }
+
+    #[tokio::test]
+    async fn a_closed_trade_is_reviewed_once() {
+        let store = Store::new(":memory:").await.unwrap();
+        store
+            .insert_intraday_trade("india_orb", "2026-11-02", "TCS", true, 2, "100", "98", "10000", Utc::now())
+            .await
+            .unwrap();
+        assert!(store.unreviewed_intraday_trades().await.unwrap().is_empty(), "still open");
+        let id = store.open_intraday_trades("india_orb").await.unwrap()[0].id;
+        store
+            .close_intraday_trade(id, "97.5", "STOP", "3", "-8", Utc::now())
+            .await
+            .unwrap();
+        let pending = store.unreviewed_intraday_trades().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].pnl, dec!(-8));
+        let row = TradeReviewRow {
+            day: "2026-11-02".into(),
+            minutes_held: 5,
+            mfe_r: Some(dec!(0.2)),
+            mae_r: Some(dec!(1.25)),
+            index_move_pct: None,
+            label: "FALSE_BREAKOUT".into(),
+            lesson: "test".into(),
+        };
+        store.insert_trade_review(&pending[0], &row, Utc::now()).await.unwrap();
+        store.insert_trade_review(&pending[0], &row, Utc::now()).await.unwrap();
+        assert!(store.unreviewed_intraday_trades().await.unwrap().is_empty());
+        let all = store.recent_trade_reviews(10).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0]["label"], "FALSE_BREAKOUT");
+        assert_eq!(all[0]["mae_r"], "1.25");
     }
 
     /// A SELL entry is a short: the open-trade view must say so, carry the
@@ -2359,6 +3936,7 @@ mod tests {
             pnl: None,
             created_at: None,
             resolved_at: None,
+            ..Default::default()
         };
         let id = store
             .insert_trade(&trade)
@@ -2644,6 +4222,27 @@ mod tests {
         assert_eq!(store.consecutive_losses().await.unwrap(), 0);
     }
 
+    #[tokio::test]
+    async fn lost_polymarket_bets_are_not_a_stock_losing_streak() {
+        let store = Store::new(":memory:").await.unwrap();
+        seed_closed(&store, "2026-01-02T09:00:00Z", "2026-01-02T10:00:00Z", "-1").await;
+        for i in 0..12 {
+            sqlx::query(
+                "INSERT INTO trades (cycle, venue_id, market_id, symbol, direction, side, entry_price, size,
+                                     edge_at_entry, claude_fair_value, confidence, kelly_raw, kelly_adjusted,
+                                     status, pnl, resolved_at)
+                 VALUES (1, 'polymarket', ?, ?, 'YES', 'BUY', '0.25', '8', '0', '0.25', '0', '0', '0',
+                         'RESOLVED_LOSS', '-2', '2026-01-03T10:00:00Z')",
+            )
+            .bind(format!("0x{i}"))
+            .bind(format!("0x{i}:YES"))
+            .execute(store.pool())
+            .await
+            .unwrap();
+        }
+        assert_eq!(store.consecutive_losses().await.unwrap(), 1, "only the stock loss counts");
+    }
+
     /// `max_trades_per_day` is only a limit if the count can see the rows.
     ///
     /// Neither insert sets `created_at`; both rely on the column default
@@ -2677,14 +4276,33 @@ mod tests {
                 pnl: None,
                 created_at: None,
                 resolved_at: None,
+                ..Default::default()
             })
             .await
             .unwrap();
 
         assert_eq!(
             store.count_trades_opened_on(today).await.unwrap(),
+            0,
+            "a Polymarket bet must not use up the stock books' daily cap"
+        );
+
+        // A venue trade (here Alpaca) opened now through the column default.
+        sqlx::query(
+            "INSERT INTO trades (cycle, venue_id, market_id, symbol, asset_class, direction,
+                                 side, entry_price, size, edge_at_entry, claude_fair_value,
+                                 confidence, kelly_raw, kelly_adjusted, status)
+             VALUES (1,'alpaca','NVDA','NVDA','equity','LONG','BUY','100','1',
+                     '0.1','0.6','0.8','0','0','OPEN')",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        assert_eq!(
+            store.count_trades_opened_on(today).await.unwrap(),
             1,
-            "a trade opened today must be visible to the daily cap"
+            "a stock trade opened today must be visible to the daily cap"
         );
         assert_eq!(
             store
