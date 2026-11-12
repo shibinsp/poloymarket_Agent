@@ -38,3 +38,20 @@ jobs:
 
       - name: Test
         run: cargo test --all-targets
+
+  analyst:
+    name: analyst (python)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: analyst
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install
+        run: uv venv -p 3.12 .venv && uv pip install -p .venv -e '.[dev,ml]'
+
+      - name: Test
+        run: .venv/bin/pytest
