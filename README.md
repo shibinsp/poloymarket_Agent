@@ -2,6 +2,8 @@
 
 A self-sustaining autonomous trading agent built in Rust that trades on [Polymarket](https://polymarket.com/) prediction markets. The agent scans markets, estimates fair value using Claude AI, identifies mispriced contracts, sizes positions using Kelly Criterion, executes trades, and pays its own API bills from profits. If balance hits $0, the agent shuts down ("dies").
 
+> **NSE intraday roadmap:** see [DEV_PLAN.md](DEV_PLAN.md) for the development and tuning plan derived from `Intraday_Trading_Agent_Architecture.docx`.
+
 ## System Architecture
 
 ```
